@@ -11,7 +11,8 @@
   "scripts": {
     "test": "node --test",
     "convert": "node ./bin/read2xsgg.js",
-    "start": "node ./bin/server.js"
+    "start": "node ./bin/server.js",
+    "docker:push": "./scripts/docker-push.sh"
   },
   "keywords": [
     "legado",
