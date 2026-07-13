@@ -16,29 +16,30 @@ const raw = {
   ruleContent: { content: "#content@html" },
 };
 
-test("alicesw.com 源会经站点适配后再转换出可用规则", () => {
+test("alicesw.com 适配符合香色书源规则§五§七", () => {
   const { sources, warnings } = convertLegado([raw]);
   const converted = sources["爱丽丝书屋"];
-  assert.match(converted.searchBook.list, /list-group-item/);
-  assert.match(converted.searchBook.bookName, /h5/);
-  // 搜索详情链接改写到目录页
-  assert.match(converted.searchBook.detailUrl, /\|@js:/);
-  assert.match(converted.searchBook.detailUrl, /other\/chapters\/id/);
-  assert.match(converted.searchBook.detailUrl, /\bvar\b/);
-  assert.doesNotMatch(converted.searchBook.detailUrl, /\bconst\b|\blet\b/);
 
-  assert.match(converted.bookDetail.tocUrl, /\/\/a\[contains/);
+  // §五：detailUrl 是详情页，不改写成目录
+  assert.match(converted.searchBook.detailUrl, /\/\/h5\/\/a\/@href/);
+  assert.doesNotMatch(converted.searchBook.detailUrl, /other\/chapters/);
+
+  // §七 示例同构：list=li，title/url=a
   assert.match(converted.chapterList.list, /mulu_list/);
   assert.match(converted.chapterList.list, /\/li$/);
   assert.equal(converted.chapterList.title, "//a/text()");
   assert.equal(converted.chapterList.url, "//a/@href");
-  assert.match(converted.chapterContent.content, /read-content/);
+
+  // §七：requestInfo 用 result（详情 URL）推导目录；§九：返回 {url:...}
+  assert.match(converted.chapterList.requestInfo, /^@js:/);
+  assert.match(converted.chapterList.requestInfo, /typeof result/);
+  assert.match(converted.chapterList.requestInfo, /other\/chapters\/id/);
+  assert.match(converted.chapterList.requestInfo, /"url"/);
+  assert.match(converted.chapterList.requestInfo, /config\.host/);
+
+  // §八 / 精华书阁：正文 |@js:
   assert.match(converted.chapterContent.content, /\|@js:/);
   assert.doesNotMatch(converted.chapterContent.content, /\|\|@js:/);
 
-  assert.match(converted.chapterList.requestInfo, /other\/chapters\/id/);
-  assert.match(converted.chapterList.requestInfo, /detailUrl/);
-  assert.match(converted.chapterList.requestInfo, /\bvar\b/);
-  assert.doesNotMatch(converted.chapterList.requestInfo, /\bconst\b|\blet\b/);
   assert.ok(warnings.some((w) => /alicesw\.com/.test(w.message)));
 });

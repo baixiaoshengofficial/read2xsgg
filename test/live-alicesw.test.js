@@ -1,6 +1,6 @@
 /**
- * 端到端：7585 必须能搜到书、改写到目录页、解析出带标题章节、打开正文。
- * 不依赖 lxml；外网不可用时 skip。
+ * 按 docs/xiangse/香色闺阁书源规则.md §七 验收：
+ * chapterList.requestInfo 的 result = 书籍详情页 URL，脚本应把它改写成目录页，再解析出章节与正文。
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -17,19 +17,22 @@ async function fetchText(url) {
   return response.text();
 }
 
-function runJs(script, result, params = {}) {
+function evalChapterListRequestInfo(script, detailPageUrl) {
   const body = String(script).replace(/^@js:\s*/i, "");
   // eslint-disable-next-line no-new-func
-  return new Function("params", "result", "config", body)(
-    params,
-    result,
+  const out = new Function(
+    "params",
+    "result",
+    "config",
+    body,
+  )(
+    { queryInfo: {} },
+    detailPageUrl, // §七：result = 书籍详情页 URL
     { host: "https://www.alicesw.com", httpHeaders: UA },
   );
-}
-
-function extractFieldJs(rule) {
-  const parts = String(rule).split(/\|@js:/);
-  return parts.length > 1 ? parts.slice(1).join("|@js:") : "";
+  if (typeof out === "string") return out;
+  if (out && typeof out === "object") return out.url || "";
+  return "";
 }
 
 function extractChaptersFromMulu(html) {
@@ -41,7 +44,7 @@ function extractChaptersFromMulu(html) {
   }));
 }
 
-test("live: 7585 搜索改写目录后必须能解析章节和正文", async (t) => {
+test("live: §七 result=详情URL → 目录页 → 章节+正文", async (t) => {
   let sourceRes;
   try {
     sourceRes = await fetch("https://www.yckceo.com/yuedu/shuyuan/json/id/7585.json", { headers: UA });
@@ -59,38 +62,25 @@ test("live: 7585 搜索改写目录后必须能解析章节和正文", async (t)
   assert.ok(src);
   assert.equal(src.chapterList.title, "//a/text()");
   assert.equal(src.chapterList.url, "//a/@href");
-  assert.match(src.searchBook.detailUrl, /\|@js:/);
-  assert.doesNotMatch(src.chapterList.requestInfo, /\bconst\b|\blet\b/);
+  assert.doesNotMatch(src.searchBook.detailUrl, /other\/chapters/);
 
   const searchUrl = String(src.searchBook.requestInfo).replace("%@keyWord", encodeURIComponent("赘婿"));
   const searchHtml = await fetchText(searchUrl);
   const hrefMatch = searchHtml.match(/list-group-item[\s\S]{0,800}?<h5[^>]*>\s*<a[^>]+href="([^"]+)"/i);
   assert.ok(hrefMatch, "搜索结果取不到书籍链接");
-  assert.match(hrefMatch[1], /\/novel\/\d+/);
+  const detailUrl = new URL(hrefMatch[1], "https://www.alicesw.com").href;
+  assert.match(detailUrl, /\/novel\/\d+/);
 
-  // 模拟香色：先跑 detailUrl 字段上的 |@js 改写
-  const rewritten = runJs(extractFieldJs(src.searchBook.detailUrl), hrefMatch[1]);
-  assert.match(String(rewritten), /\/other\/chapters\/id\/\d+\.html/, `搜索链接未改写到目录: ${rewritten}`);
+  // 严格按文档：只把详情 URL 当 result 传入
+  const catalogUrl = evalChapterListRequestInfo(src.chapterList.requestInfo, detailUrl);
+  assert.match(catalogUrl, /\/other\/chapters\/id\/\d+\.html/, `§七改写失败: ${catalogUrl}`);
 
-  // chapterList 即使只拿到改写后的 detailUrl，也应仍指向目录
-  const catalogUrl = runJs(src.chapterList.requestInfo, rewritten, {
-    queryInfo: { detailUrl: rewritten, url: "" },
-  });
-  assert.equal(catalogUrl, rewritten);
-
-  // 即使客户端没跑搜索改写、只给 novel 详情，chapterList 也必须能推导目录
-  const fromNovel = runJs(src.chapterList.requestInfo, "", {
-    queryInfo: { detailUrl: new URL(hrefMatch[1], "https://www.alicesw.com").href, url: "" },
-  });
-  assert.match(String(fromNovel), /\/other\/chapters\/id\/\d+\.html/);
+  const detailHtml = await fetchText(detailUrl);
+  assert.equal(extractChaptersFromMulu(detailHtml).length, 0, "详情页无 mulu_list，必须改写到目录页");
 
   const tocHtml = await fetchText(catalogUrl);
   const chapters = extractChaptersFromMulu(tocHtml).filter((c) => c.title && /\/book\//.test(c.url));
-  assert.ok(chapters.length > 0, `目录为空: ${catalogUrl}`);
-
-  // 目录页本身无 mulu 则失败；确认 /novel/ 详情页用同一 list 规则会得到 0（解释为何必须去目录页）
-  const detailHtml = await fetchText(new URL(hrefMatch[1], "https://www.alicesw.com").href);
-  assert.equal(extractChaptersFromMulu(detailHtml).length, 0, "详情页不应有 mulu_list；否则验收逻辑失效");
+  assert.ok(chapters.length > 0, `目录页章节为空: ${catalogUrl}`);
 
   const chapterUrl = new URL(chapters[0].url, "https://www.alicesw.com").href;
   const contentHtml = await fetchText(chapterUrl);
@@ -102,8 +92,8 @@ test("live: 7585 搜索改写目录后必须能解析章节和正文", async (t)
   assert.ok(paras.length > 0 && paras.join("").length > 50, "正文为空");
 
   console.log(JSON.stringify({
-    searchHref: hrefMatch[1],
-    rewritten,
+    detailUrl,
+    catalogUrl,
     chapters: chapters.length,
     first: chapters[0].title.slice(0, 40),
     contentChars: paras.join("").length,

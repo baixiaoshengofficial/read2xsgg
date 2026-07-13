@@ -191,8 +191,9 @@ function convertOne(source, warnings) {
     ...mapDetailRules(detailRules, detailResponseType, detailWarningFor),
   };
 
-  // 香色没有独立 tocUrl 字段：默认把详情页解析出的目录地址写入透传字段；
-  // 站点适配可覆盖 requestInfo（例如按详情 URL 推导目录页，不依赖 tocUrl 是否进 queryInfo）。
+  // 《香色闺阁书源规则》§七：chapterList.requestInfo 的 result = 书籍详情页 URL。
+  // 站点适配可覆盖 requestInfo，把详情 URL 改写成独立目录页。
+  // 官方 bookDetail 无 tocUrl；若阅读源带 tocUrl，仅作额外提取字段，不能代替 §七 的 result 语义。
   const requestInfoOverride = chapterListRequestInfoOverride(source);
   let chapterListRequestInfo = requestInfoOverride || "%@result";
   if (detailRules.tocUrl) {
@@ -201,14 +202,18 @@ function convertOne(source, warnings) {
       warn: detailWarningFor("tocUrl", detailRules.tocUrl),
     });
     if (!requestInfoOverride) {
+      // 非官方字段兜底：部分客户端若把 tocUrl 写入 queryInfo 则可直连目录
       chapterListRequestInfo = [
         "@js:",
-        "let q = params.queryInfo || {};",
-        "return q.tocUrl || q.url || result;",
+        "var q = params.queryInfo || {};",
+        'var u = (typeof result === "string") ? result : "";',
+        'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
+        "u = String(q.tocUrl || q.detailUrl || u || q.url || \"\");",
+        "return u;",
       ].join("\n");
     }
     detailWarningFor("tocUrl", detailRules.tocUrl)(
-      "详情页 tocUrl 已映射为 bookDetail.tocUrl，并由 chapterList.requestInfo 优先使用；请实测目录是否跳转正确",
+      "阅读源含 tocUrl：已写入 bookDetail.tocUrl；章节请求仍以书源规则§七的 result（详情 URL）为准，请实测目录页",
     );
   }
 
