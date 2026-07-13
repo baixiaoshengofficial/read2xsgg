@@ -56,7 +56,10 @@ test("转换一个完整的 HTML 阅读源", () => {
   assert.match(converted.searchBook.requestInfo, /params\.keyWord/);
   assert.equal(converted.searchBook.requestParamsEncode, "2147485234");
   assert.equal(converted.searchBook.list, "//*[@id='sitembox']//dl");
-  assert.equal(converted.searchBook.author, "//*[contains(concat(' ', normalize-space(@class), ' '), ' book_other ')][1]//span[1]/text()");
+  assert.equal(
+    converted.searchBook.author,
+    "(.//*[contains(concat(' ', normalize-space(@class), ' '), ' book_other ')])[1]/(.//span)[1]/text()",
+  );
   assert.equal(converted.chapterList.list, "//*[contains(concat(' ', normalize-space(@class), ' '), ' box_con ')]//dd");
   assert.match(converted.chapterContent.content, /new RegExp\("广告\.\*"/);
   assert.equal(converted.chapterContent.nextPageUrl, "//*[contains(normalize-space(.), '下一页')]/@href");
@@ -82,17 +85,19 @@ test("转换 JSONPath 规则和 JSON 响应", () => {
 });
 
 test("CSS、阅读链式选择器和分页选择器转换为 XPath", () => {
-  assert.equal(convertRule("id.info@tag.p.0@a@text"), "//*[@id='info']//p[1]//a/text()");
+  assert.equal(convertRule("id.info@tag.p.0@a@text"), "//*[@id='info']/(.//p)[1]//a/text()");
   assert.equal(
     convertRule(".txt-list > li:nth-child(n+2)"),
     "//*[contains(concat(' ', normalize-space(@class), ' '), ' txt-list ')]/li[position() >= 2]",
   );
   assert.equal(convertRule("tbody>tr!0"), "//tbody/tr[position() > 1]");
+  assert.equal(convertRule("a.1@href"), "(.//a)[2]/@href");
+  assert.equal(convertRule("tag.a.0:1:2@text"), "(.//a)[position() = 1 or position() = 2 or position() = 3]/text()");
 });
 
 test("相对属性 text/href 与 CSS 目录规则不会被误判为 JSON", () => {
   assert.equal(convertRule("text"), "/text()");
-  assert.equal(convertRule("href"), "/@href");
+  assert.equal(convertRule("href"), "//@href");
   assert.equal(convertRule("@text"), "/text()");
   assert.equal(convertRule("a@text"), "//a/text()");
   assert.equal(
@@ -101,7 +106,7 @@ test("相对属性 text/href 与 CSS 目录规则不会被误判为 JSON", () =>
   );
   assert.equal(
     convertRule("tag.a.0:1:2@text"),
-    "//a[position() = 1 or position() = 2 or position() = 3]/text()",
+    "(.//a)[position() = 1 or position() = 2 or position() = 3]/text()",
   );
 
   const source = {
@@ -122,7 +127,7 @@ test("相对属性 text/href 与 CSS 目录规则不会被误判为 JSON", () =>
   assert.equal(converted.chapterList.responseFormatType, "html");
   assert.equal(converted.chapterList.list, "//a[contains(@href, '/read/')]");
   assert.equal(converted.chapterList.title, "/text()");
-  assert.equal(converted.chapterList.url, "/@href");
+  assert.equal(converted.chapterList.url, "//@href");
   assert.match(converted.bookDetail.tocUrl, /查看全部章节/);
   assert.match(converted.chapterList.requestInfo, /q\.tocUrl/);
   assert.ok(warnings.some((warning) => warning.field === "tocUrl"));

@@ -8,10 +8,13 @@ const TEXT_PROPERTIES = new Set(["text", "textNodes", "ownText", "html"]);
 const ATTR_PROPERTIES = new Set(["href", "src", "content", "value", "title", "alt", "data-src"]);
 const RELATIVE_PROPERTIES = new Set([...TEXT_PROPERTIES, ...ATTR_PROPERTIES]);
 
-function propertyToXPath(name) {
+function propertyToXPath(name, { bare = false } = {}) {
   if (name === "html") return "";
   if (TEXT_PROPERTIES.has(name)) return "/text()";
-  if (ATTR_PROPERTIES.has(name) || name.startsWith("data-")) return `/@${name}`;
+  if (ATTR_PROPERTIES.has(name) || name.startsWith("data-")) {
+    // 单独 href：//@href 可命中节点自身；接在 a@href 后用 /@href。
+    return bare ? `//@${name}` : `/@${name}`;
+  }
   return "";
 }
 
@@ -145,6 +148,18 @@ function indexPredicateFromSuffix(suffix) {
   return `[${clauses.join(" or ")}]`;
 }
 
+/**
+ * 阅读的 a.1 / tag.p.0 是「匹配结果集中的第 N 个」，对应 XPath `(.//a)[2]`，
+ * 而不是 sibling 语义的 `//a[2]`（后者要求该 a 是父节点下第 2 个 a 子元素）。
+ * 使用 `.//` 形式，才能在目录/搜索列表的相对上下文中与文档绝对上下文同时正确。
+ */
+function withResultIndex(path, indexPredicate, first) {
+  if (!indexPredicate) return path;
+  const relative = path.startsWith("//") ? `.${path}` : path.startsWith("/") ? `.${path}` : `.//${path}`;
+  if (first) return `(${relative})${indexPredicate}`;
+  return `/(${relative})${indexPredicate}`;
+}
+
 function legacySegmentToXPath(segment, first) {
   let value = segment.trim();
   if (!value) return "";
@@ -164,20 +179,22 @@ function legacySegmentToXPath(segment, first) {
     value = value.slice(0, -indexMatch[0].length);
   }
   if (value.startsWith("id.")) {
-    return `//*[@id=${quoteXPath(value.slice(3))}]${indexPredicate}`;
+    return withResultIndex(`//*[@id=${quoteXPath(value.slice(3))}]`, indexPredicate, first);
   }
   if (value.startsWith("class.")) {
     const classes = value.slice(6).trim().split(/\s+/).filter(Boolean);
     const predicates = classes.map((name) => `contains(concat(' ', normalize-space(@class), ' '), ${quoteXPath(` ${name} `)})`);
-    return `//*[${predicates.join(" and ")}]${indexPredicate}`;
+    return withResultIndex(`//*[${predicates.join(" and ")}]`, indexPredicate, first);
   }
   if (value.startsWith("text.")) {
-    return `//*[contains(normalize-space(.), ${quoteXPath(value.slice(5))})]${indexPredicate}`;
+    return withResultIndex(`//*[contains(normalize-space(.), ${quoteXPath(value.slice(5))})]`, indexPredicate, first);
   }
   if (value.startsWith("tag.")) value = value.slice(4);
-  if (/^[a-zA-Z][\w-]*$/.test(value)) return `${first ? "//" : "//"}${value}${indexPredicate}`;
+  if (/^[a-zA-Z][\w-]*$/.test(value)) {
+    return withResultIndex(`//${value}`, indexPredicate, first);
+  }
   const cssPath = cssToXPath(value);
-  return `${cssPath}${indexPredicate}`;
+  return withResultIndex(cssPath, indexPredicate, first);
 }
 
 function legadoHtmlToXPath(selector) {
@@ -190,7 +207,7 @@ function legadoHtmlToXPath(selector) {
 
   // Bare relative properties used inside list/detail items (very common in ruleToc).
   if (RELATIVE_PROPERTIES.has(source) || (source.startsWith("@") && RELATIVE_PROPERTIES.has(source.slice(1)))) {
-    return propertyToXPath(source.startsWith("@") ? source.slice(1) : source) || ".";
+    return propertyToXPath(source.startsWith("@") ? source.slice(1) : source, { bare: true }) || ".";
   }
 
   if (source.includes("@")) {
