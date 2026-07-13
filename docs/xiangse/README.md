@@ -35,7 +35,12 @@ url:   //a/@href
 
 相对路径补全优先交给客户端；必要时用 `||@js:`（注意是双竖线）后处理 URL（§七 / §十）。
 
-### 正文后处理（§八 / §十）
+### alicesw（本仓库适配约定）
 
-- `||@js:`：XPath 后交给 JS，`result` 为字段解析结果。
-- `|@js:`：仅处理，不备选。精华书阁 demo 正文清洗使用 `|@js:`。
+站点目录在 `/other/chapters/id/{id}.html`，不在 `/novel/{id}.html`。
+
+按文档尽量走「子级 `%@result`」路径（精华书阁同款）：
+
+1. `searchBook.detailUrl` 用 `|@js:` 把 `/novel/{id}` 改成目录页（落地页=目录页）
+2. `bookDetail` / `chapterList` 的 `requestInfo` 用 `%@result`
+3. `chapterList.list/title/url` 用 `li` + `//a/text()` + `//a/@href`

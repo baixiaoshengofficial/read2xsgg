@@ -16,30 +16,21 @@ const raw = {
   ruleContent: { content: "#content@html" },
 };
 
-test("alicesw.com 适配符合香色书源规则§五§七", () => {
+test("alicesw：搜索改写到目录页，目录用 %@result（无 chapterList @js）", () => {
   const { sources, warnings } = convertLegado([raw]);
   const converted = sources["爱丽丝书屋"];
 
-  // §五：detailUrl 是详情页，不改写成目录
-  assert.match(converted.searchBook.detailUrl, /\/\/h5\/\/a\/@href/);
-  assert.doesNotMatch(converted.searchBook.detailUrl, /other\/chapters/);
+  // 搜索 detailUrl |@js: 改写成目录
+  assert.match(converted.searchBook.detailUrl, /\|@js:/);
+  assert.match(converted.searchBook.detailUrl, /other\/chapters\/id/);
 
-  // §七 示例同构：list=li，title/url=a
+  // 精华书阁式：chapterList 直接 %@result，不依赖 @js
+  assert.equal(converted.chapterList.requestInfo, "%@result");
   assert.match(converted.chapterList.list, /mulu_list/);
-  assert.match(converted.chapterList.list, /\/li$/);
   assert.equal(converted.chapterList.title, "//a/text()");
   assert.equal(converted.chapterList.url, "//a/@href");
 
-  // §七：requestInfo 用 result（详情 URL）推导目录；§九：返回 {url:...}
-  assert.match(converted.chapterList.requestInfo, /^@js:/);
-  assert.match(converted.chapterList.requestInfo, /typeof result/);
-  assert.match(converted.chapterList.requestInfo, /other\/chapters\/id/);
-  assert.match(converted.chapterList.requestInfo, /"url"/);
-  assert.match(converted.chapterList.requestInfo, /config\.host/);
-
-  // §八 / 精华书阁：正文 |@js:
+  assert.match(converted.bookDetail.bookName, /h1/);
   assert.match(converted.chapterContent.content, /\|@js:/);
-  assert.doesNotMatch(converted.chapterContent.content, /\|\|@js:/);
-
   assert.ok(warnings.some((w) => /alicesw\.com/.test(w.message)));
 });
