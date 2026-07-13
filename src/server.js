@@ -168,7 +168,8 @@ export async function downloadSource(sourceUrl, config = serverConfig()) {
 function sourceUrlFromRequest(request) {
   const rawUrl = request.url || "/";
   if (rawUrl.startsWith("/url/")) {
-    const value = rawUrl.slice("/url/".length);
+    let value = rawUrl.slice("/url/".length);
+    if (value.endsWith(".xbs")) value = value.slice(0, -".xbs".length);
     try {
       return { sourceUrl: decodeURIComponent(value), format: "xbs" };
     } catch {
@@ -184,7 +185,7 @@ function sourceUrlFromRequest(request) {
     }
   }
   const parsed = new URL(rawUrl, "http://read2xsgg.local");
-  if (parsed.pathname === "/convert" || parsed.pathname === "/convert/json") {
+  if (["/convert", "/convert.xbs", "/convert/json"].includes(parsed.pathname)) {
     return {
       sourceUrl: parsed.searchParams.get("url") || "",
       format: parsed.pathname.endsWith("/json") || parsed.searchParams.get("format") === "json" ? "json" : "xbs",
@@ -198,8 +199,9 @@ function help(config) {
     name: "read2xsgg",
     status: "ok",
     usage: {
-      path: "/url/https://example.com/legado.json",
-      query: "/convert?url=https%3A%2F%2Fexample.com%2Flegado.json",
+      xbs: "/convert.xbs?url=https%3A%2F%2Fexample.com%2Flegado.json",
+      path: "/url/https%3A%2F%2Fexample.com%2Flegado.json.xbs",
+      legacyQuery: "/convert?url=https%3A%2F%2Fexample.com%2Flegado.json",
       json: "/convert/json?url=https%3A%2F%2Fexample.com%2Flegado.json",
       health: "/healthz",
     },

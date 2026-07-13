@@ -92,23 +92,25 @@ gh secret set DOCKERHUB_TOKEN --repo baixiaoshengofficial/read2xsgg
 
 ## 在线 URL 转换
 
-部署后，可以把在线阅读源 URL 拼到 `/url/` 后面。这个地址直接返回可导入香色闺阁的 `.xbs`：
+香色闺阁会检查链接的 `.xbs` 后缀，因此推荐使用 `/convert.xbs` 接口。`url` 参数必须进行 URL 编码：
 
 ```text
-http://localhost:3000/url/https://example.com/legado.json
+http://localhost:3000/convert.xbs?url=https%3A%2F%2Fexample.com%2Flegado.json
 ```
 
 例如：
 
 ```bash
-curl -OJ 'http://localhost:3000/url/https://example.com/legado.json'
+curl -OJ 'http://localhost:3000/convert.xbs?url=https%3A%2F%2Fexample.com%2Flegado.json'
 ```
 
-当阅读源 URL 带查询参数或特殊字符时，推荐使用查询参数形式并进行 URL 编码：
+也支持整个阅读源 URL 放在路径中，并在末尾追加 `.xbs`：
 
 ```text
-http://localhost:3000/convert?url=https%3A%2F%2Fexample.com%2Flegado.json%3Ftoken%3Dabc
+http://localhost:3000/url/https%3A%2F%2Fexample.com%2Flegado.json.xbs
 ```
+
+旧的 `/convert?url=...` 和 `/url/<阅读源URL>` 接口继续保留，但不建议直接填入香色闺阁，因为它们的路径没有 `.xbs` 后缀。
 
 查看转换后的 JSON 和兼容性告警：
 
