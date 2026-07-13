@@ -1,5 +1,6 @@
 import { convertRule, inferResponseType } from "./selectors.js";
 import { convertRequest, parseHeaders } from "./requests.js";
+import { adaptLegadoSource } from "./siteAdapters.js";
 
 const EMPTY_ACTIONS = {
   relatedWord: { actionID: "relatedWord", parserID: "DOM" },
@@ -154,9 +155,14 @@ function buildBookWorld(source, context) {
 }
 
 function convertOne(source, warnings) {
+  const adaptedFrom = String(source.bookSourceUrl ?? "");
+  source = adaptLegadoSource(source);
   const sourceName = String(source.bookSourceName ?? source.name ?? "未命名书源").trim() || "未命名书源";
   const host = cleanBaseUrl(source.bookSourceUrl ?? source.url);
   const warningForSource = createWarningCollector(warnings, sourceName, "source");
+  if (/alicesw\.com/i.test(adaptedFrom)) {
+    warningForSource("siteAdapter", adaptedFrom)("已按 alicesw.com 实际页面结构修正阅读规则后再转换");
+  }
   const headers = {
     ...parseHeaders(source.header, warningForSource("header", source.header)),
     ...(source.httpUserAgent ? { "User-Agent": String(source.httpUserAgent) } : {}),

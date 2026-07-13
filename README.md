@@ -110,6 +110,12 @@ https://www.yckceo.com/yuedu/shuyuans/json/id/1193.json
 https://xs.example.com/xbs/www.yckceo.com/yuedu/shuyuans/json/id/1193.json.xbs
 ```
 
+单个书源示例（爱丽丝书屋）：
+
+```text
+https://xs.example.com/xbs/www.yckceo.com/yuedu/shuyuan/json/id/7585.json.xbs
+```
+
 也可以用短查询参数（路径本身带 `.xbs`，一般不用编码）：
 
 ```text

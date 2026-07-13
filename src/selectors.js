@@ -322,11 +322,14 @@ function splitTopLevel(value, separator) {
 }
 
 function rewriteCssHas(selector, warn) {
-  // Approximate simple :has(inner), avoiding nested ')'. Complex :has() is left with a warning.
-  return selector.replace(/:has\(([^()]+)\)/gi, (_, inner) => {
+  // li:has(a) → keep as CSS-like host[.//inner] then cssToXPath for host only
+  return selector.replace(/(^|[\s>+,])([a-zA-Z*][\w-]*(?:[.#\[][^\s:<>]*)*):has\(([^()]+)\)/gi, (_, prefix, host, inner) => {
     warn(`CSS :has() 已近似转换，复杂条件请人工复核：:has(${inner})`);
-    const convertedInner = cssToXPath(inner.trim()).replace(/^\/\//, ".//");
-    return `[${convertedInner}]`;
+    const hostPath = cssToXPath(host.trim());
+    const innerPath = cssToXPath(inner.trim()).replace(/^\/\//, ".//");
+    // Emit an already-xpath fragment that legadoHtmlToXPath will keep (starts with //)
+    const combined = `${hostPath}[${innerPath}]`;
+    return `${prefix}${combined.startsWith("//") ? combined : `//${combined}`}`;
   });
 }
 
