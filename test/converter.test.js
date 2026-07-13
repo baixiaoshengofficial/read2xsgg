@@ -90,6 +90,44 @@ test("CSS、阅读链式选择器和分页选择器转换为 XPath", () => {
   assert.equal(convertRule("tbody>tr!0"), "//tbody/tr[position() > 1]");
 });
 
+test("相对属性 text/href 与 CSS 目录规则不会被误判为 JSON", () => {
+  assert.equal(convertRule("text"), "/text()");
+  assert.equal(convertRule("href"), "/@href");
+  assert.equal(convertRule("@text"), "/text()");
+  assert.equal(convertRule("a@text"), "//a/text()");
+  assert.equal(
+    convertRule("a[href~=/read/\\d+]"),
+    "//a[contains(@href, '/read/')]",
+  );
+  assert.equal(
+    convertRule("tag.a.0:1:2@text"),
+    "//a[position() = 1 or position() = 2 or position() = 3]/text()",
+  );
+
+  const source = {
+    bookSourceName: "目录相对属性",
+    bookSourceUrl: "https://example.com/",
+    searchUrl: "https://example.com/search?q={{key}}",
+    ruleSearch: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text", tocUrl: "text.查看全部章节@href" },
+    ruleToc: {
+      chapterList: "a[href~=/read/\\d+]",
+      chapterName: "text",
+      chapterUrl: "href",
+    },
+    ruleContent: { content: "id.content@html" },
+  };
+  const { sources, warnings } = convertLegado([source]);
+  const converted = sources["目录相对属性"];
+  assert.equal(converted.chapterList.responseFormatType, "html");
+  assert.equal(converted.chapterList.list, "//a[contains(@href, '/read/')]");
+  assert.equal(converted.chapterList.title, "/text()");
+  assert.equal(converted.chapterList.url, "/@href");
+  assert.match(converted.bookDetail.tocUrl, /查看全部章节/);
+  assert.match(converted.chapterList.requestInfo, /q\.tocUrl/);
+  assert.ok(warnings.some((warning) => warning.field === "tocUrl"));
+});
+
 test("GET/POST 请求模板转换", () => {
   assert.equal(
     convertRequest("/search/{{key}}/{{page}}").requestInfo,

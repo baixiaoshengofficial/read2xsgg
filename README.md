@@ -92,36 +92,42 @@ gh secret set DOCKERHUB_TOKEN --repo baixiaoshengofficial/read2xsgg
 
 ## 在线 URL 转换
 
-香色闺阁会检查链接的 `.xbs` 后缀，因此推荐使用 `/convert.xbs` 接口。`url` 参数必须进行 URL 编码：
+香色闺阁会检查链接是否以 `.xbs` 结尾，因此推荐下面这种**最好手拼**的写法：
 
 ```text
-http://localhost:3000/convert.xbs?url=https%3A%2F%2Fexample.com%2Flegado.json
+{转换站}/xbs/{去掉 https:// 后的阅读源地址}.xbs
 ```
 
-例如：
-
-```bash
-curl -OJ 'http://localhost:3000/convert.xbs?url=https%3A%2F%2Fexample.com%2Flegado.json'
-```
-
-也支持整个阅读源 URL 放在路径中，并在末尾追加 `.xbs`：
+例如阅读源是：
 
 ```text
-http://localhost:3000/url/https%3A%2F%2Fexample.com%2Flegado.json.xbs
+https://www.yckceo.com/yuedu/shuyuans/json/id/1193.json
 ```
 
-旧的 `/convert?url=...` 和 `/url/<阅读源URL>` 接口继续保留，但不建议直接填入香色闺阁，因为它们的路径没有 `.xbs` 后缀。
+对应订阅地址：
+
+```text
+https://xs.example.com/xbs/www.yckceo.com/yuedu/shuyuans/json/id/1193.json.xbs
+```
+
+也可以用短查询参数（路径本身带 `.xbs`，一般不用编码）：
+
+```text
+https://xs.example.com/x.xbs?u=https://www.yckceo.com/yuedu/shuyuans/json/id/1193.json
+```
+
+旧接口仍然可用：
+
+```text
+http://localhost:3000/convert.xbs?url=https://example.com/legado.json
+http://localhost:3000/url/https://example.com/legado.json.xbs
+```
 
 查看转换后的 JSON 和兼容性告警：
 
 ```text
-http://localhost:3000/convert/json?url=https%3A%2F%2Fexample.com%2Flegado.json
-```
-
-也支持对应的路径形式：
-
-```text
-http://localhost:3000/json/https://example.com/legado.json
+http://localhost:3000/j/www.example.com/legado.json
+http://localhost:3000/convert/json?url=https://example.com/legado.json
 ```
 
 可以直接运行 HTTP 服务而不使用 Docker：
