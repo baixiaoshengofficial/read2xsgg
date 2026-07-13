@@ -27,17 +27,20 @@ export function chapterListRequestInfoOverride(source) {
   const hostname = hostnameOf(source);
   if (hostname === "alicesw.com") {
     // 详情页 /novel/{id}.html → 目录页 /other/chapters/id/{id}.html
-    // 不能依赖 bookDetail.tocUrl 是否写入 queryInfo（多数客户端不会）。
+    // 优先 detailUrl：queryInfo.url 在章节阶段常是首章 URL，不是详情页。
+    // requestInfo 返回对象，兼容香色主流引擎。
     return [
       "@js:",
       'const host = "https://www.alicesw.com";',
       "const q = params.queryInfo || {};",
-      "let u = String(q.tocUrl || q.url || result || \"\");",
+      "let u = \"\";",
+      "if (typeof result === \"string\") u = result;",
+      "else if (result && typeof result === \"object\") u = result.detailUrl || result.url || \"\";",
+      "u = String(q.detailUrl || q.tocUrl || u || q.url || \"\");",
       "if (u && !/^https?:/i.test(u)) u = host + (u.startsWith(\"/\") ? u : \"/\" + u);",
       "const novel = u.match(/\\/novel\\/(\\d+)/i);",
-      "if (novel) return host + \"/other/chapters/id/\" + novel[1] + \".html\";",
-      "if (/\\/other\\/chapters\\/id\\/\\d+/i.test(u)) return u;",
-      "return u;",
+      "if (novel) u = host + \"/other/chapters/id/\" + novel[1] + \".html\";",
+      "return {\"url\": u, \"httpHeaders\": (config && config.httpHeaders) ? config.httpHeaders : {}};",
     ].join("\n");
   }
   return null;
@@ -52,7 +55,7 @@ function adaptAlicesw(source) {
     header: JSON.stringify({ "User-Agent": ua }),
     ruleSearch: {
       bookList: "class.list-group-item",
-      name: "tag.h5@tag.a",
+      name: "tag.h5@tag.a@text",
       bookUrl: "tag.h5@tag.a@href",
       author: "class.text-muted.0@tag.a@text",
       intro: "class.content-txt@text",
@@ -60,7 +63,7 @@ function adaptAlicesw(source) {
     },
     ruleExplore: {
       bookList: "class.rec_rullist@tag.ul",
-      name: "class.two@tag.a",
+      name: "class.two@tag.a@text",
       bookUrl: "class.two@tag.a@href",
       author: "class.four@text",
       lastChapter: "class.three@tag.a@text",
@@ -78,10 +81,10 @@ function adaptAlicesw(source) {
       tocUrl: "@XPath://a[contains(normalize-space(.),'查看所有章节')]/@href",
     },
     ruleToc: {
-      chapterList: "class.mulu_list@tag.li@tag.a",
-      chapterName: "text",
-      // 相对路径补全，避免部分客户端报 URL 错误
-      chapterUrl: "href\n@js:\nconst host = \"https://www.alicesw.com\";\nlet u = String(result || \"\");\nif (!u) return u;\nif (/^https?:/i.test(u)) return u;\nreturn host + (u.startsWith(\"/\") ? u : \"/\" + u);",
+      // list 取 li，title/url 再取 a —— 避免 list=a 时 /text()、//@href 在真实 XPath 下取空/取到 CSS
+      chapterList: "class.mulu_list@tag.li",
+      chapterName: "tag.a@text",
+      chapterUrl: "tag.a@href",
     },
     ruleContent: {
       // 取段落文本；香色对纯元素节点经常取不到正文
