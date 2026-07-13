@@ -1,5 +1,8 @@
 # read2xsgg
 
+[![Test and publish Docker image](https://github.com/baixiaoshengofficial/read2xsgg/actions/workflows/docker.yml/badge.svg)](https://github.com/baixiaoshengofficial/read2xsgg/actions/workflows/docker.yml)
+[![Docker Hub](https://img.shields.io/docker/v/knighttools/read2xsgg?label=Docker%20Hub&sort=semver)](https://hub.docker.com/r/knighttools/read2xsgg)
+
 把「阅读 / Legado 3.x」的 JSON 书源转换成「香色闺阁」可导入的 `.xbs` 源，同时生成一份可审阅的香色 JSON 和兼容性报告。
 
 ## 功能
@@ -27,6 +30,17 @@ npm link
 
 ## Docker Compose 一键部署
 
+直接使用 Docker Hub 镜像：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+镜像地址：`knighttools/read2xsgg:latest`。
+
+如果希望从当前源码重新构建：
+
 ```bash
 docker compose up -d --build
 ```
@@ -48,6 +62,32 @@ docker compose down
 
 ```bash
 APP_PORT=8080 docker compose up -d --build
+```
+
+指定版本镜像：
+
+```bash
+IMAGE_TAG=0.2.0 docker compose up -d
+```
+
+## Docker Hub 自动发布
+
+GitHub Actions 会先在 Node.js 18 和 22 上运行测试，然后构建 `linux/amd64`、`linux/arm64` 两种架构的镜像：
+
+- 推送到 `main`：发布 `knighttools/read2xsgg:latest` 和 `sha-<commit>`。
+- 推送 `v0.2.0` 形式的 Git 标签：发布 `0.2.0`、`0.2`、`0` 等语义版本标签。
+- Pull Request：只测试和构建，不登录或推送 Docker Hub。
+
+启用发布前，需要在 Docker Hub 创建 `knighttools/read2xsgg` 仓库，并创建具有写权限的 access token。然后在 GitHub 仓库的 `Settings → Secrets and variables → Actions` 中增加：
+
+```text
+DOCKERHUB_TOKEN=<Docker Hub access token>
+```
+
+也可以用 GitHub CLI 设置，命令会安全地从终端读取 token：
+
+```bash
+gh secret set DOCKERHUB_TOKEN --repo baixiaoshengofficial/read2xsgg
 ```
 
 ## 在线 URL 转换
