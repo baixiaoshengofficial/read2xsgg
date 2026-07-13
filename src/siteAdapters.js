@@ -1,12 +1,15 @@
 /**
- * 对已知「规则与站点实际 DOM 不符」的阅读源，在转换前修正为可读的阅读规则。
- * 对齐 docs/xiangse/香色闺阁书源规则.md。
+ * alicesw 适配 —— 必须以 iOS/香色客户端 UA 见到的 DOM 为准。
  *
- * alicesw：章节在独立目录页 `/other/chapters/id/{id}.html`，不在 `/novel/{id}.html`。
- * 策略（尽量不依赖 chapterList @js，贴近精华书阁「子页用 %@result」）：
- * 1) 搜索 detailUrl 字段用 |@js: 把 /novel/{id} 改写成目录页（§五/§十）
- * 2) chapterList.requestInfo = %@result（与常见 demo 一致，无脚本）
- * 3) 仍保留一个极简 @js 兜底：若 result 仍是 /novel/ 则改写（旧书架缓存）
+ * 实测：
+ * - iPhone UA 目录页：ul.section-list（无 mulu_list）
+ * - Desktop UA 目录页：ul.mulu_list
+ * - 详情在 /novel/{id}.html（有封面 og:image / 最新章）；目录在 /other/chapters/id/{id}.html
+ *
+ * 因此：
+ * 1) 搜索 detailUrl 保持 /novel/（不要改成目录，否则封面/最新章丢失）
+ * 2) chapterList.requestInfo 按书源规则§七用 result（详情 URL）改写成目录页
+ * 3) list 同时兼容 section-list 与 mulu_list
  */
 
 function hostnameOf(source) {
@@ -20,26 +23,20 @@ function hostnameOf(source) {
 
 export function adaptLegadoSource(source) {
   if (!source || typeof source !== "object") return source;
-  const hostname = hostnameOf(source);
-  if (hostname === "alicesw.com") return adaptAlicesw(source);
+  if (hostnameOf(source) === "alicesw.com") return adaptAlicesw(source);
   return source;
 }
 
-/**
- * alicesw 已在搜索 detailUrl 用 |@js: 改写成目录页。
- * 之后 bookDetail / chapterList 都走 %@result，与精华书阁 demo 一致，避免 chapterList @js 兼容问题。
- */
+/** 《香色闺阁书源规则》§七：result = 书籍详情页 URL */
 export function chapterListRequestInfoOverride(source) {
   if (hostnameOf(source) !== "alicesw.com") return null;
-  return null;
-}
-
-function novelToCatalogJs() {
-  // §十 |@js: 字段后处理，result 为 xpath 取出的 href
   return [
     "@js:",
     'var host = "https://www.alicesw.com";',
-    'var u = String(result || "");',
+    'var u = (typeof result == "string") ? result : "";',
+    'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
+    'if (!u && params && params.queryInfo) u = params.queryInfo.detailUrl || params.queryInfo.url || "";',
+    "u = String(u || \"\");",
     'if (u && u.indexOf("http") != 0) u = host + (u.charAt(0) == "/" ? u : "/" + u);',
     "var m = u.match(/\\/novel\\/(\\d+)/i);",
     'if (m) return host + "/other/chapters/id/" + m[1] + ".html";',
@@ -47,44 +44,57 @@ function novelToCatalogJs() {
   ].join("\n");
 }
 
+function absolutizeUrlJs() {
+  return [
+    "@js:",
+    'var host = "https://www.alicesw.com";',
+    'var u = String(result || "");',
+    "if (!u) return u;",
+    'if (u.indexOf("http") == 0) return u;',
+    'if (u.indexOf("//") == 0) return "https:" + u;',
+    'return host + (u.charAt(0) == "/" ? u : "/" + u);',
+  ].join("\n");
+}
+
 function adaptAlicesw(source) {
+  // 与香色 iOS 接近的 UA；站点对 UA 会切换模板，规则已对 desktop/mobile 双写
   const ua = source.httpUserAgent
-    || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
-  const toCatalog = `\n${novelToCatalogJs()}`;
+    || "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1";
 
   return {
     ...source,
     header: JSON.stringify({ "User-Agent": ua }),
     ruleSearch: {
       bookList: "class.list-group-item",
-      name: "tag.h5@tag.a@text",
-      // 目录页同时能提供书名(h1)+章节列表，当作进入书籍的落地页
-      bookUrl: `tag.h5@tag.a@href${toCatalog}`,
+      // h5/a 内有 <em>，取元素文本不要只用 /text() 第一段
+      name: "@XPath://h5/a",
+      bookUrl: "tag.h5@tag.a@href",
       author: "class.text-muted.0@tag.a@text",
       intro: "class.content-txt@text",
       coverUrl: "tag.img@src||https://www.alicesw.com/favicon.ico",
     },
     ruleExplore: {
-      bookList: "class.rec_rullist@tag.ul",
-      name: "class.two@tag.a@text",
-      bookUrl: `class.two@tag.a@href${toCatalog}`,
+      bookList: "class.rec_rullist@tag.ul||class.section-list@tag.li",
+      name: "class.two@tag.a@text||tag.a@text",
+      bookUrl: "class.two@tag.a@href||tag.a@href",
       author: "class.four@text",
       lastChapter: "class.three@tag.a@text",
     },
     ruleBookInfo: {
-      // 目录页用 h1；若仍落到 /novel/ 则用 novel_title
-      name: "tag.h1@text||class.novel_title@text",
-      author: "class.novel_info@tag.p.0@tag.a@text",
+      name: "tag.h1@text||class.novel_title@text||class.xs-title@text",
+      author: "class.info@tag.a.0@text||class.novel_info@tag.p.0@tag.a@text",
       kind: "class.novel_info@tag.p.1@tag.a@text",
       status: "class.novel_info@tag.p.4@text",
       wordCount: "class.novel_info@tag.p.3@text",
-      lastChapter: "class.novel_info@tag.p.5@tag.a@text",
-      intro: "@XPath://h6[contains(.,'内容简介')]/following-sibling::*[1]//text()",
-      coverUrl: "class.pic@tag.img@src",
+      // 手机端「最新」后第一个 /book/ 链；桌面端 novel_info p5
+      lastChapter: "@XPath://a[contains(@href,'/book/')][1]/text()||class.novel_info@tag.p.5@tag.a@text",
+      intro: "@XPath://meta[@property='og:description']/@content||//h6[contains(.,'内容简介')]/following-sibling::*[1]//text()",
+      // 手机端常用 og:image（相对路径）；桌面端 pic img
+      coverUrl: `@XPath://meta[@property='og:image']/@content||//*[contains(@class,'pic')]//img/@src||//img[contains(@src,'cdn')]/@src\n${absolutizeUrlJs()}`,
     },
     ruleToc: {
-      // 精华书阁示例：list=li，title/url=a（§七）
-      chapterList: "@XPath://ul[contains(concat(' ', normalize-space(@class), ' '), ' mulu_list ')]/li",
+      // iPhone: section-list；Desktop: mulu_list（§十 || 备选）
+      chapterList: "@XPath://ul[contains(@class,'section-list')]/li || //ul[@class='mulu_list']/li",
       chapterName: "tag.a@text",
       chapterUrl: "tag.a@href",
     },
@@ -92,6 +102,7 @@ function adaptAlicesw(source) {
       content: "class.read-content@tag.p@text",
       replaceRegex: [
         "^\\s+",
+        "\\s*点击返回上一章.*",
         "\\s*阅读更多请访问.*",
         "\\s*本书由网友上传.*",
         "\\s*所有小说中出现的人物均为18岁以上的成人.*",

@@ -37,10 +37,16 @@ url:   //a/@href
 
 ### alicesw（本仓库适配约定）
 
-站点目录在 `/other/chapters/id/{id}.html`，不在 `/novel/{id}.html`。
+香色是 iOS 客户端，站点按 UA 切换模板：
 
-按文档尽量走「子级 `%@result`」路径（精华书阁同款）：
+| UA | 目录列表 class |
+|----|----------------|
+| iPhone | `ul.section-list` |
+| Desktop | `ul.mulu_list` |
 
-1. `searchBook.detailUrl` 用 `|@js:` 把 `/novel/{id}` 改成目录页（落地页=目录页）
-2. `bookDetail` / `chapterList` 的 `requestInfo` 用 `%@result`
-3. `chapterList.list/title/url` 用 `li` + `//a/text()` + `//a/@href`
+因此：
+
+1. `searchBook.detailUrl` 保持 `/novel/{id}.html`（封面 / 最新章在详情页）
+2. `chapterList.requestInfo` 按 §七用 `result`（详情 URL）改写成 `/other/chapters/id/{id}.html`
+3. `list` = `section-list/li || mulu_list/li`
+4. 封面优先 `og:image`（手机端），并 `|@js:` 补全绝对地址
