@@ -176,6 +176,29 @@ function convertOne(source, warnings) {
   const contentResponseType = inferResponseType(contentRules);
   const contentWarningFor = createWarningCollector(warnings, sourceName, "chapterContent");
 
+  const bookDetail = {
+    ...commonAction("bookDetail", host, detailResponseType),
+    requestInfo: "%@result",
+    ...mapDetailRules(detailRules, detailResponseType, detailWarningFor),
+  };
+
+  // 香色没有独立 tocUrl 字段：把详情页解析出的目录地址写入透传字段，chapterList 优先取用。
+  let chapterListRequestInfo = "%@result";
+  if (detailRules.tocUrl) {
+    bookDetail.tocUrl = convertRule(detailRules.tocUrl, {
+      responseType: detailResponseType,
+      warn: detailWarningFor("tocUrl", detailRules.tocUrl),
+    });
+    chapterListRequestInfo = [
+      "@js:",
+      "let q = params.queryInfo || {};",
+      "return q.tocUrl || q.url || result;",
+    ].join("\n");
+    detailWarningFor("tocUrl", detailRules.tocUrl)(
+      "详情页 tocUrl 已映射为 bookDetail.tocUrl，并由 chapterList.requestInfo 优先使用；请实测目录是否跳转正确",
+    );
+  }
+
   const converted = {
     sourceName,
     sourceUrl: host,
@@ -197,14 +220,10 @@ function convertOne(source, warnings) {
       sourceName,
       section: "searchBook",
     }),
-    bookDetail: {
-      ...commonAction("bookDetail", host, detailResponseType),
-      requestInfo: "%@result",
-      ...mapDetailRules(detailRules, detailResponseType, detailWarningFor),
-    },
+    bookDetail,
     chapterList: {
       ...commonAction("chapterList", host, tocResponseType),
-      requestInfo: "%@result",
+      requestInfo: chapterListRequestInfo,
       ...mapTocRules(tocRules, tocResponseType, tocWarningFor),
     },
     chapterContent: {

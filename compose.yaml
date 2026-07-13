@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: read2xsgg:latest
+    image: knighttools/read2xsgg:${IMAGE_TAG:-latest}
     container_name: read2xsgg
     restart: unless-stopped
     init: true

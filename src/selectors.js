@@ -4,6 +4,17 @@ function quoteXPath(value) {
   return `concat(${value.split("'").map((part) => `'${part}'`).join(', "\'", ')})`;
 }
 
+const TEXT_PROPERTIES = new Set(["text", "textNodes", "ownText", "html"]);
+const ATTR_PROPERTIES = new Set(["href", "src", "content", "value", "title", "alt", "data-src"]);
+const RELATIVE_PROPERTIES = new Set([...TEXT_PROPERTIES, ...ATTR_PROPERTIES]);
+
+function propertyToXPath(name) {
+  if (name === "html") return "";
+  if (TEXT_PROPERTIES.has(name)) return "/text()";
+  if (ATTR_PROPERTIES.has(name) || name.startsWith("data-")) return `/@${name}`;
+  return "";
+}
+
 function splitCss(selector) {
   const parts = [];
   let current = "";
@@ -48,6 +59,17 @@ function splitCss(selector) {
   return parts.filter((part, index) => part !== " " || (index > 0 && parts[index - 1] !== ">"));
 }
 
+function jsoupRegexToContains(attribute, value) {
+  // Jsoup `[attr~=regex]` uses regex matching. Approximate with literal contains().
+  const literals = String(value)
+    .replace(/\\[dDwWsS]/g, " ")
+    .replace(/\\([.^$*+?()[\]{}|\\])/g, "$1")
+    .split(/[^a-zA-Z0-9/_-]+/)
+    .filter((part) => part.length >= 2);
+  if (!literals.length) return [`@${attribute}`];
+  return literals.map((part) => `contains(@${attribute}, ${quoteXPath(part)})`);
+}
+
 function cssAtomToXPath(atom) {
   let source = atom;
   let excludedFirst = false;
@@ -77,7 +99,8 @@ function cssAtomToXPath(atom) {
       const quoted = quoteXPath(value.trim());
       predicates.push(`substring(@${attribute}, string-length(@${attribute}) - string-length(${quoted}) + 1) = ${quoted}`);
     } else if (operator === "~=") {
-      predicates.push(`contains(concat(' ', normalize-space(@${attribute}), ' '), ${quoteXPath(` ${value.trim()} `)})`);
+      // Legado/Jsoup: regex. CSS3 ~= is word-match; prefer Jsoup semantics here.
+      predicates.push(...jsoupRegexToContains(attribute, value.trim()));
     }
   }
 
@@ -110,21 +133,38 @@ export function cssToXPath(selector) {
   return xpath || selector;
 }
 
+function indexPredicateFromSuffix(suffix) {
+  const indices = suffix.split(":").map(Number);
+  if (indices.length === 1) {
+    const index = indices[0];
+    return index >= 0 ? `[${index + 1}]` : `[last() - ${Math.abs(index) - 1}]`;
+  }
+  const clauses = indices.map((index) => (
+    index >= 0 ? `position() = ${index + 1}` : `position() = last() - ${Math.abs(index) - 1}`
+  ));
+  return `[${clauses.join(" or ")}]`;
+}
+
 function legacySegmentToXPath(segment, first) {
   let value = segment.trim();
-  const propertyNames = new Set(["text", "textNodes", "ownText", "html"]);
-  if (propertyNames.has(value)) return value === "html" ? "" : "/text()";
-  if (/^(href|src|data-[\w-]+|content|value|title)$/.test(value)) return `/@${value}`;
+  if (!value) return "";
+  if (value.startsWith("@") && !value.startsWith("@css:") && !/^@json:/i.test(value)) {
+    value = value.slice(1);
+  }
+
+  const propertyPath = propertyToXPath(value);
+  if (propertyPath !== "" || TEXT_PROPERTIES.has(value) || ATTR_PROPERTIES.has(value)) {
+    return propertyPath;
+  }
 
   let indexPredicate = "";
-  const indexMatch = value.match(/\.(-?\d+)$/);
+  const indexMatch = value.match(/\.((-?\d+)(?::-?\d+)*)$/);
   if (indexMatch) {
-    const index = Number(indexMatch[1]);
-    indexPredicate = index >= 0 ? `[${index + 1}]` : `[last() - ${Math.abs(index) - 1}]`;
+    indexPredicate = indexPredicateFromSuffix(indexMatch[1]);
     value = value.slice(0, -indexMatch[0].length);
   }
   if (value.startsWith("id.")) {
-    return `${first ? "//" : "//"}*[@id=${quoteXPath(value.slice(3))}]${indexPredicate}`;
+    return `//*[@id=${quoteXPath(value.slice(3))}]${indexPredicate}`;
   }
   if (value.startsWith("class.")) {
     const classes = value.slice(6).trim().split(/\s+/).filter(Boolean);
@@ -135,33 +175,48 @@ function legacySegmentToXPath(segment, first) {
     return `//*[contains(normalize-space(.), ${quoteXPath(value.slice(5))})]${indexPredicate}`;
   }
   if (value.startsWith("tag.")) value = value.slice(4);
-  if (/^[a-zA-Z][\w-]*$/.test(value)) return `//${value}${indexPredicate}`;
-  return `${cssToXPath(value)}${indexPredicate}`;
+  if (/^[a-zA-Z][\w-]*$/.test(value)) return `${first ? "//" : "//"}${value}${indexPredicate}`;
+  const cssPath = cssToXPath(value);
+  return `${cssPath}${indexPredicate}`;
 }
 
 function legadoHtmlToXPath(selector) {
   let source = selector.trim();
   if (/^@?(?:XPath|xpath):/.test(source)) return source.replace(/^@?(?:XPath|xpath):/, "");
-  if (source.startsWith("//") || source.startsWith("/html")) return source;
+  if (source.startsWith("//") || source.startsWith("(") || source.startsWith("/html") || source.startsWith("/text()") || source.startsWith("/@")) {
+    return source;
+  }
   if (/^@css:/i.test(source)) return cssToXPath(source.replace(/^@css:/i, ""));
+
+  // Bare relative properties used inside list/detail items (very common in ruleToc).
+  if (RELATIVE_PROPERTIES.has(source) || (source.startsWith("@") && RELATIVE_PROPERTIES.has(source.slice(1)))) {
+    return propertyToXPath(source.startsWith("@") ? source.slice(1) : source) || ".";
+  }
 
   if (source.includes("@")) {
     const segments = source.split("@").filter(Boolean);
     return segments.map((segment, index) => legacySegmentToXPath(segment, index === 0)).join("");
   }
-  if (source.startsWith("id.")) return legacySegmentToXPath(source, true);
-  if (source.startsWith("class.")) return legacySegmentToXPath(source, true);
-  if (source.startsWith("tag.")) return legacySegmentToXPath(source, true);
+  if (source.startsWith("id.") || source.startsWith("class.") || source.startsWith("tag.") || source.startsWith("text.")) {
+    return legacySegmentToXPath(source, true);
+  }
   return cssToXPath(source);
 }
 
 function jsonPathToXsgg(path, warn) {
   let source = path.trim().replace(/^@json:/i, "");
+  let jsSuffix = "";
+  const jsMatch = source.match(/((?:@js:|<js>)[\s\S]*)$/i);
+  if (jsMatch) {
+    warn("阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查");
+    jsSuffix = jsMatch[1].replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
+    source = source.slice(0, jsMatch.index);
+  }
   if (source.includes("..")) {
     warn("JSONPath 的递归下降操作符 '..' 在香色中没有完全等价语法，已按普通路径转换");
     source = source.replace(/\.\./g, ".");
   }
-  return source
+  const converted = source
     .replace(/^\$\.?/, "")
     .replace(/\[['"]([^'"]+)['"]\]/g, "/$1")
     .replace(/\[(\d+)\]/g, "/$1")
@@ -169,11 +224,21 @@ function jsonPathToXsgg(path, warn) {
     .replace(/\.\*/g, "")
     .replace(/\./g, "/")
     .replace(/^\/+|\/+$/g, "");
+  if (!jsSuffix) return converted;
+  return converted ? `${converted}||${jsSuffix}` : jsSuffix;
 }
 
 function appendRegexReplacement(converted, suffix, warn) {
   const [pattern = "", replacement = ""] = suffix.split("##");
   if (!pattern) return converted;
+
+  // Legado chapter option idiom: href##$##,{"webView":true} → append option at end of URL.
+  // 香色不支持该 URL 尾部配置，这里丢掉配置并告警，只保留链接本身。
+  if (pattern === "$" && /webView/i.test(replacement)) {
+    warn("章节链接中的 webView 附加配置无法自动映射到香色 URL 字段，已只保留链接；如需 webView 请在正文 requestInfo 中配置");
+    return converted;
+  }
+
   try {
     // Validate only. The expression itself is executed by 香色闺阁.
     new RegExp(pattern);
@@ -181,6 +246,28 @@ function appendRegexReplacement(converted, suffix, warn) {
     warn("清理正则无法解析，已原样写入转换结果");
   }
   return `${converted}||@js:\nreturn String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(replacement)});`;
+}
+
+function looksLikeJsonPath(value) {
+  const trimmed = value.trim();
+  if (/^\s*(?:@?json:|\$[.[])/i.test(trimmed)) return true;
+  if (RELATIVE_PROPERTIES.has(trimmed) || RELATIVE_PROPERTIES.has(trimmed.replace(/^@/, ""))) return false;
+  if (/^(?:class|id|tag|text)\./i.test(trimmed)) return false;
+  if (/[#>@\s]|\[.|^=/.test(trimmed) || /^\./.test(trimmed)) return false;
+  // data.books / data.books[0].title 之类
+  return /^[\w$-]+(?:\[[\d*]+\]|\.[\w$*\[\]-]+)+$/.test(trimmed);
+}
+
+function looksLikeHtmlRule(value) {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (/^(?:@js:|<js>)/i.test(trimmed)) return false;
+  if (/^\s*(?:@?json:|\$[.[])/i.test(trimmed)) return false;
+  if (RELATIVE_PROPERTIES.has(trimmed) || RELATIVE_PROPERTIES.has(trimmed.replace(/^@/, ""))) return true;
+  if (/\/\/|^\/html|@(?:text|href|src|html|css:)|^\s*(?:class|id|tag|text)\./i.test(trimmed)) return true;
+  if (/[#>\[\]]/.test(trimmed) || /(?:^|[\s>+~,])[a-z][\w-]*\./i.test(trimmed)) return true;
+  if (/\s/.test(trimmed) && /[a-z]/i.test(trimmed)) return true;
+  return false;
 }
 
 export function convertRule(rule, { responseType = "html", warn = () => {} } = {}) {
@@ -195,28 +282,57 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
     return trimmed.replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
   }
 
+  // Trailing <js>/@js after a selector (Legado often writes `href\n<js>...</js>`).
+  const trailingJs = trimmed.match(/^([\s\S]*?)(\n\s*(?:@js:|<js>)[\s\S]*)$/i);
+  if (trailingJs && trailingJs[1].trim() && /[@$.#\[a-z]/i.test(trailingJs[1])) {
+    const head = convertRule(trailingJs[1].trim(), { responseType, warn });
+    warn("阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查");
+    const script = trailingJs[2].trim().replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
+    return `${head}||${script}`;
+  }
+
+  // Apply ## cleanup to the whole rule (including && combinations) before splitting.
+  const replacementIndex = trimmed.indexOf("##");
+  if (replacementIndex >= 0 && !trimmed.includes("||")) {
+    const selector = trimmed.slice(0, replacementIndex);
+    const suffix = trimmed.slice(replacementIndex + 2);
+    const converted = convertRule(selector, { responseType, warn });
+    const wrapped = converted.includes(" | ") ? `(${converted})` : converted;
+    return appendRegexReplacement(wrapped, suffix, warn);
+  }
+
+  // Legado `&&` joins all matched texts with newline; approximate with XPath union.
+  if (trimmed.includes("&&")) {
+    const parts = trimmed.split("&&").map((part) => part.trim()).filter(Boolean);
+    if (parts.length > 1) {
+      const convertedParts = parts.map((part) => convertRule(part, { responseType, warn }));
+      if (convertedParts.every((part) => part.startsWith("/") || part.startsWith("("))) {
+        warn("阅读的 &&（拼接全部匹配）已近似转换为 XPath 并集；若结果不符合预期请手工调整");
+        return convertedParts.join(" | ");
+      }
+      return convertedParts.join("||");
+    }
+  }
+
   const alternatives = trimmed.split("||");
   if (alternatives.length > 1) {
     return alternatives.map((part) => convertRule(part, { responseType, warn })).join("||");
   }
 
-  const replacementIndex = trimmed.indexOf("##");
-  const selector = replacementIndex >= 0 ? trimmed.slice(0, replacementIndex) : trimmed;
-  const suffix = replacementIndex >= 0 ? trimmed.slice(replacementIndex + 2) : "";
-  const isJson = responseType === "json" || /^@?json:/i.test(selector) || selector.startsWith("$");
-  const converted = isJson ? jsonPathToXsgg(selector, warn) : legadoHtmlToXPath(selector);
-  return replacementIndex >= 0 ? appendRegexReplacement(converted, suffix, warn) : converted;
+  const forceJson = /^@?json:/i.test(trimmed) || trimmed.startsWith("$");
+  const forceHtml = looksLikeHtmlRule(trimmed);
+  const isJson = forceJson || (responseType === "json" && !forceHtml);
+  return isJson ? jsonPathToXsgg(trimmed, warn) : legadoHtmlToXPath(trimmed);
 }
 
 export function inferResponseType(rules = {}) {
-  const values = Object.values(rules).filter((value) => typeof value === "string");
+  const values = Object.values(rules).filter((value) => typeof value === "string" && value.trim());
+  if (!values.length) return "html";
+
   const explicitJsonCount = values.filter((value) => /^\s*(?:@?json:|\$[.[])/i.test(value)).length;
-  const htmlCount = values.filter((value) => /(?:\/\/|@(?:text|href|src|html)|^\s*(?:class|id|tag)\.|[#>])/i.test(value)).length;
-  const implicitJsonCount = values.filter((value) => {
-    const trimmed = value.trim();
-    if (/^(?:class|id|tag)\./i.test(trimmed) || /^[.#]/.test(trimmed)) return false;
-    return /^[\w$-]+(?:\[[\d*]+\]|\.[\w$*\[\]-]+)*$/.test(trimmed);
-  }).length;
+  const htmlCount = values.filter((value) => looksLikeHtmlRule(value)).length;
+  const implicitJsonCount = values.filter((value) => looksLikeJsonPath(value)).length;
+
   if (explicitJsonCount > 0 && htmlCount === 0) return "json";
   if (explicitJsonCount > htmlCount) return "json";
   if (htmlCount > 0) return "html";

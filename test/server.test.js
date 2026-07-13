@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
-import { createAppServer, decodeXbs, serverConfig } from "../src/index.js";
+import { createAppServer, decodeXbs, normalizeEmbeddedSourceUrl, serverConfig } from "../src/index.js";
 
 const source = {
   bookSourceName: "在线示例",
@@ -32,8 +32,29 @@ function close(server) {
   return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
 
+test("手拼阅读源地址可还原为完整 URL", () => {
+  assert.equal(
+    normalizeEmbeddedSourceUrl("www.yckceo.com/yuedu/shuyuans/json/id/1193.json.xbs"),
+    "https://www.yckceo.com/yuedu/shuyuans/json/id/1193.json",
+  );
+  assert.equal(
+    normalizeEmbeddedSourceUrl("https/www.yckceo.com/a.json.xbs"),
+    "https://www.yckceo.com/a.json",
+  );
+  assert.equal(
+    normalizeEmbeddedSourceUrl("https://www.yckceo.com/a.json.xbs"),
+    "https://www.yckceo.com/a.json",
+  );
+  assert.equal(
+    normalizeEmbeddedSourceUrl("http%3A%2F%2F127.0.0.1%3A9%2Fa.json"),
+    "http://127.0.0.1:9/a.json",
+  );
+});
+
 test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (context) => {
-  const upstream = createServer((_request, response) => {
+  const upstreamRequests = [];
+  const upstream = createServer((request, response) => {
+    upstreamRequests.push(request.url);
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify(source));
   });
@@ -52,7 +73,7 @@ test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (
   assert.deepEqual(await health.json(), { status: "ok" });
 
   const sourceUrl = `${upstreamBase}/source.json?token=abc`;
-  const xbsResponse = await fetch(`${appBase}/url/${encodeURIComponent(sourceUrl)}`);
+  const xbsResponse = await fetch(`${appBase}/convert.xbs?url=${encodeURIComponent(sourceUrl)}`);
   assert.equal(xbsResponse.status, 200);
   assert.equal(xbsResponse.headers.get("content-type"), "application/octet-stream");
   assert.equal(xbsResponse.headers.get("x-converted-count"), "1");
@@ -61,12 +82,37 @@ test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (
   const converted = JSON.parse(decodeXbs(Buffer.from(await xbsResponse.arrayBuffer())).toString("utf8"));
   assert.equal(converted["在线示例"].sourceName, "在线示例");
 
+  const pathSourceUrl = `${upstreamBase}/source.json?token=path`;
+  const pathResponse = await fetch(`${appBase}/url/${encodeURIComponent(pathSourceUrl)}.xbs`);
+  assert.equal(pathResponse.status, 200);
+  assert.ok(pathResponse.url.endsWith(".xbs"));
+  assert.equal(upstreamRequests.at(-1), "/source.json?token=path");
+  assert.equal(
+    JSON.parse(decodeXbs(Buffer.from(await pathResponse.arrayBuffer())).toString("utf8"))["在线示例"].sourceName,
+    "在线示例",
+  );
+
+  // /xbs/{host}{path}.xbs — 去掉 https:// 后直接拼接
+  const upstreamUrl = new URL(`${upstreamBase}/source.json`);
+  const easyResponse = await fetch(`${appBase}/xbs/${upstreamUrl.host}${upstreamUrl.pathname}.xbs`);
+  assert.equal(easyResponse.status, 200);
+  assert.equal(upstreamRequests.at(-1), "/source.json");
+  assert.equal(
+    JSON.parse(decodeXbs(Buffer.from(await easyResponse.arrayBuffer())).toString("utf8"))["在线示例"].sourceName,
+    "在线示例",
+  );
+
+  // /x.xbs?u=完整地址 — 路径带 .xbs，查询参数通常无需编码
+  const shortQuery = await fetch(`${appBase}/x.xbs?u=${upstreamBase}/source.json?token=short`);
+  assert.equal(shortQuery.status, 200);
+  assert.equal(upstreamRequests.at(-1), "/source.json?token=short");
+
   const notModified = await fetch(`${appBase}/convert?url=${encodeURIComponent(sourceUrl)}`, {
     headers: { "If-None-Match": etag },
   });
   assert.equal(notModified.status, 304);
 
-  const jsonResponse = await fetch(`${appBase}/convert/json?url=${encodeURIComponent(sourceUrl)}`);
+  const jsonResponse = await fetch(`${appBase}/j/${upstreamUrl.host}${upstreamUrl.pathname}`);
   assert.equal(jsonResponse.status, 200);
   const debug = await jsonResponse.json();
   assert.equal(debug.sources["在线示例"].sourceName, "在线示例");

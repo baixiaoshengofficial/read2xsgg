@@ -165,28 +165,71 @@ export async function downloadSource(sourceUrl, config = serverConfig()) {
   throw new HttpError(502, "下载阅读源失败");
 }
 
+/**
+ * 把路径里嵌套的阅读源地址还原成可抓取 URL。
+ * 支持：
+ * - 完整 URL（可编码或原样）: https://host/path.json
+ * - 去协议手拼接: host/path.json
+ * - 代理友好: https/host/path.json
+ */
+export function normalizeEmbeddedSourceUrl(value) {
+  let source = String(value ?? "").trim();
+  if (!source) throw new HttpError(400, "缺少在线阅读源 URL");
+  if (source.endsWith(".xbs")) source = source.slice(0, -".xbs".length);
+  if (/%[0-9A-Fa-f]{2}/.test(source)) {
+    try {
+      source = decodeURIComponent(source);
+    } catch {
+      throw new HttpError(400, "路径中的阅读源 URL 编码无效");
+    }
+  }
+  source = source.trim().replace(/^\/+/, "");
+  if (!source) throw new HttpError(400, "缺少在线阅读源 URL");
+
+  if (/^https?:\/\//i.test(source)) return source;
+  // /xbs/https/www.example.com/a.json.xbs 或误写成 https:/www...
+  const schemeSlash = source.match(/^(https?)\/+(.*)$/i);
+  if (schemeSlash?.[2]) return `${schemeSlash[1].toLowerCase()}://${schemeSlash[2]}`;
+
+  // 手拼最简形式：去掉协议后直接接在 /xbs/ 后面
+  // 域名默认 https；字面量 IP（含端口）默认 http，便于本地/内网源。
+  if (/^[a-z0-9.-]+(?::\d+)?(?:\/|$)/i.test(source) || /^\[[0-9a-f:]+\](?::\d+)?(?:\/|$)/i.test(source)) {
+    const host = source.startsWith("[") ? (source.match(/^\[[0-9a-f:]+\]/i)?.[0] ?? "") : source.split("/")[0].replace(/:\d+$/, "");
+    const scheme = host && isIP(host.replace(/^\[|\]$/g, "")) ? "http" : "https";
+    return `${scheme}://${source}`;
+  }
+
+  throw new HttpError(400, "无法解析阅读源地址，请使用 https://host/path 或 host/path");
+}
+
 function sourceUrlFromRequest(request) {
   const rawUrl = request.url || "/";
-  if (rawUrl.startsWith("/url/")) {
-    const value = rawUrl.slice("/url/".length);
-    try {
-      return { sourceUrl: decodeURIComponent(value), format: "xbs" };
-    } catch {
-      throw new HttpError(400, "路径中的阅读源 URL 编码无效");
+  const pathOnly = rawUrl.split(/[?#]/, 1)[0];
+
+  // 推荐手拼：/xbs/www.example.com/legado.json.xbs
+  for (const prefix of ["/xbs/", "/x/", "/url/"]) {
+    if (pathOnly.startsWith(prefix)) {
+      return { sourceUrl: normalizeEmbeddedSourceUrl(pathOnly.slice(prefix.length)), format: "xbs" };
     }
   }
-  if (rawUrl.startsWith("/json/")) {
-    const value = rawUrl.slice("/json/".length);
-    try {
-      return { sourceUrl: decodeURIComponent(value), format: "json" };
-    } catch {
-      throw new HttpError(400, "路径中的阅读源 URL 编码无效");
+  for (const prefix of ["/json/", "/j/"]) {
+    if (pathOnly.startsWith(prefix)) {
+      return { sourceUrl: normalizeEmbeddedSourceUrl(pathOnly.slice(prefix.length)), format: "json" };
     }
   }
+
   const parsed = new URL(rawUrl, "http://read2xsgg.local");
-  if (parsed.pathname === "/convert" || parsed.pathname === "/convert/json") {
+  if (["/convert", "/convert.xbs", "/x.xbs", "/convert/json"].includes(parsed.pathname)) {
+    let sourceUrl = "";
+    // /x.xbs?u=... 把 u= 后面整段都当阅读源（支持源地址自带 ?query，免编码）
+    if (parsed.pathname === "/x.xbs") {
+      const marker = rawUrl.includes("?u=") ? "?u=" : rawUrl.includes("&u=") ? "&u=" : "";
+      sourceUrl = marker ? rawUrl.slice(rawUrl.indexOf(marker) + marker.length) : (parsed.searchParams.get("url") || "");
+    } else {
+      sourceUrl = parsed.searchParams.get("u") || parsed.searchParams.get("url") || "";
+    }
     return {
-      sourceUrl: parsed.searchParams.get("url") || "",
+      sourceUrl: sourceUrl ? normalizeEmbeddedSourceUrl(sourceUrl) : "",
       format: parsed.pathname.endsWith("/json") || parsed.searchParams.get("format") === "json" ? "json" : "xbs",
     };
   }
@@ -198,9 +241,12 @@ function help(config) {
     name: "read2xsgg",
     status: "ok",
     usage: {
-      path: "/url/https://example.com/legado.json",
-      query: "/convert?url=https%3A%2F%2Fexample.com%2Flegado.json",
-      json: "/convert/json?url=https%3A%2F%2Fexample.com%2Flegado.json",
+      easy: "/xbs/www.example.com/legado.json.xbs",
+      easyRule: "订阅地址 = {本站}/xbs/ + 去掉 https:// 后的阅读源地址 + .xbs",
+      easyQuery: "/x.xbs?u=https://www.example.com/legado.json",
+      xbs: "/convert.xbs?url=https://www.example.com/legado.json",
+      path: "/url/https://www.example.com/legado.json.xbs",
+      json: "/j/www.example.com/legado.json",
       health: "/healthz",
     },
     limits: {
