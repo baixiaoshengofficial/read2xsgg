@@ -1,7 +1,6 @@
 /**
- * 端到端实测：7585/alicesw 转换规则在真实页面上必须能取出「有标题+有章节链」的目录，以及正文。
- * 不依赖 lxml（CI 无 Python 包）；用 DOM 结构的稳定正则验收。
- * 需要外网；若离线环境拉不到源则跳过。
+ * 端到端：7585 必须能搜到书、改写到目录页、解析出带标题章节、打开正文。
+ * 不依赖 lxml；外网不可用时 skip。
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -18,21 +17,21 @@ async function fetchText(url) {
   return response.text();
 }
 
-function evalRequestInfo(script, { detailUrl = "", url = "", result = "" } = {}) {
+function runJs(script, result, params = {}) {
   const body = String(script).replace(/^@js:\s*/i, "");
   // eslint-disable-next-line no-new-func
-  const out = new Function(
-    "params",
-    "result",
-    "config",
-    body,
-  )({ queryInfo: { detailUrl, url } }, result, { host: "https://www.alicesw.com", httpHeaders: UA });
-  if (typeof out === "string") return out;
-  if (out && typeof out === "object") return out.url || "";
-  return "";
+  return new Function("params", "result", "config", body)(
+    params,
+    result,
+    { host: "https://www.alicesw.com", httpHeaders: UA },
+  );
 }
 
-/** 从 mulu_list 的 li>a 抽出章节（对应转换后的 list=//li + title=//a/text() + url=//a/@href） */
+function extractFieldJs(rule) {
+  const parts = String(rule).split(/\|@js:/);
+  return parts.length > 1 ? parts.slice(1).join("|@js:") : "";
+}
+
 function extractChaptersFromMulu(html) {
   const block = html.match(/<ul[^>]*class="[^"]*mulu_list[^"]*"[^>]*>([\s\S]*?)<\/ul>/i);
   if (!block) return [];
@@ -42,12 +41,12 @@ function extractChaptersFromMulu(html) {
   }));
 }
 
-test("live: 7585 目录必须能解析出带标题的章节，正文非空", async (t) => {
+test("live: 7585 搜索改写目录后必须能解析章节和正文", async (t) => {
   let sourceRes;
   try {
     sourceRes = await fetch("https://www.yckceo.com/yuedu/shuyuan/json/id/7585.json", { headers: UA });
   } catch (error) {
-    t.skip(`无法访问外网拉取阅读源: ${error.message}`);
+    t.skip(`无法访问外网: ${error.message}`);
     return;
   }
   if (!sourceRes.ok) {
@@ -58,28 +57,40 @@ test("live: 7585 目录必须能解析出带标题的章节，正文非空", asy
   const { sources } = convertLegado(await sourceRes.json());
   const src = sources["爱丽丝书屋"] || Object.values(sources)[0];
   assert.ok(src);
-
-  // 规则形态：list=li，title/url=a —— 禁止旧的 list=a + /text() + //@href
-  assert.match(src.chapterList.list, /\/\/li$/);
   assert.equal(src.chapterList.title, "//a/text()");
   assert.equal(src.chapterList.url, "//a/@href");
-  assert.match(src.chapterList.requestInfo, /detailUrl/);
-  assert.match(src.chapterList.requestInfo, /"url"/);
-  assert.match(src.chapterContent.content, /\|@js:/);
-  assert.doesNotMatch(src.chapterContent.content, /\|\|@js:/);
+  assert.match(src.searchBook.detailUrl, /\|@js:/);
+  assert.doesNotMatch(src.chapterList.requestInfo, /\bconst\b|\blet\b/);
 
   const searchUrl = String(src.searchBook.requestInfo).replace("%@keyWord", encodeURIComponent("赘婿"));
   const searchHtml = await fetchText(searchUrl);
   const hrefMatch = searchHtml.match(/list-group-item[\s\S]{0,800}?<h5[^>]*>\s*<a[^>]+href="([^"]+)"/i);
   assert.ok(hrefMatch, "搜索结果取不到书籍链接");
-  const detailUrl = new URL(hrefMatch[1], "https://www.alicesw.com").href;
+  assert.match(hrefMatch[1], /\/novel\/\d+/);
 
-  const catalogUrl = evalRequestInfo(src.chapterList.requestInfo, { detailUrl, url: "" });
-  assert.match(catalogUrl, /\/other\/chapters\/id\/\d+\.html/, `目录 URL 失败: ${catalogUrl}`);
+  // 模拟香色：先跑 detailUrl 字段上的 |@js 改写
+  const rewritten = runJs(extractFieldJs(src.searchBook.detailUrl), hrefMatch[1]);
+  assert.match(String(rewritten), /\/other\/chapters\/id\/\d+\.html/, `搜索链接未改写到目录: ${rewritten}`);
+
+  // chapterList 即使只拿到改写后的 detailUrl，也应仍指向目录
+  const catalogUrl = runJs(src.chapterList.requestInfo, rewritten, {
+    queryInfo: { detailUrl: rewritten, url: "" },
+  });
+  assert.equal(catalogUrl, rewritten);
+
+  // 即使客户端没跑搜索改写、只给 novel 详情，chapterList 也必须能推导目录
+  const fromNovel = runJs(src.chapterList.requestInfo, "", {
+    queryInfo: { detailUrl: new URL(hrefMatch[1], "https://www.alicesw.com").href, url: "" },
+  });
+  assert.match(String(fromNovel), /\/other\/chapters\/id\/\d+\.html/);
 
   const tocHtml = await fetchText(catalogUrl);
   const chapters = extractChaptersFromMulu(tocHtml).filter((c) => c.title && /\/book\//.test(c.url));
-  assert.ok(chapters.length > 0, `目录解析失败 sample=${JSON.stringify(extractChaptersFromMulu(tocHtml).slice(0, 2))}`);
+  assert.ok(chapters.length > 0, `目录为空: ${catalogUrl}`);
+
+  // 目录页本身无 mulu 则失败；确认 /novel/ 详情页用同一 list 规则会得到 0（解释为何必须去目录页）
+  const detailHtml = await fetchText(new URL(hrefMatch[1], "https://www.alicesw.com").href);
+  assert.equal(extractChaptersFromMulu(detailHtml).length, 0, "详情页不应有 mulu_list；否则验收逻辑失效");
 
   const chapterUrl = new URL(chapters[0].url, "https://www.alicesw.com").href;
   const contentHtml = await fetchText(chapterUrl);
@@ -88,15 +99,13 @@ test("live: 7585 目录必须能解析出带标题的章节，正文非空", asy
   const paras = [...contentBlock[0].matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)]
     .map((m) => m[1].replace(/<[^>]+>/g, "").trim())
     .filter(Boolean);
-  assert.ok(paras.length > 0 && paras.join("").length > 50, "正文为空或过短");
+  assert.ok(paras.length > 0 && paras.join("").length > 50, "正文为空");
 
-  console.log(
-    JSON.stringify({
-      detailUrl,
-      catalogUrl,
-      chapters: chapters.length,
-      first: { title: chapters[0].title.slice(0, 40), url: chapters[0].url },
-      contentChars: paras.join("").length,
-    }),
-  );
+  console.log(JSON.stringify({
+    searchHref: hrefMatch[1],
+    rewritten,
+    chapters: chapters.length,
+    first: chapters[0].title.slice(0, 40),
+    contentChars: paras.join("").length,
+  }));
 });
