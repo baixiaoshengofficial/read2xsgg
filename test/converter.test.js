@@ -62,7 +62,7 @@ test("转换一个完整的 HTML 阅读源", () => {
   );
   assert.equal(converted.chapterList.list, "//*[contains(concat(' ', normalize-space(@class), ' '), ' box_con ')]//dd");
   assert.match(converted.chapterContent.content, /new RegExp\("广告\.\*"/);
-  assert.equal(converted.chapterContent.nextPageUrl, "//*[contains(normalize-space(.), '下一页')]/@href");
+  assert.equal(converted.chapterContent.nextPageUrl, "//a[contains(normalize-space(.), '下一页')]/@href");
   assert.deepEqual(Object.keys(converted.bookWorld), ["玄幻", "都市"]);
   assert.equal(warnings.length, 0);
 });
@@ -128,6 +128,7 @@ test("相对属性 text/href 与 CSS 目录规则不会被误判为 JSON", () =>
   assert.equal(converted.chapterList.list, "//a[contains(@href, '/read/')]");
   assert.equal(converted.chapterList.title, "/text()");
   assert.equal(converted.chapterList.url, "//@href");
+  assert.match(converted.bookDetail.tocUrl, /\/\/a\[contains/);
   assert.match(converted.bookDetail.tocUrl, /查看全部章节/);
   assert.match(converted.chapterList.requestInfo, /q\.tocUrl/);
   assert.ok(warnings.some((warning) => warning.field === "tocUrl"));

@@ -1,6 +1,6 @@
 import { convertRule, inferResponseType } from "./selectors.js";
 import { convertRequest, parseHeaders } from "./requests.js";
-import { adaptLegadoSource } from "./siteAdapters.js";
+import { adaptLegadoSource, chapterListRequestInfoOverride } from "./siteAdapters.js";
 
 const EMPTY_ACTIONS = {
   relatedWord: { actionID: "relatedWord", parserID: "DOM" },
@@ -191,18 +191,22 @@ function convertOne(source, warnings) {
     ...mapDetailRules(detailRules, detailResponseType, detailWarningFor),
   };
 
-  // 香色没有独立 tocUrl 字段：把详情页解析出的目录地址写入透传字段，chapterList 优先取用。
-  let chapterListRequestInfo = "%@result";
+  // 香色没有独立 tocUrl 字段：默认把详情页解析出的目录地址写入透传字段；
+  // 站点适配可覆盖 requestInfo（例如按详情 URL 推导目录页，不依赖 tocUrl 是否进 queryInfo）。
+  const requestInfoOverride = chapterListRequestInfoOverride(source);
+  let chapterListRequestInfo = requestInfoOverride || "%@result";
   if (detailRules.tocUrl) {
     bookDetail.tocUrl = convertRule(detailRules.tocUrl, {
       responseType: detailResponseType,
       warn: detailWarningFor("tocUrl", detailRules.tocUrl),
     });
-    chapterListRequestInfo = [
-      "@js:",
-      "let q = params.queryInfo || {};",
-      "return q.tocUrl || q.url || result;",
-    ].join("\n");
+    if (!requestInfoOverride) {
+      chapterListRequestInfo = [
+        "@js:",
+        "let q = params.queryInfo || {};",
+        "return q.tocUrl || q.url || result;",
+      ].join("\n");
+    }
     detailWarningFor("tocUrl", detailRules.tocUrl)(
       "详情页 tocUrl 已映射为 bookDetail.tocUrl，并由 chapterList.requestInfo 优先使用；请实测目录是否跳转正确",
     );

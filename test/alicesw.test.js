@@ -21,11 +21,15 @@ test("alicesw.com 源会经站点适配后再转换出可用规则", () => {
   const converted = sources["爱丽丝书屋"];
   assert.match(converted.searchBook.list, /list-group-item/);
   assert.match(converted.searchBook.bookName, /h5/);
+  assert.match(converted.bookDetail.tocUrl, /\/\/a\[contains/);
   assert.match(converted.bookDetail.tocUrl, /查看所有章节/);
   assert.match(converted.chapterList.list, /mulu_list/);
   assert.match(converted.chapterContent.content, /read-content/);
   assert.match(converted.chapterContent.content, /\|@js:/);
   assert.doesNotMatch(converted.chapterContent.content, /\|\|@js:/);
-  assert.match(converted.chapterList.requestInfo, /tocUrl/);
+  // 不依赖 tocUrl 透传：按 /novel/{id} 推导目录页
+  assert.match(converted.chapterList.requestInfo, /other\/chapters\/id/);
+  assert.match(converted.chapterList.requestInfo, /novel/);
+  assert.match(converted.chapterList.url, /alicesw\.com/);
   assert.ok(warnings.some((w) => /alicesw\.com/.test(w.message)));
 });

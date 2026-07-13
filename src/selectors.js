@@ -212,6 +212,17 @@ function legadoHtmlToXPath(selector) {
 
   if (source.includes("@")) {
     const segments = source.split("@").filter(Boolean);
+    // text.下一页@href → //a[contains(.,'下一页')]/@href
+    // 不能用 //*[contains]/@href：祖先节点先命中且无 href 时，香色取首节点会得到空。
+    if (segments[0]?.startsWith("text.") && segments.length >= 2) {
+      const prop = segments[1].replace(/^@/, "");
+      if (ATTR_PROPERTIES.has(prop) || prop.startsWith("data-")) {
+        const label = quoteXPath(segments[0].slice(5));
+        const head = `//a[contains(normalize-space(.), ${label})]`;
+        const rest = segments.slice(1).map((segment) => legacySegmentToXPath(segment, false)).join("");
+        return head + rest;
+      }
+    }
     return segments.map((segment, index) => legacySegmentToXPath(segment, index === 0)).join("");
   }
   if (source.startsWith("id.") || source.startsWith("class.") || source.startsWith("tag.") || source.startsWith("text.")) {

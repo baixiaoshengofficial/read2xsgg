@@ -2,18 +2,45 @@
  * 对已知「规则与站点实际 DOM 不符」的阅读源，在转换前修正为可读的阅读规则，
  * 再走通用解析。这样 /xbs/?url=... 才能生成可用香色源。
  */
+
+function hostnameOf(source) {
+  const host = String(source?.bookSourceUrl ?? source?.url ?? "");
+  try {
+    return new URL(host.split("#")[0]).hostname.replace(/^www\./i, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
 export function adaptLegadoSource(source) {
   if (!source || typeof source !== "object") return source;
-  const host = String(source.bookSourceUrl ?? source.url ?? "");
-  let hostname = "";
-  try {
-    hostname = new URL(host.split("#")[0]).hostname.replace(/^www\./i, "").toLowerCase();
-  } catch {
-    return source;
-  }
-
+  const hostname = hostnameOf(source);
   if (hostname === "alicesw.com") return adaptAlicesw(source);
   return source;
+}
+
+/**
+ * 香色没有可靠的 tocUrl 透传时，用站点可推导的目录页地址写 chapterList.requestInfo。
+ * 返回 null 表示走通用 tocUrl / %@result 逻辑。
+ */
+export function chapterListRequestInfoOverride(source) {
+  const hostname = hostnameOf(source);
+  if (hostname === "alicesw.com") {
+    // 详情页 /novel/{id}.html → 目录页 /other/chapters/id/{id}.html
+    // 不能依赖 bookDetail.tocUrl 是否写入 queryInfo（多数客户端不会）。
+    return [
+      "@js:",
+      'const host = "https://www.alicesw.com";',
+      "const q = params.queryInfo || {};",
+      "let u = String(q.tocUrl || q.url || result || \"\");",
+      "if (u && !/^https?:/i.test(u)) u = host + (u.startsWith(\"/\") ? u : \"/\" + u);",
+      "const novel = u.match(/\\/novel\\/(\\d+)/i);",
+      "if (novel) return host + \"/other/chapters/id/\" + novel[1] + \".html\";",
+      "if (/\\/other\\/chapters\\/id\\/\\d+/i.test(u)) return u;",
+      "return u;",
+    ].join("\n");
+  }
+  return null;
 }
 
 function adaptAlicesw(source) {
@@ -47,12 +74,14 @@ function adaptAlicesw(source) {
       lastChapter: "class.novel_info@tag.p.5@tag.a@text",
       intro: "@XPath://h6[contains(.,'内容简介')]/following-sibling::*[1]/text()",
       coverUrl: "class.pic@tag.img@src",
-      tocUrl: "text.查看所有章节@href",
+      // 必须定位到 a，否则 //*[contains] 会先命中 html/body，香色取首节点 @href 得到空
+      tocUrl: "@XPath://a[contains(normalize-space(.),'查看所有章节')]/@href",
     },
     ruleToc: {
       chapterList: "class.mulu_list@tag.li@tag.a",
       chapterName: "text",
-      chapterUrl: "href",
+      // 相对路径补全，避免部分客户端报 URL 错误
+      chapterUrl: "href\n@js:\nconst host = \"https://www.alicesw.com\";\nlet u = String(result || \"\");\nif (!u) return u;\nif (/^https?:/i.test(u)) return u;\nreturn host + (u.startsWith(\"/\") ? u : \"/\" + u);",
     },
     ruleContent: {
       // 取段落文本；香色对纯元素节点经常取不到正文
