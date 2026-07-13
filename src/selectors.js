@@ -242,7 +242,9 @@ function jsonPathToXsgg(path, warn) {
     .replace(/\./g, "/")
     .replace(/^\/+|\/+$/g, "");
   if (!jsSuffix) return converted;
-  return converted ? `${converted}||${jsSuffix}` : jsSuffix;
+  return converted
+    ? (jsSuffix.startsWith("@js:") ? `${converted}|${jsSuffix}` : `${converted}||${jsSuffix}`)
+    : jsSuffix;
 }
 
 function appendRegexReplacement(converted, suffix, warn) {
@@ -262,7 +264,7 @@ function appendRegexReplacement(converted, suffix, warn) {
   } catch {
     warn("清理正则无法解析，已原样写入转换结果");
   }
-  return `${converted}||@js:\nreturn String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(replacement)});`;
+  return `${converted}|@js:\nreturn String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(replacement)});`;
 }
 
 function looksLikeJsonPath(value) {
@@ -356,7 +358,8 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
     const head = convertRule(trailingJs[1].trim(), { responseType, warn });
     warn("阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查");
     const script = trailingJs[2].trim().replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
-    return `${head}||${script}`;
+    // 香色：xpath 后处理用单竖线 |@js:；|| 表示备选规则
+    return script.startsWith("@js:") ? `${head}|${script}` : `${head}||${script}`;
   }
 
   // Apply ## cleanup to the whole rule (including && combinations) before splitting.

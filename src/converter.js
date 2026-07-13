@@ -257,13 +257,14 @@ function convertOne(source, warnings) {
   };
 
   // apply replaceRegex / replaceRegex array onto content field
+  // 香色后处理语法是「xpath|@js:」（单竖线）；「||@js:」会被当成备选规则导致正文为空。
   const replaceRegex = contentRules.replaceRegex ?? contentRules.replace;
   if (converted.chapterContent.content && replaceRegex) {
     const patterns = Array.isArray(replaceRegex) ? replaceRegex : [replaceRegex];
     const body = patterns
       .map((pattern) => `result = String(result).replace(new RegExp(${JSON.stringify(String(pattern))}, "g"), "");`)
       .join("\n");
-    converted.chapterContent.content += `||@js:\n${body}\nreturn result;`;
+    converted.chapterContent.content += `|@js:\n${body}\nreturn result;`;
   }
 
   if (!source.searchUrl) warningForSource("searchUrl", source.searchUrl)("缺少 searchUrl，转换后的源不能搜索");

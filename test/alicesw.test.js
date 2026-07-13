@@ -24,6 +24,8 @@ test("alicesw.com 源会经站点适配后再转换出可用规则", () => {
   assert.match(converted.bookDetail.tocUrl, /查看所有章节/);
   assert.match(converted.chapterList.list, /mulu_list/);
   assert.match(converted.chapterContent.content, /read-content/);
+  assert.match(converted.chapterContent.content, /\|@js:/);
+  assert.doesNotMatch(converted.chapterContent.content, /\|\|@js:/);
   assert.match(converted.chapterList.requestInfo, /tocUrl/);
   assert.ok(warnings.some((w) => /alicesw\.com/.test(w.message)));
 });

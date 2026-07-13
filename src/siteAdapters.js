@@ -55,12 +55,13 @@ function adaptAlicesw(source) {
       chapterUrl: "href",
     },
     ruleContent: {
-      content: "class.read-content",
+      // 取段落文本；香色对纯元素节点经常取不到正文
+      content: "class.read-content@tag.p@text",
       replaceRegex: [
-        "\\s*阅读更多请访问[\\s\\S]*",
-        "爱丽丝书屋[\\s\\S]*",
-        "本书由网友上传[\\s\\S]*",
-        "所有小说中出现的人物均为18岁以上的成人[\\s\\S]*",
+        "^\\s+",
+        "\\s*阅读更多请访问.*",
+        "\\s*本书由网友上传.*",
+        "\\s*所有小说中出现的人物均为18岁以上的成人.*",
       ],
     },
   };
