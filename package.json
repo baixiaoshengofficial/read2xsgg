@@ -1,0 +1,26 @@
+{
+  "name": "read2xsgg",
+  "version": "0.2.0",
+  "description": "将阅读（Legado）书源转换为香色闺阁 JSON/XBS 书源",
+  "type": "module",
+  "bin": {
+    "read2xsgg": "./bin/read2xsgg.js",
+    "read2xsgg-server": "./bin/server.js"
+  },
+  "exports": "./src/index.js",
+  "scripts": {
+    "test": "node --test",
+    "convert": "node ./bin/read2xsgg.js",
+    "start": "node ./bin/server.js"
+  },
+  "keywords": [
+    "legado",
+    "xsreader",
+    "xbs",
+    "书源"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}

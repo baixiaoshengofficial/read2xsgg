@@ -1,0 +1,36 @@
+services:
+  read2xsgg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: read2xsgg:latest
+    container_name: read2xsgg
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      FETCH_TIMEOUT_MS: ${FETCH_TIMEOUT_MS:-15000}
+      MAX_SOURCE_BYTES: ${MAX_SOURCE_BYTES:-10485760}
+      MAX_REDIRECTS: ${MAX_REDIRECTS:-5}
+      MAX_CONCURRENT: ${MAX_CONCURRENT:-8}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+      MAX_CACHE_ENTRIES: ${MAX_CACHE_ENTRIES:-100}
+      ALLOW_PRIVATE_NETWORKS: ${ALLOW_PRIVATE_NETWORKS:-false}
+      ALLOW_DNS_PROXY_NETWORKS: ${ALLOW_DNS_PROXY_NETWORKS:-true}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

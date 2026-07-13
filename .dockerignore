@@ -1,0 +1,9 @@
+.git
+.gitignore
+node_modules
+npm-debug.log*
+*.xbs
+*.converted.json
+*.report.json
+test
+.DS_Store
