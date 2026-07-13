@@ -157,7 +157,10 @@ function convertOne(source, warnings) {
   const sourceName = String(source.bookSourceName ?? source.name ?? "未命名书源").trim() || "未命名书源";
   const host = cleanBaseUrl(source.bookSourceUrl ?? source.url);
   const warningForSource = createWarningCollector(warnings, sourceName, "source");
-  const headers = parseHeaders(source.header, warningForSource("header", source.header));
+  const headers = {
+    ...parseHeaders(source.header, warningForSource("header", source.header)),
+    ...(source.httpUserAgent ? { "User-Agent": String(source.httpUserAgent) } : {}),
+  };
   if (!host) warningForSource("bookSourceUrl", source.bookSourceUrl)("缺少有效的 bookSourceUrl，生成源可能无法发起请求");
   if (source.bookSourceType === 3 || source.bookSourceType === "3") {
     warningForSource("bookSourceType", source.bookSourceType)("阅读的文件源类型在香色中没有直接等价类型，已按普通文本源输出");
@@ -235,10 +238,10 @@ function convertOne(source, warnings) {
           warn: contentWarningFor("content", contentRules.content),
         }),
       } : {}),
-      ...(contentRules.nextContentUrl ? {
-        nextPageUrl: convertRule(contentRules.nextContentUrl, {
+      ...((contentRules.nextContentUrl || contentRules.nextUrl) ? {
+        nextPageUrl: convertRule(contentRules.nextContentUrl || contentRules.nextUrl, {
           responseType: contentResponseType,
-          warn: contentWarningFor("nextContentUrl", contentRules.nextContentUrl),
+          warn: contentWarningFor("nextContentUrl", contentRules.nextContentUrl || contentRules.nextUrl),
         }),
         moreKeys: { maxPage: 999 },
       } : {}),
@@ -246,6 +249,16 @@ function convertOne(source, warnings) {
     bookWorld: buildBookWorld(source, context),
     ...structuredClone(EMPTY_ACTIONS),
   };
+
+  // apply replaceRegex / replaceRegex array onto content field
+  const replaceRegex = contentRules.replaceRegex ?? contentRules.replace;
+  if (converted.chapterContent.content && replaceRegex) {
+    const patterns = Array.isArray(replaceRegex) ? replaceRegex : [replaceRegex];
+    const body = patterns
+      .map((pattern) => `result = String(result).replace(new RegExp(${JSON.stringify(String(pattern))}, "g"), "");`)
+      .join("\n");
+    converted.chapterContent.content += `||@js:\n${body}\nreturn result;`;
+  }
 
   if (!source.searchUrl) warningForSource("searchUrl", source.searchUrl)("缺少 searchUrl，转换后的源不能搜索");
   if (!converted.searchBook.list) warningForSource("ruleSearch.bookList", searchRules.bookList)("缺少搜索列表规则");

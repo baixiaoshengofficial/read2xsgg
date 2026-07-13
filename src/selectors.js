@@ -287,6 +287,49 @@ function looksLikeHtmlRule(value) {
   return false;
 }
 
+function splitTopLevel(value, separator) {
+  const parts = [];
+  let current = "";
+  let depthParen = 0;
+  let depthBracket = 0;
+  let quote = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote) {
+      current += character;
+      if (character === quote && value[index - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      current += character;
+      continue;
+    }
+    if (character === "(") depthParen += 1;
+    else if (character === ")") depthParen -= 1;
+    else if (character === "[") depthBracket += 1;
+    else if (character === "]") depthBracket -= 1;
+    else if (depthParen === 0 && depthBracket === 0 && value.startsWith(separator, index)) {
+      if (current.trim()) parts.push(current.trim());
+      current = "";
+      index += separator.length - 1;
+      continue;
+    }
+    current += character;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+function rewriteCssHas(selector, warn) {
+  // Approximate simple :has(inner), avoiding nested ')'. Complex :has() is left with a warning.
+  return selector.replace(/:has\(([^()]+)\)/gi, (_, inner) => {
+    warn(`CSS :has() 已近似转换，复杂条件请人工复核：:has(${inner})`);
+    const convertedInner = cssToXPath(inner.trim()).replace(/^\/\//, ".//");
+    return `[${convertedInner}]`;
+  });
+}
+
 export function convertRule(rule, { responseType = "html", warn = () => {} } = {}) {
   if (rule === undefined || rule === null) return "";
   if (Array.isArray(rule)) return rule.map((item) => convertRule(item, { responseType, warn })).join("||");
@@ -297,6 +340,11 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   if (/^(?:@js:|<js>)/i.test(trimmed)) {
     warn("阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查");
     return trimmed.replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
+  }
+
+  // Absolute URL literal fallback: img@src||https://cdn/.../fallback.png
+  if (/^https?:\/\//i.test(trimmed)) {
+    return `@js:\nreturn ${JSON.stringify(trimmed)};`;
   }
 
   // Trailing <js>/@js after a selector (Legado often writes `href\n<js>...</js>`).
@@ -310,7 +358,7 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
 
   // Apply ## cleanup to the whole rule (including && combinations) before splitting.
   const replacementIndex = trimmed.indexOf("##");
-  if (replacementIndex >= 0 && !trimmed.includes("||")) {
+  if (replacementIndex >= 0 && !trimmed.includes("||") && !trimmed.includes("|")) {
     const selector = trimmed.slice(0, replacementIndex);
     const suffix = trimmed.slice(replacementIndex + 2);
     const converted = convertRule(selector, { responseType, warn });
@@ -331,15 +379,28 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
     }
   }
 
-  const alternatives = trimmed.split("||");
+  // Legado / CSS alternatives: || , and single | (not XPath " | ")
+  let alternatives = splitTopLevel(trimmed, "||");
+  if (alternatives.length === 1 && trimmed.includes("|") && !trimmed.includes(" | ")) {
+    alternatives = splitTopLevel(trimmed, "|");
+  }
+  if (alternatives.length === 1 && /,(?![^\[]*\])/.test(trimmed) && !trimmed.includes("@json:") && !trimmed.startsWith("$")) {
+    const commaParts = splitTopLevel(trimmed, ",");
+    if (commaParts.length > 1 && commaParts.every((part) => !part.includes("{{"))) {
+      alternatives = commaParts;
+    }
+  }
   if (alternatives.length > 1) {
-    return alternatives.map((part) => convertRule(part, { responseType, warn })).join("||");
+    return alternatives.map((part) => convertRule(part, { responseType, warn })).filter(Boolean).join("||");
   }
 
   const forceJson = /^@?json:/i.test(trimmed) || trimmed.startsWith("$");
   const forceHtml = looksLikeHtmlRule(trimmed);
   const isJson = forceJson || (responseType === "json" && !forceHtml);
-  return isJson ? jsonPathToXsgg(trimmed, warn) : legadoHtmlToXPath(trimmed);
+  if (isJson) return jsonPathToXsgg(trimmed, warn);
+
+  const withHas = /:has\(/i.test(trimmed) ? rewriteCssHas(trimmed, warn) : trimmed;
+  return legadoHtmlToXPath(withHas);
 }
 
 export function inferResponseType(rules = {}) {
