@@ -79,6 +79,30 @@ async function webpToPng(buffer) {
   throw new ImageDecodeError(`无法解码 WebP 图片：${lastError?.message || "ImageMagick 不可用"}`);
 }
 
+async function reverseVerticalTiles(buffer, tiles, label) {
+  const input = imageMimeType(buffer) === "image/webp" ? await webpToPng(buffer) : buffer;
+  let image;
+  try {
+    image = await Jimp.read(input);
+  } catch (error) {
+    throw new ImageDecodeError(`无法读取${label}图片：${error.message}`);
+  }
+  const { width, height, data } = image.bitmap;
+  if (!width || !height || height < tiles) throw new ImageDecodeError(`${label}图片尺寸不足，无法重排`);
+  const rowBytes = width * 4;
+  const tileHeight = Math.floor(height / tiles);
+  const remainder = height % tiles;
+  const output = Buffer.alloc(data.length);
+  for (let index = 1; index <= tiles; index += 1) {
+    const extra = index === tiles ? remainder : 0;
+    const sourceY = tileHeight * (index - 1);
+    const destinationY = height - sourceY - tileHeight - extra;
+    const byteLength = (tileHeight + extra) * rowBytes;
+    data.copy(output, destinationY * rowBytes, sourceY * rowBytes, sourceY * rowBytes + byteLength);
+  }
+  return Jimp.fromBitmap({ data: output, width, height }).getBuffer(JimpMime.png);
+}
+
 /** Reproduce 禁漫天堂's Android Canvas vertical tile reversal using RGBA pixels. */
 async function jmScramble(buffer, { url } = {}) {
   if (/qyyuapi\.com/i.test(String(url || "")) || imageMimeType(buffer) === "image/gif") return buffer;
@@ -94,32 +118,37 @@ async function jmScramble(buffer, { url } = {}) {
   const tiles = jmTileCount(bookId, imageId);
   if (!tiles) return buffer;
 
-  const input = imageMimeType(buffer) === "image/webp" ? await webpToPng(buffer) : buffer;
-  let image;
+  return reverseVerticalTiles(buffer, tiles, "禁漫");
+}
+
+/** Reproduce sources which derive a 5..14 tile count from an encoded image path. */
+async function md5ReverseTiles(buffer, { url } = {}) {
+  let parsed;
   try {
-    image = await Jimp.read(input);
-  } catch (error) {
-    throw new ImageDecodeError(`无法读取禁漫图片：${error.message}`);
+    parsed = new URL(String(url));
+  } catch {
+    throw new ImageDecodeError("MD5 分块图片 URL 无效");
   }
-  const { width, height, data } = image.bitmap;
-  if (!width || !height || height < tiles) throw new ImageDecodeError("禁漫图片尺寸不足，无法重排");
-  const rowBytes = width * 4;
-  const tileHeight = Math.floor(height / tiles);
-  const remainder = height % tiles;
-  const output = Buffer.alloc(data.length);
-  for (let index = 1; index <= tiles; index += 1) {
-    const extra = index === tiles ? remainder : 0;
-    const sourceY = tileHeight * (index - 1);
-    const destinationY = height - tileHeight * index - extra;
-    const byteLength = (tileHeight + extra) * rowBytes;
-    data.copy(output, destinationY * rowBytes, sourceY * rowBytes, sourceY * rowBytes + byteLength);
+  const match = parsed.pathname.match(/\/sr:([^/]+)\/([^/]+)/i);
+  if (!match) throw new ImageDecodeError("图片 URL 缺少 sr 和编码路径参数");
+  if (match[1] !== "1") return buffer;
+  const encodedPath = match[2].replace(/\.[^.]+$/, "");
+  let decodedPath;
+  try {
+    decodedPath = Buffer.from(encodedPath, "base64url");
+  } catch {
+    throw new ImageDecodeError("图片 URL 中的路径编码无效");
   }
-  return Jimp.fromBitmap({ data: output, width, height }).getBuffer(JimpMime.png);
+  if (!decodedPath.length) throw new ImageDecodeError("图片 URL 中的路径编码为空");
+  const md5 = createHash("md5").update(decodedPath).digest("hex");
+  const tiles = Number.parseInt(md5.slice(-2), 16) % 10 + 5;
+  return reverseVerticalTiles(buffer, tiles, "MD5 分块");
 }
 
 const DECODERS = {
   "mwwz-aes": { decode: mwwzAesCbc, processImageBytes: false },
   "jm-scramble": { decode: jmScramble, processImageBytes: true },
+  "md5-reverse-tiles": { decode: md5ReverseTiles, processImageBytes: true },
 };
 
 export function supportedImageDecoders() {
@@ -179,5 +208,12 @@ export function decoderForLegadoImageRule(rule) {
     && /bookId/.test(source)
     && /imgId/.test(source)
   ) return "jm-scramble";
+  if (
+    /src\.indexOf\(\s*["']sr:1["']\s*\)/.test(source)
+    && /base64Decode/.test(source)
+    && /md5Encode/.test(source)
+    && /parseInt\([^)]*,\s*16\)\s*%\s*10\s*\)\s*\+\s*5/.test(source)
+    && /Canvas\s*\(/.test(source)
+  ) return "md5-reverse-tiles";
   return null;
 }

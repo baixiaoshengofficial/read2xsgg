@@ -391,6 +391,27 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
   assert.equal(chapterList.url, "//@href");
 });
 
+test("MD5 分块倒序图片规则通过通用正文与解码代理转换", () => {
+  const source = {
+    bookSourceName: "脚本图片漫画",
+    bookSourceUrl: "https://comic.example/",
+    bookSourceType: 2,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
+    ruleContent: {
+      content: '//script/text()@js:var urlReg = /\\\\"imageUrl\\\\":\\\\"(.+?)\\\\"/g; return ["<img src=\\"https://cdn.example/1.jpg\\">"];',
+      imageDecode: 'if (src.indexOf("sr:1") == -1) return result; var decodedPath = java.base64Decode(path); var md5Str = java.md5Encode(decodedPath); var lastTwo = md5Str.slice(-2); var num = (parseInt(lastTwo, 16) % 10) + 5; var canvas = new Canvas(BitmapFactory.decodeByteArray(result, 0, result.length));',
+    },
+  };
+  const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example.com" });
+  const chapterContent = sources["脚本图片漫画"].chapterContent;
+  assert.match(chapterContent.requestInfo, /\/adapter\/images\?url=/);
+  assert.match(chapterContent.content, /\/image\/md5-reverse-tiles\?url=/);
+  assert.ok(warnings.some((warning) => warning.message.includes("md5-reverse-tiles")));
+});
+
 test("禁漫动态发现脚本转换为香色可见的静态分类", () => {
   const source = {
     bookSourceName: "禁漫分类测试",

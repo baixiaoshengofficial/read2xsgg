@@ -469,7 +469,7 @@ function convertOne(source, warnings, options = {}) {
     : inferResponseType(contentRules);
   const hasDirectImageRule = /(?:\bimg\b|@(?:src|data-original|data-src|data-lazy-src)\b)/i.test(String(contentRules.content || ""));
   const useHtmlComicImageAdapter = resolvedType === "comic" && contentResponseType === "html"
-    && Boolean(options.imageProxyBase) && (isJmComic || hasDirectImageRule);
+    && Boolean(options.imageProxyBase) && (Boolean(imageDecoder) || isJmComic || hasDirectImageRule);
   const contentWarningFor = createWarningCollector(warnings, sourceName, "chapterContent");
 
   const bookDetail = {

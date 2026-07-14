@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createCipheriv } from "node:crypto";
+import { createCipheriv, createHash } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
@@ -366,6 +366,26 @@ test("通用章节图片提取选择最大的同目录正文序列", () => {
   ]);
 });
 
+test("通用章节图片提取优先读取脚本中的转义 imageUrl 序列", () => {
+  assert.deepEqual(jmImageUrls(`
+    <img src="/android-chrome-192x192.png">
+    <script>self.__next.push("{\\"imageUrl\\":\\"https:\\/\\/cdn1.example\\/chapter\\/001.jpg\\",\\"imageUrl\\":\\"https:\\/\\/cdn2.example\\/chapter\\/002.jpg\\"}")</script>
+  `, "https://comic.example/chapter/1"), [
+    "https://cdn1.example/chapter/001.jpg",
+    "https://cdn2.example/chapter/002.jpg",
+  ]);
+
+  const firstChunk = JSON.stringify([1, '{"imageUrl":"https://cdn.example/chapter/001']);
+  const secondChunk = JSON.stringify([1, '.jpg","imageUrl":"https://cdn.example/chapter/002.jpg"}']);
+  assert.deepEqual(jmImageUrls(`
+    <script>self.__next_f.push(${firstChunk})</script>
+    <script>self.__next_f.push(${secondChunk})</script>
+  `, "https://comic.example/chapter/1"), [
+    "https://cdn.example/chapter/001.jpg",
+    "https://cdn.example/chapter/002.jpg",
+  ]);
+});
+
 test("禁漫镜像候选兼容发布页无协议域名和源内备用地址", () => {
   assert.deepEqual(jmMirrorCandidates(
     '<div><span>jm.example.com</span><span>https://jm2.example.com/path</span></div>',
@@ -398,9 +418,21 @@ test("图片代理直通普通图片，并可解开已注册的 AES 图片", asy
     originalPixels.copy(scrambledPixels, row * 4, (9 - row) * 4, (10 - row) * 4);
   }
   const scrambled = await Jimp.fromBitmap({ data: scrambledPixels, width: 1, height: 10 }).getBuffer(JimpMime.png);
+  const encodedPath = Buffer.from("s3://comic/images/chapter/001.jpg").toString("base64url");
+  const md5Tiles = Number.parseInt(createHash("md5").update(Buffer.from("s3://comic/images/chapter/001.jpg")).digest("hex").slice(-2), 16) % 10 + 5;
+  const md5OriginalPixels = Buffer.alloc(md5Tiles * 4);
+  for (let row = 0; row < md5Tiles; row += 1) md5OriginalPixels.writeUInt32BE(((row + 1) << 24) | 0x0000ff, row * 4);
+  const md5ScrambledPixels = Buffer.alloc(md5OriginalPixels.length);
+  for (let row = 0; row < md5Tiles; row += 1) {
+    md5OriginalPixels.copy(md5ScrambledPixels, row * 4, (md5Tiles - row - 1) * 4, (md5Tiles - row) * 4);
+  }
+  const md5Scrambled = await Jimp.fromBitmap({ data: md5ScrambledPixels, width: 1, height: md5Tiles }).getBuffer(JimpMime.png);
   const upstream = createServer((request, response) => {
     response.writeHead(200, { "Content-Type": "application/octet-stream" });
-    response.end(request.url === "/encrypted" ? encrypted : request.url?.startsWith("/photos/") ? scrambled : plain);
+    response.end(request.url === "/encrypted" ? encrypted
+      : request.url?.startsWith("/photos/") ? scrambled
+        : request.url?.includes("/sr:1/") ? md5Scrambled
+          : plain);
   });
   const upstreamBase = await listen(upstream);
   const app = createAppServer({
@@ -430,4 +462,12 @@ test("图片代理直通普通图片，并可解开已注册的 AES 图片", asy
   assert.equal(jm.headers.get("x-image-decoder"), "jm-scramble");
   const restored = await Jimp.read(Buffer.from(await jm.arrayBuffer()));
   assert.deepEqual(Buffer.from(restored.bitmap.data), originalPixels);
+
+  const md5Url = `${upstreamBase}/m/token/wm:0/sr:1/${encodedPath}.jpg`;
+  const md5 = await fetch(`${appBase}/image/md5-reverse-tiles?url=${encodeURIComponent(md5Url)}`);
+  assert.equal(md5.status, 200);
+  assert.equal(md5.headers.get("content-type"), "image/png");
+  assert.equal(md5.headers.get("x-image-decoder"), "md5-reverse-tiles");
+  const md5Restored = await Jimp.read(Buffer.from(await md5.arrayBuffer()));
+  assert.deepEqual(Buffer.from(md5Restored.bitmap.data), md5OriginalPixels);
 });

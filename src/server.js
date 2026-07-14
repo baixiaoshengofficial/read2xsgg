@@ -635,10 +635,58 @@ export function jmChapterEntries(detailPage, baseUrl) {
  * navigation, recommendations and ads are isolated images or smaller groups.
  */
 export function pageImageUrls(page, baseUrl) {
+  const html = String(page || "");
+  const embeddedDocuments = [];
+  let nextFlightStream = "";
+  for (const script of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
+    const push = script[1].match(/self\.__next_f\.push\((\[[\s\S]*\])\)\s*;?$/);
+    if (!push) continue;
+    try {
+      const payload = JSON.parse(push[1]);
+      if (typeof payload[1] === "string") nextFlightStream += payload[1];
+    } catch {
+      // A malformed hydration chunk should not prevent ordinary HTML fallback.
+    }
+  }
+  if (nextFlightStream) embeddedDocuments.push(nextFlightStream);
+  embeddedDocuments.push(html);
+
+  // Modern comic sites often serialize the page list into Next/Nuxt scripts
+  // instead of rendering <img> elements on the server. This mirrors Legado
+  // rules which scan script text for escaped `imageUrl` JSON properties.
+  let embeddedUrls = [];
+  for (const document of embeddedDocuments) {
+    const found = [];
+    const foundSeen = new Set();
+    for (const pattern of [
+      /\\"imageUrl\\"\s*:\s*\\"([\s\S]*?)\\"/gi,
+      /["']imageUrl["']\s*:\s*["']([^"']+?)["']/gi,
+    ]) {
+      for (const match of document.matchAll(pattern)) {
+        const raw = match[1]
+          .replace(/\\u0026/gi, "&")
+          .replace(/\\\//g, "/")
+          .replace(/\\\\/g, "\\");
+        if (/[<>\r\n]/.test(raw)) continue;
+        let url;
+        try {
+          url = new URL(raw, baseUrl);
+        } catch {
+          continue;
+        }
+        if (!/^https?:$/.test(url.protocol) || foundSeen.has(url.toString())) continue;
+        foundSeen.add(url.toString());
+        found.push(url.toString());
+      }
+    }
+    if (found.length > 1) return found;
+    if (found.length) embeddedUrls = found;
+  }
+
   const lazyUrls = [];
   const directUrls = [];
   const seen = new Set();
-  for (const match of String(page || "").matchAll(/<img\b([^>]*)>/gi)) {
+  for (const match of html.matchAll(/<img\b([^>]*)>/gi)) {
     const lazy = htmlAttribute(match[1], "data-original") || htmlAttribute(match[1], "data-src") || htmlAttribute(match[1], "data-lazy-src");
     const raw = lazy || htmlAttribute(match[1], "src");
     if (!raw) continue;
@@ -658,7 +706,7 @@ export function pageImageUrls(page, baseUrl) {
     (lazy ? lazyUrls : directUrls).push(key);
   }
   const candidates = lazyUrls.length ? lazyUrls : directUrls;
-  if (candidates.length < 2) return candidates;
+  if (candidates.length < 2) return candidates.length ? candidates : embeddedUrls;
 
   const groups = new Map();
   for (const value of candidates) {
