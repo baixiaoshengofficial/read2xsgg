@@ -417,11 +417,20 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   }
 
   // Trailing <js>/@js after a selector (Legado often writes `href\n<js>...</js>`).
-  const trailingJs = trimmed.match(/^([\s\S]*?)(\n\s*(?:@js:|<js>)[\s\S]*)$/i);
+  // 也兼容 `selector@js:...`；但 `|| @js:` 是香色既有的备选/后处理形式，
+  // 不能误切成 selector + 单竖线 JS。
+  let trailingJs = trimmed.match(/^([\s\S]*?)(\n\s*(?:@js:|<js>)[\s\S]*)$/i);
+  if (!trailingJs && !trimmed.includes("||")) {
+    trailingJs = trimmed.match(/^([\s\S]*?)((?:@js:|<js>)[\s\S]*)$/i);
+  }
   if (trailingJs && trailingJs[1].trim() && /[@$.#\[a-z]/i.test(trailingJs[1])) {
     const head = convertRule(trailingJs[1].trim(), { responseType, warn });
-    warn("阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查");
     const script = trailingJs[2].trim().replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
+    if (/(?:\bjava\.|\bPackages\b|\bsource\.|\bbook\.|traditionalToSimplified|\beval\s*\()/i.test(script)) {
+      warn("选择器后的阅读专用 JavaScript 在香色不可执行，已保留基础选择器并忽略该后处理");
+      return head;
+    }
+    warn("阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查");
     // 香色：xpath 后处理用单竖线 |@js:；|| 表示备选规则
     return script.startsWith("@js:") ? `${head}|${script}` : `${head}||${script}`;
   }

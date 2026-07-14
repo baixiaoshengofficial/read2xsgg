@@ -503,6 +503,26 @@ test("搜索、分类和目录的列表项字段使用相对 XPath", () => {
   assert.equal(converted.chapterList.list, "//li");
 });
 
+test("列表项的阅读专用后处理回退为基础选择器", () => {
+  const source = {
+    bookSourceName: "列表 JS 回退测试",
+    bookSourceUrl: "https://book.example.com",
+    searchUrl: "/search?q={{key}}",
+    exploreUrl: "分类::/books?page={{page}}",
+    ruleSearch: { bookList: ".card", name: ".name@text@js:eval(String(source.bookSourceComment));traditionalToSimplified(result)", bookUrl: "a@href" },
+    ruleExplore: { bookList: ".card", name: ".name@text@js:eval(String(source.bookSourceComment));traditionalToSimplified(result)", kind: "@js:java.getString('.kind@text')", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: ".content@html" },
+  };
+  const { sources, warnings } = convertLegado(source);
+  const world = sources["列表 JS 回退测试"].bookWorld["分类"];
+  assert.equal(world.bookName, ".//*[contains(concat(' ', normalize-space(@class), ' '), ' name ')]/text()");
+  assert.equal(world.cat, undefined);
+  assert.ok(warnings.some((warning) => warning.message.includes("保留基础选择器")));
+  assert.ok(warnings.some((warning) => warning.message.includes("避免香色丢弃整个列表")));
+});
+
 test("有声源保留 audio 类型，正文包装为播放 JSON", () => {
   const source = {
     bookSourceName: "示例如声",

@@ -309,6 +309,10 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", relative
     if (rules[from] !== undefined && rules[from] !== "") {
       if (from === "kind") {
         const convertedKind = portableKindRule(rules[from], responseType, warningFor, initPath);
+        if (relative && /^\s*@js:/i.test(convertedKind) && /(?:\bjava\.|\bPackages\b|\bsource\.|\bbook\.)/i.test(convertedKind)) {
+          warningFor("kind", rules[from])("列表分类字段依赖阅读专用 JavaScript，已忽略以避免香色丢弃整个列表");
+          continue;
+        }
         result[to] = relative && from !== "bookList" ? relativeListRule(convertedKind) : convertedKind;
         continue;
       }
