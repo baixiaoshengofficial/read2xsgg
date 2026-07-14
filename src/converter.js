@@ -145,6 +145,20 @@ function proxiedLineImageContent(contentRule, imageProxyBase, decoder) {
   return selector ? `${selector}|${proxyJs}` : proxyJs;
 }
 
+function nativeJmRequestInfo() {
+  return [
+    "@js:",
+    'var u = (typeof result == "string") ? result : "";',
+    'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
+    'if (u == "%@result") u = "";',
+    'if (!u && params && params.queryInfo) u = params.queryInfo.detailUrl || params.queryInfo.url || "";',
+    'u = String(u || "").trim();',
+    'if (u.indexOf("//") == 0) u = "https:" + u;',
+    'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
+    "return encodeURI(u);",
+  ].join("\n");
+}
+
 function nativeJmChapterList(host) {
   return {
     // 与已可用的 6444 相同：香色直接按详情 URL 拉取 HTML 目录。
@@ -152,17 +166,7 @@ function nativeJmChapterList(host) {
     ...commonAction("chapterList", host, "html"),
     // 不能写成 "%@result"：部分香色漫画动作不会展开这个占位符，
     // 会实际请求 https://host/%@result。按 6444 的运行时方式显式取值。
-    requestInfo: [
-      "@js:",
-      'var u = (typeof result == "string") ? result : "";',
-      'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
-      'if (u == "%@result") u = "";',
-      'if (!u && params && params.queryInfo) u = params.queryInfo.detailUrl || params.queryInfo.url || "";',
-      'u = String(u || "").trim();',
-      'if (u.indexOf("//") == 0) u = "https:" + u;',
-      'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
-      "return encodeURI(u);",
-    ].join("\n"),
+    requestInfo: nativeJmRequestInfo(),
     list: "//ul[contains(@class, 'btn-toolbar')]//a | //a[contains(@class, 'reading')]",
     title: "//h3/text() || //a/text() || @js:\nreturn String(result || '').trim();",
     url: "//@href",
@@ -361,6 +365,9 @@ function convertOne(source, warnings, options = {}) {
   const contentRules = getRules(source, "ruleContent", "contentRule");
   const resolvedType = sourceType(source.bookSourceType);
   const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode);
+  const isJmComic = resolvedType === "comic" && (
+    imageDecoder === "jm-scramble" || /(?:jmcomic|18comic|comic18j)/i.test(adaptedFrom)
+  );
   if (contentRules.imageDecode) {
     const warning = createWarningCollector(warnings, sourceName, "chapterContent")("imageDecode", contentRules.imageDecode);
     if (imageDecoder && options.imageProxyBase) {
@@ -391,7 +398,8 @@ function convertOne(source, warnings, options = {}) {
 
   const bookDetail = {
     ...commonAction("bookDetail", host, detailResponseType),
-    requestInfo: bookDetailRequestInfoOverride(source) || "%@result",
+    // 禁漫和香色的漫画详情动作不会可靠展开 %@result；使用与目录相同的运行时 URL 解析。
+    requestInfo: isJmComic ? nativeJmRequestInfo() : (bookDetailRequestInfoOverride(source) || "%@result"),
     ...mapDetailRules(detailRules, detailResponseType, detailWarningFor),
   };
 
@@ -491,7 +499,7 @@ function convertOne(source, warnings, options = {}) {
     ...structuredClone(EMPTY_ACTIONS),
   };
 
-  if ((imageDecoder === "jm-scramble" || /(?:jmcomic|18comic|comic18j)/i.test(adaptedFrom)) && resolvedType === "comic") {
+  if (isJmComic) {
     // 7584 参照 6444 使用香色原生 HTML 目录动作，避免 JSON 动作在部分版本中空列表。
     converted.chapterList = nativeJmChapterList(host);
   }

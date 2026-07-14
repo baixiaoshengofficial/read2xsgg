@@ -377,6 +377,7 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
   assert.ok(warnings.some((warning) => warning.message.includes("jm-scramble")));
   const chapterList = sources["禁漫测试"].chapterList;
   assert.equal(chapterList.responseFormatType, "html");
+  assert.match(sources["禁漫测试"].bookDetail.requestInfo, /params\.queryInfo/);
   assert.match(chapterList.requestInfo, /params\.queryInfo/);
   const requestFunction = new Function("config", "params", "result", chapterList.requestInfo.replace(/^@js:\s*/, ""));
   assert.equal(
@@ -424,7 +425,7 @@ test("禁漫动态发现脚本转换为香色可见的静态分类", () => {
   assert.match(converted.bookWorld["全部"].bookName, /video-title/);
   assert.equal(converted.bookWorld["全部"].detailUrl, "//a[contains(@href, '/album/')]/@href");
   assert.equal(converted.bookWorld["全部"].author, undefined);
-  assert.equal(converted.bookDetail.requestInfo, "%@result");
+  assert.match(converted.bookDetail.requestInfo, /params\.queryInfo/);
   assert.doesNotMatch(JSON.stringify(converted.bookDetail), /java\.|Packages/);
   assert.doesNotMatch(JSON.stringify(converted.searchBook), /java\.|Packages/);
   assert.match(converted.chapterList.requestInfo, /params\.queryInfo/);
