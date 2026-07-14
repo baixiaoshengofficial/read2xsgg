@@ -165,9 +165,11 @@ node ./bin/server.js
 
 `/image` 会直通 JPEG、PNG、GIF、WebP 等常见图片，并尝试已注册的解码器；`/image/mwwz-aes` 明确使用猕猴桃漫画的 AES-256-CBC 规则；`/image/jm-scramble` 按禁漫天堂的书号、图片号计算分块数后重组纵向图片块，并输出 PNG。代理只会返回验证过图片文件头的结果，且与在线转换一样禁止访问内网地址。
 
-在线转换时，已识别的猕猴桃漫画 AES、禁漫天堂 Canvas 重排 `imageDecode` 会自动改写为代理图片链接。代理地址会从本次转换 URL 自动推导：优先使用 `Forwarded` 或 `X-Forwarded-Host` / `X-Forwarded-Proto`，公网域名默认使用 HTTPS；无需配置对外基础 URL。反向代理应保留 `Host`，并传递主机和协议头。
+在线转换时，常规 HTML 漫画源只要正文规则包含 `img`、`@src`、`@data-original`、`@data-src` 或 `@data-lazy-src`，就会自动改为通用正文桥接：服务端请求章节页，提取图片候选并选取最大的同目录序列，再返回香色原生的 `{urls:[...]}` 正文数据。它不依赖禁漫的页面路径或 XPath，因此同类阅读源不需要逐个编写站点规则。桥接接口为 `{转换站}/adapter/images?url={章节页}`，通常由生成的 XBS 自动调用，无须手动填写。
 
-解码器采用注册机制；AES 等字节级算法可通用加入。禁漫天堂的 `BitmapFactory`、`Canvas` 规则已由服务端像素重排适配；其他站点的 Android 像素拼图仍需要按其算法新增适配器。
+已识别的猕猴桃漫画 AES、禁漫天堂 Canvas 重排 `imageDecode` 则会在上述通用图片序列之后自动选择对应的图片解码器。代理地址会从本次转换 URL 自动推导：优先使用 `Forwarded` 或 `X-Forwarded-Host` / `X-Forwarded-Proto`，公网域名默认使用 HTTPS；无需配置对外基础 URL。反向代理应保留 `Host`，并传递主机和协议头。
+
+解码器采用注册机制；AES 等字节级算法可通用加入。禁漫天堂的 `BitmapFactory`、`Canvas` 规则已由服务端像素重排适配；其他站点的 Android 像素拼图、登录态或专用加密仍需要对应的解码器/认证支持，不能凭空由任意阅读 JavaScript 通用执行。
 
 ### 服务配置
 

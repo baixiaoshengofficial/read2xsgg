@@ -523,7 +523,7 @@ function imageRequestFromRequest(request) {
 function adapterRequestFromRequest(request) {
   const parsed = new URL(request.url || "/", "http://read2xsgg.local");
   const type = parsed.pathname === "/adapter/jm/chapters" ? "jm-chapters"
-    : parsed.pathname === "/adapter/jm/images" ? "jm-images"
+    : parsed.pathname === "/adapter/images" || parsed.pathname === "/adapter/jm/images" ? "page-images"
       : "";
   return type ? { type, sourceUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "" } : null;
 }
@@ -629,12 +629,18 @@ export function jmChapterEntries(detailPage, baseUrl) {
   return [];
 }
 
-/** Extract only actual comic page images, excluding page chrome and advertising images. */
-export function jmImageUrls(chapterPage, baseUrl) {
-  const urls = [];
+/**
+ * Extract a comic page's image sequence without knowing the site beforehand.
+ * Chapter images normally form the largest same-directory sequence, whereas
+ * navigation, recommendations and ads are isolated images or smaller groups.
+ */
+export function pageImageUrls(page, baseUrl) {
+  const lazyUrls = [];
+  const directUrls = [];
   const seen = new Set();
-  for (const match of String(chapterPage || "").matchAll(/<img\b([^>]*)>/gi)) {
-    const raw = htmlAttribute(match[1], "data-original") || htmlAttribute(match[1], "data-src");
+  for (const match of String(page || "").matchAll(/<img\b([^>]*)>/gi)) {
+    const lazy = htmlAttribute(match[1], "data-original") || htmlAttribute(match[1], "data-src") || htmlAttribute(match[1], "data-lazy-src");
+    const raw = lazy || htmlAttribute(match[1], "src");
     if (!raw) continue;
     let url;
     try {
@@ -642,12 +648,35 @@ export function jmImageUrls(chapterPage, baseUrl) {
     } catch {
       continue;
     }
-    if (!/\/media\/photos\/\d+\//i.test(url.pathname) || seen.has(url.toString())) continue;
+    const key = url.toString();
+    if (seen.has(key)) continue;
+    // For ordinary src attributes, avoid common page chrome unless no lazy URLs
+    // exist. Lazy attributes are normally reserved for actual comic pages.
+    if (!lazy && (!/\.(?:avif|bmp|gif|jpe?g|png|webp)$/i.test(url.pathname)
+      || /(?:ad|avatar|banner|blank|captcha|icon|loading|logo)/i.test(url.pathname))) continue;
     seen.add(url.toString());
-    urls.push(url.toString());
+    (lazy ? lazyUrls : directUrls).push(key);
   }
-  return urls;
+  const candidates = lazyUrls.length ? lazyUrls : directUrls;
+  if (candidates.length < 2) return candidates;
+
+  const groups = new Map();
+  for (const value of candidates) {
+    const parsed = new URL(value);
+    const directory = parsed.pathname.replace(/\/[^/]*$/, "/");
+    const group = groups.get(directory) || [];
+    group.push(value);
+    groups.set(directory, group);
+  }
+  let largest = [];
+  for (const group of groups.values()) {
+    if (group.length > largest.length) largest = group;
+  }
+  return largest;
 }
+
+// Backward-compatible export for callers that previously used the JM-specific name.
+export const jmImageUrls = pageImageUrls;
 
 function cacheSet(cache, key, value, config) {
   if (config.cacheTtlMs <= 0) return;
@@ -726,11 +755,11 @@ export function createAppServer(options = {}) {
           const detailPage = await downloadSource(sourceUrl, config);
           values = adapterTarget.type === "jm-chapters"
             ? jmChapterEntries(detailPage.toString("utf8"), sourceUrl)
-            : jmImageUrls(detailPage.toString("utf8"), sourceUrl);
+            : pageImageUrls(detailPage.toString("utf8"), sourceUrl);
         } finally {
           active -= 1;
         }
-        if (!values.length) throw new HttpError(422, adapterTarget.type === "jm-chapters" ? "禁漫详情页没有解析到章节" : "禁漫章节页没有解析到图片");
+        if (!values.length) throw new HttpError(422, adapterTarget.type === "jm-chapters" ? "禁漫详情页没有解析到章节" : "页面没有解析到图片");
         sendJson(response, 200, adapterTarget.type === "jm-chapters" ? { chapters: values } : { urls: values }, { ...commonHeaders, "Cache-Control": "public, max-age=300" });
         return;
       }

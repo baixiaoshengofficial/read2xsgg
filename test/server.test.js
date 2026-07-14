@@ -319,7 +319,7 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
   assert.match(jm.bookDetail.requestInfo, /params\.queryInfo/);
   assert.match(jm.chapterContent.requestInfo, /params\.queryInfo/);
   assert.equal(jm.chapterContent.responseFormatType, "json");
-  assert.match(jm.chapterContent.requestInfo, /adapter\/jm\/images/);
+  assert.match(jm.chapterContent.requestInfo, /adapter\/images/);
   assert.doesNotMatch(JSON.stringify(jm.bookDetail), /java\.|Packages/);
   assert.doesNotMatch(JSON.stringify(jm.searchBook), /java\.|Packages/);
   assert.equal(jm.chapterList.responseFormatType, "html");
@@ -354,8 +354,9 @@ test("禁漫章节解析优先连载列表并回退单本入口", () => {
   ), [{ title: "開始閱讀", url: "https://18comic.example/photo/9" }]);
 });
 
-test("禁漫章节图片只提取正文 photos 图片", () => {
+test("通用章节图片提取选择最大的同目录正文序列", () => {
   assert.deepEqual(jmImageUrls(`
+    <img data-original="/media/categories/album/1.jpg"><img data-original="/media/categories/album/2.jpg">
     <img src="/ads/banner.png"><img data-original="https://cdn.example/media/photos/123/00001.webp">
     <img data-src="/media/photos/123/00002.webp"><img data-original="/media/photos/123/00001.webp">
   `, "https://18comic.example/photo/123"), [

@@ -159,7 +159,8 @@ function nativeJmRequestInfo() {
   ].join("\n");
 }
 
-function nativeJmAdapterRequestInfo(endpoint) {
+/** Generic action URL resolver for clients that leave %@result as a literal. */
+function runtimeAdapterRequestInfo(endpoint) {
   return [
     "@js:",
     'var u = (typeof result == "string") ? result : "";',
@@ -187,13 +188,17 @@ function nativeJmChapterList(host) {
   };
 }
 
-function proxiedJmChapterContent(host, imageProxyBase) {
+/**
+ * Generic HTML-comic bridge. The service extracts lazy/direct page images and
+ * returns {urls}; 香色 receives its native comic payload after image proxying.
+ */
+function proxiedHtmlComicChapterContent(host, imageProxyBase, decoder = "auto") {
   const base = String(imageProxyBase).replace(/\/$/, "");
-  const endpoint = `${base}/adapter/jm/images?url=`;
-  const imageEndpoint = `${base}/image/jm-scramble?url=`;
+  const endpoint = `${base}/adapter/images?url=`;
+  const imageEndpoint = `${base}/image/${decoder}?url=`;
   return {
     ...commonAction("chapterContent", host, "json"),
-    requestInfo: nativeJmAdapterRequestInfo(endpoint),
+    requestInfo: runtimeAdapterRequestInfo(endpoint),
     content: [
       "@js:",
       'var payload = (typeof result === "string") ? JSON.parse(result) : result;',
@@ -426,6 +431,9 @@ function convertOne(source, warnings, options = {}) {
   const contentResponseType = imageDecoder === "mwwz-aes" && resolvedType === "comic"
     ? "json"
     : inferResponseType(contentRules);
+  const hasDirectImageRule = /(?:\bimg\b|@(?:src|data-original|data-src|data-lazy-src)\b)/i.test(String(contentRules.content || ""));
+  const useHtmlComicImageAdapter = resolvedType === "comic" && contentResponseType === "html"
+    && Boolean(options.imageProxyBase) && (isJmComic || hasDirectImageRule);
   const contentWarningFor = createWarningCollector(warnings, sourceName, "chapterContent");
 
   const bookDetail = {
@@ -535,7 +543,9 @@ function convertOne(source, warnings, options = {}) {
   if (isJmComic) {
     // 7584 参照 6444 使用香色原生 HTML 目录动作，避免 JSON 动作在部分版本中空列表。
     converted.chapterList = nativeJmChapterList(host);
-    if (options.imageProxyBase) converted.chapterContent = proxiedJmChapterContent(host, options.imageProxyBase);
+  }
+  if (useHtmlComicImageAdapter) {
+    converted.chapterContent = proxiedHtmlComicChapterContent(host, options.imageProxyBase, imageDecoder || "auto");
   }
 
   // apply replaceRegex / replaceRegex array onto content field
