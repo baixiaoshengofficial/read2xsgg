@@ -522,8 +522,10 @@ function imageRequestFromRequest(request) {
 
 function adapterRequestFromRequest(request) {
   const parsed = new URL(request.url || "/", "http://read2xsgg.local");
-  if (parsed.pathname !== "/adapter/jm/chapters") return null;
-  return { type: "jm-chapters", sourceUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "" };
+  const type = parsed.pathname === "/adapter/jm/chapters" ? "jm-chapters"
+    : parsed.pathname === "/adapter/jm/images" ? "jm-images"
+      : "";
+  return type ? { type, sourceUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "" } : null;
 }
 
 function isLocalHost(host) {
@@ -627,6 +629,26 @@ export function jmChapterEntries(detailPage, baseUrl) {
   return [];
 }
 
+/** Extract only actual comic page images, excluding page chrome and advertising images. */
+export function jmImageUrls(chapterPage, baseUrl) {
+  const urls = [];
+  const seen = new Set();
+  for (const match of String(chapterPage || "").matchAll(/<img\b([^>]*)>/gi)) {
+    const raw = htmlAttribute(match[1], "data-original") || htmlAttribute(match[1], "data-src");
+    if (!raw) continue;
+    let url;
+    try {
+      url = new URL(raw, baseUrl);
+    } catch {
+      continue;
+    }
+    if (!/\/media\/photos\/\d+\//i.test(url.pathname) || seen.has(url.toString())) continue;
+    seen.add(url.toString());
+    urls.push(url.toString());
+  }
+  return urls;
+}
+
 function cacheSet(cache, key, value, config) {
   if (config.cacheTtlMs <= 0) return;
   if (cache.size >= config.maxCacheEntries) cache.delete(cache.keys().next().value);
@@ -699,15 +721,17 @@ export function createAppServer(options = {}) {
         if (active >= config.maxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
         const sourceUrl = normalizeRemoteUrl(adapterTarget.sourceUrl);
         active += 1;
-        let chapters;
+        let values;
         try {
           const detailPage = await downloadSource(sourceUrl, config);
-          chapters = jmChapterEntries(detailPage.toString("utf8"), sourceUrl);
+          values = adapterTarget.type === "jm-chapters"
+            ? jmChapterEntries(detailPage.toString("utf8"), sourceUrl)
+            : jmImageUrls(detailPage.toString("utf8"), sourceUrl);
         } finally {
           active -= 1;
         }
-        if (!chapters.length) throw new HttpError(422, "禁漫详情页没有解析到章节");
-        sendJson(response, 200, { chapters }, { ...commonHeaders, "Cache-Control": "public, max-age=300" });
+        if (!values.length) throw new HttpError(422, adapterTarget.type === "jm-chapters" ? "禁漫详情页没有解析到章节" : "禁漫章节页没有解析到图片");
+        sendJson(response, 200, adapterTarget.type === "jm-chapters" ? { chapters: values } : { urls: values }, { ...commonHeaders, "Cache-Control": "public, max-age=300" });
         return;
       }
       const imageTarget = imageRequestFromRequest(request);

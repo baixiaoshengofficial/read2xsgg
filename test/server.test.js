@@ -3,7 +3,7 @@ import { createCipheriv } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
-import { createAppServer, decodeXbs, jmChapterEntries, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
+import { createAppServer, decodeXbs, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
 
 const source = {
   bookSourceName: "在线示例",
@@ -288,6 +288,11 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
       response.end('<ul class="btn-toolbar"><a href="/photo/11"><li><h3>第1話</h3></li></a><a href="/photo/12"><li><h3>第2話 2卷</h3></li></a></ul>');
       return;
     }
+    if (request.url === "/photo/11") {
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      response.end('<img src="/ad.jpg"><img data-original="https://cdn.example/media/photos/1/00001.webp"><img data-original="/media/photos/1/00002.webp">');
+      return;
+    }
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify([jmSource]));
   });
@@ -313,12 +318,23 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
   assert.match(jm.bookWorld["全部"].list, /list-col/);
   assert.match(jm.bookDetail.requestInfo, /params\.queryInfo/);
   assert.match(jm.chapterContent.requestInfo, /params\.queryInfo/);
+  assert.equal(jm.chapterContent.responseFormatType, "json");
+  assert.match(jm.chapterContent.requestInfo, /adapter\/jm\/images/);
   assert.doesNotMatch(JSON.stringify(jm.bookDetail), /java\.|Packages/);
   assert.doesNotMatch(JSON.stringify(jm.searchBook), /java\.|Packages/);
   assert.equal(jm.chapterList.responseFormatType, "html");
   assert.match(jm.chapterList.requestInfo, /params\.queryInfo/);
   assert.match(jm.chapterList.list, /btn-toolbar/);
   assert.equal(jm.chapterList.url, "//@href");
+  const imageRequest = new Function("config", "params", "result", jm.chapterContent.requestInfo.replace(/^@js:\s*/, ""));
+  const imageResponse = await fetch(imageRequest({ host: upstreamBase }, { queryInfo: { url: "/photo/11" } }, ""));
+  assert.equal(imageResponse.status, 200);
+  assert.deepEqual(await imageResponse.json(), {
+    urls: [
+      "https://cdn.example/media/photos/1/00001.webp",
+      `${upstreamBase}/media/photos/1/00002.webp`,
+    ],
+  });
 });
 
 test("禁漫章节解析优先连载列表并回退单本入口", () => {
@@ -336,6 +352,17 @@ test("禁漫章节解析优先连载列表并回退单本入口", () => {
     '<a class="btn reading col" href="/photo/9">開始閱讀</a>',
     "https://18comic.example/album/9",
   ), [{ title: "開始閱讀", url: "https://18comic.example/photo/9" }]);
+});
+
+test("禁漫章节图片只提取正文 photos 图片", () => {
+  assert.deepEqual(jmImageUrls(`
+    <img src="/ads/banner.png"><img data-original="https://cdn.example/media/photos/123/00001.webp">
+    <img data-src="/media/photos/123/00002.webp"><img data-original="/media/photos/123/00001.webp">
+  `, "https://18comic.example/photo/123"), [
+    "https://cdn.example/media/photos/123/00001.webp",
+    "https://18comic.example/media/photos/123/00002.webp",
+    "https://18comic.example/media/photos/123/00001.webp",
+  ]);
 });
 
 test("禁漫镜像候选兼容发布页无协议域名和源内备用地址", () => {

@@ -159,6 +159,20 @@ function nativeJmRequestInfo() {
   ].join("\n");
 }
 
+function nativeJmAdapterRequestInfo(endpoint) {
+  return [
+    "@js:",
+    'var u = (typeof result == "string") ? result : "";',
+    'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
+    'if (u == "%@result") u = "";',
+    'if (!u && params && params.queryInfo) u = params.queryInfo.detailUrl || params.queryInfo.url || "";',
+    'u = String(u || "").trim();',
+    'if (u.indexOf("//") == 0) u = "https:" + u;',
+    'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
+    `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
+  ].join("\n");
+}
+
 function nativeJmChapterList(host) {
   return {
     // 与已可用的 6444 相同：香色直接按详情 URL 拉取 HTML 目录。
@@ -170,6 +184,24 @@ function nativeJmChapterList(host) {
     list: "//ul[contains(@class, 'btn-toolbar')]//a | //a[contains(@class, 'reading')]",
     title: "//h3/text() || //a/text() || @js:\nreturn String(result || '').trim();",
     url: "//@href",
+  };
+}
+
+function proxiedJmChapterContent(host, imageProxyBase) {
+  const base = String(imageProxyBase).replace(/\/$/, "");
+  const endpoint = `${base}/adapter/jm/images?url=`;
+  const imageEndpoint = `${base}/image/jm-scramble?url=`;
+  return {
+    ...commonAction("chapterContent", host, "json"),
+    requestInfo: nativeJmAdapterRequestInfo(endpoint),
+    content: [
+      "@js:",
+      'var payload = (typeof result === "string") ? JSON.parse(result) : result;',
+      'var images = payload && Array.isArray(payload.urls) ? payload.urls : [];',
+      `var endpoint = ${JSON.stringify(imageEndpoint)};`,
+      'var urls = images.map(function (url) { return endpoint + encodeURIComponent(String(url || "")); }).filter(Boolean);',
+      'return JSON.stringify({urls: urls, httpHeaders: {}});',
+    ].join("\n"),
   };
 }
 
@@ -503,6 +535,7 @@ function convertOne(source, warnings, options = {}) {
   if (isJmComic) {
     // 7584 参照 6444 使用香色原生 HTML 目录动作，避免 JSON 动作在部分版本中空列表。
     converted.chapterList = nativeJmChapterList(host);
+    if (options.imageProxyBase) converted.chapterContent = proxiedJmChapterContent(host, options.imageProxyBase);
   }
 
   // apply replaceRegex / replaceRegex array onto content field

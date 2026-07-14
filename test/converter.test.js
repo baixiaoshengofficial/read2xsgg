@@ -372,7 +372,7 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
   const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example.com" });
   const content = sources["禁漫测试"].chapterContent.content;
   assert.match(content, /https:\/\/convert\.example\.com\/image\/jm-scramble\?url=/);
-  assert.match(content, /encodeURIComponent\(url\)/);
+  assert.match(content, /encodeURIComponent\(String\(url/);
   assert.doesNotMatch(content, /baseUrl/);
   assert.match(sources["禁漫测试"].chapterContent.requestInfo, /params\.queryInfo/);
   assert.ok(warnings.some((warning) => warning.message.includes("jm-scramble")));

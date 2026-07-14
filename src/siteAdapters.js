@@ -207,6 +207,7 @@ function adaptJm(source) {
       kind: "span[data-type=tags]@tag.a@text",
       coverUrl: "id.album_photo_cover@tag.img.0@src",
       wordCount: "class.train-number@text",
+      lastChapter: "@XPath:(//ul[contains(@class,'btn-toolbar')]//h3/text())[last()]||@XPath://a[contains(@class,'reading')]/text()",
       tocUrl: "baseUrl",
     },
     ruleToc: {
