@@ -40,6 +40,7 @@ export function serverConfig(environment = process.env) {
     allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS),
     corsOrigin: environment.CORS_ORIGIN || "*",
     mwwzDiscoveryUrl: environment.MWWZ_DISCOVERY_URL || "https://www.manwake.cc/",
+    jmDiscoveryUrl: environment.JM_DISCOVERY_URL || "https://jmcomicqa.cc/",
   };
 }
 
@@ -236,6 +237,12 @@ function isMwwzSource(source) {
     && /(?:manwake|GLOBAL_IMAGE_ROUTES|api\/comic\/image)/i.test(String(source?.loginUrl || "") + String(source?.ruleContent?.imageDecode || ""));
 }
 
+function isJmSource(source) {
+  const runtimeRules = `${source?.loginUrl || ""}\n${source?.ruleContent?.imageDecode || ""}`;
+  return /(?:jmcomic|18comic|comic18j)/i.test(String(source?.bookSourceUrl || ""))
+    || (/(?:BitmapFactory\.decodeByteArray|new\s+Canvas)/i.test(runtimeRules) && /(?:photos|bookId|imgId)/i.test(runtimeRules));
+}
+
 export function mwwzMirrorCandidates(releasePage, baseUrl) {
   const result = [];
   for (const match of String(releasePage || "").matchAll(/<a\s+[^>]*href=["']([^"']+)["'][^>]*>/gi)) {
@@ -326,36 +333,87 @@ async function resolveMwwzMirror(config) {
   return "";
 }
 
+export function jmMirrorCandidates(discoveryPage, baseUrl, runtimeRules = "") {
+  const result = [];
+  const add = (value) => {
+    let raw = htmlText(value).trim();
+    if (!raw) return;
+    if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`;
+    try {
+      const url = new URL(raw, baseUrl);
+      if (/^https?:$/.test(url.protocol) && !result.includes(url.origin)) result.push(url.origin);
+    } catch {
+      // Ignore malformed published links.
+    }
+  };
+  for (const match of String(discoveryPage || "").matchAll(/<span\b[^>]*>([\s\S]*?)<\/span>/gi)) add(match[1]);
+  for (const match of String(runtimeRules || "").matchAll(/https?:\/\/[a-z0-9.-]+(?::\d+)?/gi)) add(match[0]);
+  return result;
+}
+
+async function resolveJmMirror(config, sources) {
+  let discovery = "";
+  try {
+    discovery = (await downloadSource(config.jmDiscoveryUrl, config)).toString("utf8");
+  } catch {
+    // The source itself contains fallback international domains; try those next.
+  }
+  const runtimeRules = sources.map((source) => source?.loginUrl || "").join("\n");
+  const candidates = jmMirrorCandidates(discovery, config.jmDiscoveryUrl, runtimeRules);
+  for (const origin of candidates) {
+    try {
+      const body = await downloadSource(`${origin}/albums?o=mr&page=1`, config);
+      const html = body.toString("utf8");
+      if (/class=["'][^"']*\blist-col\b/i.test(html) && /class=["'][^"']*\bvideo-title\b/i.test(html)) return origin;
+    } catch {
+      // Cloudflare and published mirrors rotate independently; test the next one.
+    }
+  }
+  return "";
+}
+
 async function adaptOnlineSources(input, config) {
   const sources = legacySourceList(input);
-  if (!sources.some(isMwwzSource)) return input;
-  const mirror = await resolveMwwzMirror(config);
-  if (!mirror) return input;
+  const hasMwwz = sources.some(isMwwzSource);
+  const jmSources = sources.filter(isJmSource);
+  if (!hasMwwz && !jmSources.length) return input;
+  const mwwzMirror = hasMwwz ? await resolveMwwzMirror(config) : "";
+  const jmMirror = jmSources.length ? await resolveJmMirror(config, jmSources) : "";
 
   let categories = [];
-  try {
-    const categoryPage = await downloadSource(`${mirror}/cate`, config);
-    categories = mwwzCategoryEntries(categoryPage.toString("utf8"));
-  } catch {
-    // The mirror remains useful for search/detail even if its category page is
-    // temporarily blocked. Keep the original exploration rule in that case.
+  if (mwwzMirror) {
+    try {
+      const categoryPage = await downloadSource(`${mwwzMirror}/cate`, config);
+      categories = mwwzCategoryEntries(categoryPage.toString("utf8"));
+    } catch {
+      // The mirror remains useful for search/detail even if its category page is
+      // temporarily blocked. Keep the original exploration rule in that case.
+    }
   }
 
   const cloned = structuredClone(input);
   for (const source of legacySourceList(cloned)) {
-    if (!isMwwzSource(source)) continue;
-    source.bookSourceUrl = mirror;
-    // The original header is a Legado @js expression. 香色 needs a concrete UA.
-    source.header = JSON.stringify({
-      "User-Agent": "Mozilla/5.0 (Linux; Android 9) Mobile Safari/537.36",
-      Referer: `${mirror}/`,
-    });
-    if (categories.length) {
-      source.exploreUrl = categories.map(({ title, path, tag }) => ({
-        title,
-        url: mwwzExploreRequest(path, tag),
-        pageSize: 10,
-      }));
+    if (isMwwzSource(source) && mwwzMirror) {
+      source.bookSourceUrl = mwwzMirror;
+      // The original header is a Legado @js expression. 香色 needs a concrete UA.
+      source.header = JSON.stringify({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 9) Mobile Safari/537.36",
+        Referer: `${mwwzMirror}/`,
+      });
+      if (categories.length) {
+        source.exploreUrl = categories.map(({ title, path, tag }) => ({
+          title,
+          url: mwwzExploreRequest(path, tag),
+          pageSize: 10,
+        }));
+      }
+    }
+    if (isJmSource(source) && jmMirror) {
+      source.bookSourceUrl = jmMirror;
+      source.header = JSON.stringify({
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        Referer: `${jmMirror}/`,
+      });
     }
   }
   return cloned;

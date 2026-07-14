@@ -377,6 +377,42 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
   assert.ok(warnings.some((warning) => warning.message.includes("jm-scramble")));
 });
 
+test("禁漫动态发现脚本转换为香色可见的静态分类", () => {
+  const source = {
+    bookSourceName: "禁漫分类测试",
+    bookSourceUrl: "https://jmcomicqa.cc",
+    bookSourceType: 2,
+    exploreUrl: `@js:
+      var categories = [
+        ["全部", "albums?o={key}&page="],
+        ["单本", "albums/single?o={key}&page=<,{{page}}>"]
+      ];
+      JSON.stringify(categories);`,
+    searchUrl: "{{Get('url')}}/search/photos?search_query={{key}}&page={{page}}",
+    ruleSearch: {
+      bookList: ".list-col||.list-item",
+      name: ".video-title@text",
+      author: "@js:java.getString('.author@text');",
+      bookUrl: "tag.a.0@href",
+      coverUrl: "img@data-original||img@src",
+    },
+    ruleExplore: [],
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".reading", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: ".thumb-overlay-albums@img@data-original" },
+  };
+  const { sources } = convertLegado(source);
+  const converted = sources["禁漫分类测试"];
+
+  assert.deepEqual(Object.keys(converted.bookWorld), ["全部", "单本"]);
+  assert.match(converted.bookWorld["全部"].requestInfo, /albums\?o=mr&page=/);
+  assert.match(converted.bookWorld["全部"].requestInfo, /params\.pageIndex/);
+  assert.equal(converted.bookWorld["全部"].moreKeys.pageSize, 80);
+  assert.match(converted.bookWorld["全部"].list, /list-col/);
+  assert.match(converted.bookWorld["全部"].bookName, /video-title/);
+  assert.equal(converted.bookWorld["全部"].author, undefined);
+});
+
 test("有声源保留 audio 类型，正文包装为播放 JSON", () => {
   const source = {
     bookSourceName: "示例如声",

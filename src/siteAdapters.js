@@ -25,6 +25,7 @@ export function adaptLegadoSource(source) {
   if (!source || typeof source !== "object") return source;
   if (hostnameOf(source) === "alicesw.com") return adaptAlicesw(source);
   if (isMwwzSource(source)) return adaptMwwz(source);
+  if (isJmSource(source)) return adaptJm(source);
   return source;
 }
 
@@ -136,6 +137,62 @@ function isMwwzSource(source) {
   const runtimeRules = `${source?.loginUrl || ""}\n${source?.ruleContent?.imageDecode || ""}\n${source?.ruleContent?.content || ""}`;
   return /(?:mwwz|manwake|manwapi|manwalu|mwmw|mwuu)\.cc$/i.test(hostname)
     || /(?:GLOBAL_IMAGE_ROUTES|api\/comic\/image|0B6666A0-BB59-1381-B746-a0E4C9AC)/i.test(runtimeRules);
+}
+
+function isJmSource(source) {
+  const hostname = hostnameOf(source);
+  const runtimeRules = `${source?.loginUrl || ""}\n${source?.ruleContent?.imageDecode || ""}`;
+  return /(?:jmcomic|18comic|comic18j)/i.test(hostname)
+    || (/(?:BitmapFactory\.decodeByteArray|new\s+Canvas)/i.test(runtimeRules) && /(?:photos|bookId|imgId)/i.test(runtimeRules));
+}
+
+/**
+ * 禁漫的发现页由 Legado @js 在运行时组装，香色不会执行这段 Android JS。
+ * categories 本身是合法 JSON 数组，可以安全地静态提取并固定为默认「按时间」分类。
+ */
+function jmCategoryEntries(exploreUrl) {
+  const script = String(exploreUrl || "");
+  const match = script.match(/var\s+categories\s*=\s*(\[[\s\S]*?\])\s*;/i);
+  if (!match) return [];
+  let categories;
+  try {
+    categories = JSON.parse(match[1]);
+  } catch {
+    return [];
+  }
+  return categories.flatMap((entry) => {
+    if (!Array.isArray(entry) || entry.length < 2) return [];
+    const title = String(entry[0] || "").trim();
+    let path = String(entry[1] || "").trim();
+    if (!title || !path) return [];
+    path = path
+      .replace(/\{key\}/g, "mr")
+      .replace(/<,\{\{page\}\}>/g, "{{page}}")
+      // 原源的小说 URL 多写了一个问号，会把排序参数并入 o 的值。
+      .replace(/novels\?o=mv\?o=mr/i, "novels?o=mr");
+    if (!path.includes("{{page}}")) path += "{{page}}";
+    return [{ title, url: `{{Get('url')}}/${path.replace(/^\/+/, "")}`, pageSize: 80 }];
+  });
+}
+
+function adaptJm(source) {
+  const ruleSearch = source.ruleSearch ?? source.searchRule ?? {};
+  const ruleExplore = source.ruleExplore ?? source.exploreRule ?? {};
+  const categories = jmCategoryEntries(source.exploreUrl);
+  const hasExploreRules = ruleExplore
+    && typeof ruleExplore === "object"
+    && !Array.isArray(ruleExplore)
+    && Object.keys(ruleExplore).length > 0;
+  const portableSearchRules = Object.fromEntries(Object.entries(ruleSearch).filter(([, rule]) => (
+    typeof rule !== "string" || !/\b(?:java|Packages)\s*[.(]/.test(rule)
+  )));
+  return {
+    ...source,
+    ...(categories.length ? { exploreUrl: categories } : {}),
+    // 禁漫分类页与搜索页使用同一套卡片 DOM；原源把 ruleExplore 留成 []，
+    // 是因为 Legado 会在其动态发现脚本中沿用搜索规则，香色需要显式字段。
+    ruleExplore: hasExploreRules ? ruleExplore : portableSearchRules,
+  };
 }
 
 function apiComicUrlRule(idRule) {

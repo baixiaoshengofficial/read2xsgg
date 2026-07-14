@@ -314,6 +314,9 @@ function convertOne(source, warnings, options = {}) {
   if (/alicesw\.com/i.test(adaptedFrom)) {
     warningForSource("siteAdapter", adaptedFrom)("已按 alicesw.com 实际页面结构修正阅读规则后再转换");
   }
+  if (/(?:jmcomic|18comic|comic18j)/i.test(adaptedFrom)) {
+    warningForSource("siteAdapter", adaptedFrom)("已提取禁漫动态发现分类，并显式补齐分类列表规则");
+  }
   const headers = {
     ...parseHeaders(source.header, warningForSource("header", source.header)),
     ...(source.httpUserAgent ? { "User-Agent": String(source.httpUserAgent) } : {}),

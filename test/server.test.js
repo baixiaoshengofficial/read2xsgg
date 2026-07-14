@@ -3,7 +3,7 @@ import { createCipheriv } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
-import { createAppServer, decodeXbs, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
+import { createAppServer, decodeXbs, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
 
 const source = {
   bookSourceName: "在线示例",
@@ -247,6 +247,73 @@ test("漫蛙分类页只提取可调用的漫画标签", () => {
     { title: "全部", path: "/cate", tag: "" },
     { title: "热血 & 冒险", path: "/cate/hotblooded", tag: "热血" },
   ]);
+});
+
+test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
+  let upstreamBase = "";
+  const jmSource = {
+    bookSourceName: "禁漫在线测试",
+    bookSourceUrl: "https://jmcomicqa.cc",
+    bookSourceType: 2,
+    loginUrl: "defaultIntlLinks = ['https://blocked.example'];",
+    exploreUrl: `@js:var categories = [["全部", "albums?o={key}&page="], ["短篇", "albums/short?o={key}&page=<,{{page}}>"]];`,
+    searchUrl: "{{Get('url')}}/search/photos?search_query={{key}}&page={{page}}",
+    ruleSearch: {
+      bookList: ".list-col||.list-item",
+      name: ".video-title@text",
+      bookUrl: "tag.a.0@href",
+      coverUrl: "img@data-original||img@src",
+    },
+    ruleExplore: [],
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".reading", chapterName: "text", chapterUrl: "href" },
+    ruleContent: {
+      content: ".thumb-overlay-albums@img@data-original",
+      imageDecode: "var bookId=1; var imgId=2; var img=BitmapFactory.decodeByteArray(result,0,result.length); var canvas=new Canvas(img); photos;",
+    },
+  };
+  const upstream = createServer((request, response) => {
+    if (request.url === "/release") {
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end(`<div class="international"><span>${upstreamBase}</span></div>`);
+      return;
+    }
+    if (request.url?.startsWith("/albums?")) {
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end('<div class="list-col"><a href="/album/1"><div class="video-title">漫画一</div></a></div>');
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify([jmSource]));
+  });
+  upstreamBase = await listen(upstream);
+  const app = createAppServer({
+    config: { ...serverConfig({}), allowPrivateNetworks: true, jmDiscoveryUrl: `${upstreamBase}/release` },
+  });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const response = await fetch(`${appBase}/convert.xbs?url=${encodeURIComponent(`${upstreamBase}/source.json`)}`);
+  assert.equal(response.status, 200);
+  const converted = JSON.parse(decodeXbs(Buffer.from(await response.arrayBuffer())).toString("utf8"));
+  const jm = converted["禁漫在线测试"];
+  assert.equal(jm.sourceUrl, upstreamBase);
+  assert.equal(jm.httpHeaders.Referer, `${upstreamBase}/`);
+  assert.deepEqual(Object.keys(jm.bookWorld), ["全部", "短篇"]);
+  assert.equal(jm.bookWorld["全部"].moreKeys.pageSize, 80);
+  assert.match(jm.bookWorld["全部"].requestInfo, /albums\?o=mr&page=/);
+  assert.match(jm.bookWorld["全部"].list, /list-col/);
+});
+
+test("禁漫镜像候选兼容发布页无协议域名和源内备用地址", () => {
+  assert.deepEqual(jmMirrorCandidates(
+    '<div><span>jm.example.com</span><span>https://jm2.example.com/path</span></div>',
+    "https://release.example.com/",
+    "const fallback = 'https://jm3.example.com/path';",
+  ), ["https://jm.example.com", "https://jm2.example.com", "https://jm3.example.com"]);
 });
 
 test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (context) => {
