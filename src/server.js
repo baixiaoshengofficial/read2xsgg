@@ -6,6 +6,7 @@ import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { convertLegado } from "./converter.js";
 import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
+import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
 import { encodeXbs } from "./xbs.js";
 
 class HttpError extends Error {
@@ -257,8 +258,9 @@ export function mwwzMirrorCandidates(releasePage, baseUrl) {
 }
 
 function htmlAttribute(tag, name) {
-  const match = String(tag).match(new RegExp(`\\b${name}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, "i"));
-  return match ? match[2] : null;
+  const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(tag).match(new RegExp(`\\b${escaped}\\s*=\\s*(?:(["'])([\\s\\S]*?)\\1|([^\\s>]+))`, "i"));
+  return match ? (match[2] ?? match[3]) : null;
 }
 
 function htmlText(value) {
@@ -517,7 +519,7 @@ function imageRequestFromRequest(request) {
   else if (parsed.pathname.startsWith("/image/")) decoder = parsed.pathname.slice("/image/".length);
   else return null;
   if (!/^(?:auto|passthrough|[a-z0-9-]+)$/i.test(decoder)) throw new HttpError(400, "图片解码器名称无效");
-  return { imageUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "", decoder: decoder.toLowerCase() };
+  return { imageUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "", decoder };
 }
 
 function adapterRequestFromRequest(request) {
@@ -525,7 +527,14 @@ function adapterRequestFromRequest(request) {
   const type = parsed.pathname === "/adapter/jm/chapters" ? "jm-chapters"
     : parsed.pathname === "/adapter/images" || parsed.pathname === "/adapter/jm/images" ? "page-images"
       : "";
-  return type ? { type, sourceUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "" } : null;
+  if (!type) return null;
+  let extractionPlan;
+  try {
+    extractionPlan = decodeComicExtractionPlan(parsed.searchParams.get("plan") || "");
+  } catch (error) {
+    throw new HttpError(400, error.message);
+  }
+  return { type, sourceUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "", extractionPlan };
 }
 
 function isLocalHost(host) {
@@ -634,12 +643,34 @@ export function jmChapterEntries(detailPage, baseUrl) {
  * Chapter images normally form the largest same-directory sequence, whereas
  * navigation, recommendations and ads are isolated images or smaller groups.
  */
-export function pageImageUrls(page, baseUrl) {
-  const html = String(page || "");
-  const embeddedDocuments = [];
+function normalizedImageUrl(value, baseUrl) {
+  let raw = String(value || "")
+    .replace(/\\u([\da-f]{4})/gi, (_, code) => String.fromCodePoint(Number.parseInt(code, 16)))
+    .replace(/\\\//g, "/")
+    .replace(/\\([\\"'])/g, "$1")
+    .replace(/&amp;/gi, "&")
+    .trim();
+  if (!raw || /[<>\r\n]/.test(raw) || /^(?:data|blob|javascript):/i.test(raw)) return "";
+  // srcset values may include a density/width suffix.
+  raw = raw.split(/\s+(?:\d+(?:\.\d+)?x|\d+w)\s*$/i, 1)[0];
+  if (!/^(?:https?:)?\/\//i.test(raw) && !/^(?:\/|\.\.?\/)/.test(raw)
+    && !/\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(raw)) return "";
+  try {
+    const url = new URL(raw, baseUrl);
+    return /^https?:$/.test(url.protocol) ? url.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
+function hydrationDocuments(html) {
+  const documents = [];
   let nextFlightStream = "";
   for (const script of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
-    const push = script[1].match(/self\.__next_f\.push\((\[[\s\S]*\])\)\s*;?$/);
+    // React/Next and similar hydration runtimes split one serialized payload
+    // across ordered push([...,"chunk"]) calls. Rejoin string chunks before
+    // extracting properties so URLs split at script boundaries remain intact.
+    const push = script[1].match(/self(?:\.[A-Za-z_$][\w$]*)+\.push\((\[[\s\S]*\])\)\s*;?$/);
     if (!push) continue;
     try {
       const payload = JSON.parse(push[1]);
@@ -648,37 +679,80 @@ export function pageImageUrls(page, baseUrl) {
       // A malformed hydration chunk should not prevent ordinary HTML fallback.
     }
   }
-  if (nextFlightStream) embeddedDocuments.push(nextFlightStream);
-  embeddedDocuments.push(html);
+  if (nextFlightStream) documents.push(nextFlightStream);
+  documents.push(html);
+  return documents;
+}
 
-  // Modern comic sites often serialize the page list into Next/Nuxt scripts
-  // instead of rendering <img> elements on the server. This mirrors Legado
-  // rules which scan script text for escaped `imageUrl` JSON properties.
-  let embeddedUrls = [];
-  for (const document of embeddedDocuments) {
-    const found = [];
-    const foundSeen = new Set();
-    for (const pattern of [
-      /\\"imageUrl\\"\s*:\s*\\"([\s\S]*?)\\"/gi,
-      /["']imageUrl["']\s*:\s*["']([^"']+?)["']/gi,
-    ]) {
-      for (const match of document.matchAll(pattern)) {
-        const raw = match[1]
-          .replace(/\\u0026/gi, "&")
-          .replace(/\\\//g, "/")
-          .replace(/\\\\/g, "\\");
-        if (/[<>\r\n]/.test(raw)) continue;
-        let url;
-        try {
-          url = new URL(raw, baseUrl);
-        } catch {
-          continue;
-        }
-        if (!/^https?:$/.test(url.protocol) || foundSeen.has(url.toString())) continue;
-        foundSeen.add(url.toString());
-        found.push(url.toString());
-      }
+function propertyImageUrls(document, baseUrl, extractionPlan) {
+  const plan = normalizeComicExtractionPlan(extractionPlan);
+  const hints = new Set(plan.properties.map((value) => value.toLowerCase()));
+  const groups = new Map();
+  const add = (keyValue, value) => {
+    const key = String(keyValue || "").toLowerCase();
+    const semantic = /(?:url|uri|src|source|image|img|pic|picture|file|path)/i.test(key);
+    if (!hints.has(key) && !semantic) return;
+    const url = normalizedImageUrl(value, baseUrl);
+    if (!url) return;
+    const group = groups.get(key) || [];
+    if (!group.includes(url)) group.push(url);
+    groups.set(key, group);
+  };
+
+  // The second form decodes JSON strings embedded inside HTML/JavaScript. Only
+  // declarative property names are used; source-provided regex/JS is never run.
+  const variants = [
+    String(document || ""),
+    String(document || "").replace(/\\"/g, '"').replace(/\\\//g, "/"),
+  ];
+  for (const variant of variants) {
+    for (const match of variant.matchAll(/"([A-Za-z_$][\w$-]{0,63})"\s*:\s*"((?:\\.|[^"\\])*)"/g)) {
+      add(match[1], match[2]);
     }
+  }
+  // Direct JSON APIs frequently use arrays of strings, which cannot be found
+  // by key:value text matching. Walk parsed data after the text pass so repeated
+  // textual properties retain their original order.
+  try {
+    const parsed = JSON.parse(String(document || ""));
+    const walk = (value, parentKey = "") => {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (typeof item === "string") add(parentKey, item);
+          else walk(item, parentKey);
+        }
+        return;
+      }
+      if (!value || typeof value !== "object") return;
+      for (const [key, item] of Object.entries(value)) {
+        if (typeof item === "string") add(key, item);
+        else walk(item, key);
+      }
+    };
+    walk(parsed);
+  } catch {
+    // HTML and hydration streams continue through the safe text extractor.
+  }
+  let best = [];
+  let bestScore = -1;
+  for (const [key, urls] of groups) {
+    const explicit = hints.has(key);
+    const imageLike = /(?:image|img|pic|picture|src|source)/i.test(key);
+    const score = (explicit ? 1_000_000 : 0) + (imageLike ? 10_000 : 0) + urls.length;
+    if (score > bestScore) {
+      best = urls;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+export function pageImageUrls(page, baseUrl, extractionPlan = null) {
+  const html = String(page || "");
+  const plan = normalizeComicExtractionPlan(extractionPlan);
+  let embeddedUrls = [];
+  for (const document of hydrationDocuments(html)) {
+    const found = propertyImageUrls(document, baseUrl, plan);
     if (found.length > 1) return found;
     if (found.length) embeddedUrls = found;
   }
@@ -686,27 +760,46 @@ export function pageImageUrls(page, baseUrl) {
   const lazyUrls = [];
   const directUrls = [];
   const seen = new Set();
-  for (const match of html.matchAll(/<img\b([^>]*)>/gi)) {
-    const lazy = htmlAttribute(match[1], "data-original") || htmlAttribute(match[1], "data-src") || htmlAttribute(match[1], "data-lazy-src");
-    const raw = lazy || htmlAttribute(match[1], "src");
-    if (!raw) continue;
-    let url;
-    try {
-      url = new URL(raw, baseUrl);
-    } catch {
-      continue;
+  const attributes = [...new Set([
+    ...plan.attributes,
+    "data-original", "data-src", "data-lazy-src", "data-url", "data-srcset", "src", "srcset",
+  ])];
+  for (const match of html.matchAll(/<[A-Za-z][\w:-]*\b([^>]*)>/g)) {
+    let attribute = "";
+    let raw = "";
+    for (const name of attributes) {
+      const value = htmlAttribute(match[1], name);
+      if (value) {
+        attribute = name;
+        raw = /srcset/i.test(name) ? value.split(",", 1)[0] : value;
+        if (name.toLowerCase() === "style") raw = value.match(/url\(\s*(["']?)(.*?)\1\s*\)/i)?.[2] || "";
+        break;
+      }
     }
-    const key = url.toString();
+    if (!raw) continue;
+    const key = normalizedImageUrl(raw, baseUrl);
+    if (!key) continue;
     if (seen.has(key)) continue;
     // For ordinary src attributes, avoid common page chrome unless no lazy URLs
     // exist. Lazy attributes are normally reserved for actual comic pages.
-    if (!lazy && (!/\.(?:avif|bmp|gif|jpe?g|png|webp)$/i.test(url.pathname)
-      || /(?:ad|avatar|banner|blank|captcha|icon|loading|logo)/i.test(url.pathname))) continue;
-    seen.add(url.toString());
+    const lazy = attribute !== "src" && attribute !== "srcset";
+    const pathname = new URL(key).pathname;
+    if (!lazy && (!/\.(?:avif|bmp|gif|jpe?g|png|webp)$/i.test(pathname)
+      || /(?:ad|avatar|banner|blank|captcha|icon|loading|logo)/i.test(pathname))) continue;
+    seen.add(key);
     (lazy ? lazyUrls : directUrls).push(key);
   }
   const candidates = lazyUrls.length ? lazyUrls : directUrls;
-  if (candidates.length < 2) return candidates.length ? candidates : embeddedUrls;
+  if (candidates.length < 2) {
+    if (candidates.length) return candidates;
+    if (embeddedUrls.length) return embeddedUrls;
+    const plainUrls = [];
+    for (const match of html.replace(/\\\//g, "/").matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
+      const url = normalizedImageUrl(match[0], baseUrl);
+      if (url && /\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(url) && !plainUrls.includes(url)) plainUrls.push(url);
+    }
+    return plainUrls;
+  }
 
   const groups = new Map();
   for (const value of candidates) {
@@ -803,7 +896,7 @@ export function createAppServer(options = {}) {
           const detailPage = await downloadSource(sourceUrl, config);
           values = adapterTarget.type === "jm-chapters"
             ? jmChapterEntries(detailPage.toString("utf8"), sourceUrl)
-            : pageImageUrls(detailPage.toString("utf8"), sourceUrl);
+            : pageImageUrls(detailPage.toString("utf8"), sourceUrl, adapterTarget.extractionPlan);
         } finally {
           active -= 1;
         }

@@ -2,6 +2,7 @@ import { convertRule, inferResponseType } from "./selectors.js";
 import { convertRequest, parseHeaders } from "./requests.js";
 import { adaptLegadoSource, bookDetailRequestInfoOverride, chapterListRequestInfoOverride } from "./siteAdapters.js";
 import { decoderForLegadoImageRule } from "./imageDecoder.js";
+import { compileComicExtractionPlan, encodeComicExtractionPlan } from "./comicPlan.js";
 
 const EMPTY_ACTIONS = {
   relatedWord: { actionID: "relatedWord", parserID: "DOM" },
@@ -208,9 +209,10 @@ function nativeJmChapterList(host) {
  * Generic HTML-comic bridge. The service extracts lazy/direct page images and
  * returns {urls}; 香色 receives its native comic payload after image proxying.
  */
-function proxiedHtmlComicChapterContent(host, imageProxyBase, decoder = "auto") {
+function proxiedHtmlComicChapterContent(host, imageProxyBase, decoder = "auto", extractionPlan = null) {
   const base = String(imageProxyBase).replace(/\/$/, "");
-  const endpoint = `${base}/adapter/images?url=`;
+  const encodedPlan = encodeComicExtractionPlan(extractionPlan);
+  const endpoint = `${base}/adapter/images?${encodedPlan ? `plan=${encodedPlan}&` : ""}url=`;
   const imageEndpoint = `${base}/image/${decoder}?url=`;
   return {
     ...commonAction("chapterContent", host, "json"),
@@ -438,9 +440,13 @@ function convertOne(source, warnings, options = {}) {
   const contentRules = getRules(source, "ruleContent", "contentRule");
   const resolvedType = sourceType(source.bookSourceType);
   const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode);
+  const comicExtractionPlan = compileComicExtractionPlan(contentRules.content);
   const isJmComic = resolvedType === "comic" && (
-    imageDecoder === "jm-scramble" || /(?:jmcomic|18comic|comic18j)/i.test(adaptedFrom)
+    ["jm-scramble", "id-md5-reverse-tiles"].includes(imageDecoder)
+      || String(imageDecoder || "").startsWith("id-md5-reverse-tiles-")
+      || /(?:jmcomic|18comic|comic18j)/i.test(adaptedFrom)
   );
+  const isPrefixAesDecoder = imageDecoder === "mwwz-aes" || String(imageDecoder || "").startsWith("aes-cbc-prefix-iv-");
   if (contentRules.imageDecode) {
     const warning = createWarningCollector(warnings, sourceName, "chapterContent")("imageDecode", contentRules.imageDecode);
     if (imageDecoder && options.imageProxyBase) {
@@ -464,12 +470,14 @@ function convertOne(source, warnings, options = {}) {
   const tocWarningFor = createWarningCollector(warnings, sourceName, "chapterList");
   // 漫蛙 AES 规则的正文端点返回 {data:{images,pagination}} JSON；原 content
   // 只有 @js，单靠规则推断会误判为 HTML，导致香色先做 DOM 解析后正文为空。
-  const contentResponseType = imageDecoder === "mwwz-aes" && resolvedType === "comic"
+  const contentResponseType = isPrefixAesDecoder && resolvedType === "comic"
     ? "json"
     : inferResponseType(contentRules);
-  const hasDirectImageRule = /(?:\bimg\b|@(?:src|data-original|data-src|data-lazy-src)\b)/i.test(String(contentRules.content || ""));
-  const useHtmlComicImageAdapter = resolvedType === "comic" && contentResponseType === "html"
-    && Boolean(options.imageProxyBase) && (Boolean(imageDecoder) || isJmComic || hasDirectImageRule);
+  // Online comic conversion is rule-driven: the server receives a declarative
+  // plan compiled from the original content rule and can parse HTML, JSON,
+  // hydration scripts or plain URL lists without checking the source domain.
+  const useHtmlComicImageAdapter = resolvedType === "comic" && Boolean(options.imageProxyBase)
+    && Boolean(contentRules.content);
   const contentWarningFor = createWarningCollector(warnings, sourceName, "chapterContent");
 
   const bookDetail = {
@@ -523,11 +531,13 @@ function convertOne(source, warnings, options = {}) {
       warn: contentWarningFor("content", contentRules.content),
     })
     : undefined;
-  if (imageDecoder === "mwwz-aes" && options.imageProxyBase && resolvedType === "comic") {
+  if (isPrefixAesDecoder && options.imageProxyBase && resolvedType === "comic") {
     // This API returns JSON {data:{images:[{url}]}}. Rebuild the small result in
     // 香色 JS instead of preserving Legado's src/source.getVariable() runtime calls.
     content = proxiedJsonImageContent(options.imageProxyBase, imageDecoder);
-  } else if (imageDecoder === "jm-scramble" && options.imageProxyBase && resolvedType === "comic") {
+  } else if ((["jm-scramble", "id-md5-reverse-tiles"].includes(imageDecoder)
+    || String(imageDecoder || "").startsWith("id-md5-reverse-tiles-"))
+    && options.imageProxyBase && resolvedType === "comic") {
     content = proxiedLineImageContent(content, options.imageProxyBase, imageDecoder);
   } else if (content && resolvedType === "comic") {
     content = wrapComicImageContent(content);
@@ -585,7 +595,12 @@ function convertOne(source, warnings, options = {}) {
     converted.chapterList = nativeJmChapterList(host);
   }
   if (useHtmlComicImageAdapter) {
-    converted.chapterContent = proxiedHtmlComicChapterContent(host, options.imageProxyBase, imageDecoder || "auto");
+    converted.chapterContent = proxiedHtmlComicChapterContent(
+      host,
+      options.imageProxyBase,
+      imageDecoder || "auto",
+      comicExtractionPlan,
+    );
   }
 
   // apply replaceRegex / replaceRegex array onto content field

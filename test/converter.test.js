@@ -333,7 +333,7 @@ test("漫画源保留 comic 类型，图片 URL 包成 img，并告警 imageDeco
 test("可识别的 AES 图片规则通过公开代理改写为香色图片正文", () => {
   const source = {
     bookSourceName: "AES 漫画",
-    bookSourceUrl: "https://www.mwwz.cc/",
+    bookSourceUrl: "https://api-comic.example/",
     bookSourceType: 2,
     searchUrl: "/search?q={{key}}",
     ruleSearch: { bookList: "$.data.list[*]", name: "$.title", bookUrl: "$.id" },
@@ -341,15 +341,15 @@ test("可识别的 AES 图片规则通过公开代理改写为香色图片正文
     ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
     ruleContent: {
       content: "@js:JSON.parse(src).data.images.map(x => `<img src=\"${x.url}\">`).join('\\n');",
-      imageDecode: "var iv = result.slice(0, 16); var key = java.strToBytes('0B6666A0-BB59-1381-B746-a0E4C9AC'); var cipher = java.createSymmetricCrypto(\"AES/CBC/PKCS5Padding\", key, iv); return cipher.decrypt(result.slice(16));",
+      imageDecode: "var iv = result.slice(0, 16); var key = java.strToBytes('0123456789abcdef0123456789abcdef'); var cipher = java.createSymmetricCrypto(\"AES/CBC/PKCS5Padding\", key, iv); return cipher.decrypt(result.slice(16));",
     },
   };
   const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example.com/" });
   const content = sources["AES 漫画"].chapterContent.content;
-  assert.match(content, /https:\/\/convert\.example\.com\/image\/mwwz-aes\?url=/);
-  assert.match(content, /payload\.data/);
+  assert.match(content, /https:\/\/convert\.example\.com\/image\/aes-cbc-prefix-iv-[A-Za-z0-9_-]+\?url=/);
+  assert.match(sources["AES 漫画"].chapterContent.requestInfo, /adapter\/images\?plan=/);
   assert.match(content, /JSON\.stringify\(\{urls:/);
-  assert.match(content, /encodeURIComponent\(url\)/);
+  assert.match(content, /encodeURIComponent\(String\(url/);
   assert.doesNotMatch(content, /<img src=/);
   assert.doesNotMatch(content, /source\.getVariable|JSON\.parse\(src\)/);
   assert.ok(warnings.some((warning) => warning.message.includes("图片解码代理")));
@@ -371,11 +371,11 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
   };
   const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example.com" });
   const content = sources["禁漫测试"].chapterContent.content;
-  assert.match(content, /https:\/\/convert\.example\.com\/image\/jm-scramble\?url=/);
+  assert.match(content, /https:\/\/convert\.example\.com\/image\/id-md5-reverse-tiles\?url=/);
   assert.match(content, /encodeURIComponent\(String\(url/);
   assert.doesNotMatch(content, /baseUrl/);
   assert.match(sources["禁漫测试"].chapterContent.requestInfo, /params\.queryInfo/);
-  assert.ok(warnings.some((warning) => warning.message.includes("jm-scramble")));
+  assert.ok(warnings.some((warning) => warning.message.includes("id-md5-reverse-tiles")));
   const chapterList = sources["禁漫测试"].chapterList;
   assert.equal(chapterList.responseFormatType, "html");
   assert.match(sources["禁漫测试"].bookDetail.requestInfo, /params\.queryInfo/);
@@ -402,13 +402,13 @@ test("MD5 分块倒序图片规则通过通用正文与解码代理转换", () =
     ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
     ruleContent: {
       content: '//script/text()@js:var urlReg = /\\\\"imageUrl\\\\":\\\\"(.+?)\\\\"/g; return ["<img src=\\"https://cdn.example/1.jpg\\">"];',
-      imageDecode: 'if (src.indexOf("sr:1") == -1) return result; var decodedPath = java.base64Decode(path); var md5Str = java.md5Encode(decodedPath); var lastTwo = md5Str.slice(-2); var num = (parseInt(lastTwo, 16) % 10) + 5; var canvas = new Canvas(BitmapFactory.decodeByteArray(result, 0, result.length));',
+      imageDecode: 'if (src.indexOf("sr:1") == -1) return result; var decodedPath = java.base64Decode(path); var md5Str = java.md5Encode(decodedPath); var lastTwo = md5Str.slice(-2); var num = (parseInt(lastTwo, 16) % 7) + 3; var canvas = new Canvas(BitmapFactory.decodeByteArray(result, 0, result.length));',
     },
   };
   const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example.com" });
   const chapterContent = sources["脚本图片漫画"].chapterContent;
-  assert.match(chapterContent.requestInfo, /\/adapter\/images\?url=/);
-  assert.match(chapterContent.content, /\/image\/md5-reverse-tiles\?url=/);
+  assert.match(chapterContent.requestInfo, /\/adapter\/images\?plan=.*&url=/);
+  assert.match(chapterContent.content, /\/image\/md5-reverse-tiles-7-3\?url=/);
   assert.ok(warnings.some((warning) => warning.message.includes("md5-reverse-tiles")));
 });
 

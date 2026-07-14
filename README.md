@@ -163,13 +163,13 @@ node ./bin/server.js
 {转换站}/image/jm-scramble?url=https://cdn.example.com/photos/230000/1.jpg
 ```
 
-`/image` 会直通 JPEG、PNG、GIF、WebP 等常见图片，并尝试已注册的解码器；`/image/mwwz-aes` 明确使用猕猴桃漫画的 AES-256-CBC 规则；`/image/jm-scramble` 按禁漫天堂的书号、图片号计算分块数后重组纵向图片块，并输出 PNG。代理只会返回验证过图片文件头的结果，且与在线转换一样禁止访问内网地址。
+`/image` 会直通 JPEG、PNG、GIF、WebP 等常见图片，并尝试已注册的解码能力。在线转换不会按站点域名选择解码器，而是分析阅读源 `imageDecode` 中的算法：AES-CBC 前缀 IV 会自动提取 16/24/32 字节密钥；MD5 分块倒序会自动提取取模数和偏移量；书号/图片号分块会按规则形态启用对应能力。旧的 `/image/mwwz-aes`、`/image/jm-scramble` 地址仅作为兼容别名保留。代理只会返回验证过图片文件头的结果，且与在线转换一样禁止访问内网地址。
 
-在线转换时，常规 HTML 漫画源只要正文规则包含 `img`、`@src`、`@data-original`、`@data-src` 或 `@data-lazy-src`，就会自动改为通用正文桥接：服务端请求章节页，提取图片候选并选取最大的同目录序列，再返回香色原生的 `{urls:[...]}` 正文数据。它不依赖禁漫的页面路径或 XPath，因此同类阅读源不需要逐个编写站点规则。桥接接口为 `{转换站}/adapter/images?url={章节页}`，通常由生成的 XBS 自动调用，无须手动填写。
+在线转换时，所有漫画正文都会使用规则驱动的通用桥接。转换器先把阅读 `ruleContent.content` 编译成一个不含可执行代码的提取计划，自动识别 JSON/JavaScript 属性（如 `imageUrl`、`pageSrc`、`url`）和 HTML 属性（如 `src`、`data-original`、`data-src`）；服务端再按该计划解析 HTML、JSON API、Next/React 分片脚本、`img/source` 标签或纯 URL 列表，最后返回香色原生的 `{urls:[...]}`。没有明确字段提示时，会自动发现包含图片 URL 的属性组并选择最可信的连续序列。整个过程不使用站点域名作为判断条件，也不会执行阅读源携带的任意 JavaScript。
 
-已识别的猕猴桃漫画 AES、禁漫天堂 Canvas 重排 `imageDecode` 则会在上述通用图片序列之后自动选择对应的图片解码器。代理地址会从本次转换 URL 自动推导：优先使用 `Forwarded` 或 `X-Forwarded-Host` / `X-Forwarded-Proto`，公网域名默认使用 HTTPS；无需配置对外基础 URL。反向代理应保留 `Host`，并传递主机和协议头。
+提取图片序列后，编译器会继续按 `imageDecode` 的算法能力选择参数化解码器。代理地址会从本次转换 URL 自动推导：优先使用 `Forwarded` 或 `X-Forwarded-Host` / `X-Forwarded-Proto`，公网域名默认使用 HTTPS；无需配置对外基础 URL。反向代理应保留 `Host`，并传递主机和协议头。
 
-解码器采用注册机制；AES 等字节级算法可通用加入。禁漫天堂的 `BitmapFactory`、`Canvas` 规则已由服务端像素重排适配；其他站点的 Android 像素拼图、登录态或专用加密仍需要对应的解码器/认证支持，不能凭空由任意阅读 JavaScript 通用执行。
+解码器按算法能力注册，而不是按网站注册。若以后出现当前能力集之外的全新加密或像素算法，只需新增一次该算法能力；采用相同算法的其他阅读源会从规则中自动识别并复用，不需要再增加域名或站点分支。登录态、验证码以及依赖完整 Android 环境的任意 JavaScript 仍无法安全地凭空执行。
 
 ### 服务配置
 

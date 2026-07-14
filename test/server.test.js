@@ -169,7 +169,7 @@ test("图片代理地址从本次 HTTPS 转换请求自动推导", async (contex
   });
   assert.equal(response.status, 200);
   const converted = JSON.parse(decodeXbs(Buffer.from(await response.arrayBuffer())).toString("utf8"));
-  assert.match(converted["加密漫画"].chapterContent.content, /https:\/\/xs\.example\.com\/image\/mwwz-aes\?url=/);
+  assert.match(converted["加密漫画"].chapterContent.content, /https:\/\/xs\.example\.com\/image\/aes-cbc-prefix-iv-[A-Za-z0-9_-]+\?url=/);
 });
 
 test("在线转换会发现并写入可用的漫蛙镜像", async (context) => {
@@ -410,6 +410,9 @@ test("图片代理直通普通图片，并可解开已注册的 AES 图片", asy
   const iv = Buffer.alloc(16, 7);
   const cipher = createCipheriv("aes-256-cbc", Buffer.from("0B6666A0-BB59-1381-B746-a0E4C9AC"), iv);
   const encrypted = Buffer.concat([iv, cipher.update(plain), cipher.final()]);
+  const genericKeyText = "0123456789abcdef0123456789abcdef";
+  const genericCipher = createCipheriv("aes-256-cbc", Buffer.from(genericKeyText), iv);
+  const genericEncrypted = Buffer.concat([iv, genericCipher.update(plain), genericCipher.final()]);
   const originalPixels = Buffer.alloc(10 * 4);
   for (let row = 0; row < 10; row += 1) originalPixels.writeUInt32BE(((row + 1) << 24) | 0x0000ff, row * 4);
   // bookId 230000 uses the fixed 10-tile rule, so every one-pixel row is reversed.
@@ -419,7 +422,7 @@ test("图片代理直通普通图片，并可解开已注册的 AES 图片", asy
   }
   const scrambled = await Jimp.fromBitmap({ data: scrambledPixels, width: 1, height: 10 }).getBuffer(JimpMime.png);
   const encodedPath = Buffer.from("s3://comic/images/chapter/001.jpg").toString("base64url");
-  const md5Tiles = Number.parseInt(createHash("md5").update(Buffer.from("s3://comic/images/chapter/001.jpg")).digest("hex").slice(-2), 16) % 10 + 5;
+  const md5Tiles = Number.parseInt(createHash("md5").update(Buffer.from("s3://comic/images/chapter/001.jpg")).digest("hex").slice(-2), 16) % 7 + 3;
   const md5OriginalPixels = Buffer.alloc(md5Tiles * 4);
   for (let row = 0; row < md5Tiles; row += 1) md5OriginalPixels.writeUInt32BE(((row + 1) << 24) | 0x0000ff, row * 4);
   const md5ScrambledPixels = Buffer.alloc(md5OriginalPixels.length);
@@ -430,6 +433,7 @@ test("图片代理直通普通图片，并可解开已注册的 AES 图片", asy
   const upstream = createServer((request, response) => {
     response.writeHead(200, { "Content-Type": "application/octet-stream" });
     response.end(request.url === "/encrypted" ? encrypted
+      : request.url === "/generic-encrypted" ? genericEncrypted
       : request.url?.startsWith("/photos/") ? scrambled
         : request.url?.includes("/sr:1/") ? md5Scrambled
           : plain);
@@ -456,6 +460,12 @@ test("图片代理直通普通图片，并可解开已注册的 AES 图片", asy
   assert.equal(decoded.headers.get("x-image-decoder"), "mwwz-aes");
   assert.deepEqual(Buffer.from(await decoded.arrayBuffer()), plain);
 
+  const encodedKey = Buffer.from(genericKeyText).toString("base64url");
+  const genericAes = await fetch(`${appBase}/image/aes-cbc-prefix-iv-${encodedKey}?url=${encodeURIComponent(`${upstreamBase}/generic-encrypted`)}`);
+  assert.equal(genericAes.status, 200);
+  assert.match(genericAes.headers.get("x-image-decoder"), /^aes-cbc-prefix-iv-/);
+  assert.deepEqual(Buffer.from(await genericAes.arrayBuffer()), plain);
+
   const jm = await fetch(`${appBase}/image/jm-scramble?url=${encodeURIComponent(`${upstreamBase}/photos/230000/1.jpg`)}`);
   assert.equal(jm.status, 200);
   assert.equal(jm.headers.get("content-type"), "image/png");
@@ -464,10 +474,10 @@ test("图片代理直通普通图片，并可解开已注册的 AES 图片", asy
   assert.deepEqual(Buffer.from(restored.bitmap.data), originalPixels);
 
   const md5Url = `${upstreamBase}/m/token/wm:0/sr:1/${encodedPath}.jpg`;
-  const md5 = await fetch(`${appBase}/image/md5-reverse-tiles?url=${encodeURIComponent(md5Url)}`);
+  const md5 = await fetch(`${appBase}/image/md5-reverse-tiles-7-3?url=${encodeURIComponent(md5Url)}`);
   assert.equal(md5.status, 200);
   assert.equal(md5.headers.get("content-type"), "image/png");
-  assert.equal(md5.headers.get("x-image-decoder"), "md5-reverse-tiles");
+  assert.equal(md5.headers.get("x-image-decoder"), "md5-reverse-tiles-7-3");
   const md5Restored = await Jimp.read(Buffer.from(await md5.arrayBuffer()));
   assert.deepEqual(Buffer.from(md5Restored.bitmap.data), md5OriginalPixels);
 });
