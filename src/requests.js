@@ -28,6 +28,22 @@ function splitUrlAndOptions(request) {
 }
 
 /**
+ * 阅读源常在请求开头放 cookie.removeCookie(...) 之类的副作用模板。
+ * 它不属于 URL，香色也没有等价 cookie API；移除后继续转换后面的
+ * 普通 URL 与请求配置，避免把整段模板误当作 JavaScript 请求。
+ */
+function stripLeadingLegadoSideEffectTemplates(request, warn) {
+  let value = String(request ?? "").trim();
+  let removed = false;
+  while (/^\{\{\s*(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie)\s*\([^{}]*\)\s*\}\}/i.test(value)) {
+    value = value.replace(/^\{\{\s*(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie)\s*\([^{}]*\)\s*\}\}\s*/i, "");
+    removed = true;
+  }
+  if (removed) warn("阅读请求开头的 cookie 清理表达式在香色无等价 API，已忽略并保留后续 URL 请求");
+  return value;
+}
+
+/**
  * 把阅读 URL/正文里的 Mustache 片段转成可拼进香色 @js 的表达式。
  * - {{key}} / {{page}} / {{page±n}} → params.*
  * - {{Get('url')}} / {{get("url")}} → config.host（登录分流在香色无等价，回退站点 host）
@@ -125,7 +141,7 @@ function rewriteGetTemplates(url, warn) {
 export function convertRequest(request, { headers = {}, warn = () => {}, fallback = "%@result" } = {}) {
   if (!request || request === "-") return { requestInfo: fallback };
   if (typeof request !== "string") return { requestInfo: fallback };
-  const source = request.trim();
+  const source = stripLeadingLegadoSideEffectTemplates(request, warn);
 
   if (/^@js:/i.test(source) || /^<js>/i.test(source)) {
     warn("阅读请求中的 JavaScript/模板表达式无法可靠翻译，已保留原规则供人工修改");

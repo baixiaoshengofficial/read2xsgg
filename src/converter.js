@@ -51,6 +51,22 @@ function isDetailUrlAlias(rule) {
   return /^(?:baseUrl|-|%@result)$/i.test(value);
 }
 
+/**
+ * 部分阅读文本源只是用 java.getString('CSS 选择器') 包装 DOM 提取。
+ * 香色不能执行 Android JavaScript，但选择器本身是可移植的；仅提取没有
+ * 动态拼接的首个 getString，复杂 Java 流程仍保留并给出告警。
+ */
+function portableJavaGetStringRule(rule, warn) {
+  const source = String(rule ?? "").trim();
+  if (!/^@js:/i.test(source) || !/\bjava\.getString\s*\(/i.test(source)) return null;
+  const match = source.match(/\bjava\.getString\s*\(\s*(['"])([^'"\\\r\n]+)\1(?:\s*,[^)]*)?\)/i);
+  if (!match?.[2]) return null;
+  const selector = match[2].trim();
+  if (!selector || /(?:\bjava\.|\bPackages\b|\+|;)/i.test(selector)) return null;
+  warn("已将 java.getString(...) 的静态 DOM 选择器转换为香色规则；其中的动态 Java 回退逻辑无法执行");
+  return selector;
+}
+
 /** 漫画正文：若规则取出的是图片 URL 列表，包成 <img> 供香色 comic 渲染。 */
 function wrapComicImageContent(contentRule) {
   if (!contentRule || /<img\s/i.test(contentRule)) return contentRule;
@@ -477,8 +493,12 @@ function convertOne(source, warnings, options = {}) {
     }
   }
 
+  const portableContent = portableJavaGetStringRule(
+    contentRules.content,
+    contentWarningFor("content", contentRules.content),
+  );
   let content = contentRules.content !== undefined
-    ? convertRule(contentRules.content, {
+    ? convertRule(portableContent ?? contentRules.content, {
       responseType: contentResponseType,
       warn: contentWarningFor("content", contentRules.content),
     })

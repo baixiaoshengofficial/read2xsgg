@@ -438,6 +438,28 @@ test("禁漫动态发现脚本转换为香色可见的静态分类", () => {
   assert.equal(converted.chapterList.url, "//@href");
 });
 
+test("阅读 cookie 清理模板与 java.getString 正文可降级为香色请求和选择器", () => {
+  const source = {
+    bookSourceName: "Java DOM 文本测试",
+    bookSourceUrl: "https://book.example.com",
+    searchUrl: "{{cookie.removeCookie(source.key)}}/search.html,{\"method\":\"POST\",\"body\":\"q={{key}}\"}",
+    ruleSearch: { bookList: ".book", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: "@js:var body=java.getString('.reader@p@html');result=body;" },
+  };
+  const { sources, warnings } = convertLegado(source);
+  const converted = sources["Java DOM 文本测试"];
+  assert.match(converted.searchBook.requestInfo, /POST:true/);
+  assert.match(converted.searchBook.requestInfo, /search\.html/);
+  assert.doesNotMatch(converted.searchBook.requestInfo, /removeCookie/);
+  assert.match(converted.chapterContent.content, /reader/);
+  assert.match(converted.chapterContent.content, /\/p/);
+  assert.doesNotMatch(converted.chapterContent.content, /java\.getString/);
+  assert.ok(warnings.some((warning) => warning.message.includes("cookie 清理表达式")));
+  assert.ok(warnings.some((warning) => warning.message.includes("静态 DOM 选择器")));
+});
+
 test("有声源保留 audio 类型，正文包装为播放 JSON", () => {
   const source = {
     bookSourceName: "示例如声",
