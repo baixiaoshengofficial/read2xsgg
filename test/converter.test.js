@@ -349,6 +349,9 @@ test("可识别的 AES 图片规则通过公开代理改写为香色图片正文
   const content = sources["AES 漫画"].chapterContent.content;
   assert.match(content, /https:\/\/convert\.example\.com\/image\/mwwz-aes\?url=/);
   assert.match(content, /payload\.data/);
+  assert.match(content, /JSON\.stringify\(\{urls:/);
+  assert.match(content, /encodeURIComponent\(url\)/);
+  assert.doesNotMatch(content, /<img src=/);
   assert.doesNotMatch(content, /source\.getVariable|JSON\.parse\(src\)/);
   assert.ok(warnings.some((warning) => warning.message.includes("图片解码代理")));
 });

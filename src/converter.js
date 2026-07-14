@@ -115,10 +115,12 @@ function proxiedJsonImageContent(imageProxyBase, decoder) {
     "var payload = (typeof result === \"string\") ? JSON.parse(result) : result;",
     "var images = payload && payload.data && Array.isArray(payload.data.images) ? payload.data.images : [];",
     `var endpoint = ${JSON.stringify(endpoint)};`,
-    "return images.map(function (item) {",
+    "var urls = images.map(function (item) {",
     "  var url = String((item && (item.url || item.src)) || \"\");",
-    "  return url ? '<img src=\"' + endpoint + encodeURIComponent(url) + '\">' : \"\";",
-    "}).filter(Boolean).join(\"\\n\");",
+    "  return url ? endpoint + encodeURIComponent(url) : \"\";",
+    "}).filter(Boolean);",
+    // 香色 comic 正文要求 URL 列表（或含 urls 的 JSON），不能返回 <img> HTML。
+    "return JSON.stringify({urls: urls.join(\"\\n\"), httpHeaders: {}});",
   ].join("\n");
 }
 
