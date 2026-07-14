@@ -173,7 +173,8 @@ function adaptMwwz(source) {
       // 原规则 href##(\d+)$##/api/... 只替换末尾 ID，会保留前面的
       // /comic/{bookId}/，最终得到一个必然 404 的拼接地址。
       chapterUrl: [
-        "href || @js:",
+        "href",
+        "@js:",
         "var m = String(result || \"\").match(/(\\d+)$/);",
         'return m ? config.host + "/api/comic/image/" + m[1] + "?page=1" : result;',
       ].join("\n"),

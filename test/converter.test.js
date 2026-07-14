@@ -253,7 +253,14 @@ test("漫蛙适配使用 config.host 的 API 详情与 HTML 目录", () => {
   assert.match(converted.bookWorld["热血"].detailUrl, /config\.host.*api\/comic/);
   assert.match(converted.chapterList.requestInfo, /config\.host.*\/comic\//);
   assert.match(converted.chapterList.url, /config\.host.*\/api\/comic\/image\//);
+  assert.match(converted.chapterList.url, /\/\/@href\|@js:/);
+  assert.doesNotMatch(converted.chapterList.url, /\|\|@js:/);
   assert.doesNotMatch(converted.chapterList.url, /replace\(new RegExp/);
+  const chapterUrlScript = converted.chapterList.url.split("|@js:")[1];
+  assert.equal(
+    new Function("result", "config", chapterUrlScript)("/comic/13827/2101951", converted.chapterList),
+    "https://www.mwwz.cc/api/comic/image/2101951?page=1",
+  );
   assert.equal(converted.bookDetail.tocUrl, undefined);
   assert.equal(converted.bookDetail.desc, "data/intro");
   assert.equal(converted.chapterContent.responseFormatType, "json");
