@@ -422,6 +422,7 @@ test("禁漫动态发现脚本转换为香色可见的静态分类", () => {
   assert.equal(converted.bookWorld["全部"].moreKeys.pageSize, 80);
   assert.match(converted.bookWorld["全部"].list, /list-col/);
   assert.match(converted.bookWorld["全部"].bookName, /video-title/);
+  assert.equal(converted.bookWorld["全部"].detailUrl, "//a/@href");
   assert.equal(converted.bookWorld["全部"].author, undefined);
   assert.equal(converted.bookDetail.requestInfo, "%@result");
   assert.doesNotMatch(JSON.stringify(converted.bookDetail), /java\.|Packages/);
