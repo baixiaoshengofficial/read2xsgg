@@ -39,6 +39,7 @@ export function serverConfig(environment = process.env) {
     allowPrivateNetworks: boolean(environment.ALLOW_PRIVATE_NETWORKS),
     allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS),
     corsOrigin: environment.CORS_ORIGIN || "*",
+    mwwzDiscoveryUrl: environment.MWWZ_DISCOVERY_URL || "https://www.manwake.cc/",
   };
 }
 
@@ -220,6 +221,73 @@ export async function downloadImage(imageUrl, decoder = "auto", config = serverC
   throw new HttpError(502, "下载图片失败");
 }
 
+function legacySourceList(input) {
+  if (Array.isArray(input)) return input;
+  if (!input || typeof input !== "object") return [];
+  if (input.bookSourceUrl || input.bookSourceName) return [input];
+  for (const key of ["sources", "bookSources", "data"]) {
+    if (Array.isArray(input[key])) return input[key];
+  }
+  return [];
+}
+
+function isMwwzSource(source) {
+  return /(?:mwwz|manwake|漫蛙)/i.test(String(source?.bookSourceUrl || ""))
+    && /(?:manwake|GLOBAL_IMAGE_ROUTES|api\/comic\/image)/i.test(String(source?.loginUrl || "") + String(source?.ruleContent?.imageDecode || ""));
+}
+
+export function mwwzMirrorCandidates(releasePage, baseUrl) {
+  const result = [];
+  for (const match of String(releasePage || "").matchAll(/<a\s+[^>]*href=["']([^"']+)["'][^>]*>/gi)) {
+    try {
+      const url = new URL(match[1], baseUrl);
+      if (/^https?:$/.test(url.protocol) && !result.includes(url.origin)) result.push(url.origin);
+    } catch {
+      // Ignore malformed published links and continue with the remaining mirrors.
+    }
+  }
+  return result;
+}
+
+async function resolveMwwzMirror(config) {
+  let discovery;
+  try {
+    discovery = await downloadSource(config.mwwzDiscoveryUrl, config);
+  } catch {
+    return "";
+  }
+  const candidates = mwwzMirrorCandidates(discovery.toString("utf8"), config.mwwzDiscoveryUrl);
+  for (const origin of candidates) {
+    try {
+      const body = await downloadSource(`${origin}/api/search?keyword=test&type=mh&page=1&pageSize=1`, config);
+      const parsed = JSON.parse(body.toString("utf8"));
+      if (Array.isArray(parsed?.data?.list)) return origin;
+    } catch {
+      // Mirrors frequently rotate; test the next published address.
+    }
+  }
+  return "";
+}
+
+async function adaptOnlineSources(input, config) {
+  const sources = legacySourceList(input);
+  if (!sources.some(isMwwzSource)) return input;
+  const mirror = await resolveMwwzMirror(config);
+  if (!mirror) return input;
+
+  const cloned = structuredClone(input);
+  for (const source of legacySourceList(cloned)) {
+    if (!isMwwzSource(source)) continue;
+    source.bookSourceUrl = mirror;
+    // The original header is a Legado @js expression. 香色 needs a concrete UA.
+    source.header = JSON.stringify({
+      "User-Agent": "Mozilla/5.0 (Linux; Android 9) Mobile Safari/537.36",
+      Referer: `${mirror}/`,
+    });
+  }
+  return cloned;
+}
+
 /**
  * 把路径里嵌套的阅读源地址还原成可抓取 URL。
  * 支持：
@@ -378,6 +446,7 @@ async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
   } catch (error) {
     throw new HttpError(422, `在线阅读源不是有效 JSON：${error.message}`);
   }
+  parsed = await adaptOnlineSources(parsed, config);
   let converted;
   try {
     converted = convertLegado(parsed, { imageProxyBase });

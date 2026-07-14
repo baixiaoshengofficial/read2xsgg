@@ -161,6 +161,54 @@ test("图片代理地址从本次 HTTPS 转换请求自动推导", async (contex
   assert.match(converted["加密漫画"].chapterContent.content, /https:\/\/xs\.example\.com\/image\/mwwz-aes\?url=/);
 });
 
+test("在线转换会发现并写入可用的漫蛙镜像", async (context) => {
+  const mwwzSource = {
+    ...source,
+    bookSourceName: "漫蛙镜像测试",
+    bookSourceUrl: "https://www.mwwz.cc",
+    bookSourceType: 2,
+    loginUrl: "const url = 'https://www.manwake.cc/';",
+    ruleContent: {
+      content: "@js:JSON.parse(src).data.images.map(x => `<img src=\"${x.url}\">`).join('\\n');",
+      imageDecode: "var iv = result.slice(0, 16); var key = java.strToBytes('0B6666A0-BB59-1381-B746-a0E4C9AC'); var cipher = java.createSymmetricCrypto(\"AES/CBC/PKCS5Padding\", key, iv); return cipher.decrypt(result.slice(16));",
+    },
+  };
+  let upstreamBase = "";
+  const upstream = createServer((request, response) => {
+    if (request.url === "/release") {
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end(`<div class="btnBox"><a href="${upstreamBase}/mirror">可用镜像</a></div>`);
+      return;
+    }
+    if (request.url?.startsWith("/api/search")) {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: { list: [] } }));
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(mwwzSource));
+  });
+  upstreamBase = await listen(upstream);
+  const app = createAppServer({
+    config: { ...serverConfig({}), allowPrivateNetworks: true, mwwzDiscoveryUrl: `${upstreamBase}/release` },
+  });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const response = await fetch(`${appBase}/convert.xbs?url=${encodeURIComponent(`${upstreamBase}/source.json`)}`);
+  assert.equal(response.status, 200);
+  const converted = JSON.parse(decodeXbs(Buffer.from(await response.arrayBuffer())).toString("utf8"));
+  const mirror = converted["漫蛙镜像测试"];
+  assert.equal(mirror.sourceUrl, upstreamBase);
+  assert.deepEqual(mirror.httpHeaders, {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 9) Mobile Safari/537.36",
+    Referer: `${upstreamBase}/`,
+  });
+});
+
 test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (context) => {
   const app = createAppServer({
     config: { ...serverConfig({}), allowPrivateNetworks: false, allowDnsProxyNetworks: true },
