@@ -160,17 +160,18 @@ node ./bin/server.js
 ```text
 {转换站}/image?url=https://cdn.example.com/image.jpg
 {转换站}/image/mwwz-aes?url=https://cdn.example.com/encrypted-image
+{转换站}/image/jm-scramble?url=https://cdn.example.com/photos/230000/1.jpg
 ```
 
-`/image` 会直通 JPEG、PNG、GIF、WebP 等常见图片，并尝试已注册的解码器；`/image/mwwz-aes` 明确使用猕猴桃漫画的 AES-256-CBC 规则。代理只会返回验证过图片文件头的结果，且与在线转换一样禁止访问内网地址。
+`/image` 会直通 JPEG、PNG、GIF、WebP 等常见图片，并尝试已注册的解码器；`/image/mwwz-aes` 明确使用猕猴桃漫画的 AES-256-CBC 规则；`/image/jm-scramble` 按禁漫天堂的书号、图片号计算分块数后重组纵向图片块，并输出 PNG。代理只会返回验证过图片文件头的结果，且与在线转换一样禁止访问内网地址。
 
-在线转换时，已识别的猕猴桃漫画 `imageDecode` 会自动改写为代理图片链接。若部署在 Nginx、Caddy、Cloudflare Tunnel 等反向代理之后，请设置对外访问地址，否则生成源会把容器内的 `http://host:port` 写进图片链接：
+在线转换时，已识别的猕猴桃漫画 AES、禁漫天堂 Canvas 重排 `imageDecode` 会自动改写为代理图片链接。若部署在 Nginx、Caddy、Cloudflare Tunnel 等反向代理之后，请设置对外访问地址，否则生成源会把容器内的 `http://host:port` 写进图片链接：
 
 ```bash
 PUBLIC_BASE_URL=https://xs.example.com docker compose up -d
 ```
 
-解码器采用注册机制；AES 等字节级算法可通用加入。依赖 `BitmapFactory`、`Canvas` 的 Android 像素拼图规则无法自动执行，仍需要针对站点实现服务端适配器。
+解码器采用注册机制；AES 等字节级算法可通用加入。禁漫天堂的 `BitmapFactory`、`Canvas` 规则已由服务端像素重排适配；其他站点的 Android 像素拼图仍需要按其算法新增适配器。
 
 ### 服务配置
 

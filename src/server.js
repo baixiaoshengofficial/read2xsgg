@@ -212,7 +212,7 @@ export async function downloadImage(imageUrl, decoder = "auto", config = serverC
       continue;
     }
     try {
-      return { ...decodeImage(result.buffer, decoder), upstreamUrl: current.toString() };
+      return { ...await decodeImage(result.buffer, decoder, { url: current.toString() }), upstreamUrl: current.toString() };
     } catch (error) {
       if (error instanceof ImageDecodeError) throw new HttpError(422, `图片无法解码：${error.message}`);
       throw error;

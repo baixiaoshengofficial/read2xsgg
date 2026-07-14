@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createCipheriv } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
+import { Jimp, JimpMime } from "jimp";
 import { createAppServer, decodeXbs, normalizeEmbeddedSourceUrl, serverConfig } from "../src/index.js";
 
 const source = {
@@ -146,9 +147,17 @@ test("图片代理直通普通图片，并可解开已注册的 AES 图片", asy
   const iv = Buffer.alloc(16, 7);
   const cipher = createCipheriv("aes-256-cbc", Buffer.from("0B6666A0-BB59-1381-B746-a0E4C9AC"), iv);
   const encrypted = Buffer.concat([iv, cipher.update(plain), cipher.final()]);
+  const originalPixels = Buffer.alloc(10 * 4);
+  for (let row = 0; row < 10; row += 1) originalPixels.writeUInt32BE(((row + 1) << 24) | 0x0000ff, row * 4);
+  // bookId 230000 uses the fixed 10-tile rule, so every one-pixel row is reversed.
+  const scrambledPixels = Buffer.alloc(originalPixels.length);
+  for (let row = 0; row < 10; row += 1) {
+    originalPixels.copy(scrambledPixels, row * 4, (9 - row) * 4, (10 - row) * 4);
+  }
+  const scrambled = await Jimp.fromBitmap({ data: scrambledPixels, width: 1, height: 10 }).getBuffer(JimpMime.png);
   const upstream = createServer((request, response) => {
     response.writeHead(200, { "Content-Type": "application/octet-stream" });
-    response.end(request.url === "/encrypted" ? encrypted : plain);
+    response.end(request.url === "/encrypted" ? encrypted : request.url?.startsWith("/photos/") ? scrambled : plain);
   });
   const upstreamBase = await listen(upstream);
   const app = createAppServer({
@@ -171,4 +180,11 @@ test("图片代理直通普通图片，并可解开已注册的 AES 图片", asy
   assert.equal(decoded.headers.get("content-type"), "image/jpeg");
   assert.equal(decoded.headers.get("x-image-decoder"), "mwwz-aes");
   assert.deepEqual(Buffer.from(await decoded.arrayBuffer()), plain);
+
+  const jm = await fetch(`${appBase}/image/jm-scramble?url=${encodeURIComponent(`${upstreamBase}/photos/230000/1.jpg`)}`);
+  assert.equal(jm.status, 200);
+  assert.equal(jm.headers.get("content-type"), "image/png");
+  assert.equal(jm.headers.get("x-image-decoder"), "jm-scramble");
+  const restored = await Jimp.read(Buffer.from(await jm.arrayBuffer()));
+  assert.deepEqual(Buffer.from(restored.bitmap.data), originalPixels);
 });

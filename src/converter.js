@@ -115,6 +115,27 @@ function proxiedJsonImageContent(imageProxyBase, decoder) {
   ].join("\n");
 }
 
+/** Replace Legado's baseUrl/src image-wrapper JS with portable 香色 image markup. */
+function proxiedLineImageContent(contentRule, imageProxyBase, decoder) {
+  const selector = String(contentRule || "").split("|@js:", 1)[0];
+  const endpoint = `${String(imageProxyBase).replace(/\/$/, "")}/image/${decoder}?url=`;
+  const proxyJs = [
+    "@js:",
+    "var text = String(result || \"\").trim();",
+    "if (!text) return text;",
+    `var endpoint = ${JSON.stringify(endpoint)};`,
+    "var toImage = function (url) { return '<img src=\"' + endpoint + encodeURIComponent(url) + '\">'; };",
+    "if (/<img\\s/i.test(text)) {",
+    "  return text.replace(/(<img\\b[^>]*\\bsrc=[\"'])([^\"']+)([\"'])/gi, function (_, before, url, after) {",
+    "    return before + endpoint + encodeURIComponent(url) + after;",
+    "  });",
+    "}",
+    "var urls = text.split(/\\r?\\n+/).map(function (line) { return line.trim(); }).filter(function (url) { return /^https?:\\/\\//i.test(url); });",
+    "return urls.length ? urls.map(toImage).join(\"\\n\") : text;",
+  ].join("\n");
+  return selector ? `${selector}|${proxyJs}` : proxyJs;
+}
+
 function xsggModifyTime(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) return String(Math.floor(Date.now() / 1000));
@@ -340,10 +361,12 @@ function convertOne(source, warnings, options = {}) {
       warn: contentWarningFor("content", contentRules.content),
     })
     : undefined;
-  if (imageDecoder && options.imageProxyBase && resolvedType === "comic") {
+  if (imageDecoder === "mwwz-aes" && options.imageProxyBase && resolvedType === "comic") {
     // This API returns JSON {data:{images:[{url}]}}. Rebuild the small result in
     // 香色 JS instead of preserving Legado's src/source.getVariable() runtime calls.
     content = proxiedJsonImageContent(options.imageProxyBase, imageDecoder);
+  } else if (imageDecoder === "jm-scramble" && options.imageProxyBase && resolvedType === "comic") {
+    content = proxiedLineImageContent(content, options.imageProxyBase, imageDecoder);
   } else if (content && resolvedType === "comic") {
     content = wrapComicImageContent(content);
   }

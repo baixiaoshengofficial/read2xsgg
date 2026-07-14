@@ -275,6 +275,28 @@ test("可识别的 AES 图片规则通过公开代理改写为香色图片正文
   assert.ok(warnings.some((warning) => warning.message.includes("图片解码代理")));
 });
 
+test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标签", () => {
+  const source = {
+    bookSourceName: "禁漫测试",
+    bookSourceUrl: "https://jm.example.com/",
+    bookSourceType: 2,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
+    ruleContent: {
+      content: "{{@class.row@tag.img@data-original}}\n@js:var url = baseUrl; result;",
+      imageDecode: "var bookId = 1; var imgId = 2; var img = BitmapFactory.decodeByteArray(result, 0, result.length); var canvas = new Canvas(img);",
+    },
+  };
+  const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example.com" });
+  const content = sources["禁漫测试"].chapterContent.content;
+  assert.match(content, /https:\/\/convert\.example\.com\/image\/jm-scramble\?url=/);
+  assert.match(content, /encodeURIComponent\(url\)/);
+  assert.doesNotMatch(content, /baseUrl/);
+  assert.ok(warnings.some((warning) => warning.message.includes("jm-scramble")));
+});
+
 test("有声源保留 audio 类型，正文包装为播放 JSON", () => {
   const source = {
     bookSourceName: "示例如声",
