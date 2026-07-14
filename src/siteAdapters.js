@@ -190,9 +190,9 @@ function adaptJm(source) {
   const portableSearchRules = Object.fromEntries(Object.entries(ruleSearch).filter(([, rule]) => (
     typeof rule !== "string" || !/\b(?:java|Packages)\s*[.(]/.test(rule)
   )));
-  // 香色的 bookWorld 项上下文中，(.//a)[1]/@href 常会取空；使用普通
-  // //a/@href 才会把分类卡片的详情地址写入 queryInfo.detailUrl。
-  portableSearchRules.bookUrl = "tag.a@href";
+  // 每张禁漫卡片里含点赞/收藏等多个 a；只允许真正的 /album/ 详情链接。
+  // 同时避免 (.//a)[1]/@href 在香色 bookWorld 上下文中取空的问题。
+  portableSearchRules.bookUrl = "a[href~=/album/]@href";
   const ruleToc = source.ruleToc ?? source.tocRule ?? {};
   return {
     ...source,
