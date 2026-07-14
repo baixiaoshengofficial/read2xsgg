@@ -485,7 +485,8 @@ function convertOne(source, warnings, options = {}) {
     },
     chapterContent: {
       ...commonAction("chapterContent", host, contentResponseType),
-      requestInfo: "%@result",
+      // 禁漫正文 URL 与详情/目录一样必须从香色运行时上下文取值，不能裸用 %@result。
+      requestInfo: isJmComic ? nativeJmRequestInfo() : "%@result",
       ...(content !== undefined ? { content } : {}),
       ...((contentRules.nextContentUrl || contentRules.nextUrl) ? {
         nextPageUrl: convertRule(contentRules.nextContentUrl || contentRules.nextUrl, {

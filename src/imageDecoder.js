@@ -1,4 +1,5 @@
 import { createDecipheriv, createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { Jimp, JimpMime } from "jimp";
 
 const MWWZ_AES_KEY = Buffer.from("0B6666A0-BB59-1381-B746-a0E4C9AC", "utf8");
@@ -34,6 +35,50 @@ function jmTileCount(bookId, imageId) {
   return bookNumber > 421925 ? (tailAscii % 8 + 1) * 2 : (tailAscii % 10 + 1) * 2;
 }
 
+/**
+ * Jimp 1.x cannot decode WebP, while 禁漫的当前 CDN primarily returns WebP.
+ * ImageMagick is installed in the production image and is used only as a byte
+ * format bridge; tile reassembly remains deterministic JavaScript below.
+ */
+function imageMagickConvert(command, buffer) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(command, ["webp:-", "png:-"], { stdio: ["pipe", "pipe", "pipe"] });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const chunks = [];
+    const errors = [];
+    child.stdout.on("data", (chunk) => chunks.push(chunk));
+    child.stderr.on("data", (chunk) => errors.push(chunk));
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0 && chunks.length) {
+        resolve(Buffer.concat(chunks));
+        return;
+      }
+      reject(new Error(Buffer.concat(errors).toString("utf8").trim() || `${command} exited with code ${code}`));
+    });
+    child.stdin.once("error", reject);
+    child.stdin.end(buffer);
+  });
+}
+
+async function webpToPng(buffer) {
+  let lastError;
+  // ImageMagick 7 uses `magick`; some minimal images expose only `convert`.
+  for (const command of ["magick", "convert"]) {
+    try {
+      return await imageMagickConvert(command, buffer);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new ImageDecodeError(`无法解码 WebP 图片：${lastError?.message || "ImageMagick 不可用"}`);
+}
+
 /** Reproduce 禁漫天堂's Android Canvas vertical tile reversal using RGBA pixels. */
 async function jmScramble(buffer, { url } = {}) {
   if (/qyyuapi\.com/i.test(String(url || "")) || imageMimeType(buffer) === "image/gif") return buffer;
@@ -49,9 +94,10 @@ async function jmScramble(buffer, { url } = {}) {
   const tiles = jmTileCount(bookId, imageId);
   if (!tiles) return buffer;
 
+  const input = imageMimeType(buffer) === "image/webp" ? await webpToPng(buffer) : buffer;
   let image;
   try {
-    image = await Jimp.read(buffer);
+    image = await Jimp.read(input);
   } catch (error) {
     throw new ImageDecodeError(`无法读取禁漫图片：${error.message}`);
   }

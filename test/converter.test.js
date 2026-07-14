@@ -374,6 +374,7 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
   assert.match(content, /https:\/\/convert\.example\.com\/image\/jm-scramble\?url=/);
   assert.match(content, /encodeURIComponent\(url\)/);
   assert.doesNotMatch(content, /baseUrl/);
+  assert.match(sources["禁漫测试"].chapterContent.requestInfo, /params\.queryInfo/);
   assert.ok(warnings.some((warning) => warning.message.includes("jm-scramble")));
   const chapterList = sources["禁漫测试"].chapterList;
   assert.equal(chapterList.responseFormatType, "html");

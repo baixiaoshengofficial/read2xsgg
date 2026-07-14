@@ -7,7 +7,8 @@ ENV NODE_ENV=production \
     PORT=3000
 
 COPY package.json package-lock.json LICENSE README.md ./
-RUN npm ci --omit=dev
+RUN apk add --no-cache imagemagick libwebp-tools \
+    && npm ci --omit=dev
 
 COPY --chown=node:node package.json package-lock.json LICENSE README.md ./
 COPY --chown=node:node bin ./bin
