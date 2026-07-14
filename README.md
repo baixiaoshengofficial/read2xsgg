@@ -8,11 +8,12 @@
 ## 功能
 
 - 支持单个书源、书源数组，以及常见的 `sources` / `bookSources` 包装格式。
-- 转换搜索、详情、目录、正文和发现页规则。
-- 转换 XPath、JSONPath、阅读的 Jsoup 链式选择器以及常见 CSS 选择器。
+- 按阅读 `bookSourceType` 映射香色 `sourceType`：`0→text`、`1→audio`、`2→comic`（文件源 `3` 按 text 输出并告警）。
+- 转换搜索、详情、目录、正文和发现页规则；漫画源会对图片 URL 正文做 `<img>` 包装；有声源会把媒体 URL 包装为香色播放用的 `{url, httpHeaders, forbidCache}` JSON。
+- 转换 XPath、JSONPath、阅读的 Jsoup 链式选择器、常见 CSS，以及 `{{@sel}}` / `{{Get('url')}}` 一类 Mustache 模板（登录分流回退为 `config.host`）。
 - 转换 GET、POST、请求头、表单参数、关键字/页码模板和 GBK 编码配置。
 - 原生生成 XXTEA 加密的 `.xbs`，不依赖外部转换程序。
-- 对无法无损翻译的阅读 JS、递归 JSONPath、详情 `init` 等规则生成结构化告警。
+- 对无法无损翻译的阅读 JS、`imageDecode`、登录 UI、递归 JSONPath、详情 `init` 等规则生成结构化告警。
 - 输入既可以是本地文件、URL，也可以来自标准输入。
 - 提供 HTTP 在线转换服务，香色闺阁可以直接订阅转换 URL。
 - 提供 Docker Compose 一键部署、健康检查、缓存、并发控制和 SSRF 防护。

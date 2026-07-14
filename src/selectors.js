@@ -269,13 +269,61 @@ function appendRegexReplacement(converted, suffix, warn) {
     return converted;
   }
 
+  let safeReplacement = replacement;
+  if (/\{\{\s*(?:Get|get)\s*\(/i.test(safeReplacement)) {
+    warn("替换结果含 Get(...) 登录变量，已去掉该片段；镜像/分流参数请在香色中手工配置");
+    safeReplacement = safeReplacement.replace(/\{\{\s*(?:Get|get)\(\s*['"][^'"]+['"]\s*\)\s*\}\}/gi, "");
+  }
+
   try {
     // Validate only. The expression itself is executed by 香色闺阁.
     new RegExp(pattern);
   } catch {
     warn("清理正则无法解析，已原样写入转换结果");
   }
-  return `${converted}|@js:\nreturn String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(replacement)});`;
+  return `${converted}|@js:\nreturn String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(safeReplacement)});`;
+}
+
+/**
+ * 展开阅读 Mustache：
+ * - {{@sel}} / {{@@sel}} → 选择器本身
+ * - 多行 Mustache → || 备选
+ * - 末尾 @js / <js> 仍接到后续 convertRule 处理
+ */
+function expandMustacheRule(rule, warn) {
+  const trimmed = rule.trim();
+  if (!/\{\{/.test(trimmed)) return trimmed;
+
+  const mustacheOnly = /^\s*(?:\{\{[\s\S]*?\}\}\s*)+(?:(?:@js:|<js>)[\s\S]*)?$/i.test(trimmed);
+  if (!mustacheOnly && !/\{\{\s*@/.test(trimmed)) return trimmed;
+
+  const fragments = [];
+  let trailingJs = "";
+  const jsMatch = trimmed.match(/((?:@js:|<js>)[\s\S]*)$/i);
+  let body = trimmed;
+  if (jsMatch) {
+    trailingJs = jsMatch[1].trim();
+    body = trimmed.slice(0, jsMatch.index).trim();
+  }
+
+  for (const match of body.matchAll(/\{\{\s*(@?@?)([\s\S]*?)\}\}/g)) {
+    const marks = match[1] || "";
+    let inner = match[2].trim();
+    if (!inner) continue;
+    if (/^(?:Get|get)\s*\(/i.test(inner)) {
+      warn(`规则中的 {{${marks}${inner}}} 依赖阅读登录变量，无法自动转换`);
+      continue;
+    }
+    // {{@@sel}} = 全部匹配；香色用同一选择器，由客户端聚合
+    if (marks === "@@") {
+      warn("阅读 {{@@...}}（全部匹配）已按普通选择器转换，聚合语义请实测");
+    }
+    fragments.push(inner);
+  }
+
+  if (!fragments.length) return trimmed;
+  const joined = fragments.join("||");
+  return trailingJs ? `${joined}\n${trailingJs}` : joined;
 }
 
 function looksLikeJsonPath(value) {
@@ -350,8 +398,13 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   if (rule === undefined || rule === null) return "";
   if (Array.isArray(rule)) return rule.map((item) => convertRule(item, { responseType, warn })).join("||");
   if (typeof rule !== "string") return String(rule);
-  const trimmed = rule.trim();
+  let trimmed = rule.trim();
   if (!trimmed) return "";
+
+  if (/\{\{/.test(trimmed)) {
+    trimmed = expandMustacheRule(trimmed, warn);
+    if (!trimmed) return "";
+  }
 
   if (/^(?:@js:|<js>)/i.test(trimmed)) {
     warn("阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查");

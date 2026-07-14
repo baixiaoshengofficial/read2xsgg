@@ -1,0 +1,98 @@
+{
+  "UAA小说": {
+    "sourceName": "UAA小说",
+    "sourceUrl": "https://www.uaa.com",
+    "weight": "50",
+    "enable": 1,
+    "desc": "https://www.uaa.com 成人小说站。全站 Cloudflare，已启用 webView。游客可看免费章；注册/VIP 章多仅预览或付费。",
+    "password": "",
+    "miniAppVersion": "2.56.1",
+    "lastModifyTime": "1784005127.968",
+    "sourceType": "text",
+    "authorId": "",
+    "httpHeaders": {
+      "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh-Hans;q=0.9"
+    },
+    "searchBook": {
+      "actionID": "searchBook",
+      "parserID": "DOM",
+      "responseFormatType": "html",
+      "host": "https://www.uaa.com",
+      "requestInfo": "@js:\nvar url = config.host + \"/novel/list?searchType=1&keyword=\" + encodeURIComponent(params.keyWord) + \"&page=\" + (params.pageIndex || 1);\nreturn {\n  url: url,\n  webView: true,\n  webViewJsDelay: 2.5,\n  webViewSkipUrls: [\n    \"cloudflareinsights.com\",\n    \"googletagmanager.com\",\n    \"google-analytics.com\",\n    \"aizhantj.com\",\n    \"doubleclick.net\"\n  ],\n  httpHeaders: config.httpHeaders\n};",
+      "list": "//div[contains(@class,\"novel_list_box\")]//li[contains(@class,\"novel_li_2\")]",
+      "bookName": ".//div[@class=\"title\"]/a",
+      "author": ".//div[contains(@class,\"info_box\")][contains(.,\"作者\")]/a",
+      "cover": ".//img[contains(@class,\"cover\")]/@src",
+      "detailUrl": ".//div[@class=\"title\"]/a/@href",
+      "status": ".//div[@class=\"state\"]",
+      "cat": ".//div[contains(@class,\"info_box\")][contains(.,\"题材\")]/a[1]",
+      "desc": ".//div[contains(@class,\"info_box\")][contains(.,\"简介\")] |@js:\nreturn String(result || \"\").replace(/^\\s*简介[：:]\\s*/, \"\").trim();",
+      "lastChapterTitle": ".//div[@class=\"update_desc\"]",
+      "wordCount": ".//div[@class=\"other_box\"]/*[contains(.,\"字\")]",
+      "moreKeys": {
+        "pageSize": 12,
+        "maxPage": 50
+      },
+      "validConfig": ""
+    },
+    "bookDetail": {
+      "actionID": "bookDetail",
+      "parserID": "DOM",
+      "responseFormatType": "html",
+      "host": "https://www.uaa.com",
+      "requestInfo": "@js:\nvar url = (typeof result === \"string\" ? result : (result && (result.detailUrl || result.url)) || \"\");\nreturn {\n  url: url,\n  webView: true,\n  webViewJsDelay: 2.5,\n  webViewSkipUrls: [\n    \"cloudflareinsights.com\",\n    \"googletagmanager.com\",\n    \"google-analytics.com\",\n    \"aizhantj.com\",\n    \"doubleclick.net\"\n  ],\n  httpHeaders: config.httpHeaders\n};",
+      "bookName": "//div[contains(@class,\"novel_box\")]//h1",
+      "author": "//div[contains(@class,\"novel_box\")]//div[@class=\"item\"][contains(.,\"作者\")]/a",
+      "cover": "//meta[@property=\"og:image\"]/@content || //div[contains(@class,\"novel_box\")]//img[contains(@class,\"cover\")]/@src",
+      "desc": "//meta[@property=\"og:description\"]/@content || //meta[@name=\"description\"]/@content",
+      "cat": "//div[contains(@class,\"novel_box\")]//div[@class=\"item\"][contains(.,\"题材\")]/a[1]",
+      "status": "//span[contains(@class,\"update_state\")] |@js:\nreturn String(result || \"\").replace(/^\\s*状态[：:]\\s*/, \"\").trim();",
+      "lastChapterTitle": "//div[contains(@class,\"novel_box\")]//div[@class=\"item\"][contains(.,\"最新\")] |@js:\nreturn String(result || \"\").replace(/^\\s*最新[：:]\\s*/, \"\").replace(/（[^）]*）\\s*$/, \"\").trim();",
+      "validConfig": ""
+    },
+    "chapterList": {
+      "actionID": "chapterList",
+      "parserID": "DOM",
+      "responseFormatType": "html",
+      "host": "https://www.uaa.com",
+      "requestInfo": "@js:\nvar url = (typeof result === \"string\" ? result : (result && (result.detailUrl || result.url)) || \"\");\nreturn {\n  url: url,\n  webView: true,\n  webViewJsDelay: 2.5,\n  webViewSkipUrls: [\n    \"cloudflareinsights.com\",\n    \"googletagmanager.com\",\n    \"google-analytics.com\",\n    \"aizhantj.com\",\n    \"doubleclick.net\"\n  ],\n  httpHeaders: config.httpHeaders\n};",
+      "list": "//ul[contains(@class,\"catalog_ul\")]/li[contains(@class,\"menu\")]",
+      "title": "./a",
+      "url": "./a/@href",
+      "validConfig": ""
+    },
+    "chapterContent": {
+      "actionID": "chapterContent",
+      "parserID": "DOM",
+      "responseFormatType": "html",
+      "host": "https://www.uaa.com",
+      "requestInfo": "@js:\nvar url = (typeof result === \"string\" ? result : (result && (result.url || result.detailUrl)) || \"\");\nreturn {\n  url: url,\n  webView: true,\n  webViewJsDelay: 2.5,\n  webViewSkipUrls: [\n    \"cloudflareinsights.com\",\n    \"googletagmanager.com\",\n    \"google-analytics.com\",\n    \"aizhantj.com\",\n    \"doubleclick.net\"\n  ],\n  httpHeaders: config.httpHeaders\n};",
+      "content": "//div[contains(@class,\"article\")] |@js:\nvar t = String(result || \"\").trim();\nif (!t || /此章节为付费章节/.test(t)) {\n  return \"（本章需登录/VIP 或付费解锁，游客仅可阅读免费章节）\";\n}\nreturn t;",
+      "validConfig": ""
+    },
+    "bookWorld": {},
+    "shudanList": {},
+    "shudanDetail": {
+      "actionID": "shudanDetail",
+      "parserID": "DOM"
+    },
+    "shupingList": {
+      "actionID": "shupingList",
+      "parserID": "DOM"
+    },
+    "shupingHome": {
+      "actionID": "shupingHome",
+      "parserID": "DOM"
+    },
+    "searchShudan": {
+      "actionID": "searchShudan",
+      "parserID": "DOM"
+    },
+    "relatedWord": {
+      "actionID": "relatedWord",
+      "parserID": "DOM"
+    }
+  }
+}

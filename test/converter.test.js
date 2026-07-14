@@ -166,3 +166,120 @@ test("CLI 可从标准输入读取并输出 JSON", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout)["示例书源"].sourceName, "示例书源");
 });
+
+test("bookSourceType 映射为香色 sourceType，weight 不为 0", () => {
+  const cases = [
+    [0, "text"],
+    [1, "audio"],
+    [2, "comic"],
+    [3, "text"],
+  ];
+  for (const [bookSourceType, expect] of cases) {
+    const source = structuredClone(sampleSource);
+    source.bookSourceName = `类型${bookSourceType}`;
+    source.bookSourceType = bookSourceType;
+    source.customOrder = 0;
+    source.exploreUrl = "";
+    const { sources } = convertLegado([source]);
+    const converted = sources[`类型${bookSourceType}`];
+    assert.equal(converted.sourceType, expect);
+    assert.notEqual(converted.weight, "0");
+    assert.match(converted.weight, /^[1-9]\d*$/);
+  }
+});
+
+test("Mustache {{@sel}} 与 Get('url') 请求可转换", () => {
+  assert.equal(
+    convertRule("{{@class.video-title@text}}"),
+    "//*[contains(concat(' ', normalize-space(@class), ' '), ' video-title ')]/text()",
+  );
+  const multi = convertRule(
+    "{{@class.novel-content@html}}\n{{@class.row thumb-overlay-albums@tag.img@data-original}}\n@js:\nreturn result;",
+  );
+  assert.match(multi, /novel-content/);
+  assert.match(multi, /data-original/);
+  assert.match(multi, /\|@js:/);
+
+  const req = convertRequest(
+    "{{Get('url')}}/search/photos?search_query={{key}}&page={{page}}",
+    { warn() {} },
+  );
+  assert.match(req.requestInfo, /config\.host/);
+  assert.match(req.requestInfo, /params\.keyWord/);
+  assert.match(req.requestInfo, /params\.pageIndex/);
+  assert.match(req.requestInfo, /return \{/);
+});
+
+test("漫画源保留 comic 类型，图片 URL 包成 img，并告警 imageDecode", () => {
+  const source = {
+    bookSourceName: "示例漫画",
+    bookSourceUrl: "https://comic.example.com/",
+    bookSourceType: 2,
+    customOrder: 10,
+    searchUrl: "{{Get('url')}}/search?q={{key}}&page={{page}}",
+    loginUrl: "https://comic.example.com/login",
+    ruleSearch: {
+      bookList: ".list-item",
+      name: ".video-title@text",
+      bookUrl: "tag.a.0@href",
+      coverUrl: "img@data-original||img@src",
+    },
+    ruleBookInfo: {
+      name: "h1@text",
+      tocUrl: "baseUrl",
+    },
+    ruleToc: {
+      chapterList: ".reading",
+      chapterName: "text",
+      chapterUrl: "href##(.*)##$1/?shunt={{Get('shunt')}}",
+    },
+    ruleContent: {
+      content: "{{@class.row@tag.img@data-original}}",
+      imageDecode: "JavaImporter...",
+      imageStyle: "FULL",
+    },
+  };
+  const { sources, warnings } = convertLegado([source]);
+  const converted = sources["示例漫画"];
+  assert.equal(converted.sourceType, "comic");
+  assert.equal(converted.chapterList.requestInfo, "%@result");
+  assert.equal(converted.bookDetail.tocUrl, undefined);
+  assert.match(converted.searchBook.requestInfo, /config\.host/);
+  assert.match(converted.chapterContent.content, /data-original/);
+  assert.match(converted.chapterContent.content, /<img src=/);
+  assert.match(converted.chapterList.url, /shunt=/);
+  assert.doesNotMatch(converted.chapterList.url, /\{\{Get/);
+  assert.ok(warnings.some((w) => w.field === "imageDecode"));
+  assert.ok(warnings.some((w) => w.field === "loginUrl"));
+});
+
+test("有声源保留 audio 类型，正文包装为播放 JSON", () => {
+  const source = {
+    bookSourceName: "示例如声",
+    bookSourceUrl: "https://audio.example.com/",
+    bookSourceType: 1,
+    customOrder: 8,
+    searchUrl: "https://audio.example.com/search?q={{key}}&page={{page}}",
+    ruleSearch: {
+      bookList: ".item",
+      name: "a@text",
+      bookUrl: "a@href",
+    },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: {
+      chapterList: ".chapter a",
+      chapterName: "text",
+      chapterUrl: "href",
+    },
+    ruleContent: {
+      content: "audio@src||.play-btn@data-url",
+    },
+  };
+  const { sources } = convertLegado([source]);
+  const converted = sources["示例如声"];
+  assert.equal(converted.sourceType, "audio");
+  assert.match(converted.chapterContent.content, /audio\/@src|\/\/audio\/@src/);
+  assert.match(converted.chapterContent.content, /JSON\.stringify/);
+  assert.match(converted.chapterContent.content, /forbidCache/);
+  assert.match(converted.chapterContent.content, /encodeURI/);
+});

@@ -25,7 +25,78 @@ function cleanBaseUrl(value) {
 function sourceType(type) {
   if (type === 1 || type === "1") return "audio";
   if (type === 2 || type === "2") return "comic";
-  return undefined;
+  // 阅读无独立「影视」类型；香色 video 保留给手工/扩展源。文件源(3)按文本输出。
+  if (type === 3 || type === "3") return "text";
+  return "text";
+}
+
+function sourceWeight(source) {
+  const raw = source.customOrder ?? source.weight ?? 100;
+  const numeric = Number(raw);
+  // 香色 2.56+：weight "0" 视为不可用，无法切换到该站点。
+  if (!Number.isFinite(numeric) || numeric <= 0) return "100";
+  return String(Math.min(9999, Math.floor(numeric)));
+}
+
+function isDetailUrlAlias(rule) {
+  const value = String(rule ?? "").trim();
+  return /^(?:baseUrl|-|%@result)$/i.test(value);
+}
+
+/** 漫画正文：若规则取出的是图片 URL 列表，包成 <img> 供香色 comic 渲染。 */
+function wrapComicImageContent(contentRule) {
+  if (!contentRule || /<img\s/i.test(contentRule)) return contentRule;
+  if (!/@(?:src|data-original|data-src)\b/i.test(contentRule) && !/\/@(?:src|data-original|data-src)\b/i.test(contentRule)) {
+    return contentRule;
+  }
+  if (/\|@js:/.test(contentRule)) return contentRule;
+  const wrapJs = [
+    "@js:",
+    "var text = String(result || \"\").trim();",
+    "if (!text) return text;",
+    "if (/<img\\s/i.test(text)) return text;",
+    "return text.split(/\\r?\\n+/).map(function (line) {",
+    "  line = line.trim();",
+    "  if (!line) return \"\";",
+    "  if (/^https?:\\/\\//i.test(line) || line.charAt(0) === \"/\") {",
+    "    return \"<img src=\\\"\" + line + \"\\\">\";",
+    "  }",
+    "  return line;",
+    "}).filter(Boolean).join(\"\\n\");",
+  ].join("\n");
+  return `${contentRule}|${wrapJs}`;
+}
+
+/**
+ * 有声正文：香色 audio 期望 content 最终给出可播媒体。
+ * 参考官方样例（海洋听书/老白故事）：返回 JSON 字符串 {url, httpHeaders, forbidCache}。
+ */
+function wrapAudioContent(contentRule) {
+  if (!contentRule) return contentRule;
+  // 已显式构造播放 JSON 的 JS，不再二次包装
+  if (/JSON\.stringify\s*\(\s*\{[\s\S]*\burl\b/i.test(contentRule)) return contentRule;
+  if (/forbidCache/i.test(contentRule) && /\burl\s*:/i.test(contentRule)) return contentRule;
+  const wrapJs = [
+    "@js:",
+    "var url = String(result || \"\").trim();",
+    "if (!url) return url;",
+    "if (url.charAt(0) === \"{\") return url;",
+    // 正文里偶发 <audio src> / 纯链接混排，取第一个像媒体的 URL
+    "var m = url.match(/https?:\\/\\/[^\\s\"'<>]+\\.(?:mp3|m4a|aac|ogg|wav|flac)(?:\\?[^\\s\"'<>]*)?/i)",
+    "  || url.match(/https?:\\/\\/[^\\s\"'<>]+/i)",
+    "  || (url.charAt(0) === \"/\" ? [null, url] : null);",
+    "if (m) url = m[1] || m[0];",
+    "return JSON.stringify({",
+    "  url: encodeURI(url),",
+    "  httpHeaders: config.httpHeaders,",
+    "  forbidCache: true",
+    "});",
+  ].join("\n");
+  if (/\|@js:/.test(contentRule)) {
+    // 已有后处理：在末尾再叠一层播放包装（香色多段 |@js 取最后 result 链）
+    return `${contentRule}|${wrapJs}`;
+  }
+  return `${contentRule}|${wrapJs}`;
 }
 
 function xsggModifyTime(value) {
@@ -171,11 +242,27 @@ function convertOne(source, warnings) {
   if (source.bookSourceType === 3 || source.bookSourceType === "3") {
     warningForSource("bookSourceType", source.bookSourceType)("阅读的文件源类型在香色中没有直接等价类型，已按普通文本源输出");
   }
+  if (source.loginUrl || source.loginUi || source.loginCheckJs) {
+    warningForSource("loginUrl", source.loginUrl || source.loginUi)(
+      "阅读源含登录/分流 UI（loginUrl/loginUi），香色无等价流程；Get('url') 已尽量回退为 config.host，镜像与登录态需手工处理",
+    );
+  }
 
   const searchRules = getRules(source, "ruleSearch", "searchRule");
   const detailRules = getRules(source, "ruleBookInfo", "bookInfoRule");
   const tocRules = getRules(source, "ruleToc", "tocRule");
   const contentRules = getRules(source, "ruleContent", "contentRule");
+  const resolvedType = sourceType(source.bookSourceType);
+  if (contentRules.imageDecode) {
+    createWarningCollector(warnings, sourceName, "chapterContent")("imageDecode", contentRules.imageDecode)(
+      "阅读 imageDecode（常见于漫画图片解扰）在香色无 Android 图形库，已忽略；混淆图需专用适配或手工规则",
+    );
+  }
+  if (contentRules.imageStyle) {
+    createWarningCollector(warnings, sourceName, "chapterContent")("imageStyle", contentRules.imageStyle)(
+      "阅读 imageStyle 在香色无直接字段，已忽略",
+    );
+  }
   const context = { host, headers, warnings, sourceName };
 
   const detailResponseType = inferResponseType(detailRules);
@@ -197,36 +284,57 @@ function convertOne(source, warnings) {
   const requestInfoOverride = chapterListRequestInfoOverride(source);
   let chapterListRequestInfo = requestInfoOverride || "%@result";
   if (detailRules.tocUrl) {
-    bookDetail.tocUrl = convertRule(detailRules.tocUrl, {
-      responseType: detailResponseType,
-      warn: detailWarningFor("tocUrl", detailRules.tocUrl),
-    });
-    if (!requestInfoOverride) {
-      // 非官方字段兜底：部分客户端若把 tocUrl 写入 queryInfo 则可直连目录
-      chapterListRequestInfo = [
-        "@js:",
-        "var q = params.queryInfo || {};",
-        'var u = (typeof result === "string") ? result : "";',
-        'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
-        "u = String(q.tocUrl || q.detailUrl || u || q.url || \"\");",
-        "return u;",
-      ].join("\n");
+    if (isDetailUrlAlias(detailRules.tocUrl)) {
+      // tocUrl = baseUrl 表示目录就在详情页，不要转成 //baseUrl 这种假 XPath
+      detailWarningFor("tocUrl", detailRules.tocUrl)(
+        "阅读 tocUrl 为 baseUrl（目录即详情页），章节列表直接请求详情 URL",
+      );
+      chapterListRequestInfo = requestInfoOverride || "%@result";
+    } else {
+      bookDetail.tocUrl = convertRule(detailRules.tocUrl, {
+        responseType: detailResponseType,
+        warn: detailWarningFor("tocUrl", detailRules.tocUrl),
+      });
+      if (!requestInfoOverride) {
+        // 非官方字段兜底：部分客户端若把 tocUrl 写入 queryInfo 则可直连目录
+        chapterListRequestInfo = [
+          "@js:",
+          "var q = params.queryInfo || {};",
+          'var u = (typeof result === "string") ? result : "";',
+          'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
+          "u = String(q.tocUrl || q.detailUrl || u || q.url || \"\");",
+          "return u;",
+        ].join("\n");
+      }
+      detailWarningFor("tocUrl", detailRules.tocUrl)(
+        "阅读源含 tocUrl：已写入 bookDetail.tocUrl；章节请求仍以书源规则§七的 result（详情 URL）为准，请实测目录页",
+      );
     }
-    detailWarningFor("tocUrl", detailRules.tocUrl)(
-      "阅读源含 tocUrl：已写入 bookDetail.tocUrl；章节请求仍以书源规则§七的 result（详情 URL）为准，请实测目录页",
-    );
+  }
+
+  let content = contentRules.content !== undefined
+    ? convertRule(contentRules.content, {
+      responseType: contentResponseType,
+      warn: contentWarningFor("content", contentRules.content),
+    })
+    : undefined;
+  if (content && resolvedType === "comic") {
+    content = wrapComicImageContent(content);
+  }
+  if (content && resolvedType === "audio") {
+    content = wrapAudioContent(content);
   }
 
   const converted = {
     sourceName,
     sourceUrl: host,
-    weight: String(source.customOrder ?? source.weight ?? 0),
+    weight: sourceWeight(source),
     enable: source.enabled === false ? 0 : 1,
     miniAppVersion: "2.56.1",
     lastModifyTime: xsggModifyTime(source.lastUpdateTime),
     authorId: "",
+    sourceType: resolvedType,
     ...(source.bookSourceComment ? { desc: String(source.bookSourceComment) } : {}),
-    ...(sourceType(source.bookSourceType) ? { sourceType: sourceType(source.bookSourceType) } : {}),
     ...(Object.keys(headers).length ? { httpHeaders: headers } : {}),
     searchBook: buildBookAction({
       actionID: "searchBook",
@@ -247,12 +355,7 @@ function convertOne(source, warnings) {
     chapterContent: {
       ...commonAction("chapterContent", host, contentResponseType),
       requestInfo: "%@result",
-      ...(contentRules.content !== undefined ? {
-        content: convertRule(contentRules.content, {
-          responseType: contentResponseType,
-          warn: contentWarningFor("content", contentRules.content),
-        }),
-      } : {}),
+      ...(content !== undefined ? { content } : {}),
       ...((contentRules.nextContentUrl || contentRules.nextUrl) ? {
         nextPageUrl: convertRule(contentRules.nextContentUrl || contentRules.nextUrl, {
           responseType: contentResponseType,
