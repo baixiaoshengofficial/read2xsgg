@@ -311,17 +311,16 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
   assert.equal(jm.bookWorld["全部"].moreKeys.pageSize, 80);
   assert.match(jm.bookWorld["全部"].requestInfo, /albums\?o=mr&page=/);
   assert.match(jm.bookWorld["全部"].list, /list-col/);
-  assert.match(jm.bookDetail.requestInfo, /params\.queryInfo/);
-  assert.doesNotMatch(jm.bookDetail.requestInfo, /\bresult\b/);
+  assert.equal(jm.bookDetail.requestInfo, "%@result");
   assert.doesNotMatch(JSON.stringify(jm.bookDetail), /java\.|Packages/);
   assert.doesNotMatch(JSON.stringify(jm.searchBook), /java\.|Packages/);
   assert.equal(jm.chapterList.responseFormatType, "json");
   assert.match(jm.chapterList.requestInfo, new RegExp(`${appBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/adapter/jm/chapters\\?url=`));
-  assert.equal(jm.chapterList.list, "chapters");
+  assert.equal(jm.chapterList.list, "$.chapters");
   assert.equal(jm.chapterList.title, "title");
   assert.equal(jm.chapterList.url, "url");
-  const requestFunction = new Function("config", "params", jm.chapterList.requestInfo.replace(/^@js:\s*/, ""));
-  const adapterUrl = requestFunction({ host: upstreamBase }, { queryInfo: { detailUrl: "/album/1" } });
+  const requestFunction = new Function("config", "params", "result", jm.chapterList.requestInfo.replace(/^@js:\s*/, ""));
+  const adapterUrl = requestFunction({ host: upstreamBase }, {}, "/album/1");
   const chapterResponse = await fetch(adapterUrl);
   assert.equal(chapterResponse.status, 200);
   assert.deepEqual(await chapterResponse.json(), {

@@ -38,7 +38,6 @@ export function chapterListRequestInfoOverride(source) {
 }
 
 export function bookDetailRequestInfoOverride(source) {
-  if (isJmSource(source)) return jmDetailRequestInfo();
   return null;
 }
 
@@ -71,22 +70,20 @@ function mwwzChapterListRequestInfo() {
   ].join("\n");
 }
 
-function jmDetailRequestInfo() {
-  // requestInfo 的香色运行环境只有 config/params，没有解析规则里的 result。
-  // 必须直接从 queryInfo.detailUrl 取分类/搜索阶段保存的详情地址。
+function jmChapterListRequestInfo() {
+  // 无在线代理时也要遵循章节动作的标准 result 语义。
+  // queryInfo 是为旧客户端保留的备用路径，不能作为唯一来源。
   return [
     "@js:",
+    'var u = (typeof result === "string") ? result : "";',
+    'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
     'var q = (params && params.queryInfo) ? params.queryInfo : {};',
-    'var u = String(q.detailUrl || q.url || "");',
+    'if (!u) u = q.detailUrl || q.url || "";',
     'u = String(u || "").trim();',
     'if (u.indexOf("//") == 0) u = "https:" + u;',
     'else if (u.indexOf("http") != 0) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
     'return encodeURI(u);',
   ].join("\n");
-}
-
-function jmChapterListRequestInfo() {
-  return jmDetailRequestInfo();
 }
 
 function absolutizeUrlJs() {

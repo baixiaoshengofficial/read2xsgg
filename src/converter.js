@@ -151,13 +151,19 @@ function proxiedJmChapterList(host, imageProxyBase) {
     ...commonAction("chapterList", host, "json"),
     requestInfo: [
       "@js:",
-      "var q = params.queryInfo || {};",
-      'var u = String(q.detailUrl || q.url || "").trim();',
+      // 香色的章节动作把详情页地址放在 result；queryInfo 只作为旧版客户端兜底。
+      // 不能反过来依赖 queryInfo，否则部分漫画源会请求空地址，表现为目录为空。
+      'var u = (typeof result === "string") ? result : "";',
+      'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
+      'var q = (params && params.queryInfo) ? params.queryInfo : {};',
+      'if (!u) u = q.detailUrl || q.url || "";',
+      'u = String(u || "").trim();',
       'if (u.indexOf("//") == 0) u = "https:" + u;',
       'else if (u.indexOf("http") != 0) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
       `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
     ].join("\n"),
-    list: "chapters",
+    // JSON 响应必须使用 JSONPath；裸字段名会被香色当 XPath 处理。
+    list: "$.chapters",
     title: "title",
     url: "url",
   };
