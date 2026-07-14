@@ -131,6 +131,36 @@ test("在线抓取默认禁止访问本机和内网地址", async (context) => {
   assert.match((await response.json()).error, /内网地址/);
 });
 
+test("图片代理地址从本次 HTTPS 转换请求自动推导", async (context) => {
+  const encryptedComicSource = {
+    ...source,
+    bookSourceName: "加密漫画",
+    bookSourceType: 2,
+    ruleContent: {
+      content: "@js:JSON.parse(src).data.images.map(x => `<img src=\"${x.url}\">`).join('\\n');",
+      imageDecode: "var iv = result.slice(0, 16); var key = java.strToBytes('0B6666A0-BB59-1381-B746-a0E4C9AC'); var cipher = java.createSymmetricCrypto(\"AES/CBC/PKCS5Padding\", key, iv); return cipher.decrypt(result.slice(16));",
+    },
+  };
+  const upstream = createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(encryptedComicSource));
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...serverConfig({}), allowPrivateNetworks: true } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const response = await fetch(`${appBase}/convert.xbs?url=${encodeURIComponent(`${upstreamBase}/source.json`)}`, {
+    headers: { "X-Forwarded-Host": "xs.example.com", "X-Forwarded-Proto": "https" },
+  });
+  assert.equal(response.status, 200);
+  const converted = JSON.parse(decodeXbs(Buffer.from(await response.arrayBuffer())).toString("utf8"));
+  assert.match(converted["加密漫画"].chapterContent.content, /https:\/\/xs\.example\.com\/image\/mwwz-aes\?url=/);
+});
+
 test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (context) => {
   const app = createAppServer({
     config: { ...serverConfig({}), allowPrivateNetworks: false, allowDnsProxyNetworks: true },

@@ -165,11 +165,7 @@ node ./bin/server.js
 
 `/image` 会直通 JPEG、PNG、GIF、WebP 等常见图片，并尝试已注册的解码器；`/image/mwwz-aes` 明确使用猕猴桃漫画的 AES-256-CBC 规则；`/image/jm-scramble` 按禁漫天堂的书号、图片号计算分块数后重组纵向图片块，并输出 PNG。代理只会返回验证过图片文件头的结果，且与在线转换一样禁止访问内网地址。
 
-在线转换时，已识别的猕猴桃漫画 AES、禁漫天堂 Canvas 重排 `imageDecode` 会自动改写为代理图片链接。若部署在 Nginx、Caddy、Cloudflare Tunnel 等反向代理之后，请设置对外访问地址，否则生成源会把容器内的 `http://host:port` 写进图片链接：
-
-```bash
-PUBLIC_BASE_URL=https://xs.example.com docker compose up -d
-```
+在线转换时，已识别的猕猴桃漫画 AES、禁漫天堂 Canvas 重排 `imageDecode` 会自动改写为代理图片链接。代理地址会从本次转换 URL 自动推导：优先使用 `Forwarded` 或 `X-Forwarded-Host` / `X-Forwarded-Proto`，公网域名默认使用 HTTPS；无需配置对外基础 URL。反向代理应保留 `Host`，并传递主机和协议头。
 
 解码器采用注册机制；AES 等字节级算法可通用加入。禁漫天堂的 `BitmapFactory`、`Canvas` 规则已由服务端像素重排适配；其他站点的 Android 像素拼图仍需要按其算法新增适配器。
 
@@ -188,7 +184,6 @@ Compose 支持通过环境变量调整：
 | `CACHE_TTL_SECONDS` | `300` | 内存缓存时间，设为 `0` 可关闭 |
 | `MAX_CACHE_ENTRIES` | `100` | 最大缓存条目数 |
 | `CORS_ORIGIN` | `*` | 允许的跨域来源 |
-| `PUBLIC_BASE_URL` | 空 | 服务对外基础地址；有反代/HTTPS 时必填，用于生成图片解码代理链接 |
 | `ALLOW_PRIVATE_NETWORKS` | `false` | 是否允许抓取本机或内网 URL |
 | `ALLOW_DNS_PROXY_NETWORKS` | `true` | 允许域名经 Docker Desktop、Clash 等代理解析到 `198.18.0.0/15`；直接输入该网段 IP 仍会被拦截 |
 

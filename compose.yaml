@@ -22,8 +22,6 @@ services:
       ALLOW_PRIVATE_NETWORKS: ${ALLOW_PRIVATE_NETWORKS:-false}
       ALLOW_DNS_PROXY_NETWORKS: ${ALLOW_DNS_PROXY_NETWORKS:-true}
       CORS_ORIGIN: ${CORS_ORIGIN:-*}
-      # 对外有 Nginx/Caddy/HTTPS 域名时必须设置；用于写入需要图片解码的香色源。
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
     read_only: true
     tmpfs:
       - /tmp:size=16m,noexec,nosuid,nodev

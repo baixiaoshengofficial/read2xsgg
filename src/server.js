@@ -39,7 +39,6 @@ export function serverConfig(environment = process.env) {
     allowPrivateNetworks: boolean(environment.ALLOW_PRIVATE_NETWORKS),
     allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS),
     corsOrigin: environment.CORS_ORIGIN || "*",
-    publicBaseUrl: String(environment.PUBLIC_BASE_URL || "").trim().replace(/\/$/, ""),
   };
 }
 
@@ -302,11 +301,36 @@ function imageRequestFromRequest(request) {
   return { imageUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "", decoder: decoder.toLowerCase() };
 }
 
-function publicBaseUrl(request, config) {
-  if (config.publicBaseUrl) return config.publicBaseUrl;
-  const host = String(request.headers.host || "").trim();
-  if (!/^[a-z0-9.[\]-]+(?::\d+)?$/i.test(host)) return "";
-  return `${request.socket.encrypted ? "https" : "http"}://${host}`;
+function isLocalHost(host) {
+  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+  return bare === "localhost" || bare.endsWith(".localhost") || isIP(bare) !== 0;
+}
+
+function forwardedProtocol(request) {
+  const forwarded = String(request.headers.forwarded || "").match(/(?:^|[;,]\s*)proto=\"?([^;,\s\"]+)/i)?.[1];
+  const xForwarded = String(request.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+  const protocol = forwarded || xForwarded;
+  return /^(https?|wss?)$/i.test(protocol) ? protocol.replace(/^ws/i, "http").toLowerCase() : "";
+}
+
+function publicHost(request) {
+  const forwarded = String(request.headers.forwarded || "").match(/(?:^|[;,]\s*)host=\"?([^;,\s\"]+)/i)?.[1];
+  const xForwarded = String(request.headers["x-forwarded-host"] || "").split(",")[0].trim();
+  const host = String(forwarded || xForwarded || request.headers.host || "").trim();
+  return /^[a-z0-9.[\]-]+(?::\d+)?$/i.test(host) ? host : "";
+}
+
+/**
+ * Derive the browser-visible converter origin rather than requiring a deployment
+ * variable. Reverse proxies conventionally provide X-Forwarded-Proto/Forwarded;
+ * for a public hostname without either header, HTTPS is the safe default.
+ */
+function publicBaseUrl(request) {
+  const host = publicHost(request);
+  if (!host) return "";
+  const hostname = host.startsWith("[") ? (host.match(/^\[([^\]]+)\]/)?.[1] || "") : host.replace(/:\d+$/, "");
+  const protocol = forwardedProtocol(request) || (request.socket.encrypted ? "https" : (isLocalHost(hostname) ? "http" : "https"));
+  return `${protocol}://${host}`;
 }
 
 function help(config) {
@@ -423,7 +447,7 @@ export function createAppServer(options = {}) {
 
       // The conversion may embed this server's public image-proxy URL in a
       // recognised comic rule, so do not share it across distinct public hosts.
-      const cacheKey = `${target.sourceUrl}\n${publicBaseUrl(request, config)}`;
+      const cacheKey = `${target.sourceUrl}\n${publicBaseUrl(request)}`;
       let converted = cache.get(cacheKey);
       if (converted && converted.expiresAt <= Date.now()) {
         cache.delete(cacheKey);
@@ -433,7 +457,7 @@ export function createAppServer(options = {}) {
       else {
         active += 1;
         try {
-          converted = await convertOnlineSource(target.sourceUrl, config, publicBaseUrl(request, config));
+          converted = await convertOnlineSource(target.sourceUrl, config, publicBaseUrl(request));
           cacheSet(cache, cacheKey, converted, config);
         } finally {
           active -= 1;
