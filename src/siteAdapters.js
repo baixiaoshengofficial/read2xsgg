@@ -150,6 +150,7 @@ function adaptMwwz(source) {
   const ruleSearch = source.ruleSearch ?? source.searchRule ?? {};
   const ruleExplore = source.ruleExplore ?? source.exploreRule ?? {};
   const ruleBookInfo = source.ruleBookInfo ?? source.bookInfoRule ?? {};
+  const ruleToc = source.ruleToc ?? source.tocRule ?? {};
   return {
     ...source,
     searchUrl: String(source.searchUrl || "").replace(/\{\{\s*Url\(\)\s*\}\}/gi, "{{Get('url')}}"),
@@ -166,6 +167,16 @@ function adaptMwwz(source) {
       intro: "$.intro",
       // chapterListRequestInfoOverride() derives the matching HTML directory URL.
       tocUrl: "baseUrl",
+    },
+    ruleToc: {
+      ...ruleToc,
+      // 原规则 href##(\d+)$##/api/... 只替换末尾 ID，会保留前面的
+      // /comic/{bookId}/，最终得到一个必然 404 的拼接地址。
+      chapterUrl: [
+        "href || @js:",
+        "var m = String(result || \"\").match(/(\\d+)$/);",
+        'return m ? config.host + "/api/comic/image/" + m[1] + "?page=1" : result;',
+      ].join("\n"),
     },
   };
 }

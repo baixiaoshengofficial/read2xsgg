@@ -235,8 +235,14 @@ test("漫蛙适配使用 config.host 的 API 详情与 HTML 目录", () => {
     searchUrl: "{{Url()}}/api/search?keyword={{key}}&page={{page}}",
     ruleSearch: { bookList: "$.data.list[*]", name: "$.title", bookUrl: "{{Url()}}/api/comic/{{$.id}}" },
     ruleBookInfo: { init: "$.data", name: "$.title", intro: "@js:source.getVariable(); return result.intro;", tocUrl: "{{Url()}}/comic/{{$.id}}" },
-    ruleToc: { chapterList: "#chapter-grid-container a", chapterName: "[class$=\"name\"]@text", chapterUrl: "href" },
-    ruleContent: { content: "#content", imageDecode: "var key = java.strToBytes('0B6666A0-BB59-1381-B746-a0E4C9AC');" },
+    ruleToc: {
+      chapterList: "#chapter-grid-container a", chapterName: "[class$=\"name\"]@text",
+      chapterUrl: "href##(\\d+)$##/api/comic/image/$1?page=1###",
+    },
+    ruleContent: {
+      content: "#content",
+      imageDecode: "var iv = result.slice(0, 16); var key = java.strToBytes('0B6666A0-BB59-1381-B746-a0E4C9AC'); return java.createSymmetricCrypto(\"AES/CBC/PKCS5Padding\", key, iv);",
+    },
     ruleExplore: { bookList: "$.data.list[*]", name: "$.title", bookUrl: "{{Url()}}/api/comic/{{$.url##[^\\d]}}" },
     exploreUrl: [{ title: "热血", url: "{{Get('url')}}/api/cate/hotblooded,{\"method\":\"POST\",\"body\":\"{\\\"page\\\":{\\\"page\\\":{{page}}}}\"}" }],
   };
@@ -246,8 +252,11 @@ test("漫蛙适配使用 config.host 的 API 详情与 HTML 目录", () => {
   assert.match(converted.searchBook.detailUrl, /config\.host.*api\/comic/);
   assert.match(converted.bookWorld["热血"].detailUrl, /config\.host.*api\/comic/);
   assert.match(converted.chapterList.requestInfo, /config\.host.*\/comic\//);
+  assert.match(converted.chapterList.url, /config\.host.*\/api\/comic\/image\//);
+  assert.doesNotMatch(converted.chapterList.url, /replace\(new RegExp/);
   assert.equal(converted.bookDetail.tocUrl, undefined);
   assert.equal(converted.bookDetail.desc, "data/intro");
+  assert.equal(converted.chapterContent.responseFormatType, "json");
 });
 
 test("Mustache {{@sel}} 与 Get('url') 请求可转换", () => {

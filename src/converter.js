@@ -351,7 +351,11 @@ function convertOne(source, warnings, options = {}) {
   const detailWarningFor = createWarningCollector(warnings, sourceName, "bookDetail");
   const tocResponseType = inferResponseType(tocRules);
   const tocWarningFor = createWarningCollector(warnings, sourceName, "chapterList");
-  const contentResponseType = inferResponseType(contentRules);
+  // 漫蛙 AES 规则的正文端点返回 {data:{images,pagination}} JSON；原 content
+  // 只有 @js，单靠规则推断会误判为 HTML，导致香色先做 DOM 解析后正文为空。
+  const contentResponseType = imageDecoder === "mwwz-aes" && resolvedType === "comic"
+    ? "json"
+    : inferResponseType(contentRules);
   const contentWarningFor = createWarningCollector(warnings, sourceName, "chapterContent");
 
   const bookDetail = {
