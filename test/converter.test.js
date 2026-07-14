@@ -142,6 +142,11 @@ test("GET/POST 请求模板转换", () => {
   const post = convertRequest('/search,{"method":"post","body":"q={{key}}&offset={{page-1}}"}');
   assert.match(post.requestInfo, /"q": params\.keyWord/);
   assert.match(post.requestInfo, /"offset": \(params\.pageIndex - 1\)/);
+
+  const jsonPost = convertRequest('/api/cate,{"method":"POST","body":"{\\"page\\":{\\"page\\":{{page}},\\"pageSize\\":10},\\"tag\\":\\"热血\\"}"}');
+  assert.match(jsonPost.requestInfo, /let hp = JSON\.parse\(/);
+  assert.match(jsonPost.requestInfo, /params\.pageIndex/);
+  assert.match(jsonPost.requestInfo, /POST:true/);
 });
 
 test("XBS 加解密无损往返", () => {
@@ -221,6 +226,27 @@ test("分类规则剥离阅读 java.timeFormat，保留可供香色匹配的 JSO
   assert.equal(converted.searchBook.cat, "tags");
   assert.equal(converted.bookDetail.cat, "data/tags");
   assert.ok(warnings.some((warning) => warning.field === "kind" && warning.message.includes("可移植字段")));
+});
+
+test("漫蛙适配使用 config.host 的 API 详情与 HTML 目录", () => {
+  const source = {
+    bookSourceName: "漫蛙", bookSourceUrl: "https://www.mwwz.cc", bookSourceType: 2,
+    searchUrl: "{{Url()}}/api/search?keyword={{key}}&page={{page}}",
+    ruleSearch: { bookList: "$.data.list[*]", name: "$.title", bookUrl: "{{Url()}}/api/comic/{{$.id}}" },
+    ruleBookInfo: { init: "$.data", name: "$.title", intro: "@js:source.getVariable(); return result.intro;", tocUrl: "{{Url()}}/comic/{{$.id}}" },
+    ruleToc: { chapterList: "#chapter-grid-container a", chapterName: "[class$=\"name\"]@text", chapterUrl: "href" },
+    ruleContent: { content: "#content", imageDecode: "var key = java.strToBytes('0B6666A0-BB59-1381-B746-a0E4C9AC');" },
+    ruleExplore: { bookList: "$.data.list[*]", name: "$.title", bookUrl: "{{Url()}}/api/comic/{{$.url##[^\\d]}}" },
+    exploreUrl: [{ title: "热血", url: "{{Get('url')}}/api/cate/hotblooded,{\"method\":\"POST\",\"body\":\"{\\\"page\\\":{\\\"page\\\":{{page}}}}\"}" }],
+  };
+  const { sources } = convertLegado(source, { imageProxyBase: "https://xs.example.com" });
+  const converted = sources["漫蛙"];
+  assert.match(converted.searchBook.requestInfo, /config\.host/);
+  assert.match(converted.searchBook.detailUrl, /config\.host.*api\/comic/);
+  assert.match(converted.bookWorld["热血"].detailUrl, /config\.host.*api\/comic/);
+  assert.match(converted.chapterList.requestInfo, /config\.host.*\/comic\//);
+  assert.equal(converted.bookDetail.tocUrl, undefined);
+  assert.equal(converted.bookDetail.desc, "data/intro");
 });
 
 test("Mustache {{@sel}} 与 Get('url') 请求可转换", () => {

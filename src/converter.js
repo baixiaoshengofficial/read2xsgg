@@ -211,9 +211,17 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "" } = {}) {
   const result = {};
   for (const [from, to] of Object.entries(mapping)) {
     if (rules[from] !== undefined && rules[from] !== "") {
-      result[to] = from === "kind"
-        ? portableKindRule(rules[from], responseType, warningFor, initPath)
-        : convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) });
+      if (from === "kind") {
+        result[to] = portableKindRule(rules[from], responseType, warningFor, initPath);
+        continue;
+      }
+      const convertedRule = convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) });
+      // 阅读 ruleBookInfo.init 会将后续 JSONPath 的根切换到该节点。
+      // 香色没有 init 字段，因此对无歧义的简单 JSONPath 显式补回前缀。
+      const rulePath = initPath && responseType === "json" ? simpleJsonPath(rules[from]) : "";
+      result[to] = rulePath && rulePath !== initPath && !rulePath.startsWith(`${initPath}/`)
+        ? `${initPath}/${rulePath}`
+        : convertedRule;
     }
   }
   return result;

@@ -249,6 +249,63 @@ export function mwwzMirrorCandidates(releasePage, baseUrl) {
   return result;
 }
 
+function htmlAttribute(tag, name) {
+  const match = String(tag).match(new RegExp(`\\b${name}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, "i"));
+  return match ? match[2] : null;
+}
+
+function htmlText(value) {
+  return String(value)
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#(x[\da-f]+|\d+);/gi, (_, code) => {
+      const numeric = String(code).toLowerCase().startsWith("x") ? Number.parseInt(code.slice(1), 16) : Number.parseInt(code, 10);
+      return Number.isFinite(numeric) ? String.fromCodePoint(numeric) : _;
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * 漫蛙的阅读 exploreUrl 依赖 java.ajax + Jsoup 动态抓取 /cate，香色无法执行。
+ * 在线转换时取一次公开分类页，把每个分类固化为同语义的 API 请求。
+ */
+export function mwwzCategoryEntries(categoryPage) {
+  const entries = [];
+  const seen = new Set();
+  for (const match of String(categoryPage || "").matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
+    const attributes = match[1];
+    const href = htmlAttribute(attributes, "href");
+    const tag = htmlAttribute(attributes, "data-value");
+    if (!href || tag === null || !/^\/cate(?:\/|$)/.test(href)) continue;
+    const title = htmlText(match[2]);
+    const identity = `${href}\n${tag}`;
+    if (!title || seen.has(identity)) continue;
+    seen.add(identity);
+    entries.push({ title, path: href, tag });
+  }
+  return entries;
+}
+
+function mwwzExploreRequest(path, tag) {
+  const payload = {
+    page: { page: "{{page}}", pageSize: 10 },
+    category: "comic",
+    sort: 0,
+    comic: { status: -1, day: 0, tag },
+    video: { year: 0, typeId: 0, typeId1: 0, area: "", lang: "", status: -1, day: 0 },
+    novel: { status: -1, day: 0, sortId: 0 },
+  };
+  // page must be a JSON number, not the string "{{page}}". JSON.stringify
+  // provides safe escaping for the tag, then this narrow replacement restores
+  // the runtime page placeholder used by convertRequest().
+  const body = JSON.stringify(payload).replace('"{{page}}"', "{{page}}");
+  return `{{Get('url')}}/api${path},${JSON.stringify({ method: "POST", body })}`;
+}
+
 async function resolveMwwzMirror(config) {
   let discovery;
   try {
@@ -275,6 +332,15 @@ async function adaptOnlineSources(input, config) {
   const mirror = await resolveMwwzMirror(config);
   if (!mirror) return input;
 
+  let categories = [];
+  try {
+    const categoryPage = await downloadSource(`${mirror}/cate`, config);
+    categories = mwwzCategoryEntries(categoryPage.toString("utf8"));
+  } catch {
+    // The mirror remains useful for search/detail even if its category page is
+    // temporarily blocked. Keep the original exploration rule in that case.
+  }
+
   const cloned = structuredClone(input);
   for (const source of legacySourceList(cloned)) {
     if (!isMwwzSource(source)) continue;
@@ -284,6 +350,12 @@ async function adaptOnlineSources(input, config) {
       "User-Agent": "Mozilla/5.0 (Linux; Android 9) Mobile Safari/537.36",
       Referer: `${mirror}/`,
     });
+    if (categories.length) {
+      source.exploreUrl = categories.map(({ title, path, tag }) => ({
+        title,
+        url: mwwzExploreRequest(path, tag),
+      }));
+    }
   }
   return cloned;
 }

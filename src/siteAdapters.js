@@ -24,12 +24,18 @@ function hostnameOf(source) {
 export function adaptLegadoSource(source) {
   if (!source || typeof source !== "object") return source;
   if (hostnameOf(source) === "alicesw.com") return adaptAlicesw(source);
+  if (isMwwzSource(source)) return adaptMwwz(source);
   return source;
 }
 
 /** 《香色闺阁书源规则》§七：result = 书籍详情页 URL */
 export function chapterListRequestInfoOverride(source) {
-  if (hostnameOf(source) !== "alicesw.com") return null;
+  if (hostnameOf(source) === "alicesw.com") return aliceswChapterListRequestInfo();
+  if (isMwwzSource(source)) return mwwzChapterListRequestInfo();
+  return null;
+}
+
+function aliceswChapterListRequestInfo() {
   return [
     "@js:",
     'var host = "https://www.alicesw.com";',
@@ -41,6 +47,20 @@ export function chapterListRequestInfoOverride(source) {
     "var m = u.match(/\\/novel\\/(\\d+)/i);",
     'if (m) return host + "/other/chapters/id/" + m[1] + ".html";',
     "return u;",
+  ].join("\n");
+}
+
+function mwwzChapterListRequestInfo() {
+  // 搜索/分类项的详情是 /api/comic/{id} JSON，但目录在 /comic/{id} HTML。
+  // 香色章节动作拿到的是详情 URL，不能直接重放 API 地址。
+  return [
+    "@js:",
+    'var u = (typeof result == "string") ? result : "";',
+    'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
+    'if (!u && params && params.queryInfo) u = params.queryInfo.detailUrl || params.queryInfo.url || "";',
+    'u = String(u || "");',
+    'var m = u.match(/\\/api\\/comic\\/(\\d+)/i) || u.match(/\\/comic\\/(\\d+)/i);',
+    'return m ? config.host + "/comic/" + m[1] : u;',
   ].join("\n");
 }
 
@@ -107,6 +127,45 @@ function adaptAlicesw(source) {
         "\\s*本书由网友上传.*",
         "\\s*所有小说中出现的人物均为18岁以上的成人.*",
       ],
+    },
+  };
+}
+
+function isMwwzSource(source) {
+  const hostname = hostnameOf(source);
+  const runtimeRules = `${source?.loginUrl || ""}\n${source?.ruleContent?.imageDecode || ""}\n${source?.ruleContent?.content || ""}`;
+  return /(?:mwwz|manwake|manwapi|manwalu|mwmw|mwuu)\.cc$/i.test(hostname)
+    || /(?:GLOBAL_IMAGE_ROUTES|api\/comic\/image|0B6666A0-BB59-1381-B746-a0E4C9AC)/i.test(runtimeRules);
+}
+
+function apiComicUrlRule(idRule) {
+  return `${idRule} || @js:\nreturn config.host + "/api/comic/" + String(result || "").replace(/[^\\d]/g, "");`;
+}
+
+/**
+ * 漫蛙阅读源将 Url()/source.getVariable() 混在链接规则中。在线服务已解决镜像，
+ * 这里把剩余链路改成香色的 config.host，并保留默认图片线路的 AES 代理处理。
+ */
+function adaptMwwz(source) {
+  const ruleSearch = source.ruleSearch ?? source.searchRule ?? {};
+  const ruleExplore = source.ruleExplore ?? source.exploreRule ?? {};
+  const ruleBookInfo = source.ruleBookInfo ?? source.bookInfoRule ?? {};
+  return {
+    ...source,
+    searchUrl: String(source.searchUrl || "").replace(/\{\{\s*Url\(\)\s*\}\}/gi, "{{Get('url')}}"),
+    ruleSearch: {
+      ...ruleSearch,
+      bookUrl: apiComicUrlRule("$.id"),
+    },
+    ruleExplore: {
+      ...ruleExplore,
+      bookUrl: apiComicUrlRule("$.url"),
+    },
+    ruleBookInfo: {
+      ...ruleBookInfo,
+      intro: "$.intro",
+      // chapterListRequestInfoOverride() derives the matching HTML directory URL.
+      tocUrl: "baseUrl",
     },
   };
 }

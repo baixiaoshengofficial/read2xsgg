@@ -77,8 +77,15 @@ export function replaceSimpleTemplates(value) {
 }
 
 function objectLiteralFromBody(body, warn) {
+  const source = String(body ?? "").trim();
+  // 阅读的 POST body 既可能是表单，也可能是 JSON。把 JSON 拆成
+  // key=value 会生成一个错误的单字段对象（例如 {"{\"page\"...": ""}）。
+  // 先将模板拼为 JSON 文本，再在香色运行时解析，数值型 {{page}} 也能保持数值。
+  if (/^(?:\{|\[)/.test(source)) {
+    return `JSON.parse(${expressionForTemplate(source, { warn })})`;
+  }
   const entries = [];
-  for (const pair of body.split("&")) {
+  for (const pair of source.split("&")) {
     if (!pair) continue;
     const separator = pair.indexOf("=");
     const key = separator >= 0 ? pair.slice(0, separator) : pair;

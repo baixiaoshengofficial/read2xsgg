@@ -3,7 +3,7 @@ import { createCipheriv } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
-import { createAppServer, decodeXbs, normalizeEmbeddedSourceUrl, serverConfig } from "../src/index.js";
+import { createAppServer, decodeXbs, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, serverConfig } from "../src/index.js";
 
 const source = {
   bookSourceName: "在线示例",
@@ -172,6 +172,10 @@ test("在线转换会发现并写入可用的漫蛙镜像", async (context) => {
       content: "@js:JSON.parse(src).data.images.map(x => `<img src=\"${x.url}\">`).join('\\n');",
       imageDecode: "var iv = result.slice(0, 16); var key = java.strToBytes('0B6666A0-BB59-1381-B746-a0E4C9AC'); var cipher = java.createSymmetricCrypto(\"AES/CBC/PKCS5Padding\", key, iv); return cipher.decrypt(result.slice(16));",
     },
+    ruleExplore: {
+      bookList: "$.data.list[*]", name: "$.title", author: "$.author", intro: "$.intro",
+      kind: "$.tags", bookUrl: "{{Url()}}/api/comic/{{$.url##[^\\d]}}", coverUrl: "$.pic",
+    },
   };
   let upstreamBase = "";
   const upstream = createServer((request, response) => {
@@ -183,6 +187,11 @@ test("在线转换会发现并写入可用的漫蛙镜像", async (context) => {
     if (request.url?.startsWith("/api/search")) {
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ data: { list: [] } }));
+      return;
+    }
+    if (request.url === "/cate") {
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end('<div class="tag-container"><a data-value="" href="/cate">全部</a><a data-value="热血" href="/cate/hotblooded">热血</a></div>');
       return;
     }
     response.writeHead(200, { "Content-Type": "application/json" });
@@ -207,6 +216,24 @@ test("在线转换会发现并写入可用的漫蛙镜像", async (context) => {
     "User-Agent": "Mozilla/5.0 (Linux; Android 9) Mobile Safari/537.36",
     Referer: `${upstreamBase}/`,
   });
+  assert.deepEqual(Object.keys(mirror.bookWorld), ["全部", "热血"]);
+  assert.equal(mirror.bookWorld["热血"].list, "data/list");
+  assert.match(mirror.bookWorld["热血"].requestInfo, /config\.host/);
+  assert.match(mirror.bookWorld["热血"].requestInfo, /JSON\.parse/);
+  assert.match(mirror.bookWorld["热血"].requestInfo, /params\.pageIndex/);
+});
+
+test("漫蛙分类页只提取可调用的漫画标签", () => {
+  const entries = mwwzCategoryEntries(`
+    <a data-value="1" href="javascript:void(0)">不应出现</a>
+    <a href="/cate" data-value="">全部</a>
+    <a href="/cate/hotblooded" data-value="热血">热血 &amp; 冒险</a>
+    <a href="/cate/hotblooded" data-value="热血">重复</a>
+  `);
+  assert.deepEqual(entries, [
+    { title: "全部", path: "/cate", tag: "" },
+    { title: "热血 & 冒险", path: "/cate/hotblooded", tag: "热血" },
+  ]);
 });
 
 test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (context) => {
