@@ -221,6 +221,7 @@ test("在线转换会发现并写入可用的漫蛙镜像", async (context) => {
   assert.match(mirror.bookWorld["热血"].requestInfo, /config\.host/);
   assert.match(mirror.bookWorld["热血"].requestInfo, /JSON\.parse/);
   assert.match(mirror.bookWorld["热血"].requestInfo, /params\.pageIndex/);
+  assert.match(mirror.bookWorld["热血"].requestInfo, /"Content-Type":"application\/json"/);
 });
 
 test("漫蛙分类页只提取可调用的漫画标签", () => {

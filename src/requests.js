@@ -101,6 +101,14 @@ function hasComplexTemplate(value) {
     || /\{\{(?!\s*(?:key|page)\s*\}\})/.test(value);
 }
 
+function isJsonBody(body) {
+  return /^(?:\{|\[)/.test(String(body ?? "").trim());
+}
+
+function hasHeader(headers, name) {
+  return Object.keys(headers).some((key) => key.toLowerCase() === name.toLowerCase());
+}
+
 function rewriteGetTemplates(url, warn) {
   // 仅处理含 Get()/get() 的 URL；普通 {{key}}/{{page}} 仍走占位符或通用脚本路径。
   if (!/\{\{\s*(?:Get|get)\s*\(/i.test(url)) return null;
@@ -128,6 +136,11 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
   const options = parseLooseJson(optionsText, warn);
   const method = String(options.method ?? "GET").toUpperCase();
   const mergedHeaders = { ...headers, ...(options.headers ?? {}) };
+  // JSON API commonly rejects a raw body when Content-Type is omitted (HTTP 415).
+  // 阅读源里 body 已是 JSON 时，香色的 httpParams 也必须声明这个媒体类型。
+  if (isJsonBody(options.body) && !hasHeader(mergedHeaders, "Content-Type")) {
+    mergedHeaders["Content-Type"] = "application/json";
+  }
   const charset = String(options.charset ?? "").toLowerCase();
   const encoding = /gbk|gb2312|gb18030/.test(charset)
     ? { requestParamsEncode: "2147485234", responseEncode: "2147485234" }

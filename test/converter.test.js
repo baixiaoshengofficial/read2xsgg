@@ -147,6 +147,7 @@ test("GET/POST 请求模板转换", () => {
   assert.match(jsonPost.requestInfo, /let hp = JSON\.parse\(/);
   assert.match(jsonPost.requestInfo, /params\.pageIndex/);
   assert.match(jsonPost.requestInfo, /POST:true/);
+  assert.match(jsonPost.requestInfo, /"Content-Type":"application\/json"/);
 });
 
 test("XBS 加解密无损往返", () => {
