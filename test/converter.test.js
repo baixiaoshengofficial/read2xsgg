@@ -188,6 +188,17 @@ test("bookSourceType 映射为香色 sourceType，weight 不为 0", () => {
   }
 });
 
+test("默认不抬高香色最低版本，输入显式版本则保留", () => {
+  const compatible = structuredClone(sampleSource);
+  compatible.bookSourceName = "兼容版本";
+  const explicit = structuredClone(sampleSource);
+  explicit.bookSourceName = "指定版本";
+  explicit.miniAppVersion = "2.53.2";
+  const { sources } = convertLegado([compatible, explicit]);
+  assert.equal(sources["兼容版本"].miniAppVersion, "1.0.0");
+  assert.equal(sources["指定版本"].miniAppVersion, "2.53.2");
+});
+
 test("Mustache {{@sel}} 与 Get('url') 请求可转换", () => {
   assert.equal(
     convertRule("{{@class.video-title@text}}"),

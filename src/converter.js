@@ -39,6 +39,13 @@ function sourceWeight(source) {
   return String(Math.min(9999, Math.floor(numeric)));
 }
 
+function minimumAppVersion(source) {
+  const version = String(source.miniAppVersion ?? source.minAppVersion ?? "").trim();
+  // 转换出的规则只使用基础字段；不要把开发/测试所用的客户端版本当成
+  // 用户的最低版本，否则香色会显示已导入却拒绝启用该站点。
+  return /^\d+(?:\.\d+){1,3}$/.test(version) ? version : "1.0.0";
+}
+
 function isDetailUrlAlias(rule) {
   const value = String(rule ?? "").trim();
   return /^(?:baseUrl|-|%@result)$/i.test(value);
@@ -379,7 +386,7 @@ function convertOne(source, warnings, options = {}) {
     sourceUrl: host,
     weight: sourceWeight(source),
     enable: source.enabled === false ? 0 : 1,
-    miniAppVersion: "2.56.1",
+    miniAppVersion: minimumAppVersion(source),
     lastModifyTime: xsggModifyTime(source.lastUpdateTime),
     authorId: "",
     sourceType: resolvedType,
