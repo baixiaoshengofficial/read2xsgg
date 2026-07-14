@@ -397,6 +397,26 @@ export function normalizeEmbeddedSourceUrl(value) {
   throw new HttpError(400, "无法解析阅读源地址，请使用 https://host/path 或 host/path");
 }
 
+/**
+ * yckceo 的 shuyuans（聚合/跳转）与 shuyuan（直接 JSON）接口并不总是同步：
+ * 有些 ID 在复数接口有效，有些会返回“数据不存在”的 HTML。保留原地址优先，
+ * 仅在解析失败时尝试对应的直接 JSON 地址。
+ */
+export function sourceUrlCandidates(sourceUrl) {
+  const result = [sourceUrl];
+  try {
+    const url = new URL(sourceUrl);
+    if (/(?:^|\.)yckceo\.com$/i.test(url.hostname) && /\/shuyuans\/json\/id\//i.test(url.pathname)) {
+      const fallback = new URL(url);
+      fallback.pathname = fallback.pathname.replace(/\/shuyuans\/json\/id\//i, "/shuyuan/json/id/");
+      if (fallback.toString() !== sourceUrl) result.push(fallback.toString());
+    }
+  } catch {
+    // normalizeEmbeddedSourceUrl already validates public request input.
+  }
+  return result;
+}
+
 function sourceUrlFromRequest(request) {
   const rawUrl = request.url || "/";
   const pathOnly = rawUrl.split(/[?#]/, 1)[0];
@@ -511,13 +531,27 @@ function cacheSet(cache, key, value, config) {
 }
 
 async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
-  const raw = await downloadSource(sourceUrl, config);
   let parsed;
-  try {
-    parsed = JSON.parse(raw.toString("utf8").replace(/^\uFEFF/, ""));
-  } catch (error) {
-    throw new HttpError(422, `在线阅读源不是有效 JSON：${error.message}`);
+  let parseError;
+  let downloadError;
+  for (const candidate of sourceUrlCandidates(sourceUrl)) {
+    let raw;
+    try {
+      raw = await downloadSource(candidate, config);
+    } catch (error) {
+      downloadError = error;
+      continue;
+    }
+    try {
+      parsed = JSON.parse(raw.toString("utf8").replace(/^\uFEFF/, ""));
+      break;
+    } catch (error) {
+      parseError = error;
+    }
   }
+  if (!parsed && parseError) throw new HttpError(422, `在线阅读源不是有效 JSON：${parseError.message}`);
+  if (!parsed && downloadError) throw downloadError;
+  if (!parsed) throw new HttpError(422, "在线阅读源不是有效 JSON");
   parsed = await adaptOnlineSources(parsed, config);
   let converted;
   try {

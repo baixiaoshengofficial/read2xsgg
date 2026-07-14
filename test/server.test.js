@@ -3,7 +3,7 @@ import { createCipheriv } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
-import { createAppServer, decodeXbs, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, serverConfig } from "../src/index.js";
+import { createAppServer, decodeXbs, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
 
 const source = {
   bookSourceName: "在线示例",
@@ -51,6 +51,17 @@ test("手拼阅读源地址可还原为完整 URL", () => {
     normalizeEmbeddedSourceUrl("http%3A%2F%2F127.0.0.1%3A9%2Fa.json"),
     "http://127.0.0.1:9/a.json",
   );
+});
+
+test("yckceo 复数接口解析失败时可回退到直接 JSON 接口", () => {
+  assert.deepEqual(
+    sourceUrlCandidates("https://www.yckceo.com/yuedu/shuyuans/json/id/6444.json"),
+    [
+      "https://www.yckceo.com/yuedu/shuyuans/json/id/6444.json",
+      "https://www.yckceo.com/yuedu/shuyuan/json/id/6444.json",
+    ],
+  );
+  assert.deepEqual(sourceUrlCandidates("https://example.com/source.json"), ["https://example.com/source.json"]);
 });
 
 test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (context) => {
