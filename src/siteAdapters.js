@@ -33,6 +33,7 @@ export function adaptLegadoSource(source) {
 export function chapterListRequestInfoOverride(source) {
   if (hostnameOf(source) === "alicesw.com") return aliceswChapterListRequestInfo();
   if (isMwwzSource(source)) return mwwzChapterListRequestInfo();
+  if (isJmSource(source)) return jmChapterListRequestInfo();
   return null;
 }
 
@@ -62,6 +63,20 @@ function mwwzChapterListRequestInfo() {
     'u = String(u || "");',
     'var m = u.match(/\\/api\\/comic\\/(\\d+)/i) || u.match(/\\/comic\\/(\\d+)/i);',
     'return m ? config.host + "/comic/" + m[1] : u;',
+  ].join("\n");
+}
+
+function jmChapterListRequestInfo() {
+  // 分类/搜索结果给出相对 /album/{id} 时也要确保目录动作请求完整详情 URL。
+  return [
+    "@js:",
+    'var u = (typeof result == "string") ? result : "";',
+    'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
+    'if (!u && params && params.queryInfo) u = params.queryInfo.detailUrl || params.queryInfo.url || "";',
+    'u = String(u || "").trim();',
+    'if (u.indexOf("//") == 0) return "https:" + u;',
+    'if (u.indexOf("http") == 0) return u;',
+    'return config.host + (u.charAt(0) == "/" ? u : "/" + u);',
   ].join("\n");
 }
 
@@ -186,12 +201,28 @@ function adaptJm(source) {
   const portableSearchRules = Object.fromEntries(Object.entries(ruleSearch).filter(([, rule]) => (
     typeof rule !== "string" || !/\b(?:java|Packages)\s*[.(]/.test(rule)
   )));
+  const ruleToc = source.ruleToc ?? source.tocRule ?? {};
   return {
     ...source,
     ...(categories.length ? { exploreUrl: categories } : {}),
     // 禁漫分类页与搜索页使用同一套卡片 DOM；原源把 ruleExplore 留成 []，
     // 是因为 Legado 会在其动态发现脚本中沿用搜索规则，香色需要显式字段。
     ruleExplore: hasExploreRules ? ruleExplore : portableSearchRules,
+    ruleToc: {
+      ...ruleToc,
+      // 原规则在选择器后附加 java.get/book.type 脚本，香色执行时会直接报错。
+      chapterList: "class.btn-toolbar.0@tag.a||.reading",
+      chapterName: "text",
+      // href 是 /photo/{id} 相对地址；原来的 shunt={{Get(...)}} 在香色会变成空参数。
+      chapterUrl: [
+        "href || @js:",
+        'var u = String(result || "").trim();',
+        'if (!u || /^javascript:/i.test(u)) return "";',
+        'if (u.indexOf("//") == 0) return "https:" + u;',
+        'if (u.indexOf("http") == 0) return u;',
+        'return config.host + (u.charAt(0) == "/" ? u : "/" + u);',
+      ].join("\n"),
+    },
   };
 }
 

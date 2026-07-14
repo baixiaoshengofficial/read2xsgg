@@ -411,6 +411,12 @@ test("禁漫动态发现脚本转换为香色可见的静态分类", () => {
   assert.match(converted.bookWorld["全部"].list, /list-col/);
   assert.match(converted.bookWorld["全部"].bookName, /video-title/);
   assert.equal(converted.bookWorld["全部"].author, undefined);
+  assert.match(converted.chapterList.requestInfo, /config\.host/);
+  assert.match(converted.chapterList.list, /btn-toolbar/);
+  assert.match(converted.chapterList.list, /reading/);
+  assert.doesNotMatch(converted.chapterList.list, /java\.|book\.type/);
+  assert.match(converted.chapterList.url, /config\.host/);
+  assert.doesNotMatch(converted.chapterList.url, /shunt|Get\(/);
 });
 
 test("有声源保留 audio 类型，正文包装为播放 JSON", () => {

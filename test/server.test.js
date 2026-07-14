@@ -306,6 +306,10 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
   assert.equal(jm.bookWorld["全部"].moreKeys.pageSize, 80);
   assert.match(jm.bookWorld["全部"].requestInfo, /albums\?o=mr&page=/);
   assert.match(jm.bookWorld["全部"].list, /list-col/);
+  assert.match(jm.chapterList.requestInfo, /config\.host/);
+  assert.doesNotMatch(jm.chapterList.list, /java\.|book\.type/);
+  assert.match(jm.chapterList.url, /config\.host/);
+  assert.doesNotMatch(jm.chapterList.url, /shunt|Get\(/);
 });
 
 test("禁漫镜像候选兼容发布页无协议域名和源内备用地址", () => {
