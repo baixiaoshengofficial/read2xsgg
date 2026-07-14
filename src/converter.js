@@ -278,20 +278,7 @@ function portableKindRule(rule, responseType, warningFor, initPath = "") {
   return convertRule(rule, { responseType, warn: warningFor("kind", rule) });
 }
 
-/**
- * 香色会对 list 选中的单个节点求字段值。阅读源里常把这些字段写成
- * `//a/@href` 或 CSS 转换后的 `//*[...]/text()`；它们在香色会跳回整页，
- * 因而拿不到当前卡片的 detailUrl。只对列表子字段改为相对 XPath。
- */
-function relativeListRule(rule) {
-  if (!rule || /^\s*@js:/i.test(rule)) return rule;
-  return String(rule)
-    .replace(/(^|\|\|)(\s*)\(\s*\/\//g, "$1$2(.//")
-    .replace(/(^|\|\|)(\s*)\/\//g, "$1$2.//")
-    .replace(/(^|\|\|)(\s*)\/(text\(\)|@[\w:-]+)/g, "$1$2./$3");
-}
-
-function mapBookRules(rules, responseType, warningFor, { initPath = "", relative = false } = {}) {
+function mapBookRules(rules, responseType, warningFor, { initPath = "", listContext = false } = {}) {
   const mapping = {
     bookList: "list",
     name: "bookName",
@@ -309,11 +296,11 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", relative
     if (rules[from] !== undefined && rules[from] !== "") {
       if (from === "kind") {
         const convertedKind = portableKindRule(rules[from], responseType, warningFor, initPath);
-        if (relative && /^\s*@js:/i.test(convertedKind) && /(?:\bjava\.|\bPackages\b|\bsource\.|\bbook\.)/i.test(convertedKind)) {
+        if (listContext && /^\s*@js:/i.test(convertedKind) && /(?:\bjava\.|\bPackages\b|\bsource\.|\bbook\.)/i.test(convertedKind)) {
           warningFor("kind", rules[from])("列表分类字段依赖阅读专用 JavaScript，已忽略以避免香色丢弃整个列表");
           continue;
         }
-        result[to] = relative && from !== "bookList" ? relativeListRule(convertedKind) : convertedKind;
+        result[to] = convertedKind;
         continue;
       }
       const convertedRule = convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) });
@@ -323,7 +310,7 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", relative
       const resolvedRule = rulePath && rulePath !== initPath && !rulePath.startsWith(`${initPath}/`)
         ? `${initPath}/${rulePath}`
         : convertedRule;
-      result[to] = relative && from !== "bookList" ? relativeListRule(resolvedRule) : resolvedRule;
+      result[to] = resolvedRule;
     }
   }
   return result;
@@ -348,10 +335,7 @@ function mapTocRules(rules, responseType, warningFor) {
   const result = {};
   for (const [from, to] of Object.entries(mapping)) {
     if (rules[from] !== undefined && rules[from] !== "") {
-      const convertedRule = convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) });
-      result[to] = ["chapterName", "chapterUrl", "updateTime"].includes(from)
-        ? relativeListRule(convertedRule)
-        : convertedRule;
+      result[to] = convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) });
     }
   }
   return result;
@@ -363,7 +347,7 @@ function buildBookAction({ actionID, host, request, rules, headers, warnings, so
   const action = {
     ...commonAction(actionID, host, responseType),
     ...convertRequest(request, { headers, warn: warningFor("request", request), fallback: actionID === "searchBook" ? "" : "%@result" }),
-    ...mapBookRules(rules, responseType, warningFor, { relative: true }),
+    ...mapBookRules(rules, responseType, warningFor, { listContext: true }),
   };
   if (rules.bookList && !action.moreKeys) action.moreKeys = { pageSize: 20 };
   return action;
@@ -414,7 +398,7 @@ function buildBookWorld(source, context) {
     result[title] = {
       ...commonAction("bookWorld", host, responseType),
       ...convertRequest(entry.url, { headers, warn: warningFor("exploreUrl", entry.url), fallback: "" }),
-      ...mapBookRules(rules, responseType, warningFor, { relative: true }),
+      ...mapBookRules(rules, responseType, warningFor, { listContext: true }),
       moreKeys: { pageSize },
       _sIndex: index,
     };

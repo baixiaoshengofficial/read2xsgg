@@ -126,8 +126,8 @@ test("相对属性 text/href 与 CSS 目录规则不会被误判为 JSON", () =>
   const converted = sources["目录相对属性"];
   assert.equal(converted.chapterList.responseFormatType, "html");
   assert.equal(converted.chapterList.list, "//a[contains(@href, '/read/')]");
-  assert.equal(converted.chapterList.title, "./text()");
-  assert.equal(converted.chapterList.url, ".//@href");
+  assert.equal(converted.chapterList.title, "/text()");
+  assert.equal(converted.chapterList.url, "//@href");
   assert.match(converted.bookDetail.tocUrl, /\/\/a\[contains/);
   assert.match(converted.bookDetail.tocUrl, /查看全部章节/);
   assert.match(converted.chapterList.requestInfo, /q\.tocUrl/);
@@ -424,7 +424,7 @@ test("禁漫动态发现脚本转换为香色可见的静态分类", () => {
   assert.equal(converted.bookWorld["全部"].moreKeys.pageSize, 80);
   assert.match(converted.bookWorld["全部"].list, /list-col/);
   assert.match(converted.bookWorld["全部"].bookName, /video-title/);
-  assert.equal(converted.bookWorld["全部"].detailUrl, ".//a[contains(@href, '/album/')]/@href");
+  assert.equal(converted.bookWorld["全部"].detailUrl, "//a[contains(@href, '/album/')]/@href");
   assert.equal(converted.bookWorld["全部"].author, undefined);
   assert.match(converted.bookDetail.requestInfo, /params\.queryInfo/);
   assert.doesNotMatch(JSON.stringify(converted.bookDetail), /java\.|Packages/);
@@ -479,7 +479,7 @@ test("发现页分组标题和同名分类不会相互覆盖", () => {
   assert.match(world["最新·玄幻"].requestInfo, /\/new\//);
 });
 
-test("搜索、分类和目录的列表项字段使用相对 XPath", () => {
+test("列表项字段保持香色支持的双斜线 XPath", () => {
   const source = {
     bookSourceName: "相对 XPath 测试",
     bookSourceUrl: "https://book.example.com",
@@ -495,11 +495,11 @@ test("搜索、分类和目录的列表项字段使用相对 XPath", () => {
   const converted = sources["相对 XPath 测试"];
   assert.equal(converted.bookDetail.bookName, "//h1/text()");
   assert.equal(converted.searchBook.list, "//div[@class='card']");
-  assert.equal(converted.searchBook.bookName, ".//h2/text()");
-  assert.equal(converted.searchBook.detailUrl, ".//a/@href");
-  assert.equal(converted.bookWorld["分类"].detailUrl, ".//a/@href");
-  assert.equal(converted.chapterList.title, ".//a/text()");
-  assert.equal(converted.chapterList.url, ".//a/@href");
+  assert.equal(converted.searchBook.bookName, "//h2/text()");
+  assert.equal(converted.searchBook.detailUrl, "//a/@href");
+  assert.equal(converted.bookWorld["分类"].detailUrl, "//a/@href");
+  assert.equal(converted.chapterList.title, "//a/text()");
+  assert.equal(converted.chapterList.url, "//a/@href");
   assert.equal(converted.chapterList.list, "//li");
 });
 
@@ -517,7 +517,7 @@ test("列表项的阅读专用后处理回退为基础选择器", () => {
   };
   const { sources, warnings } = convertLegado(source);
   const world = sources["列表 JS 回退测试"].bookWorld["分类"];
-  assert.equal(world.bookName, ".//*[contains(concat(' ', normalize-space(@class), ' '), ' name ')]/text()");
+  assert.equal(world.bookName, "//*[contains(concat(' ', normalize-space(@class), ' '), ' name ')]/text()");
   assert.equal(world.cat, undefined);
   assert.ok(warnings.some((warning) => warning.message.includes("保留基础选择器")));
   assert.ok(warnings.some((warning) => warning.message.includes("避免香色丢弃整个列表")));
