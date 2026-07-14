@@ -120,7 +120,7 @@ function proxiedJsonImageContent(imageProxyBase, decoder) {
     "  return url ? endpoint + encodeURIComponent(url) : \"\";",
     "}).filter(Boolean);",
     // 香色 comic 正文要求 URL 列表（或含 urls 的 JSON），不能返回 <img> HTML。
-    "return JSON.stringify({urls: urls.join(\"\\n\"), httpHeaders: {}});",
+    "return JSON.stringify({urls: urls, httpHeaders: {}});",
   ].join("\n");
 }
 
