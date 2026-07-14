@@ -5,6 +5,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { convertLegado } from "./converter.js";
+import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
 import { encodeXbs } from "./xbs.js";
 
 class HttpError extends Error {
@@ -30,6 +31,7 @@ export function serverConfig(environment = process.env) {
     port: integer(environment.PORT, 3000, 0),
     fetchTimeoutMs: integer(environment.FETCH_TIMEOUT_MS, 15_000),
     maxSourceBytes: integer(environment.MAX_SOURCE_BYTES, 10 * 1024 * 1024),
+    maxImageBytes: integer(environment.MAX_IMAGE_BYTES, 25 * 1024 * 1024),
     maxRedirects: integer(environment.MAX_REDIRECTS, 5, 0),
     maxConcurrent: integer(environment.MAX_CONCURRENT, 8),
     cacheTtlMs: integer(environment.CACHE_TTL_SECONDS, 300, 0) * 1000,
@@ -37,6 +39,7 @@ export function serverConfig(environment = process.env) {
     allowPrivateNetworks: boolean(environment.ALLOW_PRIVATE_NETWORKS),
     allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS),
     corsOrigin: environment.CORS_ORIGIN || "*",
+    publicBaseUrl: String(environment.PUBLIC_BASE_URL || "").trim().replace(/\/$/, ""),
   };
 }
 
@@ -98,13 +101,14 @@ async function resolveTarget(url, config) {
   return addresses[0];
 }
 
-function requestBuffer(url, resolved, config) {
+function requestBuffer(url, resolved, config, { maxBytes = config.maxSourceBytes, accept, headers = {}, label = "下载资源" } = {}) {
   const requester = url.protocol === "https:" ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
     const request = requester(url, {
       headers: {
-        Accept: "application/json,text/plain;q=0.9,*/*;q=0.1",
+        Accept: accept || "application/json,text/plain;q=0.9,*/*;q=0.1",
         "User-Agent": "read2xsgg/0.2",
+        ...headers,
       },
       lookup: (_hostname, options, callback) => {
         if (options?.all) callback(null, [resolved]);
@@ -120,30 +124,30 @@ function requestBuffer(url, resolved, config) {
       }
       if (status < 200 || status >= 300) {
         response.resume();
-        reject(new HttpError(502, `下载阅读源失败：上游返回 HTTP ${status}`));
+        reject(new HttpError(502, `${label}失败：上游返回 HTTP ${status}`));
         return;
       }
       const declaredLength = Number(response.headers["content-length"] || 0);
-      if (declaredLength > config.maxSourceBytes) {
+      if (declaredLength > maxBytes) {
         response.destroy();
-        reject(new HttpError(413, `阅读源超过大小限制 ${config.maxSourceBytes} 字节`));
+        reject(new HttpError(413, `${label}超过大小限制 ${maxBytes} 字节`));
         return;
       }
       const chunks = [];
       let length = 0;
       response.on("data", (chunk) => {
         length += chunk.length;
-        if (length > config.maxSourceBytes) {
-          response.destroy(new HttpError(413, `阅读源超过大小限制 ${config.maxSourceBytes} 字节`));
+        if (length > maxBytes) {
+          response.destroy(new HttpError(413, `${label}超过大小限制 ${maxBytes} 字节`));
           return;
         }
         chunks.push(chunk);
       });
-      response.on("end", () => resolve({ buffer: Buffer.concat(chunks, length) }));
+      response.on("end", () => resolve({ buffer: Buffer.concat(chunks, length), headers: response.headers }));
       response.on("error", reject);
     });
-    request.setTimeout(config.fetchTimeoutMs, () => request.destroy(new HttpError(504, `下载阅读源超时（${config.fetchTimeoutMs}ms）`)));
-    request.on("error", (error) => reject(error instanceof HttpError ? error : new HttpError(502, `下载阅读源失败：${error.message}`)));
+    request.setTimeout(config.fetchTimeoutMs, () => request.destroy(new HttpError(504, `${label}超时（${config.fetchTimeoutMs}ms）`)));
+    request.on("error", (error) => reject(error instanceof HttpError ? error : new HttpError(502, `${label}失败：${error.message}`)));
     request.end();
   });
 }
@@ -157,12 +161,64 @@ export async function downloadSource(sourceUrl, config = serverConfig()) {
   }
   for (let redirects = 0; redirects <= config.maxRedirects; redirects += 1) {
     const resolved = await resolveTarget(current, config);
-    const result = await requestBuffer(current, resolved, config);
+    const result = await requestBuffer(current, resolved, config, { label: "下载阅读源" });
     if (result.buffer) return result.buffer;
     if (redirects === config.maxRedirects) throw new HttpError(502, `阅读源重定向次数超过 ${config.maxRedirects}`);
     current = result.redirect;
   }
   throw new HttpError(502, "下载阅读源失败");
+}
+
+function normalizeRemoteUrl(value) {
+  let source = String(value ?? "").trim();
+  if (!source) throw new HttpError(400, "缺少图片 URL");
+  try {
+    source = decodeURIComponent(source);
+  } catch {
+    throw new HttpError(400, "图片 URL 编码无效");
+  }
+  let url;
+  try {
+    url = new URL(source);
+  } catch {
+    throw new HttpError(400, "图片 URL 不是有效 URL");
+  }
+  if (!/^https?:$/.test(url.protocol)) throw new HttpError(400, "图片 URL 只支持 http:// 或 https://");
+  if (url.username || url.password) throw new HttpError(400, "图片 URL 不能包含用户名或密码");
+  return url.toString();
+}
+
+export async function downloadImage(imageUrl, decoder = "auto", config = serverConfig()) {
+  let current;
+  try {
+    current = new URL(normalizeRemoteUrl(imageUrl));
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(400, "图片 URL 不是有效 URL");
+  }
+  for (let redirects = 0; redirects <= config.maxRedirects; redirects += 1) {
+    const resolved = await resolveTarget(current, config);
+    const result = await requestBuffer(current, resolved, config, {
+      maxBytes: config.maxImageBytes,
+      label: "下载图片",
+      accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+      // A same-origin Referer works for sources which reject empty Referer, while
+      // keeping the endpoint free of caller-controlled request headers.
+      headers: { Referer: `${current.protocol}//${current.host}/` },
+    });
+    if (!result.buffer) {
+      if (redirects === config.maxRedirects) throw new HttpError(502, `图片重定向次数超过 ${config.maxRedirects}`);
+      current = result.redirect;
+      continue;
+    }
+    try {
+      return { ...decodeImage(result.buffer, decoder), upstreamUrl: current.toString() };
+    } catch (error) {
+      if (error instanceof ImageDecodeError) throw new HttpError(422, `图片无法解码：${error.message}`);
+      throw error;
+    }
+  }
+  throw new HttpError(502, "下载图片失败");
 }
 
 /**
@@ -236,6 +292,23 @@ function sourceUrlFromRequest(request) {
   return null;
 }
 
+function imageRequestFromRequest(request) {
+  const parsed = new URL(request.url || "/", "http://read2xsgg.local");
+  let decoder;
+  if (parsed.pathname === "/image") decoder = parsed.searchParams.get("decoder") || "auto";
+  else if (parsed.pathname.startsWith("/image/")) decoder = parsed.pathname.slice("/image/".length);
+  else return null;
+  if (!/^(?:auto|passthrough|[a-z0-9-]+)$/i.test(decoder)) throw new HttpError(400, "图片解码器名称无效");
+  return { imageUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "", decoder: decoder.toLowerCase() };
+}
+
+function publicBaseUrl(request, config) {
+  if (config.publicBaseUrl) return config.publicBaseUrl;
+  const host = String(request.headers.host || "").trim();
+  if (!/^[a-z0-9.[\]-]+(?::\d+)?$/i.test(host)) return "";
+  return `${request.socket.encrypted ? "https" : "http"}://${host}`;
+}
+
 function help(config) {
   return {
     name: "read2xsgg",
@@ -247,13 +320,16 @@ function help(config) {
       xbs: "/convert.xbs?url=https://www.example.com/legado.json",
       path: "/url/https://www.example.com/legado.json.xbs",
       json: "/j/www.example.com/legado.json",
+      image: "/image/mwwz-aes?url=https://cdn.example.com/encrypted-image",
       health: "/healthz",
     },
     limits: {
       maxSourceBytes: config.maxSourceBytes,
+      maxImageBytes: config.maxImageBytes,
       fetchTimeoutMs: config.fetchTimeoutMs,
       allowPrivateNetworks: config.allowPrivateNetworks,
       allowDnsProxyNetworks: config.allowDnsProxyNetworks,
+      imageDecoders: supportedImageDecoders(),
     },
   };
 }
@@ -270,7 +346,7 @@ function cacheSet(cache, key, value, config) {
   cache.set(key, { expiresAt: Date.now() + config.cacheTtlMs, value });
 }
 
-async function convertOnlineSource(sourceUrl, config) {
+async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
   const raw = await downloadSource(sourceUrl, config);
   let parsed;
   try {
@@ -280,7 +356,7 @@ async function convertOnlineSource(sourceUrl, config) {
   }
   let converted;
   try {
-    converted = convertLegado(parsed);
+    converted = convertLegado(parsed, { imageProxyBase });
   } catch (error) {
     throw new HttpError(422, `无法转换在线阅读源：${error.message}`);
   }
@@ -315,6 +391,28 @@ export function createAppServer(options = {}) {
         sendJson(response, 200, { status: "ok" }, commonHeaders);
         return;
       }
+      const imageTarget = imageRequestFromRequest(request);
+      if (imageTarget) {
+        if (!imageTarget.imageUrl) throw new HttpError(400, "缺少图片 URL");
+        if (active >= config.maxConcurrent) throw new HttpError(429, "当前图片处理任务过多，请稍后重试");
+        active += 1;
+        let image;
+        try {
+          image = await downloadImage(imageTarget.imageUrl, imageTarget.decoder, config);
+        } finally {
+          active -= 1;
+        }
+        response.writeHead(200, {
+          ...commonHeaders,
+          "Content-Type": image.mimeType,
+          "Content-Length": image.buffer.length,
+          "Cache-Control": "public, max-age=3600",
+          "X-Image-Decoder": image.decoder,
+        });
+        if (request.method === "HEAD") response.end();
+        else response.end(image.buffer);
+        return;
+      }
       const target = sourceUrlFromRequest(request);
       if (!target) {
         sendJson(response, pathname === "/" ? 200 : 404, help(config), commonHeaders);
@@ -323,7 +421,9 @@ export function createAppServer(options = {}) {
       if (!target.sourceUrl) throw new HttpError(400, "缺少在线阅读源 URL");
       if (active >= config.maxConcurrent) throw new HttpError(429, "当前转换任务过多，请稍后重试");
 
-      const cacheKey = target.sourceUrl;
+      // The conversion may embed this server's public image-proxy URL in a
+      // recognised comic rule, so do not share it across distinct public hosts.
+      const cacheKey = `${target.sourceUrl}\n${publicBaseUrl(request, config)}`;
       let converted = cache.get(cacheKey);
       if (converted && converted.expiresAt <= Date.now()) {
         cache.delete(cacheKey);
@@ -333,7 +433,7 @@ export function createAppServer(options = {}) {
       else {
         active += 1;
         try {
-          converted = await convertOnlineSource(target.sourceUrl, config);
+          converted = await convertOnlineSource(target.sourceUrl, config, publicBaseUrl(request, config));
           cacheSet(cache, cacheKey, converted, config);
         } finally {
           active -= 1;

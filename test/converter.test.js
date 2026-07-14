@@ -253,6 +253,28 @@ test("漫画源保留 comic 类型，图片 URL 包成 img，并告警 imageDeco
   assert.ok(warnings.some((w) => w.field === "loginUrl"));
 });
 
+test("可识别的 AES 图片规则通过公开代理改写为香色图片正文", () => {
+  const source = {
+    bookSourceName: "AES 漫画",
+    bookSourceUrl: "https://www.mwwz.cc/",
+    bookSourceType: 2,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: "$.data.list[*]", name: "$.title", bookUrl: "$.id" },
+    ruleBookInfo: { name: "$.data.title" },
+    ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
+    ruleContent: {
+      content: "@js:JSON.parse(src).data.images.map(x => `<img src=\"${x.url}\">`).join('\\n');",
+      imageDecode: "var iv = result.slice(0, 16); var key = java.strToBytes('0B6666A0-BB59-1381-B746-a0E4C9AC'); var cipher = java.createSymmetricCrypto(\"AES/CBC/PKCS5Padding\", key, iv); return cipher.decrypt(result.slice(16));",
+    },
+  };
+  const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example.com/" });
+  const content = sources["AES 漫画"].chapterContent.content;
+  assert.match(content, /https:\/\/convert\.example\.com\/image\/mwwz-aes\?url=/);
+  assert.match(content, /payload\.data/);
+  assert.doesNotMatch(content, /source\.getVariable|JSON\.parse\(src\)/);
+  assert.ok(warnings.some((warning) => warning.message.includes("图片解码代理")));
+});
+
 test("有声源保留 audio 类型，正文包装为播放 JSON", () => {
   const source = {
     bookSourceName: "示例如声",

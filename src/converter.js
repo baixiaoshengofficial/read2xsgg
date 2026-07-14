@@ -1,6 +1,7 @@
 import { convertRule, inferResponseType } from "./selectors.js";
 import { convertRequest, parseHeaders } from "./requests.js";
 import { adaptLegadoSource, chapterListRequestInfoOverride } from "./siteAdapters.js";
+import { decoderForLegadoImageRule } from "./imageDecoder.js";
 
 const EMPTY_ACTIONS = {
   relatedWord: { actionID: "relatedWord", parserID: "DOM" },
@@ -97,6 +98,21 @@ function wrapAudioContent(contentRule) {
     return `${contentRule}|${wrapJs}`;
   }
   return `${contentRule}|${wrapJs}`;
+}
+
+/** A known encrypted comic API can be rendered through the server image proxy. */
+function proxiedJsonImageContent(imageProxyBase, decoder) {
+  const endpoint = `${String(imageProxyBase).replace(/\/$/, "")}/image/${decoder}?url=`;
+  return [
+    "@js:",
+    "var payload = (typeof result === \"string\") ? JSON.parse(result) : result;",
+    "var images = payload && payload.data && Array.isArray(payload.data.images) ? payload.data.images : [];",
+    `var endpoint = ${JSON.stringify(endpoint)};`,
+    "return images.map(function (item) {",
+    "  var url = String((item && (item.url || item.src)) || \"\");",
+    "  return url ? '<img src=\"' + endpoint + encodeURIComponent(url) + '\">' : \"\";",
+    "}).filter(Boolean).join(\"\\n\");",
+  ].join("\n");
 }
 
 function xsggModifyTime(value) {
@@ -225,7 +241,7 @@ function buildBookWorld(source, context) {
   return result;
 }
 
-function convertOne(source, warnings) {
+function convertOne(source, warnings, options = {}) {
   const adaptedFrom = String(source.bookSourceUrl ?? "");
   source = adaptLegadoSource(source);
   const sourceName = String(source.bookSourceName ?? source.name ?? "未命名书源").trim() || "未命名书源";
@@ -253,10 +269,16 @@ function convertOne(source, warnings) {
   const tocRules = getRules(source, "ruleToc", "tocRule");
   const contentRules = getRules(source, "ruleContent", "contentRule");
   const resolvedType = sourceType(source.bookSourceType);
+  const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode);
   if (contentRules.imageDecode) {
-    createWarningCollector(warnings, sourceName, "chapterContent")("imageDecode", contentRules.imageDecode)(
-      "阅读 imageDecode（常见于漫画图片解扰）在香色无 Android 图形库，已忽略；混淆图需专用适配或手工规则",
-    );
+    const warning = createWarningCollector(warnings, sourceName, "chapterContent")("imageDecode", contentRules.imageDecode);
+    if (imageDecoder && options.imageProxyBase) {
+      warning(`已识别为 ${imageDecoder}；正文图片将通过 read2xsgg 图片解码代理加载`);
+    } else if (imageDecoder) {
+      warning(`已识别为 ${imageDecoder}，但当前转换没有公开图片代理地址；请用 HTTP 在线转换接口，或传入 imageProxyBase`);
+    } else {
+      warning("阅读 imageDecode（常见于漫画图片解扰）在香色无 Android 图形库，已忽略；混淆图需专用适配或手工规则");
+    }
   }
   if (contentRules.imageStyle) {
     createWarningCollector(warnings, sourceName, "chapterContent")("imageStyle", contentRules.imageStyle)(
@@ -318,7 +340,11 @@ function convertOne(source, warnings) {
       warn: contentWarningFor("content", contentRules.content),
     })
     : undefined;
-  if (content && resolvedType === "comic") {
+  if (imageDecoder && options.imageProxyBase && resolvedType === "comic") {
+    // This API returns JSON {data:{images:[{url}]}}. Rebuild the small result in
+    // 香色 JS instead of preserving Legado's src/source.getVariable() runtime calls.
+    content = proxiedJsonImageContent(options.imageProxyBase, imageDecoder);
+  } else if (content && resolvedType === "comic") {
     content = wrapComicImageContent(content);
   }
   if (content && resolvedType === "audio") {
@@ -386,12 +412,12 @@ function convertOne(source, warnings) {
   return converted;
 }
 
-export function convertLegado(input) {
+export function convertLegado(input, options = {}) {
   const warnings = [];
   const sources = {};
   for (const source of normalizeInput(input)) {
     if (!source || typeof source !== "object") continue;
-    const converted = convertOne(source, warnings);
+    const converted = convertOne(source, warnings, options);
     let name = converted.sourceName;
     let suffix = 2;
     while (sources[name]) {

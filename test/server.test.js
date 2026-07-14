@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createCipheriv } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { createAppServer, decodeXbs, normalizeEmbeddedSourceUrl, serverConfig } from "../src/index.js";
@@ -138,4 +139,36 @@ test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (
 
   const response = await fetch(`${appBase}/convert?url=${encodeURIComponent("http://198.18.0.1/source.json")}`);
   assert.equal(response.status, 403);
+});
+
+test("图片代理直通普通图片，并可解开已注册的 AES 图片", async (context) => {
+  const plain = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00]);
+  const iv = Buffer.alloc(16, 7);
+  const cipher = createCipheriv("aes-256-cbc", Buffer.from("0B6666A0-BB59-1381-B746-a0E4C9AC"), iv);
+  const encrypted = Buffer.concat([iv, cipher.update(plain), cipher.final()]);
+  const upstream = createServer((request, response) => {
+    response.writeHead(200, { "Content-Type": "application/octet-stream" });
+    response.end(request.url === "/encrypted" ? encrypted : plain);
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({
+    config: { ...serverConfig({}), allowPrivateNetworks: true, maxImageBytes: 1024 },
+  });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const direct = await fetch(`${appBase}/image?url=${encodeURIComponent(`${upstreamBase}/plain`)}`);
+  assert.equal(direct.status, 200);
+  assert.equal(direct.headers.get("content-type"), "image/jpeg");
+  assert.equal(direct.headers.get("x-image-decoder"), "passthrough");
+  assert.deepEqual(Buffer.from(await direct.arrayBuffer()), plain);
+
+  const decoded = await fetch(`${appBase}/image/mwwz-aes?url=${encodeURIComponent(`${upstreamBase}/encrypted`)}`);
+  assert.equal(decoded.status, 200);
+  assert.equal(decoded.headers.get("content-type"), "image/jpeg");
+  assert.equal(decoded.headers.get("x-image-decoder"), "mwwz-aes");
+  assert.deepEqual(Buffer.from(await decoded.arrayBuffer()), plain);
 });

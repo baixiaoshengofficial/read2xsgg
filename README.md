@@ -16,6 +16,7 @@
 - 对无法无损翻译的阅读 JS、`imageDecode`、登录 UI、递归 JSONPath、详情 `init` 等规则生成结构化告警。
 - 输入既可以是本地文件、URL，也可以来自标准输入。
 - 提供 HTTP 在线转换服务，香色闺阁可以直接订阅转换 URL。
+- 提供受 SSRF 防护的图片代理与可扩展解码器：普通图片直通，已内置猕猴桃漫画的 AES-CBC 图片解码。
 - 提供 Docker Compose 一键部署、健康检查、缓存、并发控制和 SSRF 防护。
 
 ## 环境
@@ -152,6 +153,25 @@ npm start
 node ./bin/server.js
 ```
 
+### 漫画图片解码代理
+
+香色不能执行阅读的 `java.createSymmetricCrypto` 或 Android 图像 API。服务提供图片代理，把解码放在 Node.js 侧：
+
+```text
+{转换站}/image?url=https://cdn.example.com/image.jpg
+{转换站}/image/mwwz-aes?url=https://cdn.example.com/encrypted-image
+```
+
+`/image` 会直通 JPEG、PNG、GIF、WebP 等常见图片，并尝试已注册的解码器；`/image/mwwz-aes` 明确使用猕猴桃漫画的 AES-256-CBC 规则。代理只会返回验证过图片文件头的结果，且与在线转换一样禁止访问内网地址。
+
+在线转换时，已识别的猕猴桃漫画 `imageDecode` 会自动改写为代理图片链接。若部署在 Nginx、Caddy、Cloudflare Tunnel 等反向代理之后，请设置对外访问地址，否则生成源会把容器内的 `http://host:port` 写进图片链接：
+
+```bash
+PUBLIC_BASE_URL=https://xs.example.com docker compose up -d
+```
+
+解码器采用注册机制；AES 等字节级算法可通用加入。依赖 `BitmapFactory`、`Canvas` 的 Android 像素拼图规则无法自动执行，仍需要针对站点实现服务端适配器。
+
 ### 服务配置
 
 Compose 支持通过环境变量调整：
@@ -161,11 +181,13 @@ Compose 支持通过环境变量调整：
 | `APP_PORT` | `3000` | 映射到宿主机的端口 |
 | `FETCH_TIMEOUT_MS` | `15000` | 下载在线阅读源的超时时间 |
 | `MAX_SOURCE_BYTES` | `10485760` | 在线阅读源最大字节数 |
+| `MAX_IMAGE_BYTES` | `26214400` | 单张代理图片最大字节数 |
 | `MAX_REDIRECTS` | `5` | 最大重定向次数 |
 | `MAX_CONCURRENT` | `8` | 最大并发转换数 |
 | `CACHE_TTL_SECONDS` | `300` | 内存缓存时间，设为 `0` 可关闭 |
 | `MAX_CACHE_ENTRIES` | `100` | 最大缓存条目数 |
 | `CORS_ORIGIN` | `*` | 允许的跨域来源 |
+| `PUBLIC_BASE_URL` | 空 | 服务对外基础地址；有反代/HTTPS 时必填，用于生成图片解码代理链接 |
 | `ALLOW_PRIVATE_NETWORKS` | `false` | 是否允许抓取本机或内网 URL |
 | `ALLOW_DNS_PROXY_NETWORKS` | `true` | 允许域名经 Docker Desktop、Clash 等代理解析到 `198.18.0.0/15`；直接输入该网段 IP 仍会被拦截 |
 
