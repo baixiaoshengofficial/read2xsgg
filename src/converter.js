@@ -292,11 +292,13 @@ function buildBookWorld(source, context) {
   const result = {};
   entries.forEach((entry, index) => {
     const title = entry.title || `分类 ${index + 1}`;
+    const configuredPageSize = Number(entry.pageSize);
+    const pageSize = Number.isInteger(configuredPageSize) && configuredPageSize > 0 ? configuredPageSize : 20;
     result[title] = {
       ...commonAction("bookWorld", host, responseType),
       ...convertRequest(entry.url, { headers, warn: warningFor("exploreUrl", entry.url), fallback: "" }),
       ...mapBookRules(rules, responseType, warningFor),
-      moreKeys: { pageSize: 20 },
+      moreKeys: { pageSize },
       _sIndex: index,
     };
   });

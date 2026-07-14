@@ -354,6 +354,7 @@ async function adaptOnlineSources(input, config) {
       source.exploreUrl = categories.map(({ title, path, tag }) => ({
         title,
         url: mwwzExploreRequest(path, tag),
+        pageSize: 10,
       }));
     }
   }
