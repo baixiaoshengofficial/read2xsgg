@@ -315,7 +315,7 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
   assert.doesNotMatch(JSON.stringify(jm.bookDetail), /java\.|Packages/);
   assert.doesNotMatch(JSON.stringify(jm.searchBook), /java\.|Packages/);
   assert.equal(jm.chapterList.responseFormatType, "html");
-  assert.equal(jm.chapterList.requestInfo, "%@result");
+  assert.match(jm.chapterList.requestInfo, /params\.queryInfo/);
   assert.match(jm.chapterList.list, /btn-toolbar/);
   assert.equal(jm.chapterList.url, "//@href");
 });

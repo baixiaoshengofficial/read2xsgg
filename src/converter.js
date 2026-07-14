@@ -150,7 +150,19 @@ function nativeJmChapterList(host) {
     // 与已可用的 6444 相同：香色直接按详情 URL 拉取 HTML 目录。
     // 禁漫的原始规则 list 已定位到 <a>，再写 //a/@href 会在香色中错失当前节点。
     ...commonAction("chapterList", host, "html"),
-    requestInfo: "%@result",
+    // 不能写成 "%@result"：部分香色漫画动作不会展开这个占位符，
+    // 会实际请求 https://host/%@result。按 6444 的运行时方式显式取值。
+    requestInfo: [
+      "@js:",
+      'var u = (typeof result == "string") ? result : "";',
+      'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
+      'if (u == "%@result") u = "";',
+      'if (!u && params && params.queryInfo) u = params.queryInfo.detailUrl || params.queryInfo.url || "";',
+      'u = String(u || "").trim();',
+      'if (u.indexOf("//") == 0) u = "https:" + u;',
+      'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
+      "return encodeURI(u);",
+    ].join("\n"),
     list: "//ul[contains(@class, 'btn-toolbar')]//a | //a[contains(@class, 'reading')]",
     title: "//h3/text() || //a/text() || @js:\nreturn String(result || '').trim();",
     url: "//@href",
