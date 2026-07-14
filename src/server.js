@@ -520,6 +520,12 @@ function imageRequestFromRequest(request) {
   return { imageUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "", decoder: decoder.toLowerCase() };
 }
 
+function adapterRequestFromRequest(request) {
+  const parsed = new URL(request.url || "/", "http://read2xsgg.local");
+  if (parsed.pathname !== "/adapter/jm/chapters") return null;
+  return { type: "jm-chapters", sourceUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "" };
+}
+
 function isLocalHost(host) {
   const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
   return bare === "localhost" || bare.endsWith(".localhost") || isIP(bare) !== 0;
@@ -581,6 +587,44 @@ function sendJson(response, status, value, headers = {}) {
   const body = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Content-Length": body.length, ...headers });
   response.end(body);
+}
+
+function jmAnchorEntries(fragment, baseUrl) {
+  const entries = [];
+  const seen = new Set();
+  for (const match of String(fragment || "").matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
+    const href = htmlAttribute(match[1], "href");
+    if (!href || /^javascript:/i.test(href)) continue;
+    let url;
+    try {
+      url = new URL(href, baseUrl);
+    } catch {
+      continue;
+    }
+    if (!/^\/photo\/\d+/i.test(url.pathname) || seen.has(url.toString())) continue;
+    const title = htmlText(match[2]);
+    if (!title) continue;
+    seen.add(url.toString());
+    entries.push({ title, url: url.toString() });
+  }
+  return entries;
+}
+
+export function jmChapterEntries(detailPage, baseUrl) {
+  const html = String(detailPage || "");
+  for (const match of html.matchAll(/<ul\b([^>]*)>([\s\S]*?)<\/ul>/gi)) {
+    const className = htmlAttribute(match[1], "class") || "";
+    if (!/(?:^|\s)btn-toolbar(?:\s|$)/i.test(className)) continue;
+    const chapters = jmAnchorEntries(match[2], baseUrl);
+    if (chapters.length) return chapters;
+  }
+  for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
+    const className = htmlAttribute(match[1], "class") || "";
+    if (!/(?:^|\s)reading(?:\s|$)/i.test(className)) continue;
+    const chapters = jmAnchorEntries(match[0], baseUrl);
+    if (chapters.length) return chapters;
+  }
+  return [];
 }
 
 function cacheSet(cache, key, value, config) {
@@ -647,6 +691,23 @@ export function createAppServer(options = {}) {
       const pathname = new URL(request.url || "/", "http://read2xsgg.local").pathname;
       if (pathname === "/healthz") {
         sendJson(response, 200, { status: "ok" }, commonHeaders);
+        return;
+      }
+      const adapterTarget = adapterRequestFromRequest(request);
+      if (adapterTarget) {
+        if (!adapterTarget.sourceUrl) throw new HttpError(400, "缺少禁漫详情 URL");
+        if (active >= config.maxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
+        const sourceUrl = normalizeRemoteUrl(adapterTarget.sourceUrl);
+        active += 1;
+        let chapters;
+        try {
+          const detailPage = await downloadSource(sourceUrl, config);
+          chapters = jmChapterEntries(detailPage.toString("utf8"), sourceUrl);
+        } finally {
+          active -= 1;
+        }
+        if (!chapters.length) throw new HttpError(422, "禁漫详情页没有解析到章节");
+        sendJson(response, 200, { chapters }, { ...commonHeaders, "Cache-Control": "public, max-age=300" });
         return;
       }
       const imageTarget = imageRequestFromRequest(request);

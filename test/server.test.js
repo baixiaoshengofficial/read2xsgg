@@ -3,7 +3,7 @@ import { createCipheriv } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
-import { createAppServer, decodeXbs, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
+import { createAppServer, decodeXbs, jmChapterEntries, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
 
 const source = {
   bookSourceName: "在线示例",
@@ -283,6 +283,11 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
       response.end('<div class="list-col"><a href="/album/1"><div class="video-title">漫画一</div></a></div>');
       return;
     }
+    if (request.url === "/album/1") {
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      response.end('<ul class="btn-toolbar"><a href="/photo/11"><li><h3>第1話</h3></li></a><a href="/photo/12"><li><h3>第2話 2卷</h3></li></a></ul>');
+      return;
+    }
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify([jmSource]));
   });
@@ -310,13 +315,38 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
   assert.doesNotMatch(jm.bookDetail.requestInfo, /\bresult\b/);
   assert.doesNotMatch(JSON.stringify(jm.bookDetail), /java\.|Packages/);
   assert.doesNotMatch(JSON.stringify(jm.searchBook), /java\.|Packages/);
-  assert.match(jm.chapterList.requestInfo, /config\.host/);
-  assert.match(jm.chapterList.requestInfo, /params\.queryInfo/);
-  assert.doesNotMatch(jm.chapterList.requestInfo, /\bresult\b/);
-  assert.doesNotMatch(jm.chapterList.list, /java\.|book\.type/);
-  assert.match(jm.chapterList.list, /\|\|/);
-  assert.match(jm.chapterList.title, /^\/\/a\|\|@js:/);
-  assert.equal(jm.chapterList.url, "//a/@href");
+  assert.equal(jm.chapterList.responseFormatType, "json");
+  assert.match(jm.chapterList.requestInfo, new RegExp(`${appBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/adapter/jm/chapters\\?url=`));
+  assert.equal(jm.chapterList.list, "chapters");
+  assert.equal(jm.chapterList.title, "title");
+  assert.equal(jm.chapterList.url, "url");
+  const requestFunction = new Function("config", "params", jm.chapterList.requestInfo.replace(/^@js:\s*/, ""));
+  const adapterUrl = requestFunction({ host: upstreamBase }, { queryInfo: { detailUrl: "/album/1" } });
+  const chapterResponse = await fetch(adapterUrl);
+  assert.equal(chapterResponse.status, 200);
+  assert.deepEqual(await chapterResponse.json(), {
+    chapters: [
+      { title: "第1話", url: `${upstreamBase}/photo/11` },
+      { title: "第2話 2卷", url: `${upstreamBase}/photo/12` },
+    ],
+  });
+});
+
+test("禁漫章节解析优先连载列表并回退单本入口", () => {
+  assert.deepEqual(jmChapterEntries(`
+    <a class="reading" href="/photo/1">開始閱讀</a>
+    <ul class="btn-toolbar">
+      <a href="/photo/2"><li><h3>第1話</h3></li></a>
+      <a href="/photo/3"><li><h3>第2話 <span>第二卷</span></h3></li></a>
+    </ul>
+  `, "https://18comic.example/album/2"), [
+    { title: "第1話", url: "https://18comic.example/photo/2" },
+    { title: "第2話 第二卷", url: "https://18comic.example/photo/3" },
+  ]);
+  assert.deepEqual(jmChapterEntries(
+    '<a class="btn reading col" href="/photo/9">開始閱讀</a>',
+    "https://18comic.example/album/9",
+  ), [{ title: "開始閱讀", url: "https://18comic.example/photo/9" }]);
 });
 
 test("禁漫镜像候选兼容发布页无协议域名和源内备用地址", () => {

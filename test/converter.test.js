@@ -375,6 +375,17 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
   assert.match(content, /encodeURIComponent\(url\)/);
   assert.doesNotMatch(content, /baseUrl/);
   assert.ok(warnings.some((warning) => warning.message.includes("jm-scramble")));
+  const chapterList = sources["禁漫测试"].chapterList;
+  assert.equal(chapterList.responseFormatType, "json");
+  assert.match(chapterList.requestInfo, /https:\/\/convert\.example\.com\/adapter\/jm\/chapters\?url=/);
+  assert.equal(chapterList.list, "chapters");
+  assert.equal(chapterList.title, "title");
+  assert.equal(chapterList.url, "url");
+  const requestFunction = new Function("config", "params", chapterList.requestInfo.replace(/^@js:\s*/, ""));
+  assert.equal(
+    requestFunction({ host: "https://jm.example.com" }, { queryInfo: { detailUrl: "/album/1/中文" } }),
+    "https://convert.example.com/adapter/jm/chapters?url=https%3A%2F%2Fjm.example.com%2Falbum%2F1%2F%E4%B8%AD%E6%96%87",
+  );
 });
 
 test("禁漫动态发现脚本转换为香色可见的静态分类", () => {

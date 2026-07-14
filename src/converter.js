@@ -145,6 +145,24 @@ function proxiedLineImageContent(contentRule, imageProxyBase, decoder) {
   return selector ? `${selector}|${proxyJs}` : proxyJs;
 }
 
+function proxiedJmChapterList(host, imageProxyBase) {
+  const endpoint = `${String(imageProxyBase).replace(/\/$/, "")}/adapter/jm/chapters?url=`;
+  return {
+    ...commonAction("chapterList", host, "json"),
+    requestInfo: [
+      "@js:",
+      "var q = params.queryInfo || {};",
+      'var u = String(q.detailUrl || q.url || "").trim();',
+      'if (u.indexOf("//") == 0) u = "https:" + u;',
+      'else if (u.indexOf("http") != 0) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
+      `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
+    ].join("\n"),
+    list: "chapters",
+    title: "title",
+    url: "url",
+  };
+}
+
 function xsggModifyTime(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) return String(Math.floor(Date.now() / 1000));
@@ -466,6 +484,12 @@ function convertOne(source, warnings, options = {}) {
     bookWorld: buildBookWorld(source, context),
     ...structuredClone(EMPTY_ACTIONS),
   };
+
+  if (imageDecoder === "jm-scramble" && options.imageProxyBase && resolvedType === "comic") {
+    // 禁漫对客户端直连和 DOM 模板非常敏感。目录统一由转换服务抓取并返回
+    // 简单 JSON，香色端只做字段映射，不再承担 Cloudflare/HTML 兼容。
+    converted.chapterList = proxiedJmChapterList(host, options.imageProxyBase);
+  }
 
   // apply replaceRegex / replaceRegex array onto content field
   // 香色后处理语法是「xpath|@js:」（单竖线）；「||@js:」会被当成备选规则导致正文为空。
