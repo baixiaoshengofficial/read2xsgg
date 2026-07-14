@@ -1,6 +1,6 @@
 import { convertRule, inferResponseType } from "./selectors.js";
 import { convertRequest, parseHeaders } from "./requests.js";
-import { adaptLegadoSource, chapterListRequestInfoOverride } from "./siteAdapters.js";
+import { adaptLegadoSource, bookDetailRequestInfoOverride, chapterListRequestInfoOverride } from "./siteAdapters.js";
 import { decoderForLegadoImageRule } from "./imageDecoder.js";
 
 const EMPTY_ACTIONS = {
@@ -367,7 +367,7 @@ function convertOne(source, warnings, options = {}) {
 
   const bookDetail = {
     ...commonAction("bookDetail", host, detailResponseType),
-    requestInfo: "%@result",
+    requestInfo: bookDetailRequestInfoOverride(source) || "%@result",
     ...mapDetailRules(detailRules, detailResponseType, detailWarningFor),
   };
 

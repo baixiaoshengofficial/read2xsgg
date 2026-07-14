@@ -37,6 +37,11 @@ export function chapterListRequestInfoOverride(source) {
   return null;
 }
 
+export function bookDetailRequestInfoOverride(source) {
+  if (isJmSource(source)) return jmDetailRequestInfo();
+  return null;
+}
+
 function aliceswChapterListRequestInfo() {
   return [
     "@js:",
@@ -66,18 +71,22 @@ function mwwzChapterListRequestInfo() {
   ].join("\n");
 }
 
-function jmChapterListRequestInfo() {
-  // 分类/搜索结果给出相对 /album/{id} 时也要确保目录动作请求完整详情 URL。
+function jmDetailRequestInfo() {
+  // requestInfo 的香色运行环境只有 config/params，没有解析规则里的 result。
+  // 必须直接从 queryInfo.detailUrl 取分类/搜索阶段保存的详情地址。
   return [
     "@js:",
-    'var u = (typeof result == "string") ? result : "";',
-    'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
-    'if (!u && params && params.queryInfo) u = params.queryInfo.detailUrl || params.queryInfo.url || "";',
+    'var q = (params && params.queryInfo) ? params.queryInfo : {};',
+    'var u = String(q.detailUrl || q.url || "");',
     'u = String(u || "").trim();',
-    'if (u.indexOf("//") == 0) return "https:" + u;',
-    'if (u.indexOf("http") == 0) return u;',
-    'return config.host + (u.charAt(0) == "/" ? u : "/" + u);',
+    'if (u.indexOf("//") == 0) u = "https:" + u;',
+    'else if (u.indexOf("http") != 0) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
+    'return encodeURI(u);',
   ].join("\n");
+}
+
+function jmChapterListRequestInfo() {
+  return jmDetailRequestInfo();
 }
 
 function absolutizeUrlJs() {
@@ -207,21 +216,25 @@ function adaptJm(source) {
     ...(categories.length ? { exploreUrl: categories } : {}),
     // 禁漫分类页与搜索页使用同一套卡片 DOM；原源把 ruleExplore 留成 []，
     // 是因为 Legado 会在其动态发现脚本中沿用搜索规则，香色需要显式字段。
+    ruleSearch: portableSearchRules,
     ruleExplore: hasExploreRules ? ruleExplore : portableSearchRules,
+    ruleBookInfo: {
+      name: "id.book-name@text||tag.h1@text",
+      author: "class.phone-author-tag@text",
+      kind: "span[data-type=tags]@tag.a@text",
+      coverUrl: "id.album_photo_cover@tag.img.0@src",
+      wordCount: "class.train-number@text",
+      tocUrl: "baseUrl",
+    },
     ruleToc: {
       ...ruleToc,
       // 原规则在选择器后附加 java.get/book.type 脚本，香色执行时会直接报错。
+      // 连载漫画优先读取 btn-toolbar 中的多章节；单本没有该区块时回退到 reading。
       chapterList: "class.btn-toolbar.0@tag.a||.reading",
-      chapterName: "text",
-      // href 是 /photo/{id} 相对地址；原来的 shunt={{Get(...)}} 在香色会变成空参数。
-      chapterUrl: [
-        "href || @js:",
-        'var u = String(result || "").trim();',
-        'if (!u || /^javascript:/i.test(u)) return "";',
-        'if (u.indexOf("//") == 0) return "https:" + u;',
-        'if (u.indexOf("http") == 0) return u;',
-        'return config.host + (u.charAt(0) == "/" ? u : "/" + u);',
-      ].join("\n"),
+      // 连载标题在 a/li/h3 深层，不能用 a/text()（只会得到缩进空白）。
+      chapterName: "tag.a || @js:\nreturn String(result || '').trim();",
+      // 相对 href 由 action.host 解析；不再追加空的 shunt 参数或执行后处理 JS。
+      chapterUrl: "tag.a@href",
     },
   };
 }

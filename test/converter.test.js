@@ -411,12 +411,30 @@ test("禁漫动态发现脚本转换为香色可见的静态分类", () => {
   assert.match(converted.bookWorld["全部"].list, /list-col/);
   assert.match(converted.bookWorld["全部"].bookName, /video-title/);
   assert.equal(converted.bookWorld["全部"].author, undefined);
+  assert.match(converted.bookDetail.requestInfo, /params\.queryInfo/);
+  assert.doesNotMatch(converted.bookDetail.requestInfo, /\bresult\b/);
+  assert.doesNotMatch(JSON.stringify(converted.bookDetail), /java\.|Packages/);
+  assert.doesNotMatch(JSON.stringify(converted.searchBook), /java\.|Packages/);
   assert.match(converted.chapterList.requestInfo, /config\.host/);
+  assert.match(converted.chapterList.requestInfo, /params\.queryInfo/);
+  assert.doesNotMatch(converted.chapterList.requestInfo, /\bresult\b/);
   assert.match(converted.chapterList.list, /btn-toolbar/);
   assert.match(converted.chapterList.list, /reading/);
+  assert.match(converted.chapterList.list, /\|\|/);
   assert.doesNotMatch(converted.chapterList.list, /java\.|book\.type/);
-  assert.match(converted.chapterList.url, /config\.host/);
-  assert.doesNotMatch(converted.chapterList.url, /shunt|Get\(/);
+  assert.match(converted.chapterList.title, /^\/\/a\|\|@js:/);
+  assert.match(converted.chapterList.title, /\.trim\(\)/);
+  assert.equal(converted.chapterList.url, "//a/@href");
+  const requestFunction = new Function("config", "params", converted.chapterList.requestInfo.replace(/^@js:\s*/, ""));
+  assert.equal(
+    requestFunction({ host: "https://18comic.ink" }, { queryInfo: { detailUrl: "/album/1/中文" } }),
+    "https://18comic.ink/album/1/%E4%B8%AD%E6%96%87",
+  );
+  const detailRequestFunction = new Function("config", "params", converted.bookDetail.requestInfo.replace(/^@js:\s*/, ""));
+  assert.equal(
+    detailRequestFunction({ host: "https://18comic.ink" }, { queryInfo: { detailUrl: "/album/2/测试" } }),
+    "https://18comic.ink/album/2/%E6%B5%8B%E8%AF%95",
+  );
 });
 
 test("有声源保留 audio 类型，正文包装为播放 JSON", () => {
