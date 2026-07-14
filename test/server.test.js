@@ -314,21 +314,10 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
   assert.equal(jm.bookDetail.requestInfo, "%@result");
   assert.doesNotMatch(JSON.stringify(jm.bookDetail), /java\.|Packages/);
   assert.doesNotMatch(JSON.stringify(jm.searchBook), /java\.|Packages/);
-  assert.equal(jm.chapterList.responseFormatType, "json");
-  assert.match(jm.chapterList.requestInfo, new RegExp(`${appBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/adapter/jm/chapters\\?url=`));
-  assert.equal(jm.chapterList.list, "$.chapters");
-  assert.equal(jm.chapterList.title, "title");
-  assert.equal(jm.chapterList.url, "url");
-  const requestFunction = new Function("config", "params", "result", jm.chapterList.requestInfo.replace(/^@js:\s*/, ""));
-  const adapterUrl = requestFunction({ host: upstreamBase }, {}, "/album/1");
-  const chapterResponse = await fetch(adapterUrl);
-  assert.equal(chapterResponse.status, 200);
-  assert.deepEqual(await chapterResponse.json(), {
-    chapters: [
-      { title: "第1話", url: `${upstreamBase}/photo/11` },
-      { title: "第2話 2卷", url: `${upstreamBase}/photo/12` },
-    ],
-  });
+  assert.equal(jm.chapterList.responseFormatType, "html");
+  assert.equal(jm.chapterList.requestInfo, "%@result");
+  assert.match(jm.chapterList.list, /btn-toolbar/);
+  assert.equal(jm.chapterList.url, "//@href");
 });
 
 test("禁漫章节解析优先连载列表并回退单本入口", () => {

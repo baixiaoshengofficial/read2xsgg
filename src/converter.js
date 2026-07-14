@@ -145,27 +145,15 @@ function proxiedLineImageContent(contentRule, imageProxyBase, decoder) {
   return selector ? `${selector}|${proxyJs}` : proxyJs;
 }
 
-function proxiedJmChapterList(host, imageProxyBase) {
-  const endpoint = `${String(imageProxyBase).replace(/\/$/, "")}/adapter/jm/chapters?url=`;
+function nativeJmChapterList(host) {
   return {
-    ...commonAction("chapterList", host, "json"),
-    requestInfo: [
-      "@js:",
-      // 香色的章节动作把详情页地址放在 result；queryInfo 只作为旧版客户端兜底。
-      // 不能反过来依赖 queryInfo，否则部分漫画源会请求空地址，表现为目录为空。
-      'var u = (typeof result === "string") ? result : "";',
-      'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
-      'var q = (params && params.queryInfo) ? params.queryInfo : {};',
-      'if (!u) u = q.detailUrl || q.url || "";',
-      'u = String(u || "").trim();',
-      'if (u.indexOf("//") == 0) u = "https:" + u;',
-      'else if (u.indexOf("http") != 0) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
-      `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
-    ].join("\n"),
-    // JSON 响应必须使用 JSONPath；裸字段名会被香色当 XPath 处理。
-    list: "$.chapters",
-    title: "title",
-    url: "url",
+    // 与已可用的 6444 相同：香色直接按详情 URL 拉取 HTML 目录。
+    // 禁漫的原始规则 list 已定位到 <a>，再写 //a/@href 会在香色中错失当前节点。
+    ...commonAction("chapterList", host, "html"),
+    requestInfo: "%@result",
+    list: "//ul[contains(@class, 'btn-toolbar')]//a | //a[contains(@class, 'reading')]",
+    title: "//h3/text() || //a/text() || @js:\nreturn String(result || '').trim();",
+    url: "//@href",
   };
 }
 
@@ -491,10 +479,9 @@ function convertOne(source, warnings, options = {}) {
     ...structuredClone(EMPTY_ACTIONS),
   };
 
-  if (imageDecoder === "jm-scramble" && options.imageProxyBase && resolvedType === "comic") {
-    // 禁漫对客户端直连和 DOM 模板非常敏感。目录统一由转换服务抓取并返回
-    // 简单 JSON，香色端只做字段映射，不再承担 Cloudflare/HTML 兼容。
-    converted.chapterList = proxiedJmChapterList(host, options.imageProxyBase);
+  if ((imageDecoder === "jm-scramble" || /(?:jmcomic|18comic|comic18j)/i.test(adaptedFrom)) && resolvedType === "comic") {
+    // 7584 参照 6444 使用香色原生 HTML 目录动作，避免 JSON 动作在部分版本中空列表。
+    converted.chapterList = nativeJmChapterList(host);
   }
 
   // apply replaceRegex / replaceRegex array onto content field

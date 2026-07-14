@@ -376,20 +376,12 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
   assert.doesNotMatch(content, /baseUrl/);
   assert.ok(warnings.some((warning) => warning.message.includes("jm-scramble")));
   const chapterList = sources["禁漫测试"].chapterList;
-  assert.equal(chapterList.responseFormatType, "json");
-  assert.match(chapterList.requestInfo, /https:\/\/convert\.example\.com\/adapter\/jm\/chapters\?url=/);
-  assert.equal(chapterList.list, "$.chapters");
-  assert.equal(chapterList.title, "title");
-  assert.equal(chapterList.url, "url");
-  const requestFunction = new Function("config", "params", "result", chapterList.requestInfo.replace(/^@js:\s*/, ""));
-  assert.equal(
-    requestFunction({ host: "https://jm.example.com" }, {}, "/album/1/中文"),
-    "https://convert.example.com/adapter/jm/chapters?url=https%3A%2F%2Fjm.example.com%2Falbum%2F1%2F%E4%B8%AD%E6%96%87",
-  );
-  assert.equal(
-    requestFunction({ host: "https://jm.example.com" }, { queryInfo: { detailUrl: "/album/2" } }, ""),
-    "https://convert.example.com/adapter/jm/chapters?url=https%3A%2F%2Fjm.example.com%2Falbum%2F2",
-  );
+  assert.equal(chapterList.responseFormatType, "html");
+  assert.equal(chapterList.requestInfo, "%@result");
+  assert.match(chapterList.list, /btn-toolbar/);
+  assert.match(chapterList.list, /reading/);
+  assert.match(chapterList.title, /h3\/text/);
+  assert.equal(chapterList.url, "//@href");
 });
 
 test("禁漫动态发现脚本转换为香色可见的静态分类", () => {
@@ -429,21 +421,13 @@ test("禁漫动态发现脚本转换为香色可见的静态分类", () => {
   assert.equal(converted.bookDetail.requestInfo, "%@result");
   assert.doesNotMatch(JSON.stringify(converted.bookDetail), /java\.|Packages/);
   assert.doesNotMatch(JSON.stringify(converted.searchBook), /java\.|Packages/);
-  assert.match(converted.chapterList.requestInfo, /config\.host/);
-  assert.match(converted.chapterList.requestInfo, /params\.queryInfo/);
-  assert.match(converted.chapterList.requestInfo, /\bresult\b/);
+  assert.equal(converted.chapterList.requestInfo, "%@result");
   assert.match(converted.chapterList.list, /btn-toolbar/);
   assert.match(converted.chapterList.list, /reading/);
-  assert.match(converted.chapterList.list, /\|\|/);
   assert.doesNotMatch(converted.chapterList.list, /java\.|book\.type/);
-  assert.match(converted.chapterList.title, /^\/\/a\|\|@js:/);
+  assert.match(converted.chapterList.title, /h3\/text/);
   assert.match(converted.chapterList.title, /\.trim\(\)/);
-  assert.equal(converted.chapterList.url, "//a/@href");
-  const requestFunction = new Function("config", "params", "result", converted.chapterList.requestInfo.replace(/^@js:\s*/, ""));
-  assert.equal(
-    requestFunction({ host: "https://18comic.ink" }, {}, "/album/1/中文"),
-    "https://18comic.ink/album/1/%E4%B8%AD%E6%96%87",
-  );
+  assert.equal(converted.chapterList.url, "//@href");
 });
 
 test("有声源保留 audio 类型，正文包装为播放 JSON", () => {

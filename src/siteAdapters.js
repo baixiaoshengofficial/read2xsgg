@@ -33,7 +33,6 @@ export function adaptLegadoSource(source) {
 export function chapterListRequestInfoOverride(source) {
   if (hostnameOf(source) === "alicesw.com") return aliceswChapterListRequestInfo();
   if (isMwwzSource(source)) return mwwzChapterListRequestInfo();
-  if (isJmSource(source)) return jmChapterListRequestInfo();
   return null;
 }
 
@@ -67,22 +66,6 @@ function mwwzChapterListRequestInfo() {
     'u = String(u || "");',
     'var m = u.match(/\\/api\\/comic\\/(\\d+)/i) || u.match(/\\/comic\\/(\\d+)/i);',
     'return m ? config.host + "/comic/" + m[1] : u;',
-  ].join("\n");
-}
-
-function jmChapterListRequestInfo() {
-  // 无在线代理时也要遵循章节动作的标准 result 语义。
-  // queryInfo 是为旧客户端保留的备用路径，不能作为唯一来源。
-  return [
-    "@js:",
-    'var u = (typeof result === "string") ? result : "";',
-    'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
-    'var q = (params && params.queryInfo) ? params.queryInfo : {};',
-    'if (!u) u = q.detailUrl || q.url || "";',
-    'u = String(u || "").trim();',
-    'if (u.indexOf("//") == 0) u = "https:" + u;',
-    'else if (u.indexOf("http") != 0) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
-    'return encodeURI(u);',
   ].join("\n");
 }
 
