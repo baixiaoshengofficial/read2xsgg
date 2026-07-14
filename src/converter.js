@@ -173,7 +173,29 @@ function commonAction(actionID, host, responseFormatType) {
   return { actionID, validConfig: "", host, responseFormatType, parserID: "DOM" };
 }
 
-function mapBookRules(rules, responseType, warningFor) {
+function simpleJsonPath(rule) {
+  const value = String(rule ?? "").trim().replace(/^@json:/i, "");
+  const match = value.match(/^\$\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)$/);
+  return match ? match[1].replace(/\./g, "/") : "";
+}
+
+/**
+ * 阅读漫画源常用 `$.tags + java.timeFormat(...)` 作为分类展示。
+ * 香色没有 java.timeFormat；保留 tags 才能让客户端对书籍类型/分类做匹配。
+ */
+function portableKindRule(rule, responseType, warningFor, initPath = "") {
+  const source = String(rule ?? "");
+  if (/^@js:/i.test(source) && /java\.timeFormat/i.test(source)) {
+    const field = source.match(/\$\.([A-Za-z_$][\w$]*)/)?.[1];
+    if (field) {
+      warningFor("kind", rule)(`分类规则含阅读 java.timeFormat，已保留可移植字段 ${initPath ? `${initPath}/` : ""}${field}`);
+      return `${initPath ? `${initPath}/` : ""}${field}`;
+    }
+  }
+  return convertRule(rule, { responseType, warn: warningFor("kind", rule) });
+}
+
+function mapBookRules(rules, responseType, warningFor, { initPath = "" } = {}) {
   const mapping = {
     bookList: "list",
     name: "bookName",
@@ -189,14 +211,16 @@ function mapBookRules(rules, responseType, warningFor) {
   const result = {};
   for (const [from, to] of Object.entries(mapping)) {
     if (rules[from] !== undefined && rules[from] !== "") {
-      result[to] = convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) });
+      result[to] = from === "kind"
+        ? portableKindRule(rules[from], responseType, warningFor, initPath)
+        : convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) });
     }
   }
   return result;
 }
 
 function mapDetailRules(rules, responseType, warningFor) {
-  const result = mapBookRules(rules, responseType, warningFor);
+  const result = mapBookRules(rules, responseType, warningFor, { initPath: simpleJsonPath(rules.init) });
   if (rules.init) {
     warningFor("init", rules.init)("详情页 init 规则没有直接等价字段，已忽略；请检查详情页请求与解析结果");
   }

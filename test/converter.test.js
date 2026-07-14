@@ -199,6 +199,30 @@ test("默认不抬高香色最低版本，输入显式版本则保留", () => {
   assert.equal(sources["指定版本"].miniAppVersion, "2.53.2");
 });
 
+test("分类规则剥离阅读 java.timeFormat，保留可供香色匹配的 JSON 分类", () => {
+  const source = {
+    bookSourceName: "漫画分类",
+    bookSourceUrl: "https://comic.example.com",
+    bookSourceType: 2,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: {
+      bookList: "$.data.list[*]", name: "$.title", bookUrl: "$.id",
+      kind: "@js:var $ = result; $.tags + ',' + java.timeFormat($.editTime * 1000);",
+    },
+    ruleBookInfo: {
+      init: "$.data", name: "$.title",
+      kind: "@js:var $ = result; $.tags + ',' + java.timeFormat($.editTime * 1000);",
+    },
+    ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: ".content" },
+  };
+  const { sources, warnings } = convertLegado(source);
+  const converted = sources["漫画分类"];
+  assert.equal(converted.searchBook.cat, "tags");
+  assert.equal(converted.bookDetail.cat, "data/tags");
+  assert.ok(warnings.some((warning) => warning.field === "kind" && warning.message.includes("可移植字段")));
+});
+
 test("Mustache {{@sel}} 与 Get('url') 请求可转换", () => {
   assert.equal(
     convertRule("{{@class.video-title@text}}"),
