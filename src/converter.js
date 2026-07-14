@@ -358,9 +358,17 @@ function parseExploreEntries(exploreUrl, warningFor) {
       warningFor("exploreUrl", exploreUrl)("发现页配置看似 JSON，但解析失败，已尝试按 title::url 行解析");
     }
   }
+  let group = "";
   return source.split(/\r?\n/).map((line) => {
-    const separator = line.indexOf("::");
-    return separator > 0 ? { title: line.slice(0, separator).trim(), url: line.slice(separator + 2).trim() } : null;
+    const value = line.trim();
+    const separator = value.indexOf("::");
+    if (separator <= 0) {
+      // 阅读发现页常以“——总点击——”这类无 URL 的行分组；保留它，
+      // 否则后面重复的“玄幻”等名称会在香色对象中互相覆盖。
+      if (value) group = value.replace(/[—－\-\s]/g, "") || group;
+      return null;
+    }
+    return { title: value.slice(0, separator).trim(), url: value.slice(separator + 2).trim(), group };
   }).filter((item) => item?.title && item?.url);
 }
 
@@ -372,7 +380,13 @@ function buildBookWorld(source, context) {
   const responseType = inferResponseType(rules);
   const result = {};
   entries.forEach((entry, index) => {
-    const title = entry.title || `分类 ${index + 1}`;
+    const baseTitle = entry.group ? `${entry.group}·${entry.title}` : (entry.title || `分类 ${index + 1}`);
+    let title = baseTitle;
+    let duplicate = 2;
+    while (Object.hasOwn(result, title)) {
+      title = `${baseTitle} (${duplicate})`;
+      duplicate += 1;
+    }
     const configuredPageSize = Number(entry.pageSize);
     const pageSize = Number.isInteger(configuredPageSize) && configuredPageSize > 0 ? configuredPageSize : 20;
     result[title] = {
