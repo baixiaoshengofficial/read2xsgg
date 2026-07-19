@@ -7,6 +7,7 @@ import { isIP } from "node:net";
 import { convertLegado } from "./converter.js";
 import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
 import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
+import { decodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
 import { encodeXbs } from "./xbs.js";
 
 class HttpError extends Error {
@@ -38,7 +39,7 @@ export function serverConfig(environment = process.env) {
     cacheTtlMs: integer(environment.CACHE_TTL_SECONDS, 300, 0) * 1000,
     maxCacheEntries: integer(environment.MAX_CACHE_ENTRIES, 100),
     allowPrivateNetworks: boolean(environment.ALLOW_PRIVATE_NETWORKS),
-    allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS),
+    allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS, true),
     corsOrigin: environment.CORS_ORIGIN || "*",
     mwwzDiscoveryUrl: environment.MWWZ_DISCOVERY_URL || "https://www.manwake.cc/",
     jmDiscoveryUrl: environment.JM_DISCOVERY_URL || "https://jmcomicqa.cc/",
@@ -526,11 +527,14 @@ function adapterRequestFromRequest(request) {
   const parsed = new URL(request.url || "/", "http://read2xsgg.local");
   const type = parsed.pathname === "/adapter/jm/chapters" ? "jm-chapters"
     : parsed.pathname === "/adapter/images" || parsed.pathname === "/adapter/jm/images" ? "page-images"
+      : parsed.pathname === "/adapter/media" ? "page-media"
       : "";
   if (!type) return null;
   let extractionPlan;
   try {
-    extractionPlan = decodeComicExtractionPlan(parsed.searchParams.get("plan") || "");
+    extractionPlan = type === "page-media"
+      ? decodeMediaExtractionPlan(parsed.searchParams.get("plan") || "", parsed.searchParams.get("kind") || "audio")
+      : decodeComicExtractionPlan(parsed.searchParams.get("plan") || "");
   } catch (error) {
     throw new HttpError(400, error.message);
   }
@@ -694,6 +698,13 @@ function propertyImageUrls(document, baseUrl, extractionPlan) {
     if (!hints.has(key) && !semantic) return;
     const url = normalizedImageUrl(value, baseUrl);
     if (!url) return;
+    const explicit = hints.has(key);
+    const imageSemantic = /(?:image|img|pic|picture|src|source)/i.test(key);
+    const imageExtension = /\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(url);
+    // SEO JSON-LD commonly contains many page-level `url` fields. Generic
+    // url/path/file keys are only image candidates when the original rule
+    // named that key or the value itself looks like an image.
+    if (!explicit && !imageSemantic && !imageExtension) return;
     const group = groups.get(key) || [];
     if (!group.includes(url)) group.push(url);
     groups.set(key, group);
@@ -764,11 +775,12 @@ export function pageImageUrls(page, baseUrl, extractionPlan = null) {
     ...plan.attributes,
     "data-original", "data-src", "data-lazy-src", "data-url", "data-srcset", "src", "srcset",
   ])];
-  for (const match of html.matchAll(/<[A-Za-z][\w:-]*\b([^>]*)>/g)) {
+  for (const match of html.matchAll(/<([A-Za-z][\w:-]*)\b([^>]*)>/g)) {
+    const tagName = match[1].toLowerCase();
     let attribute = "";
     let raw = "";
     for (const name of attributes) {
-      const value = htmlAttribute(match[1], name);
+      const value = htmlAttribute(match[2], name);
       if (value) {
         attribute = name;
         raw = /srcset/i.test(name) ? value.split(",", 1)[0] : value;
@@ -784,7 +796,13 @@ export function pageImageUrls(page, baseUrl, extractionPlan = null) {
     // exist. Lazy attributes are normally reserved for actual comic pages.
     const lazy = attribute !== "src" && attribute !== "srcset";
     const pathname = new URL(key).pathname;
-    if (!lazy && (!/\.(?:avif|bmp|gif|jpe?g|png|webp)$/i.test(pathname)
+    const imageElement = /^(?:img|picture|source)$/i.test(tagName);
+    const imageExtension = /\.(?:avif|bmp|gif|jpe?g|png|webp)$/i.test(pathname);
+    // data-url is also widely used by pagination/navigation controls. Signed
+    // extensionless images remain valid on actual image elements, but an
+    // arbitrary div/a data-url must look like an image before it is accepted.
+    if (!imageElement && attribute !== "style" && !imageExtension) continue;
+    if (!lazy && (!imageExtension
       || /(?:ad|avatar|banner|blank|captcha|icon|loading|logo)/i.test(pathname))) continue;
     seen.add(key);
     (lazy ? lazyUrls : directUrls).push(key);
@@ -813,11 +831,128 @@ export function pageImageUrls(page, baseUrl, extractionPlan = null) {
   for (const group of groups.values()) {
     if (group.length > largest.length) largest = group;
   }
+  const numbered = largest.map((value, index) => {
+    const pathname = new URL(value).pathname;
+    const match = pathname.match(/(?:^|\/)(?:[^/]*?)(\d+)(?:\.[A-Za-z0-9]+)$/);
+    return { value, index, number: match ? Number(match[1]) : null };
+  });
+  if (numbered.length >= 2 && numbered.filter((item) => Number.isFinite(item.number)).length / numbered.length >= 0.8) {
+    return numbered
+      .sort((left, right) => (left.number ?? Number.MAX_SAFE_INTEGER) - (right.number ?? Number.MAX_SAFE_INTEGER) || left.index - right.index)
+      .map((item) => item.value);
+  }
   return largest;
 }
 
 // Backward-compatible export for callers that previously used the JM-specific name.
 export const jmImageUrls = pageImageUrls;
+
+const AUDIO_ONLY_EXTENSION = /\.(?:aac|flac|m4a|m4b|mp3|oga|ogg|opus|wav)(?:[?#]|$)/i;
+const VIDEO_ONLY_EXTENSION = /\.(?:mp4|m4v|mov|mkv|ts|webm)(?:[?#]|$)/i;
+const STREAM_MEDIA_EXTENSION = /\.(?:m3u8|m4s)(?:[?#]|$)/i;
+const NON_MEDIA_EXTENSION = /\.(?:avif|bmp|css|gif|ico|jpe?g|js|json|png|svg|ttf|woff2?|webp)(?:[?#]|$)/i;
+
+function mediaExtensionPattern(kind) {
+  return kind === "video"
+    ? /\.(?:m3u8|m4s|mp4|m4v|mov|mkv|ts|webm)(?:[?#]|$)/i
+    : /\.(?:aac|flac|m3u8|m4a|m4b|m4s|mp3|oga|ogg|opus|wav)(?:[?#]|$)/i;
+}
+
+function normalizedMediaUrl(value, baseUrl, kind, { allowGeneric = false } = {}) {
+  let raw = String(value || "")
+    .replace(/\\u([\da-f]{4})/gi, (_, code) => String.fromCodePoint(Number.parseInt(code, 16)))
+    .replace(/\\\//g, "/")
+    .replace(/\\([\\"'])/g, "$1")
+    .replace(/&amp;/gi, "&")
+    .trim();
+  const embedded = raw.match(/https?:\/\/[^\s"'<>]+/i);
+  if (embedded && embedded[0] !== raw) raw = embedded[0];
+  raw = raw.replace(/[),;]+$/, "");
+  if (!raw || /[<>\r\n]/.test(raw) || /^(?:blob|data|javascript):/i.test(raw)) return "";
+  if (!/^(?:https?:)?\/\//i.test(raw) && !/^(?:\/|\.\.?\/)/.test(raw)) return "";
+  try {
+    const url = new URL(raw, baseUrl);
+    if (!/^https?:$/.test(url.protocol) || NON_MEDIA_EXTENSION.test(url.toString())) return "";
+    if (kind === "audio" && VIDEO_ONLY_EXTENSION.test(url.toString())) return "";
+    if (kind === "video" && AUDIO_ONLY_EXTENSION.test(url.toString())) return "";
+    if (!allowGeneric && !mediaExtensionPattern(kind).test(url.toString())) return "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Extract playable audio/video URLs from JSON, HTML and inline player scripts.
+ * Rule-derived plans only prioritize field/attribute names; source JavaScript
+ * is never evaluated by the server.
+ */
+export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
+  const plan = normalizeMediaExtractionPlan(extractionPlan, extractionPlan?.kind);
+  const kind = plan.kind;
+  const direct = normalizedMediaUrl(baseUrl, baseUrl, kind);
+  if (direct) return [direct];
+
+  const hints = new Set(plan.properties.map((value) => value.toLowerCase()));
+  const candidates = new Map();
+  let order = 0;
+  const add = (keyValue, value, allowGeneric = false) => {
+    const key = String(keyValue || "").toLowerCase();
+    const semantic = /(?:url|uri|src|source|audio|sound|voice|track|play|video|media|stream|hls|m3u8|file|path)/i.test(key);
+    if (!semantic && !hints.has(key) && !allowGeneric) return;
+    const url = normalizedMediaUrl(value, baseUrl, kind, { allowGeneric: allowGeneric || hints.has(key) || semantic });
+    if (!url || candidates.has(url)) return;
+    const extension = mediaExtensionPattern(kind).test(url);
+    const kindName = kind === "video" ? /(?:video|stream|hls|m3u8)/i.test(key) : /(?:audio|sound|voice|track)/i.test(key);
+    const quality = Number(key.match(/(?:^|_)(\d{2,4})$/)?.[1] || 0);
+    const stream = STREAM_MEDIA_EXTENSION.test(url);
+    const score = (extension ? 1_000_000 : 0) + (hints.has(key) ? 100_000 : 0)
+      + (kindName ? 10_000 : 0) + (stream ? 1_000 : 0) + quality - order;
+    candidates.set(url, score);
+    order += 1;
+  };
+
+  const text = String(page || "");
+  const variants = [text, text.replace(/\\"/g, '"').replace(/\\\//g, "/")];
+  for (const variant of variants) {
+    for (const match of variant.matchAll(/"([A-Za-z_$][\w$-]{0,63})"\s*:\s*"((?:\\.|[^"\\])*)"/g)) {
+      add(match[1], match[2]);
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+    const walk = (value, parentKey = "") => {
+      if (Array.isArray(value)) {
+        for (const item of value) typeof item === "string" ? add(parentKey, item) : walk(item, parentKey);
+        return;
+      }
+      if (!value || typeof value !== "object") return;
+      for (const [key, item] of Object.entries(value)) {
+        if (typeof item === "string") add(key, item);
+        else walk(item, key);
+      }
+    };
+    walk(parsed);
+  } catch {
+    // Ordinary HTML/player pages continue through attribute and URL scanning.
+  }
+
+  const attributes = [...new Set([...plan.attributes, "src", "data-src", "data-url", "data-play-url", "href"])];
+  for (const match of text.matchAll(/<(audio|video|source|iframe)\b([^>]*)>/gi)) {
+    for (const attribute of attributes) {
+      const value = htmlAttribute(match[2], attribute);
+      if (value) add(attribute, value, true);
+    }
+  }
+  for (const match of text.replace(/\\\//g, "/").matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
+    add("media", match[0], false);
+  }
+
+  return [...candidates.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .map(([url]) => url);
+}
 
 function cacheSet(cache, key, value, config) {
   if (config.cacheTtlMs <= 0) return;
@@ -887,21 +1022,34 @@ export function createAppServer(options = {}) {
       }
       const adapterTarget = adapterRequestFromRequest(request);
       if (adapterTarget) {
-        if (!adapterTarget.sourceUrl) throw new HttpError(400, "缺少禁漫详情 URL");
+        if (!adapterTarget.sourceUrl) throw new HttpError(400, "缺少待解析页面 URL");
         if (active >= config.maxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
         const sourceUrl = normalizeRemoteUrl(adapterTarget.sourceUrl);
         active += 1;
         let values;
         try {
-          const detailPage = await downloadSource(sourceUrl, config);
-          values = adapterTarget.type === "jm-chapters"
-            ? jmChapterEntries(detailPage.toString("utf8"), sourceUrl)
-            : pageImageUrls(detailPage.toString("utf8"), sourceUrl, adapterTarget.extractionPlan);
+          if (adapterTarget.type === "page-media") {
+            values = pageMediaUrls("", sourceUrl, adapterTarget.extractionPlan);
+          }
+          if (!values?.length) {
+            const detailPage = await downloadSource(sourceUrl, config);
+            values = adapterTarget.type === "jm-chapters"
+              ? jmChapterEntries(detailPage.toString("utf8"), sourceUrl)
+              : adapterTarget.type === "page-media"
+                ? pageMediaUrls(detailPage.toString("utf8"), sourceUrl, adapterTarget.extractionPlan)
+                : pageImageUrls(detailPage.toString("utf8"), sourceUrl, adapterTarget.extractionPlan);
+          }
         } finally {
           active -= 1;
         }
-        if (!values.length) throw new HttpError(422, adapterTarget.type === "jm-chapters" ? "禁漫详情页没有解析到章节" : "页面没有解析到图片");
-        sendJson(response, 200, adapterTarget.type === "jm-chapters" ? { chapters: values } : { urls: values }, { ...commonHeaders, "Cache-Control": "public, max-age=300" });
+        if (!values.length) {
+          const message = adapterTarget.type === "jm-chapters" ? "详情页没有解析到章节"
+            : adapterTarget.type === "page-media" ? "页面没有解析到媒体地址" : "页面没有解析到图片";
+          throw new HttpError(422, message);
+        }
+        const payload = adapterTarget.type === "jm-chapters" ? { chapters: values }
+          : adapterTarget.type === "page-media" ? { url: values[0] } : { urls: values };
+        sendJson(response, 200, payload, { ...commonHeaders, "Cache-Control": "public, max-age=300" });
         return;
       }
       const imageTarget = imageRequestFromRequest(request);

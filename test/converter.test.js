@@ -179,6 +179,7 @@ test("bookSourceType 映射为香色 sourceType，weight 不为 0", () => {
     [1, "audio"],
     [2, "comic"],
     [3, "text"],
+    [4, "video"],
   ];
   for (const [bookSourceType, expect] of cases) {
     const source = structuredClone(sampleSource);
@@ -192,6 +193,22 @@ test("bookSourceType 映射为香色 sourceType，weight 不为 0", () => {
     assert.notEqual(converted.weight, "0");
     assert.match(converted.weight, /^[1-9]\d*$/);
   }
+});
+
+test("旧类型号可按分组和正文能力自动识别图片源", () => {
+  const source = {
+    ...structuredClone(sampleSource),
+    bookSourceName: "旧版图片源",
+    bookSourceType: 3,
+    bookSourceGroup: "图片书源",
+    ruleContent: { content: ".reader img@html" },
+  };
+  const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const converted = sources["旧版图片源"];
+  assert.equal(converted.sourceType, "comic");
+  assert.match(converted.chapterContent.requestInfo, /\/adapter\/images/);
+  assert.ok(warnings.some((warning) => warning.message.includes("自动识别为 comic")));
+  assert.ok(!warnings.some((warning) => warning.message.includes("文件源类型")));
 });
 
 test("默认不抬高香色最低版本，输入显式版本则保留", () => {
@@ -500,6 +517,29 @@ test("发现页分组标题和同名分类不会相互覆盖", () => {
   assert.match(world["最新·玄幻"].requestInfo, /\/new\//);
 });
 
+test("缺少发现页时使用搜索规则生成可选择的分类入口", () => {
+  const source = {
+    bookSourceName: "仅搜索源",
+    bookSourceUrl: "https://search-only.example.com",
+    searchUrl: "/search?q={{key}}&page={{page}}",
+    ruleSearch: {
+      checkKeyWord: "测试书名 | 备用书名",
+      bookList: ".result",
+      name: ".name@text",
+      bookUrl: "a@href",
+    },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: ".content@text" },
+  };
+  const { sources, warnings } = convertLegado(source);
+  const entry = sources["仅搜索源"].bookWorld["搜索入口"];
+  assert.ok(entry);
+  assert.match(entry.requestInfo, /%E6%B5%8B%E8%AF%95%E4%B9%A6%E5%90%8D/);
+  assert.equal(entry.list, "//*[contains(concat(' ', normalize-space(@class), ' '), ' result ')]");
+  assert.ok(warnings.some((warning) => warning.message.includes("生成分类入口")));
+});
+
 test("列表项字段保持香色支持的双斜线 XPath", () => {
   const source = {
     bookSourceName: "相对 XPath 测试",
@@ -573,4 +613,61 @@ test("有声源保留 audio 类型，正文包装为播放 JSON", () => {
   assert.match(converted.chapterContent.content, /JSON\.stringify/);
   assert.match(converted.chapterContent.content, /forbidCache/);
   assert.match(converted.chapterContent.content, /encodeURI/);
+});
+
+test("有声和视频正文为空时自动使用章节媒体 URL", () => {
+  for (const [bookSourceType, expectedType] of [[1, "audio"], [4, "video"]]) {
+    const source = {
+      bookSourceName: `直链${expectedType}`,
+      bookSourceUrl: `https://${expectedType}.example.com`,
+      bookSourceType,
+      searchUrl: "/search?q={{key}}",
+      ruleSearch: { bookList: "$.list[*]", name: "$.name", bookUrl: "$.url" },
+      ruleBookInfo: { name: "$.name" },
+      ruleToc: { chapterList: "$.items[*]", chapterName: "$.name", chapterUrl: "$.url" },
+      ruleContent: {},
+    };
+    const { sources, warnings } = convertLegado(source);
+    const converted = sources[`直链${expectedType}`];
+    assert.equal(converted.sourceType, expectedType);
+    assert.match(converted.chapterContent.content, /params\.queryInfo/);
+    assert.match(converted.chapterContent.content, /forbidCache/);
+    assert.ok(warnings.some((warning) => warning.message.includes("章节 URL 作为播放地址")));
+    assert.ok(!warnings.some((warning) => warning.message === "缺少正文规则"));
+  }
+});
+
+test("依赖 Android API 的媒体正文通过在线通用提取器转换", () => {
+  const source = {
+    bookSourceName: "媒体提取器",
+    bookSourceUrl: "https://media.example.com",
+    bookSourceType: 4,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".item", name: ".name@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".episode", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: '@js:java.getString("iframe@src")' },
+  };
+  const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const converted = sources["媒体提取器"];
+  assert.equal(converted.sourceType, "video");
+  assert.match(converted.chapterContent.requestInfo, /convert\.example\/adapter\/media\?kind=video/);
+  assert.match(converted.chapterContent.content, /payload\.url/);
+});
+
+test("JSON 音视频正文通过通用提取器兼容上游字段改名", () => {
+  const source = {
+    bookSourceName: "JSON 有声",
+    bookSourceUrl: "https://audio.example.com",
+    bookSourceType: 1,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: "$.list[*]", name: "$.name", bookUrl: "$.url" },
+    ruleBookInfo: { name: "$.name" },
+    ruleToc: { chapterList: "$.episodes[*]", chapterName: "$.name", chapterUrl: "$.apiUrl" },
+    ruleContent: { content: "$.info.sound.soundurl_64" },
+  };
+  const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const converted = sources["JSON 有声"];
+  assert.match(converted.chapterContent.requestInfo, /\/adapter\/media\?kind=audio/);
+  assert.match(converted.chapterContent.content, /payload\.url/);
 });

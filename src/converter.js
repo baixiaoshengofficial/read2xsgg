@@ -3,6 +3,7 @@ import { convertRequest, parseHeaders } from "./requests.js";
 import { adaptLegadoSource, bookDetailRequestInfoOverride, chapterListRequestInfoOverride } from "./siteAdapters.js";
 import { decoderForLegadoImageRule } from "./imageDecoder.js";
 import { compileComicExtractionPlan, encodeComicExtractionPlan } from "./comicPlan.js";
+import { compileMediaExtractionPlan, encodeMediaExtractionPlan } from "./mediaPlan.js";
 
 const EMPTY_ACTIONS = {
   relatedWord: { actionID: "relatedWord", parserID: "DOM" },
@@ -24,10 +25,25 @@ function cleanBaseUrl(value) {
   }
 }
 
-function sourceType(type) {
+function sourceType(source) {
+  const type = source?.bookSourceType;
   if (type === 1 || type === "1") return "audio";
   if (type === 2 || type === "2") return "comic";
-  // 阅读无独立「影视」类型；香色 video 保留给手工/扩展源。文件源(3)按文本输出。
+  // 新版/扩展阅读源已使用 4 表示影视，香色有原生 video 类型。
+  if (type === 4 || type === "4") return "video";
+  const group = String(source?.bookSourceGroup || "");
+  const contentRules = getRules(source, "ruleContent", "contentRule");
+  const contentRule = `${contentRules?.content || ""}\n${contentRules?.imageStyle || ""}\n${contentRules?.imageDecode || ""}`;
+  // Some collections keep the old numeric type while grouping newer media
+  // sources correctly. Infer capabilities from declarative metadata/rules, not
+  // from a site name or domain.
+  if (/(?:影视|视频|电影|直播)/i.test(group)) return "video";
+  if (/(?:有声|音频|音乐|听书)/i.test(group)) return "audio";
+  if (/(?:漫画|图片|图集|写真)/i.test(group)
+    || ((type === 3 || type === "3") && /(?:\bimg\b|image|page-chapter|cp_img|data-original|imageStyle)/i.test(contentRule))) {
+    return "comic";
+  }
+  // True file/download sources have no direct 香色 equivalent and remain text.
   if (type === 3 || type === "3") return "text";
   return "text";
 }
@@ -96,7 +112,7 @@ function wrapComicImageContent(contentRule) {
  * 有声正文：香色 audio 期望 content 最终给出可播媒体。
  * 参考官方样例（海洋听书/老白故事）：返回 JSON 字符串 {url, httpHeaders, forbidCache}。
  */
-function wrapAudioContent(contentRule) {
+function wrapMediaContent(contentRule) {
   if (!contentRule) return contentRule;
   // 已显式构造播放 JSON 的 JS，不再二次包装
   if (/JSON\.stringify\s*\(\s*\{[\s\S]*\burl\b/i.test(contentRule)) return contentRule;
@@ -122,6 +138,23 @@ function wrapAudioContent(contentRule) {
     return `${contentRule}|${wrapJs}`;
   }
   return `${contentRule}|${wrapJs}`;
+}
+
+/** Audio/video sources often put the playable URL directly in chapterUrl. */
+function directMediaContent() {
+  return [
+    "@js:",
+    'var q = (typeof params !== "undefined" && params.queryInfo) || {};',
+    'var url = String(q.url || q.detailUrl || q.chapterUrl || "").trim();',
+    'if (!url && typeof result === "string" && /^(?:https?:)?\\/\\//i.test(result.trim())) url = result.trim();',
+    'if (url.indexOf("//") === 0) url = "https:" + url;',
+    'else if (url && !/^https?:\\/\\//i.test(url)) url = config.host + (url.charAt(0) === "/" ? url : "/" + url);',
+    "return JSON.stringify({",
+    "  url: encodeURI(url),",
+    "  httpHeaders: config.httpHeaders,",
+    "  forbidCache: true",
+    "});",
+  ].join("\n");
 }
 
 /** A known encrypted comic API can be rendered through the server image proxy. */
@@ -224,6 +257,27 @@ function proxiedHtmlComicChapterContent(host, imageProxyBase, decoder = "auto", 
       `var endpoint = ${JSON.stringify(imageEndpoint)};`,
       'var urls = images.map(function (url) { return endpoint + encodeURIComponent(String(url || "")); }).filter(Boolean);',
       'return JSON.stringify({urls: urls, httpHeaders: {}});',
+    ].join("\n"),
+  };
+}
+
+/** Generic server-side audio/video URL extraction for JSON and Android-only rules. */
+function proxiedMediaChapterContent(host, imageProxyBase, kind, extractionPlan) {
+  const base = String(imageProxyBase).replace(/\/$/, "");
+  const encodedPlan = encodeMediaExtractionPlan(extractionPlan);
+  const endpoint = `${base}/adapter/media?kind=${kind}&plan=${encodedPlan}&url=`;
+  return {
+    ...commonAction("chapterContent", host, "json"),
+    requestInfo: runtimeAdapterRequestInfo(endpoint),
+    content: [
+      "@js:",
+      'var payload = (typeof result === "string") ? JSON.parse(result) : result;',
+      'var url = String((payload && payload.url) || "").trim();',
+      "return JSON.stringify({",
+      "  url: encodeURI(url),",
+      "  httpHeaders: config.httpHeaders,",
+      "  forbidCache: true",
+      "});",
     ].join("\n"),
   };
 }
@@ -359,6 +413,10 @@ function parseExploreEntries(exploreUrl, warningFor) {
   if (!exploreUrl || exploreUrl === "-") return [];
   if (Array.isArray(exploreUrl)) return exploreUrl.filter((item) => item?.title && item?.url);
   const source = String(exploreUrl).trim();
+  if (/^(?:@js:|<js>)/i.test(source)) {
+    warningFor("exploreUrl", exploreUrl)("发现页依赖阅读 Android JavaScript，无法安全执行；将尝试生成通用搜索入口分类");
+    return [];
+  }
   if (source.startsWith("[")) {
     try {
       return JSON.parse(source).filter((item) => item?.title && item?.url);
@@ -382,9 +440,36 @@ function parseExploreEntries(exploreUrl, warningFor) {
 
 function buildBookWorld(source, context) {
   const { host, headers, warnings, sourceName } = context;
-  const rules = getRules(source, "ruleExplore", "exploreRule");
+  let rules = getRules(source, "ruleExplore", "exploreRule");
   const warningFor = createWarningCollector(warnings, sourceName, "bookWorld");
-  const entries = parseExploreEntries(source.exploreUrl, warningFor);
+  let entries = parseExploreEntries(source.exploreUrl, warningFor);
+  if (!entries.length) {
+    const searchRules = getRules(source, "ruleSearch", "searchRule");
+    if (rules?.bookList && host) {
+      entries = [{ title: "站点首页", url: host }];
+      warningFor("exploreUrl", source.exploreUrl)("缺少可移植发现分类，已使用原发现规则生成站点首页入口");
+    } else if (source.searchUrl && searchRules?.bookList) {
+      rules = searchRules;
+      const testKeyword = String(searchRules.checkKeyWord || "")
+        .split(/[|,，\n]/)[0]
+        .trim();
+      let request = String(source.searchUrl);
+      if (/^(?:@js:|<js>)/i.test(request)) {
+        // Android-only search scripts cannot run in 香色. The host is still a
+        // valid configured category and keeps an otherwise searchable source
+        // visible in the site switcher.
+        request = host;
+      } else {
+        request = request.replace(/\{\{\s*key\s*\}\}/gi, encodeURIComponent(testKeyword));
+      }
+      entries = [{ title: "搜索入口", url: request }];
+      warningFor("exploreUrl", source.exploreUrl)(
+        testKeyword
+          ? `缺少可移植发现分类，已使用搜索规则和测试关键词“${testKeyword}”生成分类入口`
+          : "缺少可移植发现分类，已使用搜索规则生成分类入口",
+      );
+    }
+  }
   const responseType = inferResponseType(rules);
   const result = {};
   entries.forEach((entry, index) => {
@@ -425,8 +510,12 @@ function convertOne(source, warnings, options = {}) {
     ...(source.httpUserAgent ? { "User-Agent": String(source.httpUserAgent) } : {}),
   };
   if (!host) warningForSource("bookSourceUrl", source.bookSourceUrl)("缺少有效的 bookSourceUrl，生成源可能无法发起请求");
-  if (source.bookSourceType === 3 || source.bookSourceType === "3") {
+  const resolvedType = sourceType(source);
+  if ((source.bookSourceType === 3 || source.bookSourceType === "3") && resolvedType === "text") {
     warningForSource("bookSourceType", source.bookSourceType)("阅读的文件源类型在香色中没有直接等价类型，已按普通文本源输出");
+  }
+  if (![1, 2, 4, "1", "2", "4"].includes(source.bookSourceType) && resolvedType !== "text") {
+    warningForSource("bookSourceType", source.bookSourceType)(`已根据源分组和正文媒体规则自动识别为 ${resolvedType}`);
   }
   if (source.loginUrl || source.loginUi || source.loginCheckJs) {
     warningForSource("loginUrl", source.loginUrl || source.loginUi)(
@@ -438,9 +527,11 @@ function convertOne(source, warnings, options = {}) {
   const detailRules = getRules(source, "ruleBookInfo", "bookInfoRule");
   const tocRules = getRules(source, "ruleToc", "tocRule");
   const contentRules = getRules(source, "ruleContent", "contentRule");
-  const resolvedType = sourceType(source.bookSourceType);
   const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode);
   const comicExtractionPlan = compileComicExtractionPlan(contentRules.content);
+  const mediaExtractionPlan = (resolvedType === "audio" || resolvedType === "video")
+    ? compileMediaExtractionPlan(`${contentRules.content || ""}\n${tocRules.chapterUrl || ""}`, resolvedType)
+    : null;
   const isJmComic = resolvedType === "comic" && (
     ["jm-scramble", "id-md5-reverse-tiles"].includes(imageDecoder)
       || String(imageDecoder || "").startsWith("id-md5-reverse-tiles-")
@@ -542,8 +633,8 @@ function convertOne(source, warnings, options = {}) {
   } else if (content && resolvedType === "comic") {
     content = wrapComicImageContent(content);
   }
-  if (content && resolvedType === "audio") {
-    content = wrapAudioContent(content);
+  if (content && (resolvedType === "audio" || resolvedType === "video")) {
+    content = wrapMediaContent(content);
   }
 
   const converted = {
@@ -601,6 +692,24 @@ function convertOne(source, warnings, options = {}) {
       imageDecoder || "auto",
       comicExtractionPlan,
     );
+  }
+  const mediaRuleNeedsServer = contentResponseType === "json"
+    || /(?:\bjava\.|\bPackages\b|\bandroid\.|\bsource\.|\bbook\.|\bjavaScript\.)/i
+      .test(String(contentRules.content || ""));
+  const hasMediaChapterUrl = Boolean(tocRules.chapterUrl && String(tocRules.chapterUrl).trim() !== "-");
+  if ((resolvedType === "audio" || resolvedType === "video") && !contentRules.content && hasMediaChapterUrl) {
+    converted.chapterContent.content = directMediaContent();
+    contentWarningFor("content", contentRules.content)("正文为空但章节规则提供媒体 URL，已自动将章节 URL 作为播放地址");
+  }
+  if ((resolvedType === "audio" || resolvedType === "video") && options.imageProxyBase
+    && hasMediaChapterUrl && mediaRuleNeedsServer) {
+    converted.chapterContent = proxiedMediaChapterContent(
+      host,
+      options.imageProxyBase,
+      resolvedType,
+      mediaExtractionPlan,
+    );
+    contentWarningFor("content", contentRules.content)("正文为 JSON 媒体接口或依赖阅读 Android API，已改由通用媒体提取器解析播放地址");
   }
 
   // apply replaceRegex / replaceRegex array onto content field

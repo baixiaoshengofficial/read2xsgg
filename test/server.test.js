@@ -142,6 +142,32 @@ test("在线抓取默认禁止访问本机和内网地址", async (context) => {
   assert.match((await response.json()).error, /内网地址/);
 });
 
+test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", async (context) => {
+  const upstream = createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ data: { trackUrl: "/media/chapter.m4a" } }));
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...serverConfig({}), allowPrivateNetworks: true } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const audioPlan = Buffer.from(JSON.stringify({
+    version: 1, kind: "audio", properties: ["trackUrl"], attributes: [],
+  })).toString("base64url");
+  const audio = await fetch(`${appBase}/adapter/media?kind=audio&plan=${audioPlan}&url=${encodeURIComponent(`${upstreamBase}/chapter/1`)}`);
+  assert.equal(audio.status, 200);
+  assert.deepEqual(await audio.json(), { url: `${upstreamBase}/media/chapter.m4a` });
+
+  const direct = "https://cdn.example/live/master.m3u8?token=abc";
+  const video = await fetch(`${appBase}/adapter/media?kind=video&url=${encodeURIComponent(direct)}`);
+  assert.equal(video.status, 200);
+  assert.deepEqual(await video.json(), { url: direct });
+});
+
 test("图片代理地址从本次 HTTPS 转换请求自动推导", async (context) => {
   const encryptedComicSource = {
     ...source,
@@ -354,15 +380,15 @@ test("禁漫章节解析优先连载列表并回退单本入口", () => {
   ), [{ title: "開始閱讀", url: "https://18comic.example/photo/9" }]);
 });
 
-test("通用章节图片提取选择最大的同目录正文序列", () => {
+test("通用章节图片提取选择最大的同目录正文序列并按数字文件名排序", () => {
   assert.deepEqual(jmImageUrls(`
     <img data-original="/media/categories/album/1.jpg"><img data-original="/media/categories/album/2.jpg">
     <img src="/ads/banner.png"><img data-original="https://cdn.example/media/photos/123/00001.webp">
     <img data-src="/media/photos/123/00002.webp"><img data-original="/media/photos/123/00001.webp">
   `, "https://18comic.example/photo/123"), [
     "https://cdn.example/media/photos/123/00001.webp",
-    "https://18comic.example/media/photos/123/00002.webp",
     "https://18comic.example/media/photos/123/00001.webp",
+    "https://18comic.example/media/photos/123/00002.webp",
   ]);
 });
 
@@ -403,6 +429,11 @@ test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (
 
   const response = await fetch(`${appBase}/convert?url=${encodeURIComponent("http://198.18.0.1/source.json")}`);
   assert.equal(response.status, 403);
+});
+
+test("DNS 透明代理兼容默认开启且可以显式关闭", () => {
+  assert.equal(serverConfig({}).allowDnsProxyNetworks, true);
+  assert.equal(serverConfig({ ALLOW_DNS_PROXY_NETWORKS: "false" }).allowDnsProxyNetworks, false);
 });
 
 test("图片代理直通普通图片，并可解开已注册的 AES 图片", async (context) => {
