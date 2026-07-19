@@ -86,6 +86,7 @@ docker login
 
 - `knighttools/read2xsgg:latest`
 - `knighttools/read2xsgg:sha-<commit>`
+- 两个标签都包含 `linux/amd64` 和 `linux/arm64` 镜像清单
 
 可覆盖镜像名 / 标签 / 平台：
 

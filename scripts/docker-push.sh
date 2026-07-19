@@ -4,8 +4,9 @@ set -euo pipefail
 
 IMAGE="${IMAGE:-knighttools/read2xsgg}"
 TAG="${TAG:-latest}"
-PLATFORM="${PLATFORM:-linux/amd64}"
+PLATFORM="${PLATFORM:-linux/amd64,linux/arm64}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+COMMIT_TAG="sha-$(git -C "$ROOT" rev-parse --short HEAD)"
 
 cd "$ROOT"
 
@@ -14,15 +15,12 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Building ${IMAGE}:${TAG} (${PLATFORM}) from $(git rev-parse --short HEAD)"
-docker build \
+echo "Building and pushing ${IMAGE}:${TAG} (${PLATFORM}) from ${COMMIT_TAG#sha-}"
+docker buildx build \
   --platform "${PLATFORM}" \
   -t "${IMAGE}:${TAG}" \
-  -t "${IMAGE}:sha-$(git rev-parse --short HEAD)" \
+  -t "${IMAGE}:${COMMIT_TAG}" \
+  --push \
   .
-
-echo "Pushing ${IMAGE}:${TAG}"
-docker push "${IMAGE}:${TAG}"
-docker push "${IMAGE}:sha-$(git rev-parse --short HEAD)"
 
 echo "Done. Pull with: docker pull ${IMAGE}:${TAG}"
