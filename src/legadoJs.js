@@ -8,10 +8,15 @@ export function legadoTemplateExpression(value) {
   const expression = String(value || "").trim();
   if (/^key$/i.test(expression)) return "params.keyWord";
   if (/^page$/i.test(expression)) return "params.pageIndex";
-  if (/^java\.encodeURI\(\s*key\s*\)$/i.test(expression)) return "encodeURIComponent(params.keyWord)";
-  if (/^encodeURI\(\s*key\s*\)$/i.test(expression)) return "encodeURIComponent(params.keyWord)";
+  if (/^(?:java\.)?encodeURI(?:Component)?\(\s*key\s*\)$/i.test(expression)) return "encodeURIComponent(params.keyWord)";
+  if (/^source\.bookSourceUrl$/i.test(expression)) return "config.host";
   if (/^[\d\s()+*/%.-]*\bpage\b[\d\s()+*/%.-]*$/i.test(expression)) {
     return expression.replace(/\bpage\b/gi, "params.pageIndex");
+  }
+  const withoutStrings = expression.replace(/(['"])(?:\\.|(?!\1)[\s\S])*?\1/g, '""');
+  const pageRemainder = withoutStrings.replace(/\bpage\b/gi, "");
+  if (/\bpage\b/i.test(withoutStrings) && /^[\d\s?:()+*/%<>=!&|.'"_-]*$/.test(pageRemainder)) {
+    return `(${expression.replace(/\bpage\b/gi, "params.pageIndex")})`;
   }
   const resultPath = expression.match(/^\$\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)$/)?.[1];
   if (resultPath) return propertyExpression("result", resultPath);

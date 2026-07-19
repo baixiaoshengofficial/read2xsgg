@@ -162,9 +162,8 @@ function directMediaContent() {
 function proxiedJsonImageContent(imageProxyBase, decoder) {
   const endpoint = `${String(imageProxyBase).replace(/\/$/, "")}/image/${decoder}?url=`;
   return [
-    "@js:",
-    "var payload = (typeof result === \"string\") ? JSON.parse(result) : result;",
-    "var images = payload && payload.data && Array.isArray(payload.data.images) ? payload.data.images : [];",
+    "data/images|@js:",
+    "var images = Array.isArray(result) ? result : [];",
     `var endpoint = ${JSON.stringify(endpoint)};`,
     "var urls = images.map(function (item) {",
     "  var url = String((item && (item.url || item.src)) || \"\");",
@@ -259,9 +258,8 @@ function proxiedHtmlComicChapterContent(host, imageProxyBase, decoder = "auto", 
     ...commonAction("chapterContent", host, "json"),
     requestInfo: runtimeAdapterRequestInfo(endpoint),
     content: [
-      "@js:",
-      'var payload = (typeof result === "string") ? JSON.parse(result) : result;',
-      'var images = payload && Array.isArray(payload.urls) ? payload.urls : [];',
+      "urls|@js:",
+      'var images = Array.isArray(result) ? result : [];',
       `var endpoint = ${JSON.stringify(imageEndpoint)};`,
       'var urls = images.map(function (url) { return endpoint + encodeURIComponent(String(url || "")); }).filter(Boolean);',
       'return JSON.stringify({urls: urls, httpHeaders: {}});',
@@ -464,13 +462,80 @@ function parseExploreEntries(exploreUrl, warningFor) {
   }).filter((item) => item?.title && item?.url);
 }
 
+function compactCategoryTemplate(value, host) {
+  let template = String(value || "").trim();
+  if (!template || /^(?:@js:|<js>)/i.test(template) || /,\s*\{[\s\S]*\}\s*$/.test(template)) return "";
+  template = template
+    .replace(/^\{\{\s*(?:Get|get)\(\s*["']url["']\s*\)\s*\}\}/i, "")
+    .replace(/^\{\{\s*(?:baseUrl|bookSourceUrl)\s*\}\}/i, "");
+  if (host && template.startsWith(host)) template = template.slice(host.length) || "/";
+  template = template
+    .replace(/\{\{\s*page\s*\}\}/gi, "__READ2XSGG_PAGE__")
+    .replace(/%@pageIndex/g, "__READ2XSGG_PAGE__");
+  if (/\{\{|%@(?:keyWord|filter)/i.test(template)) return "";
+  return template;
+}
+
+/**
+ * 大型阅读源集合常带几十个甚至几百个普通 GET 分类。逐项展开为独立
+ * bookWorld action 会让 XBS 膨胀数十倍，也会触发香色的导入/切换异常。
+ * 用香色原生 requestFilters 保存分类值，运行时只保留一个 action。
+ */
+function compactBookWorld(entries, { host, rules, responseType, warningFor }) {
+  if (entries.length < 7) return null;
+  const templates = entries.map((entry) => compactCategoryTemplate(entry.url, host));
+  if (templates.some((template) => !template)) return null;
+
+  const labels = entries.map((entry, index) => {
+    const label = entry.group ? `${entry.group}·${entry.title}` : entry.title;
+    return `${String(label || `分类 ${index + 1}`).replace(/::|[\r\n]/g, " ")}::${index}`;
+  });
+  const configuredPageSize = Number(entries[0]?.pageSize);
+  const pageSize = Number.isInteger(configuredPageSize) && configuredPageSize > 0 ? configuredPageSize : 20;
+  const requestInfo = [
+    "@js:",
+    `var urls = ${JSON.stringify(templates)};`,
+    "var filters = (params && params.filters) || {};",
+    "var selected = (params && params.filter != null) ? params.filter : filters.category;",
+    "var index = Number(selected == null || selected === '' ? 0 : selected);",
+    "var url = String(urls[index] || urls[0] || '');",
+    "url = url.split('__READ2XSGG_PAGE__').join(String(params.pageIndex || 1));",
+    "return encodeURI(url);",
+  ].join("\n");
+
+  warningFor("exploreUrl", `${entries.length} entries`)(
+    `已将 ${entries.length} 个普通 GET 分类压缩为香色 requestFilters，避免分类动作过多导致导入或切换异常`,
+  );
+  return {
+    分类: {
+      ...commonAction("bookWorld", host, responseType),
+      requestInfo,
+      ...mapBookRules(rules, responseType, warningFor, { listContext: true }),
+      moreKeys: { pageSize, requestFilters: ["category", ...labels].join("\n") },
+      _sIndex: 0,
+    },
+  };
+}
+
 function buildBookWorld(source, context) {
   const { host, headers, warnings, sourceName } = context;
   const exploreRules = getRules(source, "ruleExplore", "exploreRule");
   const searchRules = getRules(source, "ruleSearch", "searchRule");
   const rules = { ...searchRules };
   for (const [key, value] of Object.entries(exploreRules)) {
-    if (value !== undefined && value !== null && String(value).trim() !== "") rules[key] = value;
+    if (value === undefined || value === null || String(value).trim() === "") continue;
+    const searchFallback = searchRules[key];
+    if (hasUnsupportedLegadoRuntime(String(value))
+      && searchFallback !== undefined
+      && searchFallback !== null
+      && String(searchFallback).trim() !== ""
+      && !hasUnsupportedLegadoRuntime(String(searchFallback))) {
+      createWarningCollector(warnings, sourceName, "bookWorld")(`ruleExplore.${key}`, value)(
+        `发现规则 ${key} 依赖阅读 Android 运行时，已自动回退到可执行的搜索规则`,
+      );
+      continue;
+    }
+    rules[key] = value;
   }
   const warningFor = createWarningCollector(warnings, sourceName, "bookWorld");
   let entries = parseExploreEntries(source.exploreUrl, warningFor);
@@ -487,6 +552,10 @@ function buildBookWorld(source, context) {
       const testKeyword = String(searchRules.checkKeyWord || "")
         .split(/[|,，\n]/)[0]
         .trim();
+      if (!testKeyword) {
+        warningFor("exploreUrl", source.exploreUrl)("缺少可移植发现分类，搜索规则也没有测试关键词；不再生成必为空的伪分类");
+        return {};
+      }
       let request = String(source.searchUrl);
       if (/^(?:@js:|<js>)/i.test(request)) {
         warningFor("exploreUrl", source.exploreUrl)("搜索请求依赖阅读 Android JavaScript，不能用它伪造可用分类");
@@ -503,6 +572,8 @@ function buildBookWorld(source, context) {
     }
   }
   const responseType = inferResponseType(rules);
+  const compacted = compactBookWorld(entries, { host, rules, responseType, warningFor });
+  if (compacted) return compacted;
   const result = {};
   entries.forEach((entry, index) => {
     const baseTitle = entry.group ? `${entry.group}·${entry.title}` : (entry.title || `分类 ${index + 1}`);
@@ -600,7 +671,7 @@ function convertOne(source, warnings, options = {}) {
   // plan compiled from the original content rule and can parse HTML, JSON,
   // hydration scripts or plain URL lists without checking the source domain.
   const useHtmlComicImageAdapter = resolvedType === "comic" && Boolean(options.imageProxyBase)
-    && Boolean(contentRules.content);
+    && Boolean(contentRules.content) && !isPrefixAesDecoder;
   const contentWarningFor = createWarningCollector(warnings, sourceName, "chapterContent");
 
   const bookDetail = {
@@ -792,8 +863,53 @@ function convertOne(source, warnings, options = {}) {
 }
 
 function completePortableAction(action, fields) {
-  if (!action || hasUnsupportedLegadoRuntime(JSON.stringify(action))) return false;
-  return fields.every((field) => typeof action[field] === "string" && action[field].trim() !== "");
+  if (!action) return false;
+  return fields.every((field) => (
+    typeof action[field] === "string"
+    && action[field].trim() !== ""
+    && !hasUnsupportedLegadoRuntime(JSON.stringify(action[field]))
+  ));
+}
+
+function sanitizePortableAction(action, requiredFields, warnings, sourceName, section) {
+  if (!action || typeof action !== "object") return action;
+  const cleaned = { ...action };
+  for (const [field, value] of Object.entries(cleaned)) {
+    if (requiredFields.includes(field) || !hasUnsupportedLegadoRuntime(JSON.stringify(value))) continue;
+    delete cleaned[field];
+    warnings.push({
+      source: sourceName,
+      section,
+      field,
+      message: "该可选字段仍依赖阅读 Android 运行时，已删除字段并保留可执行的核心动作",
+      rule: value,
+    });
+  }
+  return cleaned;
+}
+
+function sanitizeConvertedActions(source, warnings) {
+  const name = source.sourceName;
+  const specs = {
+    searchBook: ["requestInfo", "list", "bookName", "detailUrl"],
+    bookDetail: ["requestInfo"],
+    chapterList: ["requestInfo", "list", "title", "url"],
+    chapterContent: ["requestInfo", "content"],
+  };
+  for (const [section, required] of Object.entries(specs)) {
+    source[section] = sanitizePortableAction(source[section], required, warnings, name, section);
+  }
+  source.bookWorld = Object.fromEntries(Object.entries(source.bookWorld || {}).map(([title, action]) => ([
+    title,
+    sanitizePortableAction(
+      action,
+      ["requestInfo", "list", "bookName", "detailUrl"],
+      warnings,
+      name,
+      `bookWorld.${title}`,
+    ),
+  ])));
+  return source;
 }
 
 export function portableConvertedSource(source) {
@@ -815,6 +931,7 @@ export function convertLegado(input, options = {}) {
     if (!source || typeof source !== "object") continue;
     const converted = convertOne(source, warnings, options);
     if (options.omitNonPortable) {
+      sanitizeConvertedActions(converted, warnings);
       converted.bookWorld = Object.fromEntries(Object.entries(converted.bookWorld || {}).filter(([, action]) => (
         completePortableAction(action, ["requestInfo", "list", "bookName", "detailUrl"])
       )));

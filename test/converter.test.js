@@ -280,6 +280,7 @@ test("漫蛙适配使用 config.host 的 API 详情与 HTML 目录", () => {
   assert.equal(converted.bookDetail.tocUrl, undefined);
   assert.equal(converted.bookDetail.desc, "data/intro");
   assert.equal(converted.chapterContent.responseFormatType, "json");
+  assert.match(converted.chapterContent.content, /^data\/images\|@js:/);
 });
 
 test("Mustache {{@sel}} 与 Get('url') 请求可转换", () => {
@@ -368,10 +369,11 @@ test("可识别的 AES 图片规则通过公开代理改写为香色图片正文
   };
   const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example.com/" });
   const content = sources["AES 漫画"].chapterContent.content;
+  assert.match(content, /^data\/images\|@js:/);
   assert.match(content, /https:\/\/convert\.example\.com\/image\/aes-cbc-prefix-iv-[A-Za-z0-9_-]+\?url=/);
-  assert.match(sources["AES 漫画"].chapterContent.requestInfo, /adapter\/images\?plan=/);
+  assert.equal(sources["AES 漫画"].chapterContent.requestInfo, "%@result");
   assert.match(content, /JSON\.stringify\(\{urls:/);
-  assert.match(content, /encodeURIComponent\(String\(url/);
+  assert.match(content, /encodeURIComponent\(url\)/);
   assert.doesNotMatch(content, /<img src=/);
   assert.doesNotMatch(content, /source\.getVariable|JSON\.parse\(src\)/);
   assert.ok(warnings.some((warning) => warning.message.includes("图片解码代理")));
@@ -393,6 +395,7 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
   };
   const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example.com" });
   const content = sources["禁漫测试"].chapterContent.content;
+  assert.match(content, /^urls\|@js:/);
   assert.match(content, /https:\/\/convert\.example\.com\/image\/id-md5-reverse-tiles\?url=/);
   assert.match(content, /encodeURIComponent\(String\(url/);
   assert.doesNotMatch(content, /baseUrl/);
@@ -522,6 +525,34 @@ test("发现页分组标题和同名分类不会相互覆盖", () => {
   assert.match(world["最新·玄幻"].requestInfo, /\/new\//);
 });
 
+test("大量普通 GET 分类压缩为一个香色原生筛选动作", () => {
+  const source = {
+    bookSourceName: "大型分类测试",
+    bookSourceUrl: "https://book.example.com",
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".book", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: ".content@html" },
+    exploreUrl: Array.from({ length: 12 }, (_, index) => ({
+      title: `分类 ${index + 1}`,
+      url: `{{Get('url')}}/category/${index + 1}?page={{page}}`,
+    })),
+    ruleExplore: { bookList: ".book", name: "a@text", bookUrl: "a@href" },
+  };
+  const { sources, warnings } = convertLegado(source);
+  const world = sources["大型分类测试"].bookWorld;
+  assert.deepEqual(Object.keys(world), ["分类"]);
+  assert.match(world["分类"].moreKeys.requestFilters, /^category\n分类 1::0/m);
+  assert.match(world["分类"].moreKeys.requestFilters, /分类 12::11$/m);
+  assert.match(world["分类"].requestInfo, /params\.filter/);
+  assert.match(world["分类"].requestInfo, /params\.pageIndex/);
+  assert.doesNotMatch(world["分类"].requestInfo, /\{\{|%@pageIndex/);
+  const request = new Function("params", world["分类"].requestInfo.replace(/^@js:\s*/, ""));
+  assert.equal(request({ filter: "11", pageIndex: 3 }), "/category/12?page=3");
+  assert.ok(warnings.some((warning) => warning.message.includes("压缩为香色 requestFilters")));
+});
+
 test("缺少发现页时使用搜索规则生成可选择的分类入口", () => {
   const source = {
     bookSourceName: "仅搜索源",
@@ -543,6 +574,22 @@ test("缺少发现页时使用搜索规则生成可选择的分类入口", () =>
   assert.match(entry.requestInfo, /%E6%B5%8B%E8%AF%95%E4%B9%A6%E5%90%8D/);
   assert.equal(entry.list, "//*[contains(concat(' ', normalize-space(@class), ' '), ' result ')]");
   assert.ok(warnings.some((warning) => warning.message.includes("生成分类入口")));
+});
+
+test("没有发现分类和测试关键词的搜索源不会伪造空分类", () => {
+  const source = {
+    bookSourceName: "空分类源",
+    bookSourceUrl: "https://empty.example.com",
+    searchUrl: "/search?q={{key}}&page={{page}}",
+    ruleSearch: { bookList: ".result", name: ".name@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: ".content@text" },
+  };
+  const { sources, skipped, warnings } = convertLegado(source, { omitNonPortable: true });
+  assert.equal(sources["空分类源"], undefined);
+  assert.deepEqual(skipped.map((item) => item.source), ["空分类源"]);
+  assert.ok(warnings.some((warning) => warning.message.includes("不再生成必为空的伪分类")));
 });
 
 test("有分类 URL 但发现规则为空时复用搜索列表规则", () => {
@@ -572,6 +619,21 @@ test("有分类 URL 但发现规则为空时复用搜索列表规则", () => {
   assert.match(converted.chapterList.url, /params\.queryInfo/);
   assert.ok(warnings.some((warning) => warning.message.includes("搜索规则补齐")));
   assert.ok(warnings.some((warning) => warning.message.includes("当前详情页作为章节地址")));
+});
+
+test("发现核心字段依赖 Android Java 时逐字段回退搜索规则", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "发现字段回退";
+  source.ruleExplore = {
+    ...source.ruleExplore,
+    name: "@js:return java.getString('.broken-name');",
+    bookUrl: "@js:return source.getVariable();",
+  };
+  const { sources, warnings } = convertLegado(source, { omitNonPortable: true });
+  const world = sources["发现字段回退"].bookWorld["玄幻"];
+  assert.match(world.bookName, /\/\/dd\/\/h3\/\/a\/text\(\)/);
+  assert.equal(world.detailUrl, "//dd//h3//a/@href");
+  assert.ok(warnings.some((warning) => warning.message.includes("已自动回退到可执行的搜索规则")));
 });
 
 test("全局请求头中的阅读 baseUrl 模板固化为源站地址", () => {
@@ -604,6 +666,20 @@ test("在线质量门槛跳过仍含 Android 运行时的伪可用源", () => {
   assert.ok(sources["可移植源"]);
   assert.equal(sources["Android 专用源"], undefined);
   assert.deepEqual(skipped.map((item) => item.source), ["Android 专用源"]);
+});
+
+test("在线质量门槛只删除 Android 专用可选字段而保留可执行列表", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "可选字段含 Java";
+  source.ruleSearch.author = "@js:return java.getString('.author');";
+  source.ruleExplore.author = "@js:return java.getString('.author');";
+  const { sources, skipped, warnings } = convertLegado(source, { omitNonPortable: true });
+  const converted = sources["可选字段含 Java"];
+  assert.ok(converted);
+  assert.deepEqual(skipped, []);
+  assert.equal(converted.searchBook.author, undefined);
+  assert.equal(converted.bookWorld["玄幻"].author, undefined);
+  assert.ok(warnings.some((warning) => warning.message.includes("已删除字段并保留可执行的核心动作")));
 });
 
 test("列表项字段保持香色支持的双斜线 XPath", () => {

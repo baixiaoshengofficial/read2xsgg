@@ -21,6 +21,15 @@ test("动态分类请求中的分页模板可生成香色请求 JavaScript", () 
   assert.doesNotMatch(converted.requestInfo, /\{\{/);
 });
 
+test("分页三元表达式、关键词编码和源站模板可移植", () => {
+  const converted = convertRequest("{{source.bookSourceUrl}}/new/{{page==1?'':'index_'+page+'.html'}}?q={{encodeURIComponent(key)}}");
+  assert.match(converted.requestInfo, /config\.host/);
+  assert.match(converted.requestInfo, /params\.pageIndex\s*==\s*1/);
+  assert.match(converted.requestInfo, /encodeURIComponent\(params\.keyWord\)/);
+  assert.doesNotMatch(converted.requestInfo, /\{\{/);
+  assert.equal(hasUnsupportedLegadoRuntime(converted.requestInfo), false);
+});
+
 test("书名运行时模板不会被误转成 HTML 或 JSON 选择器", () => {
   assert.equal(
     convertRule("{{book.name}}"),

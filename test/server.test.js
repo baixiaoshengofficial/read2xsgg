@@ -10,6 +10,7 @@ const source = {
   bookSourceUrl: "https://example.com",
   searchUrl: "/search?q={{key}}&page={{page}}",
   ruleSearch: {
+    checkKeyWord: "测试",
     bookList: ".book-list > li",
     name: "h3 > a",
     author: ".author",
