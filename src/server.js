@@ -9,6 +9,7 @@ import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDe
 import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
 import { decodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
 import { encodeXbs } from "./xbs.js";
+import { parseHeaders } from "./requests.js";
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -40,6 +41,9 @@ export function serverConfig(environment = process.env) {
     maxCacheEntries: integer(environment.MAX_CACHE_ENTRIES, 100),
     allowPrivateNetworks: boolean(environment.ALLOW_PRIVATE_NETWORKS),
     allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS, true),
+    preflightSources: boolean(environment.PREFLIGHT_SOURCES),
+    preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 2_500),
+    preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 48),
     corsOrigin: environment.CORS_ORIGIN || "*",
     mwwzDiscoveryUrl: environment.MWWZ_DISCOVERY_URL || "https://www.manwake.cc/",
     jmDiscoveryUrl: environment.JM_DISCOVERY_URL || "https://jmcomicqa.cc/",
@@ -117,7 +121,7 @@ function requestBuffer(url, resolved, config, { maxBytes = config.maxSourceBytes
         if (options?.all) callback(null, [resolved]);
         else callback(null, resolved.address, resolved.family);
       },
-      servername: url.hostname,
+      ...(!isIP(url.hostname) ? { servername: url.hostname } : {}),
     }, (response) => {
       const status = response.statusCode ?? 0;
       if (status >= 300 && status < 400 && response.headers.location) {
@@ -170,6 +174,99 @@ export async function downloadSource(sourceUrl, config = serverConfig()) {
     current = result.redirect;
   }
   throw new HttpError(502, "下载阅读源失败");
+}
+
+function probeRequest(url, resolved, config, headers = {}, method = "HEAD") {
+  const requester = url.protocol === "https:" ? httpsRequest : httpRequest;
+  return new Promise((resolve, reject) => {
+    const request = requester(url, {
+      method,
+      headers: {
+        Accept: "text/html,application/json;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
+        ...headers,
+      },
+      lookup: (_hostname, options, callback) => {
+        if (options?.all) callback(null, [resolved]);
+        else callback(null, resolved.address, resolved.family);
+      },
+      ...(!isIP(url.hostname) ? { servername: url.hostname } : {}),
+    }, (response) => {
+      response.resume();
+      resolve({ status: response.statusCode || 0, location: response.headers.location });
+    });
+    request.setTimeout(config.preflightTimeoutMs, () => request.destroy(new Error("preflight timeout")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+async function sourceOriginReachable(source, config) {
+  let current;
+  try {
+    current = new URL(String(source?.bookSourceUrl || source?.sourceUrl || source?.url || "").split("#", 1)[0]);
+  } catch {
+    return false;
+  }
+  if (!/^https?:$/.test(current.protocol)) return false;
+  let headers = {};
+  try {
+    headers = source?.httpHeaders && typeof source.httpHeaders === "object"
+      ? { ...source.httpHeaders }
+      : parseHeaders(source?.header);
+  } catch {
+    headers = {};
+  }
+  if (source?.httpUserAgent) headers["User-Agent"] = String(source.httpUserAgent);
+  for (let redirects = 0; redirects <= Math.min(config.maxRedirects, 3); redirects += 1) {
+    try {
+      const resolved = await resolveTarget(current, config);
+      const result = await probeRequest(current, resolved, config, headers);
+      if (result.status >= 300 && result.status < 400 && result.location) {
+        current = new URL(result.location, current);
+        continue;
+      }
+      if ([401, 403].includes(result.status) || result.status >= 500) {
+        const getResult = await probeRequest(current, resolved, config, headers, "GET");
+        return getResult.status > 0 && getResult.status < 500 && ![401, 403].includes(getResult.status);
+      }
+      return result.status > 0 && result.status < 500;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+export async function filterReachableSources(input, config) {
+  const sources = legacySourceList(input);
+  if (!config.preflightSources || !sources.length) return { input, skipped: [] };
+  const results = new Array(sources.length);
+  const originTasks = new Map();
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(config.preflightConcurrency, sources.length) }, async () => {
+    while (cursor < sources.length) {
+      const index = cursor;
+      cursor += 1;
+      const source = sources[index];
+      let key = String(source?.bookSourceUrl || source?.sourceUrl || source?.url || "");
+      try {
+        key = new URL(key.split("#", 1)[0]).origin;
+      } catch {
+        // Invalid URLs intentionally remain unique and fail the probe.
+      }
+      if (!originTasks.has(key)) originTasks.set(key, sourceOriginReachable(source, config));
+      results[index] = await originTasks.get(key);
+    }
+  });
+  await Promise.all(workers);
+  const reachable = [];
+  const skipped = [];
+  sources.forEach((source, index) => {
+    if (results[index]) reachable.push(source);
+    else skipped.push({ source: String(source?.bookSourceName || source?.sourceName || source?.name || "未命名书源"), reason: "上游站点无法访问或拒绝访问" });
+  });
+  return { input: reachable, skipped };
 }
 
 function normalizeRemoteUrl(value) {
@@ -528,17 +625,57 @@ function adapterRequestFromRequest(request) {
   const type = parsed.pathname === "/adapter/jm/chapters" ? "jm-chapters"
     : parsed.pathname === "/adapter/images" || parsed.pathname === "/adapter/jm/images" ? "page-images"
       : parsed.pathname === "/adapter/media" ? "page-media"
+        : parsed.pathname === "/adapter/toc" ? "toc-redirect"
       : "";
   if (!type) return null;
   let extractionPlan;
   try {
     extractionPlan = type === "page-media"
       ? decodeMediaExtractionPlan(parsed.searchParams.get("plan") || "", parsed.searchParams.get("kind") || "audio")
-      : decodeComicExtractionPlan(parsed.searchParams.get("plan") || "");
+      : type === "page-images" ? decodeComicExtractionPlan(parsed.searchParams.get("plan") || "") : null;
   } catch (error) {
     throw new HttpError(400, error.message);
   }
-  return { type, sourceUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "", extractionPlan };
+  return {
+    type,
+    sourceUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "",
+    hint: parsed.searchParams.get("hint") || "",
+    extractionPlan,
+  };
+}
+
+function plainText(value) {
+  return String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function pageTocUrl(page, baseUrl, hint = "") {
+  const candidates = [];
+  let order = 0;
+  for (const match of String(page || "").matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
+    const href = htmlAttribute(match[1], "href");
+    if (!href || /^(?:javascript|#)/i.test(href)) continue;
+    let url;
+    try {
+      url = new URL(href, baseUrl).toString();
+    } catch {
+      continue;
+    }
+    const text = plainText(match[2]);
+    let score = -order;
+    if (hint && text.includes(hint)) score += 1_000;
+    if (/(?:章节目录|全部章节|目录|chapter\s*list|catalog|directory)/i.test(text)) score += 500;
+    if (/(?:rcatalog|catalog|chapter[-_/]?list|chapters|directory|mulu)/i.test(url)) score += 200;
+    if (/(?:开始阅读|立即阅读|下一章|上一章|read\s*now)/i.test(text)) score -= 300;
+    candidates.push({ url, score });
+    order += 1;
+  }
+  return candidates.sort((left, right) => right.score - left.score)[0]?.url || "";
 }
 
 function isLocalHost(host) {
@@ -964,12 +1101,18 @@ async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
   let parsed;
   let parseError;
   let downloadError;
-  for (const candidate of sourceUrlCandidates(sourceUrl)) {
+  const candidates = sourceUrlCandidates(sourceUrl);
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    const candidate = candidates[candidateIndex];
     let raw;
     try {
       raw = await downloadSource(candidate, config);
     } catch (error) {
       downloadError = error;
+      // shuyuans -> shuyuan is only a response-format fallback. A transient
+      // DNS/TLS/CDN failure must not silently turn an aggregate ID into an
+      // unrelated single source with the same numeric ID.
+      if (candidateIndex === 0) throw error;
       continue;
     }
     try {
@@ -985,9 +1128,24 @@ async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
   parsed = await adaptOnlineSources(parsed, config);
   let converted;
   try {
-    converted = convertLegado(parsed, { imageProxyBase });
+    converted = convertLegado(parsed, { imageProxyBase, omitNonPortable: true });
   } catch (error) {
     throw new HttpError(422, `无法转换在线阅读源：${error.message}`);
+  }
+  const preflight = await filterReachableSources(Object.values(converted.sources), config);
+  if (config.preflightSources) {
+    const reachableSources = new Set(preflight.input);
+    converted.sources = Object.fromEntries(Object.entries(converted.sources).filter(([, source]) => reachableSources.has(source)));
+  }
+  if (preflight.skipped.length) {
+    converted.skipped.unshift(...preflight.skipped);
+    converted.warnings.push(...preflight.skipped.map((item) => ({
+      source: item.source,
+      section: "source",
+      field: "availability",
+      message: `已从在线 XBS 跳过：${item.reason}`,
+      rule: "",
+    })));
   }
   const count = Object.keys(converted.sources).length;
   if (!count) throw new HttpError(422, "在线地址中没有可转换的阅读源");
@@ -1025,6 +1183,20 @@ export function createAppServer(options = {}) {
         if (!adapterTarget.sourceUrl) throw new HttpError(400, "缺少待解析页面 URL");
         if (active >= config.maxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
         const sourceUrl = normalizeRemoteUrl(adapterTarget.sourceUrl);
+        if (adapterTarget.type === "toc-redirect") {
+          active += 1;
+          let targetUrl;
+          try {
+            const detailPage = await downloadSource(sourceUrl, config);
+            targetUrl = pageTocUrl(detailPage.toString("utf8"), sourceUrl, adapterTarget.hint);
+          } finally {
+            active -= 1;
+          }
+          if (!targetUrl) throw new HttpError(422, "详情页没有解析到目录链接");
+          response.writeHead(302, { ...commonHeaders, Location: targetUrl, "Cache-Control": "public, max-age=300" });
+          response.end();
+          return;
+        }
         active += 1;
         let values;
         try {
@@ -1106,6 +1278,7 @@ export function createAppServer(options = {}) {
         ETag: converted.etag,
         "Cache-Control": `public, max-age=${Math.floor(config.cacheTtlMs / 1000)}`,
         "X-Converted-Count": String(converted.count),
+        "X-Skipped-Count": String(converted.skipped?.length || 0),
         "X-Warning-Count": String(converted.warnings.length),
       };
       if (request.headers["if-none-match"] === converted.etag) {
@@ -1114,7 +1287,7 @@ export function createAppServer(options = {}) {
         return;
       }
       if (target.format === "json") {
-        sendJson(response, 200, { sources: converted.sources, warnings: converted.warnings }, headers);
+        sendJson(response, 200, { sources: converted.sources, warnings: converted.warnings, skipped: converted.skipped || [] }, headers);
         return;
       }
       const filename = `read2xsgg-${createHash("sha256").update(target.sourceUrl).digest("hex").slice(0, 12)}.xbs`;

@@ -141,13 +141,13 @@ test("GET/POST 请求模板转换", () => {
   );
   const post = convertRequest('/search,{"method":"post","body":"q={{key}}&offset={{page-1}}"}');
   assert.match(post.requestInfo, /"q": params\.keyWord/);
-  assert.match(post.requestInfo, /"offset": \(params\.pageIndex - 1\)/);
+  assert.match(post.requestInfo, /"offset":\s*params\.pageIndex\s*-\s*1/);
 
   const jsonPost = convertRequest('/api/cate,{"method":"POST","body":"{\\"page\\":{\\"page\\":{{page}},\\"pageSize\\":10},\\"tag\\":\\"热血\\"}"}');
   assert.match(jsonPost.requestInfo, /let hp = JSON\.parse\(/);
   assert.match(jsonPost.requestInfo, /params\.pageIndex/);
   assert.match(jsonPost.requestInfo, /POST:true/);
-  assert.match(jsonPost.requestInfo, /"Content-Type":"application\/json"/);
+  assert.match(jsonPost.requestInfo, /"Content-Type":\s*"application\/json"/);
 });
 
 test("XBS 加解密无损往返", () => {
@@ -302,6 +302,11 @@ test("Mustache {{@sel}} 与 Get('url') 请求可转换", () => {
   assert.match(req.requestInfo, /params\.keyWord/);
   assert.match(req.requestInfo, /params\.pageIndex/);
   assert.match(req.requestInfo, /return \{/);
+});
+
+test("Mustache 字符串常量转换为香色可执行规则", () => {
+  assert.equal(convertRule('{{"固定作者"}}'), '@js:\nreturn "固定作者";');
+  assert.equal(convertRule("{{'固定分类'}}"), '@js:\nreturn "固定分类";');
 });
 
 test("漫画源保留 comic 类型，图片 URL 包成 img，并告警 imageDecode", () => {
@@ -538,6 +543,67 @@ test("缺少发现页时使用搜索规则生成可选择的分类入口", () =>
   assert.match(entry.requestInfo, /%E6%B5%8B%E8%AF%95%E4%B9%A6%E5%90%8D/);
   assert.equal(entry.list, "//*[contains(concat(' ', normalize-space(@class), ' '), ' result ')]");
   assert.ok(warnings.some((warning) => warning.message.includes("生成分类入口")));
+});
+
+test("有分类 URL 但发现规则为空时复用搜索列表规则", () => {
+  const source = {
+    bookSourceName: "图片分类复用",
+    bookSourceUrl: "https://comic.example.com",
+    bookSourceType: 2,
+    exploreUrl: JSON.stringify([{ title: "美图", url: "/gallery?page={{page}}" }]),
+    ruleExplore: {},
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: {
+      bookList: ".masonry-item",
+      name: "h5@text",
+      bookUrl: "a@href",
+      coverUrl: "img@src",
+    },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: "body", chapterName: '{{"正文"}}', chapterUrl: "" },
+    ruleContent: { content: ".post-body@html" },
+  };
+  const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const converted = sources["图片分类复用"];
+  const world = converted.bookWorld["美图"];
+  assert.match(world.list, /masonry-item/);
+  assert.equal(world.bookName, "//h5/text()");
+  assert.equal(world.detailUrl, "//a/@href");
+  assert.match(converted.chapterList.url, /params\.queryInfo/);
+  assert.ok(warnings.some((warning) => warning.message.includes("搜索规则补齐")));
+  assert.ok(warnings.some((warning) => warning.message.includes("当前详情页作为章节地址")));
+});
+
+test("全局请求头中的阅读 baseUrl 模板固化为源站地址", () => {
+  const input = structuredClone(sampleSource);
+  input.header = JSON.stringify({ Referer: "{{baseUrl}}", "X-Dropped": "{{unknown}}" });
+  const { sources } = convertLegado(input);
+  const converted = Object.values(sources)[0];
+  assert.equal(converted.httpHeaders.Referer, "https://example.com");
+  assert.equal(Object.hasOwn(converted.httpHeaders, "X-Dropped"), false);
+  assert.doesNotMatch(JSON.stringify(converted.httpHeaders), /\{\{/);
+});
+
+test("HTML 详情独立目录链接通过通用跳转器请求", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "独立目录页";
+  source.ruleBookInfo.tocUrl = '//span[text()="章节目录"]/parent::a/@href';
+  const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const request = sources["独立目录页"].chapterList.requestInfo;
+  assert.match(request, /convert\.example\/adapter\/toc\?hint=/);
+  assert.match(request, /encodeURIComponent\(u\)/);
+});
+
+test("在线质量门槛跳过仍含 Android 运行时的伪可用源", () => {
+  const good = structuredClone(sampleSource);
+  good.bookSourceName = "可移植源";
+  const bad = structuredClone(sampleSource);
+  bad.bookSourceName = "Android 专用源";
+  bad.searchUrl = "@js:\nreturn java.ajax(source.getKey());";
+  const { sources, skipped } = convertLegado([good, bad], { omitNonPortable: true });
+  assert.ok(sources["可移植源"]);
+  assert.equal(sources["Android 专用源"], undefined);
+  assert.deepEqual(skipped.map((item) => item.source), ["Android 专用源"]);
 });
 
 test("列表项字段保持香色支持的双斜线 XPath", () => {

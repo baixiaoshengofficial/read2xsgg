@@ -38,7 +38,9 @@ function extractChapters(html) {
   }));
 }
 
-test("live iPhone UA: 详情有封面/最新章，改写目录后有章节+正文", async (t) => {
+test("live iPhone UA: 详情有封面/最新章，改写目录后有章节+正文", {
+  skip: process.env.RUN_LIVE_TESTS === "1" ? false : "实时上游测试请运行 npm run test:live",
+}, async (t) => {
   let sourceRes;
   try {
     sourceRes = await fetch("https://www.yckceo.com/yuedu/shuyuan/json/id/7585.json", { headers: IPHONE_UA });

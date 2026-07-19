@@ -3,7 +3,7 @@ import { createCipheriv, createHash } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
-import { createAppServer, decodeXbs, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
+import { createAppServer, decodeXbs, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageTocUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
 
 const source = {
   bookSourceName: "在线示例",
@@ -90,6 +90,7 @@ test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (
   assert.equal(xbsResponse.status, 200);
   assert.equal(xbsResponse.headers.get("content-type"), "application/octet-stream");
   assert.equal(xbsResponse.headers.get("x-converted-count"), "1");
+  assert.equal(xbsResponse.headers.get("x-skipped-count"), "0");
   const etag = xbsResponse.headers.get("etag");
   assert.ok(etag);
   const converted = JSON.parse(decodeXbs(Buffer.from(await xbsResponse.arrayBuffer())).toString("utf8"));
@@ -132,6 +133,45 @@ test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (
   assert.ok(Array.isArray(debug.warnings));
 });
 
+test("聚合源在线预检会跳过无法连接的上游站点", async (context) => {
+  let upstreamBase = "";
+  const upstream = createServer((request, response) => {
+    if (request.url?.startsWith("/source.json")) {
+      const reachable = { ...structuredClone(source), bookSourceName: "可访问", bookSourceUrl: upstreamBase };
+      const unreachable = { ...structuredClone(source), bookSourceName: "不可访问", bookSourceUrl: "http://127.0.0.1:1" };
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify([reachable, unreachable]));
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "text/plain" });
+    response.end("ok");
+  });
+  upstreamBase = await listen(upstream);
+  const app = createAppServer({
+    config: {
+      ...serverConfig({}),
+      allowPrivateNetworks: true,
+      preflightSources: true,
+      preflightTimeoutMs: 250,
+      preflightConcurrency: 2,
+    },
+  });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const response = await fetch(`${appBase}/convert/json?url=${encodeURIComponent(`${upstreamBase}/source.json`)}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-converted-count"), "1");
+  assert.equal(response.headers.get("x-skipped-count"), "1");
+  const payload = await response.json();
+  assert.ok(payload.sources["可访问"]);
+  assert.equal(payload.sources["不可访问"], undefined);
+  assert.deepEqual(payload.skipped.map((item) => item.source), ["不可访问"]);
+});
+
 test("在线抓取默认禁止访问本机和内网地址", async (context) => {
   const app = createAppServer({ config: { ...serverConfig({}), allowPrivateNetworks: false } });
   const appBase = await listen(app);
@@ -166,6 +206,32 @@ test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", as
   const video = await fetch(`${appBase}/adapter/media?kind=video&url=${encodeURIComponent(direct)}`);
   assert.equal(video.status, 200);
   assert.deepEqual(await video.json(), { url: direct });
+});
+
+test("通用目录跳转器从详情页选择章节目录而不是开始阅读", async (context) => {
+  const html = `
+    <a href="/novel/read/1"><span>开始阅读</span></a>
+    <a href="/novel/rcatalog/1"><i></i><span>章节目录</span></a>
+  `;
+  assert.equal(pageTocUrl(html, "https://book.example/detail/1", "章节目录"), "https://book.example/novel/rcatalog/1");
+
+  const upstream = createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/html" });
+    response.end(html);
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...serverConfig({}), allowPrivateNetworks: true } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+  const response = await fetch(
+    `${appBase}/adapter/toc?hint=${encodeURIComponent("章节目录")}&url=${encodeURIComponent(`${upstreamBase}/detail/1`)}`,
+    { redirect: "manual" },
+  );
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get("location"), `${upstreamBase}/novel/rcatalog/1`);
 });
 
 test("图片代理地址从本次 HTTPS 转换请求自动推导", async (context) => {
@@ -258,7 +324,7 @@ test("在线转换会发现并写入可用的漫蛙镜像", async (context) => {
   assert.match(mirror.bookWorld["热血"].requestInfo, /config\.host/);
   assert.match(mirror.bookWorld["热血"].requestInfo, /JSON\.parse/);
   assert.match(mirror.bookWorld["热血"].requestInfo, /params\.pageIndex/);
-  assert.match(mirror.bookWorld["热血"].requestInfo, /"Content-Type":"application\/json"/);
+  assert.match(mirror.bookWorld["热血"].requestInfo, /"Content-Type":\s*"application\/json"/);
   assert.equal(mirror.bookWorld["热血"].moreKeys.pageSize, 10);
 });
 

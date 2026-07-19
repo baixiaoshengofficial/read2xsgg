@@ -4,6 +4,7 @@ import { adaptLegadoSource, bookDetailRequestInfoOverride, chapterListRequestInf
 import { decoderForLegadoImageRule } from "./imageDecoder.js";
 import { compileComicExtractionPlan, encodeComicExtractionPlan } from "./comicPlan.js";
 import { compileMediaExtractionPlan, encodeMediaExtractionPlan } from "./mediaPlan.js";
+import { hasUnsupportedLegadoRuntime } from "./legadoJs.js";
 
 const EMPTY_ACTIONS = {
   relatedWord: { actionID: "relatedWord", parserID: "DOM" },
@@ -224,6 +225,13 @@ function runtimeAdapterRequestInfo(endpoint) {
   ].join("\n");
 }
 
+function tocLinkHint(rule) {
+  const source = String(rule || "");
+  return source.match(/(?:text\(\)|text\.)\s*(?:=|,)?\s*["']([^"']{1,32})["']/i)?.[1]
+    || source.match(/["']([^"']*(?:章节|目录|chapter|catalog)[^"']*)["']/i)?.[1]
+    || "";
+}
+
 function nativeJmChapterList(host) {
   return {
     // 与已可用的 6444 相同：香色直接按详情 URL 拉取 HTML 目录。
@@ -306,6 +314,24 @@ function getRules(source, modern, legacy) {
 
 function createWarningCollector(warnings, sourceName, section) {
   return (field, rule) => (message) => warnings.push({ source: sourceName, section, field, message, rule });
+}
+
+function portableHeaders(input, host, warningFor) {
+  const result = {};
+  for (const [name, rawValue] of Object.entries(input || {})) {
+    if (rawValue === undefined || rawValue === null) continue;
+    let value = String(rawValue)
+      .replace(/\{\{\s*baseUrl\s*\}\}/gi, host)
+      .replace(/\{\{\s*bookSourceUrl\s*\}\}/gi, host)
+      .replace(/\{\{\s*(?:Get|get)\(\s*["']url["']\s*\)\s*\}\}/g, host);
+    if (/\{\{/.test(value)) {
+      warningFor("header", `${name}: ${rawValue}`)(`请求头 ${name} 含无法移植的阅读模板，已忽略该请求头`);
+      continue;
+    }
+    value = value.replace(/[\r\n]+/g, " ").trim();
+    if (value) result[String(name)] = value;
+  }
+  return result;
 }
 
 function commonAction(actionID, host, responseFormatType) {
@@ -440,25 +466,31 @@ function parseExploreEntries(exploreUrl, warningFor) {
 
 function buildBookWorld(source, context) {
   const { host, headers, warnings, sourceName } = context;
-  let rules = getRules(source, "ruleExplore", "exploreRule");
+  const exploreRules = getRules(source, "ruleExplore", "exploreRule");
+  const searchRules = getRules(source, "ruleSearch", "searchRule");
+  const rules = { ...searchRules };
+  for (const [key, value] of Object.entries(exploreRules)) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") rules[key] = value;
+  }
   const warningFor = createWarningCollector(warnings, sourceName, "bookWorld");
   let entries = parseExploreEntries(source.exploreUrl, warningFor);
+  const exploreCoreComplete = Boolean(exploreRules.bookList && exploreRules.name && exploreRules.bookUrl);
+  const effectiveCoreComplete = Boolean(rules.bookList && rules.name && rules.bookUrl);
+  if (entries.length && !exploreCoreComplete && effectiveCoreComplete) {
+    warningFor("ruleExplore", exploreRules)("发现页规则不完整，已用搜索规则补齐列表、书名或详情地址");
+  }
   if (!entries.length) {
-    const searchRules = getRules(source, "ruleSearch", "searchRule");
-    if (rules?.bookList && host) {
+    if (effectiveCoreComplete && exploreRules.bookList && host) {
       entries = [{ title: "站点首页", url: host }];
       warningFor("exploreUrl", source.exploreUrl)("缺少可移植发现分类，已使用原发现规则生成站点首页入口");
-    } else if (source.searchUrl && searchRules?.bookList) {
-      rules = searchRules;
+    } else if (source.searchUrl && searchRules.bookList && searchRules.name && searchRules.bookUrl) {
       const testKeyword = String(searchRules.checkKeyWord || "")
         .split(/[|,，\n]/)[0]
         .trim();
       let request = String(source.searchUrl);
       if (/^(?:@js:|<js>)/i.test(request)) {
-        // Android-only search scripts cannot run in 香色. The host is still a
-        // valid configured category and keeps an otherwise searchable source
-        // visible in the site switcher.
-        request = host;
+        warningFor("exploreUrl", source.exploreUrl)("搜索请求依赖阅读 Android JavaScript，不能用它伪造可用分类");
+        return {};
       } else {
         request = request.replace(/\{\{\s*key\s*\}\}/gi, encodeURIComponent(testKeyword));
       }
@@ -505,10 +537,10 @@ function convertOne(source, warnings, options = {}) {
   if (/(?:jmcomic|18comic|comic18j)/i.test(adaptedFrom)) {
     warningForSource("siteAdapter", adaptedFrom)("已提取禁漫动态发现分类，并显式补齐分类列表规则");
   }
-  const headers = {
+  const headers = portableHeaders({
     ...parseHeaders(source.header, warningForSource("header", source.header)),
     ...(source.httpUserAgent ? { "User-Agent": String(source.httpUserAgent) } : {}),
-  };
+  }, host, warningForSource);
   if (!host) warningForSource("bookSourceUrl", source.bookSourceUrl)("缺少有效的 bookSourceUrl，生成源可能无法发起请求");
   const resolvedType = sourceType(source);
   if ((source.bookSourceType === 3 || source.bookSourceType === "3") && resolvedType === "text") {
@@ -596,20 +628,41 @@ function convertOne(source, warnings, options = {}) {
         warn: detailWarningFor("tocUrl", detailRules.tocUrl),
       });
       if (!requestInfoOverride) {
-        // 非官方字段兜底：部分客户端若把 tocUrl 写入 queryInfo 则可直连目录
-        chapterListRequestInfo = [
-          "@js:",
-          "var q = params.queryInfo || {};",
-          'var u = (typeof result === "string") ? result : "";',
-          'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
-          "u = String(q.tocUrl || q.detailUrl || u || q.url || \"\");",
-          "return u;",
-        ].join("\n");
+        const nameTemplate = String(detailRules.name || "").trim().match(/^\{\{\s*([\s\S]*?)\s*\}\}$/)?.[0];
+        const tocTemplate = String(detailRules.tocUrl || "");
+        if (nameTemplate && tocTemplate.includes(nameTemplate)) {
+          const request = tocTemplate.split(nameTemplate).join("{{book.name}}");
+          chapterListRequestInfo = convertRequest(request, {
+            headers,
+            warn: tocWarningFor("request", request),
+            fallback: "%@result",
+          }).requestInfo;
+          detailWarningFor("tocUrl", detailRules.tocUrl)("目录 URL 与详情书名使用同一字段，已改为从香色 queryInfo.bookName 构造目录请求");
+        } else {
+          // 非官方字段兜底：部分客户端若把 tocUrl 写入 queryInfo 则可直连目录
+          chapterListRequestInfo = [
+            "@js:",
+            "var q = params.queryInfo || {};",
+            'var u = (typeof result === "string") ? result : "";',
+            'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
+            "u = String(q.tocUrl || q.detailUrl || u || q.url || \"\");",
+            "return u;",
+          ].join("\n");
+        }
       }
       detailWarningFor("tocUrl", detailRules.tocUrl)(
         "阅读源含 tocUrl：已写入 bookDetail.tocUrl；章节请求仍以书源规则§七的 result（详情 URL）为准，请实测目录页",
       );
     }
+  }
+  if (detailRules.tocUrl && detailResponseType === "html" && options.imageProxyBase
+    && !/^(?:@js:|<js>|https?:\/\/|\{\{)/i.test(String(detailRules.tocUrl).trim())) {
+    const base = String(options.imageProxyBase).replace(/\/$/, "");
+    const hint = tocLinkHint(detailRules.tocUrl);
+    chapterListRequestInfo = runtimeAdapterRequestInfo(
+      `${base}/adapter/toc?hint=${encodeURIComponent(hint)}&url=`,
+    );
+    detailWarningFor("tocUrl", detailRules.tocUrl)("HTML 详情页的独立目录链接已改由通用目录跳转器解析，避免依赖非标准 queryInfo.tocUrl");
   }
 
   const portableContent = portableJavaGetStringRule(
@@ -701,6 +754,14 @@ function convertOne(source, warnings, options = {}) {
     converted.chapterContent.content = directMediaContent();
     contentWarningFor("content", contentRules.content)("正文为空但章节规则提供媒体 URL，已自动将章节 URL 作为播放地址");
   }
+  if (resolvedType === "comic" && converted.chapterList.list && !converted.chapterList.url) {
+    converted.chapterList.url = [
+      "@js:",
+      "var q = params.queryInfo || {};",
+      'return String(q.detailUrl || q.url || params.responseUrl || config.host || "");',
+    ].join("\n");
+    tocWarningFor("chapterUrl", tocRules.chapterUrl)("单章节图片源没有 chapterUrl，已使用当前详情页作为章节地址");
+  }
   if ((resolvedType === "audio" || resolvedType === "video") && options.imageProxyBase
     && hasMediaChapterUrl && mediaRuleNeedsServer) {
     converted.chapterContent = proxiedMediaChapterContent(
@@ -730,12 +791,50 @@ function convertOne(source, warnings, options = {}) {
   return converted;
 }
 
+function completePortableAction(action, fields) {
+  if (!action || hasUnsupportedLegadoRuntime(JSON.stringify(action))) return false;
+  return fields.every((field) => typeof action[field] === "string" && action[field].trim() !== "");
+}
+
+export function portableConvertedSource(source) {
+  const world = Object.values(source?.bookWorld || {}).some((action) => (
+    completePortableAction(action, ["requestInfo", "list", "bookName", "detailUrl"])
+  ));
+  const search = completePortableAction(source?.searchBook, ["requestInfo", "list", "bookName", "detailUrl"]);
+  const detail = completePortableAction(source?.bookDetail, ["requestInfo"]);
+  const toc = completePortableAction(source?.chapterList, ["requestInfo", "list", "title", "url"]);
+  const content = completePortableAction(source?.chapterContent, ["requestInfo", "content"]);
+  return { portable: Boolean(source?.sourceUrl && world && search && detail && toc && content), world, search, detail, toc, content };
+}
+
 export function convertLegado(input, options = {}) {
   const warnings = [];
   const sources = {};
+  const skipped = [];
   for (const source of normalizeInput(input)) {
     if (!source || typeof source !== "object") continue;
     const converted = convertOne(source, warnings, options);
+    if (options.omitNonPortable) {
+      converted.bookWorld = Object.fromEntries(Object.entries(converted.bookWorld || {}).filter(([, action]) => (
+        completePortableAction(action, ["requestInfo", "list", "bookName", "detailUrl"])
+      )));
+      const compatibility = portableConvertedSource(converted);
+      if (!compatibility.portable) {
+        const failed = Object.entries(compatibility)
+          .filter(([key, value]) => key !== "portable" && !value)
+          .map(([key]) => key)
+          .join(", ");
+        skipped.push({ source: converted.sourceName, reason: `香色核心链路不可执行：${failed}` });
+        warnings.push({
+          source: converted.sourceName,
+          section: "source",
+          field: "compatibility",
+          message: `已从在线 XBS 跳过，避免导入不可用源：${failed}`,
+          rule: "",
+        });
+        continue;
+      }
+    }
     let name = converted.sourceName;
     let suffix = 2;
     while (sources[name]) {
@@ -761,5 +860,5 @@ export function convertLegado(input, options = {}) {
     seenWarnings.add(key);
     return true;
   });
-  return { sources, warnings: uniqueWarnings };
+  return { sources, warnings: uniqueWarnings, skipped };
 }

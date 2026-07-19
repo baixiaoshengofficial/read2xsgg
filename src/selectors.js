@@ -1,3 +1,5 @@
+import { legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
+
 function quoteXPath(value) {
   if (!value.includes("'")) return `'${value}'`;
   if (!value.includes('"')) return `"${value}"`;
@@ -341,6 +343,10 @@ function looksLikeHtmlRule(value) {
   if (!trimmed) return false;
   if (/^(?:@js:|<js>)/i.test(trimmed)) return false;
   if (/^\s*(?:@?json:|\$[.[])/i.test(trimmed)) return false;
+  // A composed absolute URL is an output value, not an HTML selector. Treating
+  // `https://.../{{$.id}}` as XPath solely because it contains `//` makes a
+  // JSON detail response enter the DOM parser.
+  if (/^https?:\/\//i.test(trimmed)) return false;
   if (RELATIVE_PROPERTIES.has(trimmed) || RELATIVE_PROPERTIES.has(trimmed.replace(/^@/, ""))) return true;
   if (/\/\/|^\/html|@(?:text|href|src|html|css:)|^\s*(?:class|id|tag|text)\./i.test(trimmed)) return true;
   if (/[#>\[\]]/.test(trimmed) || /(?:^|[\s>+~,])[a-z][\w-]*\./i.test(trimmed)) return true;
@@ -401,19 +407,42 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   let trimmed = rule.trim();
   if (!trimmed) return "";
 
+  const literalMustache = trimmed.match(/^\{\{\s*(["'])([\s\S]*)\1\s*\}\}$/);
+  if (literalMustache) {
+    return `@js:\nreturn ${JSON.stringify(literalMustache[2])};`;
+  }
+  const runtimeMustache = trimmed.match(/^\{\{\s*([\s\S]*?)\s*\}\}$/);
+  const runtimeExpression = runtimeMustache ? legadoTemplateExpression(runtimeMustache[1]) : "";
+  if (runtimeExpression) return `@js:\nreturn String(${runtimeExpression});`;
+
+  const leadingScript = trimmed.match(/^<js>([\s\S]*?)<\/js>\s*([\s\S]+)$/i);
+  if (leadingScript) {
+    warn("列表规则开头的阅读 JavaScript 前处理无法安全移植，已忽略前处理并保留后续选择器");
+    trimmed = leadingScript[2].trim();
+  }
+
+  if (/^(?:@js:|<js>)/i.test(trimmed)) {
+    const normalized = trimmed.replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
+    const rewritten = rewriteLegadoJavaScript(normalized);
+    warn(rewritten === normalized
+      ? "阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查"
+      : "已将阅读 JavaScript 中的分页、关键词或结果字段模板转换为香色运行时表达式");
+    return rewritten;
+  }
+
+  if (trimmed.includes("{{") && !/\{\{\s*@/.test(trimmed)) {
+    const composed = rewriteLegadoJavaScript(`@js:\nreturn ${JSON.stringify(trimmed)};`);
+    if (!composed.includes("{{")) return composed;
+  }
+
   if (/\{\{/.test(trimmed)) {
     trimmed = expandMustacheRule(trimmed, warn);
     if (!trimmed) return "";
   }
 
-  if (/^(?:@js:|<js>)/i.test(trimmed)) {
-    warn("阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查");
-    return trimmed.replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
-  }
-
   // Absolute URL literal fallback: img@src||https://cdn/.../fallback.png
   if (/^https?:\/\//i.test(trimmed)) {
-    return `@js:\nreturn ${JSON.stringify(trimmed)};`;
+    return rewriteLegadoJavaScript(`@js:\nreturn ${JSON.stringify(trimmed)};`);
   }
 
   // Trailing <js>/@js after a selector (Legado often writes `href\n<js>...</js>`).
@@ -425,7 +454,9 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   }
   if (trailingJs && trailingJs[1].trim() && /[@$.#\[a-z]/i.test(trailingJs[1])) {
     const head = convertRule(trailingJs[1].trim(), { responseType, warn });
-    const script = trailingJs[2].trim().replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
+    const script = rewriteLegadoJavaScript(
+      trailingJs[2].trim().replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, ""),
+    );
     if (/(?:\bjava\.|\bPackages\b|\bsource\.|\bbook\.|traditionalToSimplified|\beval\s*\()/i.test(script)) {
       warn("选择器后的阅读专用 JavaScript 在香色不可执行，已保留基础选择器并忽略该后处理");
       return head;
@@ -486,7 +517,9 @@ export function inferResponseType(rules = {}) {
   const values = Object.values(rules).filter((value) => typeof value === "string" && value.trim());
   if (!values.length) return "html";
 
-  const explicitJsonCount = values.filter((value) => /^\s*(?:@?json:|\$[.[])/i.test(value)).length;
+  const explicitJsonCount = values.filter((value) => (
+    /^\s*(?:@?json:|\$[.[])/i.test(value) || /\{\{\s*\$\.[^}]+\}\}/.test(value)
+  )).length;
   const htmlCount = values.filter((value) => looksLikeHtmlRule(value)).length;
   const implicitJsonCount = values.filter((value) => looksLikeJsonPath(value)).length;
 

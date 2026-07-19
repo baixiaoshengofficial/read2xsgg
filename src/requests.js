@@ -1,3 +1,5 @@
+import { legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
+
 function warnAndReturn(warn, message, fallback) {
   warn(message);
   return fallback;
@@ -50,25 +52,18 @@ function stripLeadingLegadoSideEffectTemplates(request, warn) {
  * - 其余 Get(...) → 空串并告警
  */
 function expressionForTemplate(template, { keyword = true, warn = () => {} } = {}) {
-  const pattern =
-    /\{\{\s*(?:key|page(?:\s*([+-])\s*(\d+))?|Get\(\s*['"]([^'"]+)['"]\s*\)|get\(\s*['"]([^'"]+)['"]\s*\))\s*\}\}/gi;
+  const pattern = /\{\{\s*([\s\S]*?)\s*\}\}/g;
   const parts = [];
   let lastIndex = 0;
   let usedHostFallback = false;
   for (const match of template.matchAll(pattern)) {
     if (match.index > lastIndex) parts.push(JSON.stringify(template.slice(lastIndex, match.index)));
-    const raw = match[0];
-    const inner = raw.replace(/^\{\{\s*|\s*\}\}$/g, "");
-    if (/^key$/i.test(inner)) {
-      parts.push(keyword ? "params.keyWord" : "params.pageIndex");
-    } else if (/^page$/i.test(inner)) {
-      parts.push("params.pageIndex");
-    } else if (/^page\s*[+-]\s*\d+$/i.test(inner)) {
-      const op = match[1];
-      const n = match[2];
-      parts.push(`(params.pageIndex ${op} ${n})`);
-    } else {
-      const getKey = match[3] || match[4] || "";
+    const inner = match[1].trim();
+    const portable = legadoTemplateExpression(inner);
+    if (portable) {
+      parts.push(!keyword && /^key$/i.test(inner) ? "params.pageIndex" : portable);
+    } else if (/^(?:Get|get)\s*\(/i.test(inner)) {
+      const getKey = inner.match(/^[^(]+\(\s*['"]([^'"]+)['"]\s*\)$/)?.[1] || "";
       if (/^url$/i.test(getKey)) {
         parts.push("config.host");
         usedHostFallback = true;
@@ -76,6 +71,9 @@ function expressionForTemplate(template, { keyword = true, warn = () => {} } = {
         warn(`请求模板含 Get('${getKey}')，香色无登录变量，已替换为空串`);
         parts.push('""');
       }
+    } else {
+      warn(`请求模板表达式 {{${inner}}} 无法自动转换，已原样保留`);
+      parts.push(JSON.stringify(match[0]));
     }
     lastIndex = match.index + match[0].length;
   }
@@ -108,6 +106,16 @@ function objectLiteralFromBody(body, warn) {
     const value = separator >= 0 ? pair.slice(separator + 1) : "";
     entries.push(`${JSON.stringify(decodeURIComponent(key))}: ${expressionForTemplate(value, { warn })}`);
   }
+  return `{${entries.join(", ")}}`;
+}
+
+function objectLiteralFromHeaders(headers, warn) {
+  const entries = Object.entries(headers).map(([key, value]) => {
+    const expression = typeof value === "string" && value.includes("{{")
+      ? expressionForTemplate(value, { warn })
+      : JSON.stringify(value);
+    return `${JSON.stringify(key)}: ${expression}`;
+  });
   return `{${entries.join(", ")}}`;
 }
 
@@ -144,8 +152,11 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
   const source = stripLeadingLegadoSideEffectTemplates(request, warn);
 
   if (/^@js:/i.test(source) || /^<js>/i.test(source)) {
-    warn("阅读请求中的 JavaScript/模板表达式无法可靠翻译，已保留原规则供人工修改");
-    return { requestInfo: source.replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "") };
+    const normalized = source.replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
+    const rewritten = rewriteLegadoJavaScript(normalized);
+    if (rewritten !== normalized) warn("已将阅读 JavaScript 中的分页、关键词或结果字段模板转换为香色运行时表达式");
+    else warn("阅读请求中的 JavaScript/模板表达式无法可靠翻译，已保留原规则供人工修改");
+    return { requestInfo: rewritten };
   }
 
   const { url, optionsText } = splitUrlAndOptions(source);
@@ -169,7 +180,7 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
     if (options.body) lines.push(`let hp = ${objectLiteralFromBody(String(options.body), warn)};`);
     const result = ["url:url", `POST:${method === "POST"}`];
     if (options.body) result.push("httpParams:hp");
-    if (Object.keys(mergedHeaders).length) result.push(`httpHeaders:${JSON.stringify(mergedHeaders)}`);
+    if (Object.keys(mergedHeaders).length) result.push(`httpHeaders:${objectLiteralFromHeaders(mergedHeaders, warn)}`);
     if (options.webView) result.push("webView:true");
     lines.push(`return {${result.join(",")}};`);
     return { requestInfo: lines.join("\n"), ...encoding };
@@ -190,7 +201,7 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
   if (options.body) lines.push(`let hp = ${objectLiteralFromBody(String(options.body), warn)};`);
   const result = ["url:url", `POST:${method === "POST"}`];
   if (options.body) result.push("httpParams:hp");
-  if (Object.keys(mergedHeaders).length) result.push(`httpHeaders:${JSON.stringify(mergedHeaders)}`);
+  if (Object.keys(mergedHeaders).length) result.push(`httpHeaders:${objectLiteralFromHeaders(mergedHeaders, warn)}`);
   if (options.webView) result.push("webView:true");
   lines.push(`return {${result.join(",")}};`);
   return { requestInfo: lines.join("\n"), ...encoding };
