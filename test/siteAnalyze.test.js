@@ -370,3 +370,62 @@ test("skippedBuckets 识别 rules-stale 与 analyze-failed", () => {
     "analyze-failed": 1,
   });
 });
+
+test("verify budget 到期后保留未抽测源", async () => {
+  const plan = {
+    version: 1,
+    kind: "books",
+    host: "https://novel.example",
+    responseType: "html",
+    list: "//li",
+    fields: {
+      name: { selector: ".//a", replacements: [], hostPrefix: false, matchTemplate: null },
+      url: { selector: ".//a/@href", replacements: [], hostPrefix: false, matchTemplate: null },
+    },
+    headers: {},
+  };
+  const encoded = encodeBridgePlan(plan);
+  const makeSource = (name) => ({
+    sourceName: name,
+    host: "https://novel.example",
+    sourceType: "text",
+    bookWorld: {
+      分类: {
+        actionID: "bookWorld",
+        host: "https://novel.example",
+        responseFormatType: "html",
+        requestInfo: `https://convert.example/adapter/books?plan=${encoded}&page=%@pageIndex&pageSize=20&slice=1&url=/list`,
+        list: "//li",
+        bookName: ".//a",
+        detailUrl: ".//a/@href",
+      },
+    },
+    chapterList: {
+      actionID: "chapterList",
+      host: "https://novel.example",
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      list: "//a",
+      title: ".",
+      url: "./@href",
+    },
+  });
+  const slowDownload = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    return Buffer.from("<html><body><p>no books</p></body></html>");
+  };
+  const sources = Object.fromEntries(
+    Array.from({ length: 6 }, (_, i) => [`源${i}`, makeSource(`源${i}`)]),
+  );
+  const gated = await applyVerifyAndAnalyzeFallback(sources, {
+    download: slowDownload,
+    concurrency: 2,
+    timeoutMs: 200,
+    enabled: true,
+    analyzeFallback: false,
+    budgetMs: 40,
+  });
+  assert.ok(gated.unverifiedCount >= 1, `expected unverified, got ${gated.unverifiedCount}`);
+  assert.equal(Object.keys(gated.sources).length + gated.skipped.length, 6);
+  assert.equal(Object.keys(gated.sources).length, gated.unverifiedCount);
+});

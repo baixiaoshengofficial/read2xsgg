@@ -20,9 +20,11 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Building and pushing ${IMAGE}:${TAG} (${PLATFORM}) from ${COMMIT_TAG#sha-}"
+GIT_SHA="$(git -C "$ROOT" rev-parse --short HEAD)"
+echo "Building and pushing ${IMAGE}:${TAG} (${PLATFORM}) from ${GIT_SHA}"
 docker buildx build \
   --platform "${PLATFORM}" \
+  --build-arg "GIT_SHA=${GIT_SHA}" \
   -t "${IMAGE}:${TAG}" \
   -t "${IMAGE}:${COMMIT_TAG}" \
   --push \

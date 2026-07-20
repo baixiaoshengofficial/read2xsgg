@@ -2,9 +2,11 @@ FROM node:22-alpine
 
 WORKDIR /app
 
+ARG GIT_SHA=
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
-    PORT=3000
+    PORT=3000 \
+    GIT_SHA=${GIT_SHA}
 
 COPY package.json package-lock.json LICENSE README.md ./
 RUN apk add --no-cache imagemagick libwebp-tools \

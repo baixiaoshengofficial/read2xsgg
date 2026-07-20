@@ -44,6 +44,8 @@ function boolean(value, fallback = false) {
 
 export function serverConfig(environment = process.env) {
   return {
+    version: environment.npm_package_version || environment.APP_VERSION || "0.2.0",
+    commit: environment.GIT_SHA || environment.SOURCE_COMMIT || environment.COMMIT_SHA || "",
     host: environment.HOST || "0.0.0.0",
     port: integer(environment.PORT, 3000, 0),
     fetchTimeoutMs: integer(environment.FETCH_TIMEOUT_MS, 15_000),
@@ -61,10 +63,14 @@ export function serverConfig(environment = process.env) {
     preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES, false),
     preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 3_000),
     preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 4),
-    // 转换后抽测列表+目录；失败则回退自动识站（小说 HTML 启发式）。
+    // 转换后抽测列表+目录。大聚合源默认不做识站回退（太慢会拖垮 /source 订阅）。
     verifyConvertedSources: boolean(environment.VERIFY_CONVERTED_SOURCES, true),
-    analyzeFallback: boolean(environment.ANALYZE_FALLBACK, true),
+    analyzeFallback: boolean(environment.ANALYZE_FALLBACK, false),
     analyzeTimeoutMs: integer(environment.ANALYZE_TIMEOUT_MS, 8_000),
+    // Wall-clock budget for verify phase; remainder kept unverified.
+    verifyBudgetMs: integer(environment.VERIFY_BUDGET_MS, 20_000),
+    // Skip verify entirely above this count (aggregate shuyuans).
+    verifyMaxSources: integer(environment.VERIFY_MAX_SOURCES, 50),
     maxComicPages: integer(environment.MAX_COMIC_PAGES, 50),
     maxComicImages: integer(environment.MAX_COMIC_IMAGES, 2_000),
     comicPageConcurrency: integer(environment.COMIC_PAGE_CONCURRENCY, 4),
@@ -1164,6 +1170,8 @@ function publicBaseUrl(request) {
 function help(config) {
   return {
     name: "read2xsgg",
+    version: config.version || "",
+    commit: config.commit || "",
     status: "ok",
     usage: {
       site: "/url/www.novel-site.example.xbs",
@@ -1191,6 +1199,8 @@ function help(config) {
       preflightTimeoutMs: config.preflightTimeoutMs,
       verifyConvertedSources: config.verifyConvertedSources,
       analyzeFallback: config.analyzeFallback,
+      verifyBudgetMs: config.verifyBudgetMs,
+      verifyMaxSources: config.verifyMaxSources,
       imageDecoders: supportedImageDecoders(),
     },
   };
@@ -1742,15 +1752,29 @@ async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
     { ...config, fetchTimeoutMs: Math.max(config.preflightTimeoutMs, 1_000) },
     headers,
   );
+  const sourceCount = Object.keys(converted.sources).length;
+  const verifyEnabled = config.verifyConvertedSources
+    && sourceCount > 0
+    && sourceCount <= (config.verifyMaxSources || 50);
   const gated = await applyVerifyAndAnalyzeFallback(converted.sources, {
     download,
     concurrency: config.preflightConcurrency,
     timeoutMs: config.preflightTimeoutMs,
     analyzeTimeoutMs: config.analyzeTimeoutMs,
-    enabled: config.verifyConvertedSources,
+    enabled: verifyEnabled,
     analyzeFallback: config.analyzeFallback,
+    budgetMs: config.verifyBudgetMs,
   });
   converted.sources = gated.sources;
+  if (!verifyEnabled && config.verifyConvertedSources && sourceCount > (config.verifyMaxSources || 50)) {
+    converted.warnings.push({
+      source: "",
+      section: "source",
+      field: "verify",
+      message: `源数量 ${sourceCount} 超过抽测上限 ${config.verifyMaxSources}，已跳过抽测直接保留转换结果`,
+      rule: "",
+    });
+  }
   if (gated.skipped.length) {
     converted.skipped.push(...gated.skipped);
     converted.warnings.push(...gated.skipped.map((item) => ({
@@ -1762,6 +1786,15 @@ async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
     })));
   }
   if (gated.warnings.length) converted.warnings.push(...gated.warnings);
+  if (gated.unverifiedCount) {
+    converted.warnings.push({
+      source: "",
+      section: "source",
+      field: "verify",
+      message: `抽测超时预算已用尽，另有 ${gated.unverifiedCount} 个源未抽测仍保留`,
+      rule: "",
+    });
+  }
 
   const count = Object.keys(converted.sources).length;
   if (!count) throw new HttpError(422, "在线地址中没有可转换的阅读源");

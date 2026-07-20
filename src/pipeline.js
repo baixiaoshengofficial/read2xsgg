@@ -4,6 +4,9 @@ import { verifyConvertedSource } from "./verifySource.js";
 /**
  * After Legado conversion + origin preflight: verify each source; on failure
  * try site-analyze fallback; otherwise skip as rules-stale / analyze-failed.
+ *
+ * When `budgetMs` elapses, remaining sources are kept unverified so large
+ * aggregate converts still finish within proxy/client timeouts.
  */
 export async function applyVerifyAndAnalyzeFallback(sources, {
   download,
@@ -12,6 +15,7 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
   analyzeTimeoutMs = 8_000,
   enabled = true,
   analyzeFallback = true,
+  budgetMs = 0,
 } = {}) {
   const input = Object.entries(sources || {});
   if (!enabled || !input.length) {
@@ -22,6 +26,7 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
       fallbackCount: 0,
       verifiedCount: input.length,
       failedVerifyCount: 0,
+      unverifiedCount: 0,
     };
   }
 
@@ -30,13 +35,22 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
   const warnings = [];
   let fallbackCount = 0;
   let failedVerifyCount = 0;
+  let unverifiedCount = 0;
   let cursor = 0;
+  const deadline = budgetMs > 0 ? Date.now() + budgetMs : 0;
 
   const workers = Array.from({ length: Math.min(concurrency, input.length) }, async () => {
     while (cursor < input.length) {
       const index = cursor;
       cursor += 1;
       const [name, source] = input[index];
+
+      if (deadline && Date.now() >= deadline) {
+        kept[name] = source;
+        unverifiedCount += 1;
+        continue;
+      }
+
       const verified = await verifyConvertedSource(source, { download, timeoutMs });
       if (verified.ok) {
         kept[name] = source;
@@ -96,7 +110,8 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
     skipped,
     warnings,
     fallbackCount,
-    verifiedCount: Object.keys(kept).length - fallbackCount,
+    verifiedCount: Object.keys(kept).length - fallbackCount - unverifiedCount,
     failedVerifyCount,
+    unverifiedCount,
   };
 }
