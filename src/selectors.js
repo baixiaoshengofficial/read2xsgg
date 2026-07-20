@@ -557,7 +557,13 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   }
 
   const forceJson = /^@?json:/i.test(trimmed) || trimmed.startsWith("$");
-  const forceHtml = looksLikeHtmlRule(trimmed);
+  const bareRelativeProperty = RELATIVE_PROPERTIES.has(trimmed)
+    || RELATIVE_PROPERTIES.has(trimmed.replace(/^@/, ""));
+  // In a declared JSON response, `title`, `content`, `src` and similar bare
+  // names are overwhelmingly object fields. They were previously forced down
+  // the HTML attribute path (`//@title`), so a valid API response produced an
+  // empty bridge list. Explicit CSS/XPath/`a@href` rules still override JSON.
+  const forceHtml = looksLikeHtmlRule(trimmed) && !(responseType === "json" && bareRelativeProperty);
   const isJson = forceJson || (responseType === "json" && !forceHtml);
   if (isJson) return jsonPathToXsgg(trimmed, warn);
 

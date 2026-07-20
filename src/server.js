@@ -44,7 +44,7 @@ export function serverConfig(environment = process.env) {
     host: environment.HOST || "0.0.0.0",
     port: integer(environment.PORT, 3000, 0),
     fetchTimeoutMs: integer(environment.FETCH_TIMEOUT_MS, 15_000),
-    maxSourceBytes: integer(environment.MAX_SOURCE_BYTES, 10 * 1024 * 1024),
+    maxSourceBytes: integer(environment.MAX_SOURCE_BYTES, 32 * 1024 * 1024),
     maxImageBytes: integer(environment.MAX_IMAGE_BYTES, 25 * 1024 * 1024),
     maxRedirects: integer(environment.MAX_REDIRECTS, 5, 0),
     maxConcurrent: integer(environment.MAX_CONCURRENT, 8),

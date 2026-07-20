@@ -134,7 +134,7 @@ function normalizePlan(value) {
   }
   const headers = {};
   for (const [name, headerValue] of Object.entries(value.headers || {})) {
-    if (!/^(?:user-agent|referer|origin|accept-language)$/i.test(name)) continue;
+    if (!/^(?:user-agent|referer|origin|accept|accept-language|content-type|x-requested-with)$/i.test(name)) continue;
     headers[name] = String(headerValue).slice(0, 2048);
   }
   return {

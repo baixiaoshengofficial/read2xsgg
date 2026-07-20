@@ -1,5 +1,5 @@
 import { convertRule, inferResponseType } from "./selectors.js";
-import { convertRequest, parseHeaders } from "./requests.js";
+import { convertRequest, parseHeaders, parseLooseJson } from "./requests.js";
 import { adaptLegadoSource, bookDetailRequestInfoOverride, chapterListRequestInfoOverride } from "./siteAdapters.js";
 import { decoderForLegadoImageRule } from "./imageDecoder.js";
 import { compileComicExtractionPlan, encodeComicExtractionPlan } from "./comicPlan.js";
@@ -266,7 +266,7 @@ function bridgeEndpoint(base, type, plan) {
 
 function bridgeBookAction(action, bridgeBase, headers) {
   if (!action?.list || !action?.bookName || !action?.detailUrl || !action?.requestInfo) return action;
-  const plan = compileBookBridgePlan(action, headers);
+  const plan = compileBookBridgePlan(action, { ...headers, ...(action.httpHeaders || {}) });
   if (!plan.list || !plan.fields.name || !plan.fields.url) return action;
   const endpoint = bridgeEndpoint(bridgeBase, "books", plan);
   const requestInfo = bridgeRequestInfo(action.requestInfo, endpoint);
@@ -291,7 +291,7 @@ function bridgeBookAction(action, bridgeBase, headers) {
 
 function bridgeDetailAction(action, bridgeBase, headers) {
   if (!action?.bookName || !action?.requestInfo) return action;
-  const plan = compileDetailBridgePlan(action, headers);
+  const plan = compileDetailBridgePlan(action, { ...headers, ...(action.httpHeaders || {}) });
   if (!plan.fields.name) return action;
   const endpoint = bridgeEndpoint(bridgeBase, "detail", plan);
   const requestInfo = bridgeRequestInfo(action.requestInfo, endpoint);
@@ -312,7 +312,10 @@ function bridgeDetailAction(action, bridgeBase, headers) {
 
 function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {} } = {}) {
   if (!action?.list || !action?.title || !action?.url) return action;
-  const plan = compileChapterBridgePlan(action, { tocSelector, headers });
+  const plan = compileChapterBridgePlan(action, {
+    tocSelector,
+    headers: { ...headers, ...(action.httpHeaders || {}) },
+  });
   if (!plan.list || !plan.fields.title || !plan.fields.url) return action;
   const endpoint = bridgeEndpoint(bridgeBase, "chapters", plan);
   const requestInfo = tocSelector
@@ -331,7 +334,7 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
 
 function bridgeTextAction(action, bridgeBase, headers) {
   if (!action?.content || /^@js:/i.test(String(action.content).trim())) return action;
-  const plan = compileTextBridgePlan(action, headers);
+  const plan = compileTextBridgePlan(action, { ...headers, ...(action.httpHeaders || {}) });
   if (!plan.fields.content) return action;
   const endpoint = bridgeEndpoint(bridgeBase, "text", plan);
   const requestInfo = bridgeRequestInfo(action.requestInfo || "%@result", endpoint);
@@ -437,6 +440,107 @@ function normalizeInput(input) {
 
 function getRules(source, modern, legacy) {
   return source[modern] ?? source[legacy] ?? {};
+}
+
+function splitStoredEntries(value) {
+  const entries = [];
+  let current = "";
+  let quote = "";
+  let depth = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote) {
+      current += character;
+      if (character === quote && value[index - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') quote = character;
+    else if (character === "{" || character === "[" || character === "(") depth += 1;
+    else if (character === "}" || character === "]" || character === ")") depth -= 1;
+    if (character === "," && depth === 0) {
+      if (current.trim()) entries.push(current.trim());
+      current = "";
+    } else current += character;
+  }
+  if (current.trim()) entries.push(current.trim());
+  return entries;
+}
+
+function storedMappings(rule) {
+  const mappings = new Map();
+  for (const match of String(rule || "").matchAll(/@put:\{([\s\S]*?)\}(?=(?:\s*##|\s*@js:|\s*<js>|\s*$))/gi)) {
+    const parsed = parseLooseJson(`{${match[1]}}`, () => {});
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.keys(parsed).length) {
+      for (const [key, value] of Object.entries(parsed)) mappings.set(key, String(value));
+      continue;
+    }
+    for (const entry of splitStoredEntries(match[1])) {
+      const pair = entry.match(/^\s*([A-Za-z_$][\w$-]*)\s*:\s*([\s\S]+?)\s*$/);
+      if (!pair) continue;
+      let value = pair[2];
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        try {
+          value = value.startsWith('"') ? JSON.parse(value) : value.slice(1, -1).replace(/\\'/g, "'");
+        } catch {
+          value = value.slice(1, -1);
+        }
+      }
+      mappings.set(pair[1], String(value));
+    }
+  }
+  return mappings;
+}
+
+function jsonStoredTemplate(selector) {
+  const value = String(selector || "").trim().replace(/^@json:/i, "");
+  if (/^\$\.[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*$/.test(value)) return `{{${value}}}`;
+  if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*$/.test(value)) return `{{$.${value}}}`;
+  return "";
+}
+
+function resolveStoredRule(rule, mappings) {
+  if (typeof rule !== "string") return rule;
+  const withoutPut = rule.replace(/@put:\{[\s\S]*?\}(?=(?:\s*##|\s*@js:|\s*<js>|\s*$))/gi, "").trim();
+  return withoutPut.replace(/@get:\{\s*([A-Za-z_$][\w$-]*)\s*\}/gi, (token, key, offset, whole) => {
+    const selector = mappings.get(key);
+    if (!selector) return token;
+    const before = whole.slice(0, offset).trim();
+    const after = whole.slice(offset + token.length).trim();
+    if (!before && (!after || /^(?:##|@js:|<js>)/i.test(after))) return selector;
+    return jsonStoredTemplate(selector) || token;
+  });
+}
+
+function resolveLegadoStoredRules(source) {
+  const keys = ["ruleSearch", "searchRule", "ruleExplore", "exploreRule", "ruleBookInfo", "bookInfoRule", "ruleToc", "tocRule", "ruleContent", "contentRule"];
+  const groups = keys.map((key) => [key, source[key]]).filter(([, rules]) => rules && typeof rules === "object" && !Array.isArray(rules));
+  const candidates = new Map();
+  const locals = new Map();
+  for (const [key, rules] of groups) {
+    const mapping = new Map();
+    for (const value of Object.values(rules)) {
+      for (const [name, selector] of storedMappings(value)) {
+        mapping.set(name, selector);
+        if (!candidates.has(name)) candidates.set(name, new Set());
+        candidates.get(name).add(selector);
+      }
+    }
+    locals.set(key, mapping);
+  }
+  const unique = new Map([...candidates].filter(([, values]) => values.size === 1).map(([name, values]) => [name, [...values][0]]));
+  let changed = 0;
+  const result = { ...source };
+  for (const [key, rules] of groups) {
+    const mappings = new Map([...unique, ...locals.get(key)]);
+    const resolved = {};
+    for (const [field, value] of Object.entries(rules)) {
+      const next = resolveStoredRule(value, mappings);
+      if (next !== value) changed += 1;
+      resolved[field] = next;
+    }
+    result[key] = resolved;
+  }
+  return { source: result, changed };
 }
 
 function createWarningCollector(warnings, sourceName, section) {
@@ -576,23 +680,32 @@ function buildBookAction({ actionID, host, request, rules, headers, warnings, so
 
 function parseExploreEntries(exploreUrl, warningFor) {
   if (!exploreUrl || exploreUrl === "-") return [];
-  if (Array.isArray(exploreUrl)) return exploreUrl.filter((item) => item?.title && item?.url);
+  const validEntries = (entries) => entries
+    .filter((item) => item?.title && item?.url)
+    .map((item) => ({ ...item, title: String(item.title).trim(), url: String(item.url).trim() }))
+    .filter((item) => item.title && item.url);
+  if (Array.isArray(exploreUrl)) return validEntries(exploreUrl);
   const source = String(exploreUrl).trim();
   if (/^(?:@js:|<js>)/i.test(source)) {
     warningFor("exploreUrl", exploreUrl)("发现页依赖阅读 Android JavaScript，无法安全执行；将尝试生成通用搜索入口分类");
     return [];
   }
   if (source.startsWith("[")) {
-    try {
-      return JSON.parse(source).filter((item) => item?.title && item?.url);
-    } catch {
-      warningFor("exploreUrl", exploreUrl)("发现页配置看似 JSON，但解析失败，已尝试按 title::url 行解析");
+    const parsed = parseLooseJson(source, () => {});
+    if (Array.isArray(parsed)) {
+      const entries = validEntries(parsed);
+      if (entries.length) return entries;
     }
+    warningFor("exploreUrl", exploreUrl)("发现页配置看似 JSON，但宽松解析后仍无有效分类，已尝试按 title::url 行解析");
   }
   let group = "";
   return source.split(/\r?\n/).map((line) => {
     const value = line.trim();
     const separator = value.indexOf("::");
+    if (separator > 0 && !value.slice(separator + 2).trim()) {
+      group = value.slice(0, separator).replace(/[—－\-\s]/g, "") || group;
+      return null;
+    }
     if (separator <= 0) {
       // 阅读发现页常以“——总点击——”这类无 URL 的行分组；保留它，
       // 否则后面重复的“玄幻”等名称会在香色对象中互相覆盖。
@@ -631,14 +744,18 @@ function compactBookWorld(entries, { host, rules, responseType, warningFor }) {
   const templates = entries.map((entry) => compactCategoryTemplate(entry.url, host));
   if (templates.some((template) => !template)) return null;
 
+  const seenLabels = new Map();
   const labels = entries.map((entry, index) => {
     const label = entry.group ? `${entry.group}·${entry.title}` : entry.title;
-    return `${String(label || `分类 ${index + 1}`).replace(/::|[\r\n]/g, " ")}::${index}`;
+    const base = String(label || `分类 ${index + 1}`).replace(/::|[\r\n]/g, " ");
+    const occurrence = (seenLabels.get(base) || 0) + 1;
+    seenLabels.set(base, occurrence);
+    return `${occurrence === 1 ? base : `${base} (${occurrence})`}::${index}`;
   });
   const configuredPageSize = Number(entries[0]?.pageSize);
   const pageSize = Number.isInteger(configuredPageSize) && configuredPageSize > 0 ? configuredPageSize : 20;
   const requestFilters = labels.map((label, index) => (
-    `${label.slice(0, label.lastIndexOf("::") + 2)}${templates[index].replaceAll("__READ2XSGG_PAGE__", "%@pageIndex")}`
+    `${label.slice(0, label.lastIndexOf("::") + 2)}${templates[index]}`
   ));
 
   warningFor("exploreUrl", `${entries.length} entries`)(
@@ -647,11 +764,16 @@ function compactBookWorld(entries, { host, rules, responseType, warningFor }) {
   return {
     分类: {
       ...commonAction("bookWorld", host, responseType),
-      // 单键字符串筛选直接把所选 value 替换进 %@filter。这是香色最老、
-      // 最稳定的公开语义，不依赖未文档化的 params.filter。
-      requestInfo: "%@filter",
+      // 香色不会保证对 `%@filter` 注入值中的 `%@pageIndex` 做第二轮
+      // 占位符替换。改用文档化的多键 params.filters，并由单个 JS 在
+      // 运行时替换内部哨兵，避免实际请求残留字面量 `%@pageIndex`。
+      requestInfo: [
+        "@js:",
+        'var f = (params.filters && params.filters.category) || "";',
+        'return String(f).replace(/__READ2XSGG_PAGE__/g, String(params.pageIndex || 1));',
+      ].join("\n"),
       ...mapBookRules(rules, responseType, warningFor, { listContext: true }),
-      moreKeys: { pageSize, requestFilters: requestFilters.join("\n") },
+      moreKeys: { pageSize, requestFilters: `_category\n${requestFilters.join("\n")}` },
       _sIndex: 0,
     },
   };
@@ -679,15 +801,20 @@ function buildBookWorld(source, context) {
   }
   const warningFor = createWarningCollector(warnings, sourceName, "bookWorld");
   let entries = parseExploreEntries(source.exploreUrl, warningFor);
+  const exploreUrlMissing = source.exploreUrl === undefined
+    || source.exploreUrl === null
+    || source.exploreUrl === "-"
+    || (typeof source.exploreUrl === "string" && !source.exploreUrl.trim())
+    || (Array.isArray(source.exploreUrl) && !source.exploreUrl.length);
   const exploreCoreComplete = Boolean(exploreRules.bookList && exploreRules.name && exploreRules.bookUrl);
   const effectiveCoreComplete = Boolean(rules.bookList && rules.name && rules.bookUrl);
   if (entries.length && !exploreCoreComplete && effectiveCoreComplete) {
     warningFor("ruleExplore", exploreRules)("发现页规则不完整，已用搜索规则补齐列表、书名或详情地址");
   }
   if (!entries.length) {
-    if (effectiveCoreComplete && exploreRules.bookList && host) {
+    if (exploreUrlMissing && effectiveCoreComplete && exploreRules.bookList && host) {
       entries = [{ title: "站点首页", url: host }];
-      warningFor("exploreUrl", source.exploreUrl)("缺少可移植发现分类，已使用原发现规则生成站点首页入口");
+      warningFor("exploreUrl", source.exploreUrl)("发现地址为空且原发现规则完整，已使用原发现规则生成站点首页入口");
     } else if (source.searchUrl && searchRules.bookList && searchRules.name && searchRules.bookUrl) {
       const testKeyword = String(searchRules.checkKeyWord || "")
         .split(/[|,，\n]/)[0]
@@ -740,8 +867,13 @@ function convertOne(source, warnings, options = {}) {
   const adaptedFrom = String(source.bookSourceUrl ?? "");
   source = adaptLegadoSource(source);
   const sourceName = String(source.bookSourceName ?? source.name ?? "未命名书源").trim() || "未命名书源";
+  const stored = resolveLegadoStoredRules(source);
+  source = stored.source;
   const host = cleanBaseUrl(source.bookSourceUrl ?? source.url);
   const warningForSource = createWarningCollector(warnings, sourceName, "source");
+  if (stored.changed) {
+    warningForSource("storedRules", `${stored.changed} fields`)("已将阅读 @put/@get 状态规则编译为当前列表项或详情页的静态选择器/JSON 字段模板");
+  }
   if (/alicesw\.com/i.test(adaptedFrom)) {
     warningForSource("siteAdapter", adaptedFrom)("已按 alicesw.com 实际页面结构修正阅读规则后再转换");
   }
@@ -993,7 +1125,23 @@ function convertOne(source, warnings, options = {}) {
     const body = patterns
       .map((pattern) => `result = String(result).replace(new RegExp(${JSON.stringify(String(pattern))}, "g"), "");`)
       .join("\n");
-    converted.chapterContent.content += `||@js:\n${body}\nreturn result;`;
+    const current = String(converted.chapterContent.content);
+    const marker = current.match(/\|\|\s*@js:/i);
+    if (marker) {
+      const selector = current.slice(0, marker.index).trim();
+      const previous = current.slice(marker.index + marker[0].length).trim();
+      converted.chapterContent.content = [
+        `${selector}||@js:`,
+        "var __read2xsggPrevious = (function (result) {",
+        previous,
+        "})(result);",
+        'if (typeof __read2xsggPrevious !== "undefined") result = __read2xsggPrevious;',
+        body,
+        "return result;",
+      ].join("\n");
+    } else {
+      converted.chapterContent.content += `||@js:\n${body}\nreturn result;`;
+    }
   }
 
   if (options.imageProxyBase) {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan } from "../src/index.js";
+import { compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan, hasUnsupportedLegadoRuntime } from "../src/index.js";
 
 const sampleSource = {
   bookSourceName: "示例书源",
@@ -83,6 +83,9 @@ test("转换 JSONPath 规则和 JSON 响应", () => {
   assert.equal(sources["JSON API"].searchBook.responseFormatType, "json");
   assert.equal(sources["JSON API"].searchBook.list, "data/books");
   assert.equal(sources["JSON API"].searchBook.author, "author/name");
+  assert.equal(convertRule("title", { responseType: "json" }), "title");
+  assert.equal(convertRule("content", { responseType: "json" }), "content");
+  assert.equal(convertRule("a@href", { responseType: "json" }), "//a/@href");
 });
 
 test("CSS、阅读链式选择器和分页选择器转换为 XPath", () => {
@@ -161,6 +164,49 @@ test("GET/POST 请求模板转换", () => {
   const branchRequest = new Function("config", "params", branch.replace(/^@js:\s*/, ""));
   assert.equal(branchRequest({}, { pageIndex: 1 }).url, "/tuijian");
   assert.equal(branchRequest({}, { pageIndex: 3 }).url, "/tuijian/page/3");
+
+  const headed = convertRequest('/api/list,{"headers":{"Referer":"https://example.com/","X-Requested-With":"XMLHttpRequest"}}');
+  assert.deepEqual(headed.httpHeaders, {
+    Referer: "https://example.com/",
+    "X-Requested-With": "XMLHttpRequest",
+  });
+});
+
+test("阅读请求 JavaScript 的裸 page/key 与末尾表达式会编译为香色返回值", () => {
+  const paged = convertRequest('@js:config.host + "/list?q=" + key + "&page=" + page').requestInfo;
+  assert.match(paged, /return \(/);
+  assert.match(paged, /params\.keyWord/);
+  assert.match(paged, /params\.pageIndex/);
+  assert.equal(hasUnsupportedLegadoRuntime(paged), false);
+  assert.equal(new Function("config", "params", "result", paged.replace(/^@js:\s*/, ""))(
+    { host: "https://example.com" },
+    { keyWord: "书", pageIndex: 3 },
+    "",
+  ), "https://example.com/list?q=书&page=3");
+
+  assert.equal(hasUnsupportedLegadoRuntime("@js:if (result) result.trim();"), true);
+});
+
+test("单花括号 JSON 字段 URL 和安全的 @put/@get 选择器会被统一编译", () => {
+  assert.match(convertRule("https://api.example/book/{$.id}"), /result\.id/);
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "状态规则测试";
+  source.ruleSearch.name = "a@text@put:{u:\"a@href\"}";
+  source.ruleSearch.bookUrl = "@get:{u}";
+  source.ruleExplore.name = "a@text@put:{u:\"a@href\"}";
+  source.ruleExplore.bookUrl = "@get:{u}";
+  source.ruleBookInfo = {
+    init: '@put:{n:"[property$=book_name]@content",a:"[property$=author]@content"}',
+    name: "@get:{n}",
+    author: "@get:{a}",
+  };
+  const { sources, skipped } = convertLegado(source, { omitNonPortable: true });
+  const converted = sources["状态规则测试"];
+  assert.deepEqual(skipped, []);
+  assert.equal(converted.searchBook.detailUrl, "//a/@href");
+  assert.match(converted.bookDetail.bookName, /book_name/);
+  assert.match(converted.bookDetail.author, /author/);
+  assert.doesNotMatch(JSON.stringify(converted), /@(?:put|get):|\{\$\./i);
 });
 
 test("XBS 加解密无损往返", () => {
@@ -627,6 +673,14 @@ test("发现页分组标题和同名分类不会相互覆盖", () => {
   assert.match(world["最新·玄幻"].requestInfo, /\/new\//);
 });
 
+test("以空 URL 的 title:: 行表示的发现分组会进入分类名称", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "空 URL 分组测试";
+  source.exploreUrl = "小说::\n热门::/novel/{{page}}\n音乐::\n热门::/music/{{page}}";
+  const { sources } = convertLegado(source);
+  assert.deepEqual(Object.keys(sources["空 URL 分组测试"].bookWorld), ["小说·热门", "音乐·热门"]);
+});
+
 test("大量普通 GET 分类压缩为一个香色原生筛选动作", () => {
   const source = {
     bookSourceName: "大型分类测试",
@@ -645,11 +699,60 @@ test("大量普通 GET 分类压缩为一个香色原生筛选动作", () => {
   const { sources, warnings } = convertLegado(source);
   const world = sources["大型分类测试"].bookWorld;
   assert.deepEqual(Object.keys(world), ["分类"]);
-  assert.match(world["分类"].moreKeys.requestFilters, /^分类 1::\/category\/1\?page=%@pageIndex/m);
-  assert.match(world["分类"].moreKeys.requestFilters, /分类 12::\/category\/12\?page=%@pageIndex$/m);
-  assert.equal(world["分类"].requestInfo, "%@filter");
-  assert.doesNotMatch(world["分类"].moreKeys.requestFilters, /^category$/m);
+  assert.match(world["分类"].moreKeys.requestFilters, /^_category$/m);
+  assert.match(world["分类"].moreKeys.requestFilters, /^分类 1::\/category\/1\?page=__READ2XSGG_PAGE__$/m);
+  assert.match(world["分类"].moreKeys.requestFilters, /分类 12::\/category\/12\?page=__READ2XSGG_PAGE__$/m);
+  assert.match(world["分类"].requestInfo, /params\.filters\.category/);
+  assert.match(world["分类"].requestInfo, /params\.pageIndex/);
+  assert.doesNotMatch(world["分类"].moreKeys.requestFilters, /%@pageIndex/);
   assert.ok(warnings.some((warning) => warning.message.includes("压缩为香色 requestFilters")));
+});
+
+test("压缩分类中的重名项会生成唯一筛选标题", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "重名筛选测试";
+  source.exploreUrl = Array.from({ length: 7 }, (_, index) => ({
+    title: "热门",
+    url: `/category/${index + 1}?page={{page}}`,
+  }));
+  const { sources } = convertLegado(source);
+  const filters = sources["重名筛选测试"].bookWorld["分类"].moreKeys.requestFilters;
+  assert.match(filters, /^热门::\/category\/1/m);
+  assert.match(filters, /^热门 \(7\)::\/category\/7/m);
+});
+
+test("宽松 JSON 分类支持单引号、裸键、尾逗号和控制字符", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "宽松分类测试";
+  source.exploreUrl = "[{title:'玄幻\u0000',url:'/fantasy?page={{page}}',},]";
+  const { sources } = convertLegado(source);
+  const world = sources["宽松分类测试"].bookWorld;
+  assert.deepEqual(Object.keys(world), ["玄幻"]);
+  assert.equal(world["玄幻"].requestInfo, "/fantasy?page=%@pageIndex");
+});
+
+test("动态发现配置无法编译时不会把发现选择器错误套到站点首页", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "动态分类拒绝首页兜底";
+  source.exploreUrl = "@js:return java.ajax('/categories');";
+  source.ruleSearch.checkKeyWord = "";
+  const { sources, skipped } = convertLegado(source, { omitNonPortable: true });
+  assert.equal(sources["动态分类拒绝首页兜底"], undefined);
+  assert.deepEqual(skipped.map((item) => item.source), ["动态分类拒绝首页兜底"]);
+});
+
+test("正文清理规则与既有后处理合并为单个香色 JavaScript", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "正文后处理合并";
+  source.ruleContent = {
+    content: ".content@text@js:return String(result).trim();",
+    replaceRegex: ["广告", "推广"],
+  };
+  const { sources } = convertLegado(source);
+  const content = sources["正文后处理合并"].chapterContent.content;
+  assert.equal((content.match(/\|\|\s*@js:/gi) || []).length, 1);
+  const script = content.slice(content.search(/@js:/i) + 4);
+  assert.doesNotThrow(() => new Function("result", script));
 });
 
 test("缺少发现页时使用搜索规则生成可选择的分类入口", () => {

@@ -141,23 +141,26 @@ function filtersForAction(action, preferredTitle = "") {
 
   const filters = {};
   let key = "";
+  let selectedKey = "";
   for (const line of lines) {
     if (!line.includes("::")) {
       key = line.replace(/^_/, "");
       continue;
     }
+    if (line === simpleSelected) selectedKey = key;
     if (key && filters[key] === undefined) filters[key] = line.slice(line.indexOf("::") + 2);
   }
+  if (selectedKey) filters[selectedKey] = simpleValue;
   return { title: simpleTitle, filter: simpleValue, filters };
 }
 
 function substituteRequest(template, values) {
   return String(template || "")
-    .replaceAll("%@filter", String(values.filter || ""))
     .replaceAll("%@keyWord", encodeURIComponent(values.keyWord || ""))
     .replaceAll("%@pageIndex", String(values.pageIndex || 1))
     .replaceAll("%@offset", String(values.offset || 0))
-    .replaceAll("%@result", String(values.result || ""));
+    .replaceAll("%@result", String(values.result || ""))
+    .replaceAll("%@filter", String(values.filter || ""));
 }
 
 function absoluteUrl(value, base) {

@@ -13,6 +13,10 @@ export function parseLooseJson(value, warn = () => {}) {
   } catch {
     try {
       const normalized = value
+        // A number of public Legado collections contain literal NUL/newline
+        // characters inside JSON-like strings. They are invalid JSON but are
+        // only formatting noise for request/category metadata.
+        .replace(/[\u0000-\u001F]/g, " ")
         .replace(/([{,]\s*)([A-Za-z_$][\w$-]*)(\s*:)/g, '$1"$2"$3')
         .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, content) => JSON.stringify(content.replace(/\\'/g, "'")))
         .replace(/,\s*([}\]])/g, "$1");
@@ -183,6 +187,10 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
   if (isJsonBody(options.body) && !hasHeader(mergedHeaders, "Content-Type")) {
     mergedHeaders["Content-Type"] = "application/json";
   }
+  const staticHeaders = Object.fromEntries(Object.entries(mergedHeaders).filter(([, value]) => (
+    !String(value).includes("{{")
+  )));
+  const actionHeaders = Object.keys(staticHeaders).length ? { httpHeaders: staticHeaders } : {};
   const charset = String(options.charset ?? "").toLowerCase();
   const encoding = /gbk|gb2312|gb18030/.test(charset)
     ? { requestParamsEncode: "2147485234", responseEncode: "2147485234" }
@@ -200,7 +208,7 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
     if (Object.keys(mergedHeaders).length) result.push(`httpHeaders:${objectLiteralFromHeaders(mergedHeaders, warn)}`);
     if (options.webView) result.push("webView:true");
     lines.push(`return {${result.join(",")}};`);
-    return { requestInfo: lines.join("\n"), ...encoding };
+    return { requestInfo: lines.join("\n"), ...encoding, ...actionHeaders };
   }
 
   // {{Get('url')}}/path?q={{key}} 这类：先归一成表达式，再走标准 @js 请求对象。
@@ -213,7 +221,7 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
     if (Object.keys(mergedHeaders).length) result.push(`httpHeaders:${objectLiteralFromHeaders(mergedHeaders, warn)}`);
     if (options.webView) result.push("webView:true");
     lines.push(`return {${result.join(",")}};`);
-    return { requestInfo: lines.join("\n"), ...encoding };
+    return { requestInfo: lines.join("\n"), ...encoding, ...actionHeaders };
   }
 
   if (/^\{\{/i.test(url) && !/\{\{\s*(?:key|page|Get|get)/i.test(url)) {
@@ -224,7 +232,7 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
   const needsScript = method === "POST" || options.body || options.webView || hasComplexTemplate(url);
 
   if (!needsScript) {
-    return { requestInfo: replaceSimpleTemplates(url), ...encoding };
+    return { requestInfo: replaceSimpleTemplates(url), ...encoding, ...actionHeaders };
   }
 
   const lines = ["@js:", `let url = ${expressionForTemplate(url, { warn })};`];
@@ -234,7 +242,7 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
   if (Object.keys(mergedHeaders).length) result.push(`httpHeaders:${objectLiteralFromHeaders(mergedHeaders, warn)}`);
   if (options.webView) result.push("webView:true");
   lines.push(`return {${result.join(",")}};`);
-  return { requestInfo: lines.join("\n"), ...encoding };
+  return { requestInfo: lines.join("\n"), ...encoding, ...actionHeaders };
 }
 
 export function parseHeaders(header, warn = () => {}) {

@@ -673,6 +673,7 @@ test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (
 });
 
 test("DNS 透明代理默认开启，资源密集型在线预检默认关闭", () => {
+  assert.equal(serverConfig({}).maxSourceBytes, 32 * 1024 * 1024);
   assert.equal(serverConfig({}).allowDnsProxyNetworks, true);
   assert.equal(serverConfig({}).preflightSources, false);
   assert.equal(serverConfig({}).preflightDeep, false);

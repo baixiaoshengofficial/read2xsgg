@@ -211,7 +211,7 @@ Compose 支持通过环境变量调整：
 | --- | ---: | --- |
 | `APP_PORT` | `3000` | 映射到宿主机的端口 |
 | `FETCH_TIMEOUT_MS` | `15000` | 下载在线阅读源的超时时间 |
-| `MAX_SOURCE_BYTES` | `10485760` | 在线阅读源最大字节数 |
+| `MAX_SOURCE_BYTES` | `33554432` | 在线阅读源最大字节数（32 MiB，可容纳大型聚合源） |
 | `MAX_IMAGE_BYTES` | `26214400` | 单张代理图片最大字节数 |
 | `MAX_REDIRECTS` | `5` | 最大重定向次数 |
 | `MAX_CONCURRENT` | `8` | 最大并发转换数 |

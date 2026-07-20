@@ -59,7 +59,7 @@ test("香色动作链执行器验证分类、详情、章节和正文", async (c
   const report = await runXbsPipeline(converted, { filter: "分类 12", pageIndex: 2 });
   assert.equal(report.ok, true, report.error);
   assert.equal(report.steps.bookWorld.listCount, 1);
-  assert.match(report.steps.bookWorld.requestUrl, /\/category\/12\?page=2$/);
+  assert.equal(new URL(report.steps.bookWorld.requestUrl).searchParams.get("url"), "/category/12?page=2");
   assert.equal(report.steps.chapterList.listCount, 2);
   assert.equal(report.steps.chapterContent.itemCount > 0, true);
 });
