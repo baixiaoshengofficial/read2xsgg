@@ -15,7 +15,8 @@ function firstRequestFilter(action) {
 
 function declarativeBridgeAction(action, type) {
   const requestInfo = String(action?.requestInfo || "");
-  const match = requestInfo.match(new RegExp(`/adapter/${type}\\?plan=([A-Za-z0-9_-]+)&url=`));
+  // Allow paging/query params between plan= and url= (e.g. &page=&pageSize=&slice=1).
+  const match = requestInfo.match(new RegExp(`/adapter/${type}\\?plan=([A-Za-z0-9_-]+)[^"'\\\\\\s]*?&url=`));
   if (!match) return null;
   try {
     return { plan: decodeBridgePlan(match[1]), requestInfo };

@@ -47,7 +47,7 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
         skipped.push({ source: name, reason: verified.reason || "rules-stale: empty-list" });
         continue;
       }
-      const host = String(source?.host || "").trim();
+      const host = String(source?.sourceUrl || source?.host || source?.bookSourceUrl || "").trim();
       if (!host) {
         skipped.push({ source: name, reason: verified.reason || "rules-stale: empty-list" });
         continue;

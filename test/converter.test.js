@@ -465,6 +465,38 @@ test("桥接按 offset/limit 分页，而不是丢弃后续条目", () => {
   assert.equal(chapters.hasMore, true);
 });
 
+test("桥接 URL 在 plan 与 url 之间插入分页参数后仍可被抽测识别", () => {
+  const source = {
+    bookSourceName: "分页桥接识别",
+    bookSourceUrl: "https://page.example.com",
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: {
+      bookList: "class.item@tag.li",
+      name: "tag.a@text",
+      bookUrl: "tag.a@href",
+      checkKeyWord: "测试",
+    },
+    exploreUrl: "首页::https://page.example.com/list.html",
+    ruleExplore: {
+      bookList: "class.item@tag.li",
+      name: "tag.a@text",
+      bookUrl: "tag.a@href",
+    },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: "class.list@tag.a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: "id.content@text" },
+  };
+  const { sources } = convertLegado(source, {
+    omitNonPortable: true,
+    imageProxyBase: "https://convert.example",
+  });
+  const world = Object.values(sources["分页桥接识别"].bookWorld)[0];
+  assert.match(String(world.requestInfo), /\/adapter\/books\?plan=[A-Za-z0-9_-]+[^"'\\\s]*&url=/);
+  assert.match(String(world.requestInfo), /slice=1/);
+  // Old brittle regex required plan= immediately before &url= and would miss these sources.
+  assert.doesNotMatch(String(world.requestInfo), /plan=[A-Za-z0-9_-]+&url=/);
+});
+
 test("无上游分页时桥接请求会注入 page/pageSize/slice 供客户端翻页", () => {
   const source = {
     bookSourceName: "无分页站",
