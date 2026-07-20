@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan, hasUnsupportedLegadoRuntime } from "../src/index.js";
+import { compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan, hasUnsupportedLegadoRuntime, inferResponseType } from "../src/index.js";
 
 const sampleSource = {
   bookSourceName: "示例书源",
@@ -900,12 +900,12 @@ test("列表项字段保持香色支持的双斜线 XPath", () => {
   };
   const { sources } = convertLegado(source);
   const converted = sources["相对 XPath 测试"];
-  assert.equal(converted.bookDetail.bookName, "//h1/text()");
+  assert.equal(converted.bookDetail.bookName, "//h1");
   assert.equal(converted.searchBook.list, "//div[@class='card']");
-  assert.equal(converted.searchBook.bookName, "//h2/text()");
+  assert.equal(converted.searchBook.bookName, "//h2");
   assert.equal(converted.searchBook.detailUrl, "//a/@href");
   assert.equal(converted.bookWorld["分类"].detailUrl, "//a/@href");
-  assert.equal(converted.chapterList.title, "//a/text()");
+  assert.equal(converted.chapterList.title, "//a");
   assert.equal(converted.chapterList.url, "//a/@href");
   assert.equal(converted.chapterList.list, "(//li)[self::a[@href] or .//a[@href]]");
 });
@@ -924,7 +924,7 @@ test("列表项的阅读专用后处理回退为基础选择器", () => {
   };
   const { sources, warnings } = convertLegado(source);
   const world = sources["列表 JS 回退测试"].bookWorld["分类"];
-  assert.equal(world.bookName, "//*[contains(concat(' ', normalize-space(@class), ' '), ' name ')]/text()");
+  assert.equal(world.bookName, "//*[contains(concat(' ', normalize-space(@class), ' '), ' name ')]");
   assert.equal(world.cat, undefined);
   assert.ok(warnings.some((warning) => warning.message.includes("保留基础选择器")));
   assert.ok(warnings.some((warning) => warning.message.includes("避免香色丢弃整个列表")));
@@ -1101,4 +1101,105 @@ test("在线质量门槛跳过依赖 sourceRegex 的有声源", () => {
   assert.equal(sources["拦截有声"], undefined);
   assert.ok(skipped.some((item) => /sourceRegex/.test(item.reason)));
   assert.equal(buckets.media, 1);
+});
+
+test("CSS 负索引 [-n] 转为 last()-based position，不再生成非法 @-n", () => {
+  assert.equal(
+    convertRule(".panel[-2]@.grid@.item"),
+    "//*[contains(concat(' ', normalize-space(@class), ' '), ' panel ')][position() = last() - 1]//*[contains(concat(' ', normalize-space(@class), ' '), ' grid ')]//*[contains(concat(' ', normalize-space(@class), ' '), ' item ')]",
+  );
+  assert.equal(convertRule("li[0]"), "//li[position() = 1]");
+});
+
+test("JSON API 字段与 {$.id} URL 模板不再被误判成 HTML XPath", () => {
+  const rules = {
+    author: "authorName",
+    bookList: "data||data.items",
+    bookUrl: "/pc/book/{$.bookId}/catalog",
+    coverUrl: "bookIconUrl@js:result || ''",
+    name: "bookName",
+  };
+  assert.equal(inferResponseType(rules), "json");
+  assert.equal(convertRule(rules.bookList, { responseType: "json" }), "data||data/items");
+  assert.match(convertRule(rules.bookUrl, { responseType: "json" }), /result\.bookId/);
+  assert.equal(convertRule(rules.name, { responseType: "json" }), "bookName");
+});
+
+test("桥接分类 URL 会替换 %@pageIndex，避免适配器把占位符当成坏编码", () => {
+  const source = {
+    bookSourceName: "分页搜索入口",
+    bookSourceUrl: "https://novel.example.com",
+    searchUrl: "/so/{{key}}/{{page}}",
+    ruleSearch: {
+      bookList: ".item",
+      name: "a@text",
+      bookUrl: "a@href",
+      checkKeyWord: "测试",
+    },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: "#content@html" },
+  };
+  const { sources } = convertLegado(source, {
+    omitNonPortable: true,
+    imageProxyBase: "https://convert.example",
+  });
+  const world = Object.values(sources["分页搜索入口"].bookWorld)[0];
+  assert.match(world.requestInfo, /%@pageIndex/);
+  assert.match(world.requestInfo, /encodeURIComponent\(u\)/);
+  assert.match(world.requestInfo, /params\.pageIndex/);
+  assert.doesNotMatch(world.requestInfo, /&url=.*%@pageIndex/);
+});
+
+test("空 URL 的不可移植 POST 搜索会被跳过", () => {
+  const source = {
+    bookSourceName: "空地址搜索",
+    bookSourceUrl: "https://m.example.com",
+    searchUrl: '{{cookie.removeCookie(source.getKey()); org.jsoup.Jsoup.parse(java.ajax(source.key)).select("form").attr("action")}},{"body":"searchkey={{key}}","method":"POST"}',
+    ruleSearch: { bookList: ".bookbox", name: "a@text", bookUrl: "a@href", checkKeyWord: "剑来" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: "#content@html" },
+  };
+  const { sources, skipped } = convertLegado(source, {
+    omitNonPortable: true,
+    imageProxyBase: "https://convert.example",
+  });
+  assert.equal(sources["空地址搜索"], undefined);
+  assert.ok(skipped.some((item) => /有效 URL|请求地址为空/.test(item.reason)));
+});
+
+test("JSON 章节 @js 标题/URL 模板会编译进桥接计划", () => {
+  const source = {
+    bookSourceName: "JSON 目录模板",
+    bookSourceUrl: "https://api.example.com",
+    exploreUrl: "榜单::/rank?page={{page}}",
+    ruleExplore: {
+      bookList: "data.items",
+      name: "bookName",
+      bookUrl: "/book/{$.bookId}/catalog",
+    },
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: "data.items", name: "bookName", bookUrl: "/book/{$.id}/catalog" },
+    ruleBookInfo: { name: "$.name" },
+    ruleToc: {
+      chapterList: "data.data[?(@.volume == false)]",
+      chapterName: "{$.free}{$.name}@js:result.replace('false','').replace('true','')",
+      chapterUrl: "/chapter/{$.id}",
+    },
+    ruleContent: { content: "data.content" },
+  };
+  const { sources } = convertLegado(source, {
+    omitNonPortable: true,
+    imageProxyBase: "https://convert.example",
+  });
+  const toc = sources["JSON 目录模板"].chapterList;
+  assert.equal(toc.list, "$.data");
+  assert.equal(toc.title, "title");
+  assert.equal(toc.url, "url");
+  const plan = decodeBridgePlan(String(toc.requestInfo).match(/plan=([^&]+)/)[1]);
+  assert.equal(plan.list, "data/data");
+  assert.equal(plan.fields.title.selector, "name");
+  assert.equal(plan.fields.url.selector, "id");
+  assert.equal(plan.fields.url.matchTemplate.prefix, "/chapter/");
 });

@@ -1,4 +1,4 @@
-import { legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
+import { hasUnsupportedLegadoRuntime, legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
 
 function quoteXPath(value) {
   if (!value.includes("'")) return `'${value}'`;
@@ -102,6 +102,17 @@ function cssAtomToXPath(atom) {
     slicePredicate = clauses.join(" and ");
   }
 
+  // Legado also uses a single index like `.panel[-2]` / `li[0]` for the Nth
+  // match (negative from the end). That must not become a bogus `@-2` attribute.
+  const indexOnly = source.match(/\[\s*(-?\d+)\s*\]$/);
+  if (!slicePredicate && indexOnly) {
+    source = source.slice(0, indexOnly.index);
+    const index = Number(indexOnly[1]);
+    slicePredicate = index >= 0
+      ? `position() = ${index + 1}`
+      : `position() = last() - ${Math.abs(index) - 1}`;
+  }
+
   const tagMatch = source.match(/^[a-zA-Z][\w-]*|^\*/);
   const tag = tagMatch?.[0] ?? "*";
   if (tagMatch) source = source.slice(tagMatch[0].length);
@@ -115,6 +126,8 @@ function cssAtomToXPath(atom) {
   }
   for (const match of source.matchAll(/\[\s*([\w:-]+)(?:\s*([~|^$*]?=)\s*["']?([^\]"']+)["']?)?\s*\]/g)) {
     const [, attribute, operator, value] = match;
+    // Numeric-only tokens are result indices handled above, never attributes.
+    if (/^-?\d+$/.test(attribute)) continue;
     if (!operator) predicates.push(`@${attribute}`);
     else if (operator === "=") predicates.push(`@${attribute}=${quoteXPath(value.trim())}`);
     else if (operator === "*=") predicates.push(`contains(@${attribute}, ${quoteXPath(value.trim())})`);
@@ -289,6 +302,10 @@ function jsonPathToXsgg(path, warn) {
     warn("JSONPath 的递归下降操作符 '..' 在香色中没有完全等价语法，已按普通路径转换");
     source = source.replace(/\.\./g, ".");
   }
+  if (/\[\?\(|\[\(/.test(source)) {
+    warn("JSONPath 过滤表达式在香色中没有完全等价语法，已保留父级数组路径");
+    source = source.replace(/\[\?\([\s\S]*?\)\]|\[\([\s\S]*?\)\]/g, "");
+  }
   const converted = source
     .replace(/^\$\.?/, "")
     .replace(/\[['"]([^'"]+)['"]\]/g, "/$1")
@@ -376,9 +393,16 @@ function looksLikeJsonPath(value) {
   if (/^\s*(?:@?json:|\$[.[])/i.test(trimmed)) return true;
   if (RELATIVE_PROPERTIES.has(trimmed) || RELATIVE_PROPERTIES.has(trimmed.replace(/^@/, ""))) return false;
   if (/^(?:class|id|tag|text)\./i.test(trimmed)) return false;
-  if (/[#>@\s]|\[.|^=/.test(trimmed) || /^\./.test(trimmed)) return false;
-  // data.books / data.books[0].title 之类
-  return /^[\w$-]+(?:\[[\d*]+\]|\.[\w$*\[\]-]+)+$/.test(trimmed);
+  // JSONPath filters: data.items[?(@.id)] / data[(@.length)]
+  if (/^[\w$-]+(?:\.[A-Za-z_$][\w$]*|\[\d+\]|\[\?\([\s\S]*?\)\]|\[\([\s\S]*?\)\])+$/.test(trimmed)) return true;
+  if (/[#>@\s]|=/.test(trimmed) || /^\./.test(trimmed)) return false;
+  if (/\[(?!\?|\(|\d|\*)/.test(trimmed)) return false;
+  // data / bookName / authorName — bare JSON object fields
+  if (/^[A-Za-z_$][\w$]*$/.test(trimmed)) return true;
+  // data.books / data.books[0].title / data||data.items
+  if (/^[\w$-]+(?:\[[\d*]+\]|\.[\w$*\[\]-]+)+$/.test(trimmed)) return true;
+  return splitTopLevel(trimmed, "||").length > 1
+    && splitTopLevel(trimmed, "||").every((part) => looksLikeJsonPath(part));
 }
 
 function looksLikeHtmlRule(value) {
@@ -390,9 +414,21 @@ function looksLikeHtmlRule(value) {
   // `https://.../{{$.id}}` as XPath solely because it contains `//` makes a
   // JSON detail response enter the DOM parser.
   if (/^https?:\/\//i.test(trimmed)) return false;
+  // JSON URL / field templates: /pc/book/{$.id}/catalog or {{$.name}}
+  if (/\{(?:\{\s*)?\$\./.test(trimmed)) return false;
+  // Common Legado JSON form `field@js:...` / `field||alt@js:` is not HTML.
+  if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*(?:\s*\|\|\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*)*(?:@js:|<js>)/i.test(trimmed)) {
+    return false;
+  }
+  if (looksLikeJsonPath(trimmed.split(/(?:@js:|<js>|##)/i, 1)[0].trim())) return false;
   if (RELATIVE_PROPERTIES.has(trimmed) || RELATIVE_PROPERTIES.has(trimmed.replace(/^@/, ""))) return true;
   if (/\/\/|^\/html|@(?:text|href|src|html|css:)|^\s*(?:class|id|tag|text)\./i.test(trimmed)) return true;
-  if (/[#>\[\]]/.test(trimmed) || /(?:^|[\s>+~,])[a-z][\w-]*\./i.test(trimmed)) return true;
+  if (/[#>\[\]]/.test(trimmed) && !/\[\?\(|\[\(/.test(trimmed)) return true;
+  // CSS `div.class` / `a.href`, but not JSON `data.items` / `bookName`.
+  if (/(?:^|[\s>+~,])(?:[a-z][\w-]*)\.(?:[a-z][\w-]*)/i.test(trimmed)
+    && /(?:^|[\s>+~,])(?:div|span|a|p|li|ul|ol|td|tr|table|img|h[1-6]|section|article|main|body|html)\./i.test(trimmed)) {
+    return true;
+  }
   if (/\s/.test(trimmed) && /[a-z]/i.test(trimmed)) return true;
   return false;
 }
@@ -474,6 +510,53 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
       ? "阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查"
       : "已将阅读 JavaScript 中的分页、关键词或结果字段模板转换为香色运行时表达式");
     return rewritten;
+  }
+
+  // Absolute or relative JSON URL / field templates:
+  // `/pc/book/{$.id}` / `{$.free}{$.name}` / `https://x/{{$.id}}`.
+  // Rewrite before HTML/JSONPath branching so `{$.field}` is not treated as a path.
+  if ((/\{\{\s*\$\./.test(trimmed) || /(?<!\{)\{(\$\.[^}]+)\}(?!\})/.test(trimmed))
+    && !looksLikeHtmlRule(trimmed.replace(/\{(?:\{\s*)?\$\.[^}]+\}(?:\})?/g, "x"))) {
+    let template = trimmed;
+    let scriptBody = "";
+    let cleanupPattern = "";
+    let cleanupReplacement = "";
+    const trailing = template.match(/^([\s\S]*?)((?:@js:|<js>)[\s\S]*)$/i);
+    if (trailing && trailing[1].trim()) {
+      template = trailing[1].trim();
+      let script = trailing[2].trim().replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
+      const scriptCleanup = script.match(/^@js:\s*([\s\S]*?)##([\s\S]*)$/i);
+      if (scriptCleanup) {
+        scriptBody = scriptCleanup[1].trim().replace(/;\s*$/, "");
+        const [pattern = "", replacement = ""] = scriptCleanup[2].split("##");
+        cleanupPattern = pattern;
+        cleanupReplacement = replacement;
+      } else {
+        scriptBody = script.replace(/^@js:\s*/i, "").replace(/;\s*$/, "");
+      }
+    } else {
+      const templateCleanup = template.match(/^(.*?)##([\s\S]*)$/);
+      if (templateCleanup && /\{(?:\{\s*)?\$\./.test(templateCleanup[1])) {
+        template = templateCleanup[1].trim();
+        const [pattern = "", replacement = ""] = templateCleanup[2].split("##");
+        cleanupPattern = pattern;
+        cleanupReplacement = replacement;
+      }
+    }
+    let expression = rewriteLegadoJavaScript(`@js:\nreturn ${JSON.stringify(template)};`)
+      .replace(/^@js:\s*return\s+/i, "")
+      .replace(/;\s*$/, "");
+    if (scriptBody) {
+      expression = `(function(result){ return (${scriptBody}); })(${expression})`;
+    }
+    if (cleanupPattern) {
+      expression = `String(${expression}).replace(new RegExp(${JSON.stringify(cleanupPattern)}, "g"), ${JSON.stringify(cleanupReplacement)})`;
+    }
+    const composed = `@js:\nreturn ${expression};`;
+    if (!composed.includes("{{") && !/\{(\$\.)/.test(composed)) {
+      if (!hasUnsupportedLegadoRuntime(composed)) warn("已将阅读 JSON 字段模板转换为香色运行时表达式");
+      return composed;
+    }
   }
 
   if (trimmed.includes("{{") && !/\{\{\s*@/.test(trimmed)) {
@@ -559,12 +642,14 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   const forceJson = /^@?json:/i.test(trimmed) || trimmed.startsWith("$");
   const bareRelativeProperty = RELATIVE_PROPERTIES.has(trimmed)
     || RELATIVE_PROPERTIES.has(trimmed.replace(/^@/, ""));
-  // In a declared JSON response, `title`, `content`, `src` and similar bare
-  // names are overwhelmingly object fields. They were previously forced down
-  // the HTML attribute path (`//@title`), so a valid API response produced an
-  // empty bridge list. Explicit CSS/XPath/`a@href` rules still override JSON.
-  const forceHtml = looksLikeHtmlRule(trimmed) && !(responseType === "json" && bareRelativeProperty);
-  const isJson = forceJson || (responseType === "json" && !forceHtml);
+  // In a declared JSON response, `title`, `content`, `src`, `data.items` and
+  // similar names are overwhelmingly object fields. They were previously forced
+  // down the HTML attribute path (`//@title` / `//data`), so a valid API
+  // response produced an empty bridge list. Explicit CSS/XPath/`a@href` rules
+  // still override JSON.
+  const forceHtml = looksLikeHtmlRule(trimmed)
+    && !(responseType === "json" && (bareRelativeProperty || looksLikeJsonPath(trimmed)));
+  const isJson = forceJson || (responseType === "json" && !forceHtml) || (responseType !== "html" && looksLikeJsonPath(trimmed) && !looksLikeHtmlRule(trimmed));
   if (isJson) return jsonPathToXsgg(trimmed, warn);
 
   const withHas = /:has\(/i.test(trimmed) ? rewriteCssHas(trimmed, warn) : trimmed;

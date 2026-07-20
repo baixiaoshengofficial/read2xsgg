@@ -172,17 +172,61 @@ export function decodeBridgePlan(encoded) {
 function inferredScriptField(rule, preferredNames = []) {
   const source = String(rule || "").trim();
   if (!/^@js:/i.test(source)) return rule;
-  const concatenated = source.match(
+  const threePart = source.match(
     /return\s+\(?\s*("(?:\\.|[^"\\])*")\s*\+\s*String\(result\.([A-Za-z_$][\w$]*)\)\s*\+\s*("(?:\\.|[^"\\])*")\s*\)?\s*;/i,
   );
-  if (concatenated) {
+  if (threePart) {
     try {
+      const prefix = JSON.parse(threePart[1]);
+      const suffix = JSON.parse(threePart[3]);
       return {
-        selector: concatenated[2],
+        selector: threePart[2],
+        hostPrefix: Boolean(prefix && !/^https?:\/\//i.test(prefix)),
         matchTemplate: {
           pattern: "^([\\s\\S]+)$",
-          prefix: JSON.parse(concatenated[1]),
-          suffix: JSON.parse(concatenated[3]),
+          prefix,
+          suffix,
+          hostPrefix: Boolean(prefix && !/^https?:\/\//i.test(prefix)),
+        },
+      };
+    } catch {
+      return "";
+    }
+  }
+  const prefixOnly = source.match(
+    /return\s+\(?\s*("(?:\\.|[^"\\])*")\s*\+\s*String\(result\.([A-Za-z_$][\w$]*)\)\s*\)?\s*;/i,
+  );
+  if (prefixOnly) {
+    try {
+      const prefix = JSON.parse(prefixOnly[1]);
+      return {
+        selector: prefixOnly[2],
+        hostPrefix: Boolean(prefix && !/^https?:\/\//i.test(prefix)),
+        matchTemplate: {
+          pattern: "^([\\s\\S]+)$",
+          prefix,
+          suffix: "",
+          hostPrefix: Boolean(prefix && !/^https?:\/\//i.test(prefix)),
+        },
+      };
+    } catch {
+      return "";
+    }
+  }
+  const suffixOnly = source.match(
+    /return\s+\(?\s*String\(result\.([A-Za-z_$][\w$]*)\)\s*\+\s*("(?:\\.|[^"\\])*")\s*\)?\s*;/i,
+  );
+  if (suffixOnly) {
+    try {
+      const suffix = JSON.parse(suffixOnly[2]);
+      return {
+        selector: suffixOnly[1],
+        hostPrefix: false,
+        matchTemplate: {
+          pattern: "^([\\s\\S]+)$",
+          prefix: "",
+          suffix,
+          hostPrefix: false,
         },
       };
     } catch {
@@ -244,7 +288,11 @@ export function compileChapterBridgePlan(action, { tocSelector = "", headers = {
     responseType: action.responseFormatType,
     list: action.list,
     tocSelector,
-    fields: { title: action.title, url: action.url, updateTime: action.updateTime },
+    fields: {
+      title: inferredScriptField(action.title, [/title/i, /name/i, /chapter/i]),
+      url: inferredScriptField(action.url, [/url/i, /id/i, /href/i]),
+      updateTime: action.updateTime,
+    },
     headers,
   });
 }

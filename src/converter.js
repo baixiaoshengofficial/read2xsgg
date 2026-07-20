@@ -255,6 +255,24 @@ function bridgeRequestInfo(requestInfo, endpoint) {
       `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
     ].join("\n");
   }
+  // Plain request templates still carry 香色 placeholders. Substitute them in
+  // @js before encoding; a literal `%@pageIndex` inside `url=` is invalid
+  // percent-encoding and the adapter rejects the whole category request.
+  if (/%@(?:pageIndex|keyWord|filter|offset)\b/.test(source)) {
+    return [
+      "@js:",
+      `var u = ${JSON.stringify(source)};`,
+      'u = String(u)',
+      '.replace(/%@pageIndex/g, String((params && params.pageIndex) || 1))',
+      '.replace(/%@offset/g, String((params && params.offset) || 0))',
+      '.replace(/%@keyWord/g, encodeURIComponent((params && params.keyWord) || ""))',
+      '.replace(/%@filter/g, String((params && params.filters && params.filters.category) || (params && params.filter) || ""));',
+      'u = String(u || "").trim();',
+      'if (u.indexOf("//") == 0) u = "https:" + u;',
+      'else if (u && !/^https?:\\/\\//i.test(u)) u = (config.host || "") + (u.charAt(0) == "/" ? u : "/" + u);',
+      `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
+    ].join("\n");
+  }
   // The adapter reads everything after `url=` verbatim, so target query
   // parameters may remain unescaped and XSGG can still substitute placeholders.
   return `${endpoint}${source}`;
@@ -357,10 +375,26 @@ function tocLinkHint(rule) {
 // 后代文本。直译成 /text() 只会取直接文本节点，标题里有 span 时就会变空。
 function compatibleTextRule(original, converted) {
   const source = String(original || "").trim();
-  if (!/(?:^|@)(?:text|textNodes|ownText)$/i.test(source.split("##", 1)[0].trim())) return converted;
-  if (converted === "/text()") return ".";
-  const result = String(converted).replace(/\/text\(\)(?=(?:\||$))/g, "");
-  return result.startsWith("|") ? `.${result}` : result;
+  const result = String(converted || "");
+  if (!result) return result;
+  const fromTextProperty = /(?:^|@)(?:text|textNodes|ownText)$/i.test(source.split("##", 1)[0].trim());
+  // Also normalize native XPath that already ends in /text() — 香色 and the
+  // bridge executor both prefer element textContent over direct text nodes.
+  if (fromTextProperty || /\/text\(\)\s*$/.test(result.split("||", 1)[0].trim()) || /\/text\(\)/.test(result)) {
+    if (result === "/text()") return ".";
+    return result
+      .split("||")
+      .map((part) => part
+        .split(/\s+\|\s+/)
+        .map((piece) => {
+          const trimmed = piece.trim();
+          if (trimmed === "/text()") return ".";
+          return trimmed.replace(/\/text\(\)(?=\s*$)/g, "") || ".";
+        })
+        .join(" | "))
+      .join("||");
+  }
+  return result;
 }
 
 function nativeJmChapterList(host) {
@@ -769,7 +803,10 @@ function compactBookWorld(entries, { host, rules, responseType, warningFor }) {
       // 运行时替换内部哨兵，避免实际请求残留字面量 `%@pageIndex`。
       requestInfo: [
         "@js:",
-        'var f = (params.filters && params.filters.category) || "";',
+        'var f = (params.filters && params.filters.category) || params.filter || "";',
+        'if (!f && params.filters) {',
+        "  for (var k in params.filters) { if (params.filters[k]) { f = params.filters[k]; break; } }",
+        "}",
         'return String(f).replace(/__READ2XSGG_PAGE__/g, String(params.pageIndex || 1));',
       ].join("\n"),
       ...mapBookRules(rules, responseType, warningFor, { listContext: true }),
@@ -783,22 +820,6 @@ function buildBookWorld(source, context) {
   const { host, headers, warnings, sourceName } = context;
   const exploreRules = getRules(source, "ruleExplore", "exploreRule");
   const searchRules = getRules(source, "ruleSearch", "searchRule");
-  const rules = { ...searchRules };
-  for (const [key, value] of Object.entries(exploreRules)) {
-    if (value === undefined || value === null || String(value).trim() === "") continue;
-    const searchFallback = searchRules[key];
-    if (hasUnsupportedLegadoRuntime(String(value))
-      && searchFallback !== undefined
-      && searchFallback !== null
-      && String(searchFallback).trim() !== ""
-      && !hasUnsupportedLegadoRuntime(String(searchFallback))) {
-      createWarningCollector(warnings, sourceName, "bookWorld")(`ruleExplore.${key}`, value)(
-        `发现规则 ${key} 依赖阅读 Android 运行时，已自动回退到可执行的搜索规则`,
-      );
-      continue;
-    }
-    rules[key] = value;
-  }
   const warningFor = createWarningCollector(warnings, sourceName, "bookWorld");
   let entries = parseExploreEntries(source.exploreUrl, warningFor);
   const exploreUrlMissing = source.exploreUrl === undefined
@@ -806,37 +827,64 @@ function buildBookWorld(source, context) {
     || source.exploreUrl === "-"
     || (typeof source.exploreUrl === "string" && !source.exploreUrl.trim())
     || (Array.isArray(source.exploreUrl) && !source.exploreUrl.length);
+  let useSearchRulesOnly = false;
   const exploreCoreComplete = Boolean(exploreRules.bookList && exploreRules.name && exploreRules.bookUrl);
-  const effectiveCoreComplete = Boolean(rules.bookList && rules.name && rules.bookUrl);
-  if (entries.length && !exploreCoreComplete && effectiveCoreComplete) {
-    warningFor("ruleExplore", exploreRules)("发现页规则不完整，已用搜索规则补齐列表、书名或详情地址");
-  }
   if (!entries.length) {
-    if (exploreUrlMissing && effectiveCoreComplete && exploreRules.bookList && host) {
+    const testKeyword = String(searchRules.checkKeyWord || "")
+      .split(/[|,，\n]/)[0]
+      .trim()
+      // Only invent a keyword when a homepage crawl would otherwise be created
+      // from explore rules with no exploreUrl — those selectors often match nav.
+      || (exploreUrlMissing && exploreRules.bookList ? "小说" : "");
+    const canSearchEntry = Boolean(
+      source.searchUrl
+      && searchRules.bookList
+      && searchRules.name
+      && searchRules.bookUrl
+      && testKeyword
+      && !/^(?:@js:|<js>)/i.test(String(source.searchUrl)),
+    );
+    if (canSearchEntry) {
+      const request = String(source.searchUrl).replace(/\{\{\s*key\s*\}\}/gi, encodeURIComponent(testKeyword));
+      entries = [{ title: "搜索入口", url: request }];
+      useSearchRulesOnly = true;
+      warningFor("exploreUrl", source.exploreUrl)(
+        `缺少可移植发现分类，已使用搜索规则和测试关键词“${testKeyword}”生成分类入口`,
+      );
+    } else if (exploreUrlMissing && exploreCoreComplete && host) {
       entries = [{ title: "站点首页", url: host }];
       warningFor("exploreUrl", source.exploreUrl)("发现地址为空且原发现规则完整，已使用原发现规则生成站点首页入口");
     } else if (source.searchUrl && searchRules.bookList && searchRules.name && searchRules.bookUrl) {
-      const testKeyword = String(searchRules.checkKeyWord || "")
-        .split(/[|,，\n]/)[0]
-        .trim();
       if (!testKeyword) {
         warningFor("exploreUrl", source.exploreUrl)("缺少可移植发现分类，搜索规则也没有测试关键词；不再生成必为空的伪分类");
         return {};
       }
-      let request = String(source.searchUrl);
-      if (/^(?:@js:|<js>)/i.test(request)) {
-        warningFor("exploreUrl", source.exploreUrl)("搜索请求依赖阅读 Android JavaScript，不能用它伪造可用分类");
-        return {};
-      } else {
-        request = request.replace(/\{\{\s*key\s*\}\}/gi, encodeURIComponent(testKeyword));
-      }
-      entries = [{ title: "搜索入口", url: request }];
-      warningFor("exploreUrl", source.exploreUrl)(
-        testKeyword
-          ? `缺少可移植发现分类，已使用搜索规则和测试关键词“${testKeyword}”生成分类入口`
-          : "缺少可移植发现分类，已使用搜索规则生成分类入口",
-      );
+      warningFor("exploreUrl", source.exploreUrl)("搜索请求依赖阅读 Android JavaScript，不能用它伪造可用分类");
+      return {};
     }
+  }
+
+  const rules = { ...searchRules };
+  if (!useSearchRulesOnly) {
+    for (const [key, value] of Object.entries(exploreRules)) {
+      if (value === undefined || value === null || String(value).trim() === "") continue;
+      const searchFallback = searchRules[key];
+      if (hasUnsupportedLegadoRuntime(String(value))
+        && searchFallback !== undefined
+        && searchFallback !== null
+        && String(searchFallback).trim() !== ""
+        && !hasUnsupportedLegadoRuntime(String(searchFallback))) {
+        createWarningCollector(warnings, sourceName, "bookWorld")(`ruleExplore.${key}`, value)(
+          `发现规则 ${key} 依赖阅读 Android 运行时，已自动回退到可执行的搜索规则`,
+        );
+        continue;
+      }
+      rules[key] = value;
+    }
+  }
+  const effectiveCoreComplete = Boolean(rules.bookList && rules.name && rules.bookUrl);
+  if (entries.length && !exploreCoreComplete && effectiveCoreComplete && !useSearchRulesOnly) {
+    warningFor("ruleExplore", exploreRules)("发现页规则不完整，已用搜索规则补齐列表、书名或详情地址");
   }
   const responseType = inferResponseType(rules);
   const compacted = compactBookWorld(entries, { host, rules, responseType, warningFor });
@@ -1301,10 +1349,25 @@ function nonPortableLoginReason(source) {
   return "依赖登录/分流变量 Get(...)，香色无法复现阅读登录 UI";
 }
 
+function nonPortableEmptyRequestReason(converted) {
+  const worlds = Object.values(converted?.bookWorld || {});
+  const actions = [...worlds, converted?.searchBook].filter(Boolean);
+  for (const action of actions) {
+    const info = String(action?.requestInfo || "").trim();
+    if (!info) return "分类/搜索请求地址为空";
+    // Unconvertible Legado search JS often collapses to `let url = ""` with POST.
+    if (/^@js:/i.test(info) && /\blet\s+url\s*=\s*""\s*;/.test(info) && /\bPOST\s*:\s*true\b/.test(info)) {
+      return "搜索/分类请求无法生成有效 URL（阅读 JavaScript 不可移植）";
+    }
+  }
+  return "";
+}
+
 function nonPortableOmitReason(source, converted, options = {}) {
   return nonPortableOnlineMediaReason(source, converted)
     || nonPortableImageDecodeReason(source, options)
-    || nonPortableLoginReason(source);
+    || nonPortableLoginReason(source)
+    || nonPortableEmptyRequestReason(converted);
 }
 
 export function convertLegado(input, options = {}) {
@@ -1386,6 +1449,7 @@ export function skippedBuckets(skipped = []) {
     else if (/imageDecode|花屏|解码代理/i.test(reason)) key = "imageDecode";
     else if (/登录|分流|Get\s*\(/i.test(reason)) key = "login";
     else if (/sourceRegex|媒体流|可播放|媒体/i.test(reason)) key = "media";
+    else if (/有效 URL|请求地址为空|不可移植/i.test(reason)) key = "core-chain";
     else if (/核心链路/i.test(reason)) key = "core-chain";
     buckets[key] = (buckets[key] || 0) + 1;
   }

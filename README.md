@@ -209,7 +209,7 @@ npm run validate:xbs -- source.xbs 禁漫大王🎃
 npm run validate:xbs -- source.xbs --all --limit 20 --concurrency 4 --no-media
 ```
 
-对 `1197`（828 条）在 `omitNonPortable` + 在线 `imageProxyBase` 下约保留 428 条（跳过约 400：`core-chain` 为主，另有 `media` / `imageDecode` / `login`）。本地 `validate:xbs --all --limit 30 --concurrency 4 --no-media` 抽测基线约 **12/30 通过**；目标是导入后可用率明显高于「形状门槛过宽且预检全关」的旧行为，而不是接近 828。
+对 `1197`（828 条）在 `omitNonPortable` + 在线 `imageProxyBase` 下约保留 420+ 条（跳过约 400：`core-chain` 为主，另有 `media` / `imageDecode` / `login`）。本地 `validate:xbs --all --limit 30 --concurrency 4 --no-media` 抽测仍会受上游 502/504 影响；本轮重点修复的是「能导入但列表/目录为空」的转换缺陷（负索引 CSS、JSON 误判 HTML、`%@pageIndex` 坏编码、章节 `@js` 模板未进桥接等），而不是把通过率冲到接近 828。
 
 本机 Docker 发布脚本默认先执行包括离线动作链在内的完整测试，测试失败不会构建或推送镜像。只有明确设置 `SKIP_VALIDATION=1` 才会跳过该门槛。
 
