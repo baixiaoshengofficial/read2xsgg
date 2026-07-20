@@ -35,6 +35,6 @@ test("alicesw：详情保持 /novel/，目录兼容 section-list|mulu_list，cha
   // §七 result → 目录
   assert.match(c.chapterList.requestInfo, /^@js:/);
   assert.match(c.chapterList.requestInfo, /other\/chapters\/id/);
-  assert.equal(c.chapterList.title, "//a/text()");
+  assert.equal(c.chapterList.title, "//a");
   assert.equal(c.chapterList.url, "//a/@href");
 });

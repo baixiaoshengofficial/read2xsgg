@@ -231,6 +231,16 @@ function tocLinkHint(rule) {
     || "";
 }
 
+// 香色对 XPath 选中的元素会读取完整 textContent；阅读的 @text 也包含
+// 后代文本。直译成 /text() 只会取直接文本节点，标题里有 span 时就会变空。
+function compatibleTextRule(original, converted) {
+  const source = String(original || "").trim();
+  if (!/(?:^|@)(?:text|textNodes|ownText)$/i.test(source.split("##", 1)[0].trim())) return converted;
+  if (converted === "/text()") return ".";
+  const result = String(converted).replace(/\/text\(\)(?=(?:\||$))/g, "");
+  return result.startsWith("|") ? `.${result}` : result;
+}
+
 function nativeJmChapterList(host) {
   return {
     // 与已可用的 6444 相同：香色直接按详情 URL 拉取 HTML 目录。
@@ -383,7 +393,10 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
         result[to] = convertedKind;
         continue;
       }
-      const convertedRule = convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) });
+      const convertedRule = compatibleTextRule(
+        rules[from],
+        convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) }),
+      );
       // 阅读 ruleBookInfo.init 会将后续 JSONPath 的根切换到该节点。
       // 香色没有 init 字段，因此对无歧义的简单 JSONPath 显式补回前缀。
       const rulePath = initPath && responseType === "json" ? simpleJsonPath(rules[from]) : "";
@@ -415,8 +428,17 @@ function mapTocRules(rules, responseType, warningFor) {
   const result = {};
   for (const [from, to] of Object.entries(mapping)) {
     if (rules[from] !== undefined && rules[from] !== "") {
-      result[to] = convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) });
+      result[to] = compatibleTextRule(
+        rules[from],
+        convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) }),
+      );
     }
+  }
+  // Legado silently ignores chapter group/header rows whose URL field is empty.
+  // 香色 may keep such rows and then fail on the first title. Filter HTML list
+  // nodes to entries that actually contain a link whenever chapterUrl is href.
+  if (responseType === "html" && result.list && /(?:^|@)href(?:$|##)/i.test(String(rules.chapterUrl || ""))) {
+    result.list = `(${result.list})[self::a[@href] or .//a[@href]]`;
   }
   return result;
 }
@@ -492,16 +514,9 @@ function compactBookWorld(entries, { host, rules, responseType, warningFor }) {
   });
   const configuredPageSize = Number(entries[0]?.pageSize);
   const pageSize = Number.isInteger(configuredPageSize) && configuredPageSize > 0 ? configuredPageSize : 20;
-  const requestInfo = [
-    "@js:",
-    `var urls = ${JSON.stringify(templates)};`,
-    "var filters = (params && params.filters) || {};",
-    "var selected = (params && params.filter != null) ? params.filter : filters.category;",
-    "var index = Number(selected == null || selected === '' ? 0 : selected);",
-    "var url = String(urls[index] || urls[0] || '');",
-    "url = url.split('__READ2XSGG_PAGE__').join(String(params.pageIndex || 1));",
-    "return encodeURI(url);",
-  ].join("\n");
+  const requestFilters = labels.map((label, index) => (
+    `${label.slice(0, label.lastIndexOf("::") + 2)}${templates[index].replaceAll("__READ2XSGG_PAGE__", "%@pageIndex")}`
+  ));
 
   warningFor("exploreUrl", `${entries.length} entries`)(
     `已将 ${entries.length} 个普通 GET 分类压缩为香色 requestFilters，避免分类动作过多导致导入或切换异常`,
@@ -509,9 +524,11 @@ function compactBookWorld(entries, { host, rules, responseType, warningFor }) {
   return {
     分类: {
       ...commonAction("bookWorld", host, responseType),
-      requestInfo,
+      // 单键字符串筛选直接把所选 value 替换进 %@filter。这是香色最老、
+      // 最稳定的公开语义，不依赖未文档化的 params.filter。
+      requestInfo: "%@filter",
       ...mapBookRules(rules, responseType, warningFor, { listContext: true }),
-      moreKeys: { pageSize, requestFilters: ["category", ...labels].join("\n") },
+      moreKeys: { pageSize, requestFilters: requestFilters.join("\n") },
       _sIndex: 0,
     },
   };
@@ -730,8 +747,9 @@ function convertOne(source, warnings, options = {}) {
     && !/^(?:@js:|<js>|https?:\/\/|\{\{)/i.test(String(detailRules.tocUrl).trim())) {
     const base = String(options.imageProxyBase).replace(/\/$/, "");
     const hint = tocLinkHint(detailRules.tocUrl);
+    const selector = String(bookDetail.tocUrl || "");
     chapterListRequestInfo = runtimeAdapterRequestInfo(
-      `${base}/adapter/toc?hint=${encodeURIComponent(hint)}&url=`,
+      `${base}/adapter/toc?hint=${encodeURIComponent(hint)}&selector=${encodeURIComponent(selector)}&url=`,
     );
     detailWarningFor("tocUrl", detailRules.tocUrl)("HTML 详情页的独立目录链接已改由通用目录跳转器解析，避免依赖非标准 queryInfo.tocUrl");
   }
@@ -867,7 +885,7 @@ function completePortableAction(action, fields) {
   return fields.every((field) => (
     typeof action[field] === "string"
     && action[field].trim() !== ""
-    && !hasUnsupportedLegadoRuntime(JSON.stringify(action[field]))
+    && !hasUnsupportedLegadoRuntime(action[field])
   ));
 }
 
@@ -875,7 +893,7 @@ function sanitizePortableAction(action, requiredFields, warnings, sourceName, se
   if (!action || typeof action !== "object") return action;
   const cleaned = { ...action };
   for (const [field, value] of Object.entries(cleaned)) {
-    if (requiredFields.includes(field) || !hasUnsupportedLegadoRuntime(JSON.stringify(value))) continue;
+    if (requiredFields.includes(field) || !hasUnsupportedLegadoRuntime(typeof value === "string" ? value : JSON.stringify(value))) continue;
     delete cleaned[field];
     warnings.push({
       source: sourceName,

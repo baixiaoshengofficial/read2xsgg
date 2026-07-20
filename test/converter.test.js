@@ -58,9 +58,9 @@ test("转换一个完整的 HTML 阅读源", () => {
   assert.equal(converted.searchBook.list, "//*[@id='sitembox']//dl");
   assert.equal(
     converted.searchBook.author,
-    "(.//*[contains(concat(' ', normalize-space(@class), ' '), ' book_other ')])[1]/(.//span)[1]/text()",
+    "(.//*[contains(concat(' ', normalize-space(@class), ' '), ' book_other ')])[1]//span[1]",
   );
-  assert.equal(converted.chapterList.list, "//*[contains(concat(' ', normalize-space(@class), ' '), ' box_con ')]//dd");
+  assert.equal(converted.chapterList.list, "(//*[contains(concat(' ', normalize-space(@class), ' '), ' box_con ')]//dd)[self::a[@href] or .//a[@href]]");
   assert.match(converted.chapterContent.content, /new RegExp\("广告\.\*"/);
   assert.equal(converted.chapterContent.nextPageUrl, "//a[contains(normalize-space(.), '下一页')]/@href");
   assert.deepEqual(Object.keys(converted.bookWorld), ["玄幻", "都市"]);
@@ -85,12 +85,14 @@ test("转换 JSONPath 规则和 JSON 响应", () => {
 });
 
 test("CSS、阅读链式选择器和分页选择器转换为 XPath", () => {
-  assert.equal(convertRule("id.info@tag.p.0@a@text"), "//*[@id='info']/(.//p)[1]//a/text()");
+  assert.equal(convertRule("id.info@tag.p.0@a@text"), "//*[@id='info']//p[1]//a/text()");
   assert.equal(
     convertRule(".txt-list > li:nth-child(n+2)"),
     "//*[contains(concat(' ', normalize-space(@class), ' '), ' txt-list ')]/li[position() >= 2]",
   );
   assert.equal(convertRule("tbody>tr!0"), "//tbody/tr[position() > 1]");
+  assert.equal(convertRule(".l li[0:-1]"), "//*[contains(concat(' ', normalize-space(@class), ' '), ' l ')]//li[position() >= 1 and position() <= last() - 1]");
+  assert.equal(convertRule('##<a\\s*href="([^\"]+)"##$1###'), "//a/@href");
   assert.equal(convertRule("a.1@href"), "(.//a)[2]/@href");
   assert.equal(convertRule("tag.a.0:1:2@text"), "(.//a)[position() = 1 or position() = 2 or position() = 3]/text()");
 });
@@ -125,8 +127,8 @@ test("相对属性 text/href 与 CSS 目录规则不会被误判为 JSON", () =>
   const { sources, warnings } = convertLegado([source]);
   const converted = sources["目录相对属性"];
   assert.equal(converted.chapterList.responseFormatType, "html");
-  assert.equal(converted.chapterList.list, "//a[contains(@href, '/read/')]");
-  assert.equal(converted.chapterList.title, "/text()");
+  assert.equal(converted.chapterList.list, "(//a[contains(@href, '/read/')])[self::a[@href] or .//a[@href]]");
+  assert.equal(converted.chapterList.title, ".");
   assert.equal(converted.chapterList.url, "//@href");
   assert.match(converted.bookDetail.tocUrl, /\/\/a\[contains/);
   assert.match(converted.bookDetail.tocUrl, /查看全部章节/);
@@ -470,7 +472,7 @@ test("禁漫动态发现脚本转换为香色可见的静态分类", () => {
   assert.equal(converted.bookWorld["全部"].moreKeys.pageSize, 80);
   assert.match(converted.bookWorld["全部"].list, /list-col/);
   assert.match(converted.bookWorld["全部"].bookName, /video-title/);
-  assert.equal(converted.bookWorld["全部"].detailUrl, "//a[contains(@href, '/album/')]/@href");
+  assert.match(converted.bookWorld["全部"].detailUrl, /match\(\/\\\/album/);
   assert.equal(converted.bookWorld["全部"].author, undefined);
   assert.match(converted.bookDetail.requestInfo, /params\.queryInfo/);
   assert.doesNotMatch(JSON.stringify(converted.bookDetail), /java\.|Packages/);
@@ -543,13 +545,10 @@ test("大量普通 GET 分类压缩为一个香色原生筛选动作", () => {
   const { sources, warnings } = convertLegado(source);
   const world = sources["大型分类测试"].bookWorld;
   assert.deepEqual(Object.keys(world), ["分类"]);
-  assert.match(world["分类"].moreKeys.requestFilters, /^category\n分类 1::0/m);
-  assert.match(world["分类"].moreKeys.requestFilters, /分类 12::11$/m);
-  assert.match(world["分类"].requestInfo, /params\.filter/);
-  assert.match(world["分类"].requestInfo, /params\.pageIndex/);
-  assert.doesNotMatch(world["分类"].requestInfo, /\{\{|%@pageIndex/);
-  const request = new Function("params", world["分类"].requestInfo.replace(/^@js:\s*/, ""));
-  assert.equal(request({ filter: "11", pageIndex: 3 }), "/category/12?page=3");
+  assert.match(world["分类"].moreKeys.requestFilters, /^分类 1::\/category\/1\?page=%@pageIndex/m);
+  assert.match(world["分类"].moreKeys.requestFilters, /分类 12::\/category\/12\?page=%@pageIndex$/m);
+  assert.equal(world["分类"].requestInfo, "%@filter");
+  assert.doesNotMatch(world["分类"].moreKeys.requestFilters, /^category$/m);
   assert.ok(warnings.some((warning) => warning.message.includes("压缩为香色 requestFilters")));
 });
 
@@ -614,7 +613,7 @@ test("有分类 URL 但发现规则为空时复用搜索列表规则", () => {
   const converted = sources["图片分类复用"];
   const world = converted.bookWorld["美图"];
   assert.match(world.list, /masonry-item/);
-  assert.equal(world.bookName, "//h5/text()");
+  assert.equal(world.bookName, "//h5");
   assert.equal(world.detailUrl, "//a/@href");
   assert.match(converted.chapterList.url, /params\.queryInfo/);
   assert.ok(warnings.some((warning) => warning.message.includes("搜索规则补齐")));
@@ -631,7 +630,7 @@ test("发现核心字段依赖 Android Java 时逐字段回退搜索规则", () 
   };
   const { sources, warnings } = convertLegado(source, { omitNonPortable: true });
   const world = sources["发现字段回退"].bookWorld["玄幻"];
-  assert.match(world.bookName, /\/\/dd\/\/h3\/\/a\/text\(\)/);
+  assert.match(world.bookName, /\/\/dd\/\/h3\/\/a/);
   assert.equal(world.detailUrl, "//dd//h3//a/@href");
   assert.ok(warnings.some((warning) => warning.message.includes("已自动回退到可执行的搜索规则")));
 });
@@ -703,7 +702,7 @@ test("列表项字段保持香色支持的双斜线 XPath", () => {
   assert.equal(converted.bookWorld["分类"].detailUrl, "//a/@href");
   assert.equal(converted.chapterList.title, "//a/text()");
   assert.equal(converted.chapterList.url, "//a/@href");
-  assert.equal(converted.chapterList.list, "//li");
+  assert.equal(converted.chapterList.list, "(//li)[self::a[@href] or .//a[@href]]");
 });
 
 test("列表项的阅读专用后处理回退为基础选择器", () => {

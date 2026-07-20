@@ -1,4 +1,5 @@
 export { convertLegado, portableConvertedSource } from "./converter.js";
+export { loadXbsSources, runXbsPipeline } from "./xbsRuntime.js";
 export { convertRule, cssToXPath, inferResponseType } from "./selectors.js";
 export { convertRequest } from "./requests.js";
 export { decodeXbs, encodeXbs } from "./xbs.js";

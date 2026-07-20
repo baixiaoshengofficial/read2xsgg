@@ -215,6 +215,10 @@ test("通用目录跳转器从详情页选择章节目录而不是开始阅读",
     <a href="/novel/rcatalog/1"><i></i><span>章节目录</span></a>
   `;
   assert.equal(pageTocUrl(html, "https://book.example/detail/1", "章节目录"), "https://book.example/novel/rcatalog/1");
+  assert.equal(
+    pageTocUrl('<a class="book_more" href="/catalog/7">More</a>', "https://book.example/detail/7", "", "//*[contains(concat(' ', normalize-space(@class), ' '), ' book_more ')]//a/@href || //*[@class='book_more']/@href"),
+    "https://book.example/catalog/7",
+  );
 
   const upstream = createServer((_request, response) => {
     response.writeHead(200, { "Content-Type": "text/html" });

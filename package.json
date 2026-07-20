@@ -5,12 +5,15 @@
   "type": "module",
   "bin": {
     "read2xsgg": "./bin/read2xsgg.js",
-    "read2xsgg-server": "./bin/server.js"
+    "read2xsgg-server": "./bin/server.js",
+    "read2xsgg-validate": "./bin/validate-xbs.js"
   },
   "exports": "./src/index.js",
   "scripts": {
     "test": "node --test",
     "test:live": "RUN_LIVE_TESTS=1 node --test test/live-alicesw.test.js",
+    "test:xbs-live": "RUN_XBS_LIVE=1 node --test test/live-xbs.test.js",
+    "validate:xbs": "node ./bin/validate-xbs.js",
     "convert": "node ./bin/read2xsgg.js",
     "start": "node ./bin/server.js",
     "docker:push": "./scripts/docker-push.sh"
@@ -26,6 +29,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "jimp": "^1.6.1"
+    "jimp": "^1.6.1",
+    "jsdom": "^24.1.3"
   }
 }

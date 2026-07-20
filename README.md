@@ -187,6 +187,18 @@ node ./bin/server.js
 
 `npm test` 只运行可重复的离线测试；需要检查真实上游的详情、目录和正文时运行 `npm run test:live`。这样上游临时断线不会让 GitHub Actions 每次推送都误报失败。
 
+转换器还提供香色动作链验收器。它会真正执行“分类 → 分类列表 → 详情 → 章节目录 → 正文 → 首个媒体文件”，并在分类首条是刚上架、已删除或尚无章节的坏数据时最多换 5 本复测；全部候选都失败才返回非零退出码：
+
+```bash
+# 验证指定源
+npm run validate:xbs -- source.xbs 禁漫大王🎃
+
+# 并发抽测聚合 XBS 中前 20 个源（不下载正文媒体文件）
+npm run validate:xbs -- source.xbs --all --limit 20 --concurrency 4 --no-media
+```
+
+本机 Docker 发布脚本默认先执行包括离线动作链在内的完整测试，测试失败不会构建或推送镜像。只有明确设置 `SKIP_VALIDATION=1` 才会跳过该门槛。
+
 ### 服务配置
 
 Compose 支持通过环境变量调整：

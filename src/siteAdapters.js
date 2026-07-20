@@ -192,7 +192,11 @@ function adaptJm(source) {
   )));
   // 每张禁漫卡片里含点赞/收藏等多个 a；只允许真正的 /album/ 详情链接。
   // 同时避免 (.//a)[1]/@href 在香色 bookWorld 上下文中取空的问题。
-  portableSearchRules.bookUrl = "a[href~=/album/]@href";
+  portableSearchRules.bookUrl = [
+    "a[href~=/album/]@href || @js:",
+    "var m = String(result || '').match(/\\/album\\/\\d+/);",
+    "return m ? m[0] : result;",
+  ].join("\n");
   const ruleToc = source.ruleToc ?? source.tocRule ?? {};
   return {
     ...source,

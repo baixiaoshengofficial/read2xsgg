@@ -78,9 +78,28 @@ function jsoupRegexToContains(attribute, value) {
 function cssAtomToXPath(atom) {
   let source = atom;
   let excludedFirst = false;
+  let slicePredicate = "";
   if (/!0$/.test(source)) {
     source = source.slice(0, -2);
     excludedFirst = true;
+  }
+
+  // Legado/Jsoup supports result slices such as `li[0:-1]`. This is not a CSS
+  // attribute selector: [0:-1] means all matches except the last one. Treating
+  // it as an attribute made the generated XPath syntactically invalid.
+  const slice = source.match(/\[\s*(-?\d*)\s*:\s*(-?\d*)\s*\]$/);
+  if (slice && (slice[1] || slice[2])) {
+    source = source.slice(0, slice.index);
+    const start = slice[1] === "" ? null : Number(slice[1]);
+    const end = slice[2] === "" ? null : Number(slice[2]);
+    const clauses = [];
+    if (start !== null) clauses.push(start >= 0
+      ? `position() >= ${start + 1}`
+      : `position() >= last() - ${Math.abs(start) - 1}`);
+    if (end !== null) clauses.push(end >= 0
+      ? `position() <= ${end}`
+      : `position() <= last() - ${Math.abs(end)}`);
+    slicePredicate = clauses.join(" and ");
   }
 
   const tagMatch = source.match(/^[a-zA-Z][\w-]*|^\*/);
@@ -118,7 +137,20 @@ function cssAtomToXPath(atom) {
   const lt = source.match(/:lt\(\s*(\d+)\s*\)/);
   if (lt) predicates.push(`position() <= ${lt[1]}`);
   if (excludedFirst) predicates.push("position() > 1");
+  if (slicePredicate) predicates.push(slicePredicate);
   return `${tag}${predicates.map((predicate) => `[${predicate}]`).join("")}`;
+}
+
+function regexOnlyAttributeRule(rule, warn) {
+  if (!String(rule).startsWith("##")) return "";
+  const [pattern = "", replacement = ""] = String(rule).slice(2).split("##");
+  if (!/^\$1(?:#*)?$/.test(replacement)) return "";
+  const attribute = pattern.match(/\b(href|src|data-src|data-original|content)\s*=\s*["']\s*\(\[\^["']/i)?.[1]
+    || pattern.match(/\b(href|src|data-src|data-original|content)\b/i)?.[1];
+  if (!attribute) return "";
+  const tag = pattern.match(/<\s*(a|img|meta|source)\b/i)?.[1]?.toLowerCase() || "*";
+  warn(`纯 HTML 正则取 ${attribute} 已转换为 XPath 属性选择器`);
+  return `//${tag}/@${attribute}`;
 }
 
 export function cssToXPath(selector) {
@@ -159,7 +191,10 @@ function withResultIndex(path, indexPredicate, first) {
   if (!indexPredicate) return path;
   const relative = path.startsWith("//") ? `.${path}` : path.startsWith("/") ? `.${path}` : `.//${path}`;
   if (first) return `(${relative})${indexPredicate}`;
-  return `/(${relative})${indexPredicate}`;
+  // Chained `/(…)` is not valid XPath 1.0 (and JSDOM/XSGG reject it).
+  // A step predicate is evaluated within the current list item and preserves
+  // Legado's usual tag.a.-1 / tag.p.0 intent.
+  return `${path}${indexPredicate}`;
 }
 
 function legacySegmentToXPath(segment, first) {
@@ -407,6 +442,9 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   let trimmed = rule.trim();
   if (!trimmed) return "";
 
+  const attributeFallback = regexOnlyAttributeRule(trimmed, warn);
+  if (attributeFallback) return attributeFallback;
+
   const literalMustache = trimmed.match(/^\{\{\s*(["'])([\s\S]*)\1\s*\}\}$/);
   if (literalMustache) {
     return `@js:\nreturn ${JSON.stringify(literalMustache[2])};`;
@@ -468,12 +506,16 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
 
   // Apply ## cleanup to the whole rule (including && combinations) before splitting.
   const replacementIndex = trimmed.indexOf("##");
-  if (replacementIndex >= 0 && !trimmed.includes("||") && !trimmed.includes("|")) {
+  if (replacementIndex >= 0) {
     const selector = trimmed.slice(0, replacementIndex);
     const suffix = trimmed.slice(replacementIndex + 2);
-    const converted = convertRule(selector, { responseType, warn });
-    const wrapped = converted.includes(" | ") ? `(${converted})` : converted;
-    return appendRegexReplacement(wrapped, suffix, warn);
+    // Pipes after ## belong to the regular expression, not to Legado selector
+    // alternatives (for example ad|script cleanup patterns).
+    if (!selector.includes("||") && !selector.includes("|")) {
+      const converted = convertRule(selector, { responseType, warn });
+      const wrapped = converted.includes(" | ") ? `(${converted})` : converted;
+      return appendRegexReplacement(wrapped, suffix, warn);
+    }
   }
 
   // Legado `&&` joins all matched texts with newline; approximate with XPath union.

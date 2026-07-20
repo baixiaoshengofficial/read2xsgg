@@ -10,6 +10,11 @@ COMMIT_TAG="sha-$(git -C "$ROOT" rev-parse --short HEAD)"
 
 cd "$ROOT"
 
+if [[ "${SKIP_VALIDATION:-0}" != "1" ]]; then
+  echo "Running offline XBS action-chain tests before publishing..."
+  npm test
+fi
+
 if ! docker info >/dev/null 2>&1; then
   echo "Docker 未运行，请先启动 Docker Desktop。" >&2
   exit 1

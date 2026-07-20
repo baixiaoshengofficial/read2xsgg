@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { JSDOM } from "jsdom";
 import { convertLegado } from "./converter.js";
 import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
 import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
@@ -640,6 +641,7 @@ function adapterRequestFromRequest(request) {
     type,
     sourceUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "",
     hint: parsed.searchParams.get("hint") || "",
+    selector: parsed.searchParams.get("selector") || "",
     extractionPlan,
   };
 }
@@ -654,7 +656,19 @@ function plainText(value) {
     .trim();
 }
 
-export function pageTocUrl(page, baseUrl, hint = "") {
+export function pageTocUrl(page, baseUrl, hint = "", selector = "") {
+  if (selector) {
+    const document = new JSDOM(String(page || "")).window.document;
+    for (const expression of String(selector).split(/\s*\|\|\s*/).filter(Boolean)) {
+      try {
+        const found = document.evaluate(expression, document, null, document.defaultView.XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+        const value = found?.nodeType === 2 ? found.nodeValue : found?.getAttribute?.("href") || found?.querySelector?.("a[href]")?.getAttribute("href");
+        if (value && !/^(?:javascript|#)/i.test(value)) return new URL(value, baseUrl).toString();
+      } catch {
+        // Fall through to the heuristic scorer for malformed/unsupported XPath.
+      }
+    }
+  }
   const candidates = [];
   let order = 0;
   for (const match of String(page || "").matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
@@ -1187,8 +1201,11 @@ export function createAppServer(options = {}) {
           active += 1;
           let targetUrl;
           try {
-            const detailPage = await downloadSource(sourceUrl, config);
-            targetUrl = pageTocUrl(detailPage.toString("utf8"), sourceUrl, adapterTarget.hint);
+            for (let attempt = 0; attempt < 3 && !targetUrl; attempt += 1) {
+              if (attempt) await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+              const detailPage = await downloadSource(sourceUrl, config);
+              targetUrl = pageTocUrl(detailPage.toString("utf8"), sourceUrl, adapterTarget.hint, adapterTarget.selector);
+            }
           } finally {
             active -= 1;
           }
