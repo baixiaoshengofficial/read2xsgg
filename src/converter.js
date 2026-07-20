@@ -781,6 +781,54 @@ function buildBookAction({ actionID, host, request, rules, headers, warnings, so
   return action;
 }
 
+function extractTitleUrlLinesFromText(text) {
+  let group = "";
+  return String(text || "").split(/\r?\n/).map((line) => {
+    const value = line.trim();
+    const separator = value.indexOf("::");
+    if (separator > 0 && !value.slice(separator + 2).trim()) {
+      group = value.slice(0, separator).replace(/[—－\-\s]/g, "") || group;
+      return null;
+    }
+    if (separator <= 0) {
+      if (value) group = value.replace(/[—－\-\s]/g, "") || group;
+      return null;
+    }
+    const title = value.slice(0, separator).trim();
+    const url = value.slice(separator + 2).trim();
+    if (!title || !url) return null;
+    if (!/^(?:\/|https?:\/\/)/i.test(url) && !/\{\{\s*page\s*\}\}|%@pageIndex/i.test(url)) return null;
+    return { title, url, group };
+  }).filter((item) => item?.title && item?.url);
+}
+
+/**
+ * Many Legado sources embed plain `标题::/path/{{page}}` tables inside @js
+ * template strings (not executable discovery). Extract those statically.
+ */
+function extractExploreEntriesFromJs(script) {
+  const entries = [];
+  const seen = new Set();
+  const pushAll = (chunk) => {
+    for (const entry of extractTitleUrlLinesFromText(chunk)) {
+      const key = `${entry.group || ""}|${entry.title}|${entry.url}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entries.push(entry);
+    }
+  };
+  for (const match of String(script || "").matchAll(/`([\s\S]*?)`/g)) pushAll(match[1]);
+  for (const match of String(script || "").matchAll(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g)) {
+    try {
+      pushAll(JSON.parse(match[0].replace(/^'/, '"').replace(/'$/, '"')));
+    } catch {
+      pushAll(match[0].slice(1, -1));
+    }
+  }
+  if (!entries.length) pushAll(script);
+  return entries;
+}
+
 function parseExploreEntries(exploreUrl, warningFor) {
   if (!exploreUrl || exploreUrl === "-") return [];
   const validEntries = (entries) => entries
@@ -790,6 +838,13 @@ function parseExploreEntries(exploreUrl, warningFor) {
   if (Array.isArray(exploreUrl)) return validEntries(exploreUrl);
   const source = String(exploreUrl).trim();
   if (/^(?:@js:|<js>)/i.test(source)) {
+    const extracted = extractExploreEntriesFromJs(source);
+    if (extracted.length) {
+      warningFor("exploreUrl", exploreUrl)(
+        `已从发现页脚本中静态提取 ${extracted.length} 个 title::url 分类`,
+      );
+      return extracted;
+    }
     warningFor("exploreUrl", exploreUrl)("发现页依赖阅读 Android JavaScript，无法安全执行；将尝试生成通用搜索入口分类");
     return [];
   }
@@ -801,22 +856,7 @@ function parseExploreEntries(exploreUrl, warningFor) {
     }
     warningFor("exploreUrl", exploreUrl)("发现页配置看似 JSON，但宽松解析后仍无有效分类，已尝试按 title::url 行解析");
   }
-  let group = "";
-  return source.split(/\r?\n/).map((line) => {
-    const value = line.trim();
-    const separator = value.indexOf("::");
-    if (separator > 0 && !value.slice(separator + 2).trim()) {
-      group = value.slice(0, separator).replace(/[—－\-\s]/g, "") || group;
-      return null;
-    }
-    if (separator <= 0) {
-      // 阅读发现页常以“——总点击——”这类无 URL 的行分组；保留它，
-      // 否则后面重复的“玄幻”等名称会在香色对象中互相覆盖。
-      if (value) group = value.replace(/[—－\-\s]/g, "") || group;
-      return null;
-    }
-    return { title: value.slice(0, separator).trim(), url: value.slice(separator + 2).trim(), group };
-  }).filter((item) => item?.title && item?.url);
+  return extractTitleUrlLinesFromText(source);
 }
 
 function compactCategoryTemplate(value, host) {

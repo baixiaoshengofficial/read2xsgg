@@ -112,6 +112,7 @@ export function createJobWorker({ store, config, concurrency = 1, downloadSource
 
       await store.updateJob(jobId, {
         status: "running",
+        phase: "download",
         startedAt: job.startedAt || new Date().toISOString(),
         error: "",
       });
@@ -119,7 +120,7 @@ export function createJobWorker({ store, config, concurrency = 1, downloadSource
       const onProgress = async (progress) => {
         if (isCancelled(jobId)) return;
         try {
-          await store.updateJob(jobId, { progress });
+          await store.updateJob(jobId, { progress, phase: "verify" });
         } catch {
           // Ignore progress write races.
         }
@@ -127,6 +128,7 @@ export function createJobWorker({ store, config, concurrency = 1, downloadSource
 
       let result;
       if (job.mode === "site") {
+        await store.updateJob(jobId, { phase: "analyze" });
         const download = (url, headers = {}) => downloadSource(
           url,
           { ...config, fetchTimeoutMs: config.analyzeTimeoutMs },
@@ -155,6 +157,7 @@ export function createJobWorker({ store, config, concurrency = 1, downloadSource
         };
         await onProgress({ done: count, total: count, kept: count, skipped: 0, unverified: 0, fallback: count, failed: 0 });
       } else {
+        await store.updateJob(jobId, { phase: "convert" });
         const jobConfig = {
           ...config,
           verifyConvertedSources: true,
@@ -177,9 +180,11 @@ export function createJobWorker({ store, config, concurrency = 1, downloadSource
 
       if (isCancelled(jobId)) return;
 
+      await store.updateJob(jobId, { phase: "save" });
       await store.saveArtifacts(jobId, { xbs: result.xbs, json: result.json });
       await store.updateJob(jobId, {
         status: "done",
+        phase: "done",
         count: result.count,
         fallbackCount: result.fallbackCount || 0,
         skippedBuckets: result.skippedBuckets || {},
@@ -200,6 +205,7 @@ export function createJobWorker({ store, config, concurrency = 1, downloadSource
       try {
         await store.updateJob(jobId, {
           status: "failed",
+          phase: "failed",
           error: error?.message || String(error),
           finishedAt: new Date().toISOString(),
         });

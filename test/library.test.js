@@ -194,6 +194,28 @@ test("删除运行中任务会释放队列槽位并启动下一个", async () =>
   }
 });
 
+test("并发进度更新不会损坏 job JSON", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-lock-"));
+  try {
+    const store = createLibraryStore(dir);
+    const job = await store.createJob({ url: "https://example.com/a.json" });
+    await store.updateJob(job.id, { status: "running", phase: "verify" });
+    await Promise.all(
+      Array.from({ length: 40 }, (_, i) => store.updateJob(job.id, {
+        progress: { done: i, total: 40, kept: i, skipped: 0, unverified: 0, fallback: 0, failed: 0 },
+      })),
+    );
+    const final = await store.getJob(job.id);
+    assert.equal(final.status, "running");
+    assert.equal(final.progress.total, 40);
+    const listed = await store.listJobs();
+    assert.equal(listed[0].id, job.id);
+    assert.equal(listed[0].status, "running");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("进度回写不会覆盖 done 状态", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-race-"));
   try {

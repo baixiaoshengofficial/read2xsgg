@@ -23,9 +23,26 @@ async function readJson(filePath, fallback = null) {
 async function writeJsonAtomic(filePath, value) {
   const dir = path.dirname(filePath);
   await mkdir(dir, { recursive: true });
-  const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await rename(tmp, filePath);
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await rename(tmp, filePath);
+  } catch (error) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+function createLockMap() {
+  const tails = new Map();
+  return function withLock(key, fn) {
+    const prev = tails.get(key) || Promise.resolve();
+    const next = prev.catch(() => {}).then(fn);
+    tails.set(key, next);
+    return next.finally(() => {
+      if (tails.get(key) === next) tails.delete(key);
+    });
+  };
 }
 
 /**
@@ -36,12 +53,15 @@ export function createLibraryStore(dataDir) {
   const jobsDir = path.join(root, "jobs");
   const artifactsDir = path.join(root, "artifacts");
   const indexPath = path.join(root, "index.json");
+  const withLock = createLockMap();
 
   async function ensure() {
     await mkdir(jobsDir, { recursive: true });
     await mkdir(artifactsDir, { recursive: true });
-    const index = await readJson(indexPath, null);
-    if (!index) await writeJsonAtomic(indexPath, { version: 1, jobs: [] });
+    await withLock("index", async () => {
+      const index = await readJson(indexPath, null);
+      if (!index) await writeJsonAtomic(indexPath, { version: 1, jobs: [] });
+    });
   }
 
   function jobPath(id) {
@@ -52,50 +72,57 @@ export function createLibraryStore(dataDir) {
     return path.join(artifactsDir, `${id}.${ext}`);
   }
 
-  async function readIndex() {
-    await ensure();
+  async function readIndexUnlocked() {
     const index = await readJson(indexPath, { version: 1, jobs: [] });
     if (!Array.isArray(index.jobs)) index.jobs = [];
     return index;
   }
 
-  async function writeIndex(index) {
-    await writeJsonAtomic(indexPath, index);
-  }
-
   async function upsertIndexEntry(entry) {
-    const index = await readIndex();
-    const next = {
-      id: entry.id,
-      title: entry.title || "",
-      sourceUrl: entry.sourceUrl || "",
-      mode: entry.mode || "source",
-      status: entry.status,
-      updatedAt: entry.updatedAt || nowIso(),
-      count: entry.count ?? null,
-      error: entry.error || "",
-    };
-    const pos = index.jobs.findIndex((item) => item.id === next.id);
-    if (pos >= 0) index.jobs[pos] = next;
-    else index.jobs.unshift(next);
-    await writeIndex(index);
-    return next;
+    return withLock("index", async () => {
+      const index = await readIndexUnlocked();
+      const next = {
+        id: entry.id,
+        title: entry.title || "",
+        sourceUrl: entry.sourceUrl || "",
+        mode: entry.mode || "source",
+        status: entry.status,
+        updatedAt: entry.updatedAt || nowIso(),
+        count: entry.count ?? null,
+        error: entry.error || "",
+        progress: entry.progress || null,
+        phase: entry.phase || "",
+      };
+      const pos = index.jobs.findIndex((item) => item.id === next.id);
+      if (pos >= 0) index.jobs[pos] = next;
+      else index.jobs.unshift(next);
+      await writeJsonAtomic(indexPath, index);
+      return next;
+    });
   }
 
   async function removeIndexEntry(id) {
-    const index = await readIndex();
-    index.jobs = index.jobs.filter((item) => item.id !== id);
-    await writeIndex(index);
+    return withLock("index", async () => {
+      const index = await readIndexUnlocked();
+      index.jobs = index.jobs.filter((item) => item.id !== id);
+      await writeJsonAtomic(indexPath, index);
+    });
   }
 
   async function getJob(id) {
     await ensure();
-    return readJson(jobPath(id), null);
+    return withLock(`job:${id}`, () => readJson(jobPath(id), null));
   }
 
   async function listJobs() {
-    const index = await readIndex();
-    return index.jobs;
+    await ensure();
+    const index = await withLock("index", () => readIndexUnlocked());
+    const full = [];
+    for (const entry of index.jobs) {
+      const job = await getJob(entry.id);
+      full.push(job || entry);
+    }
+    return full;
   }
 
   async function createJob({ url, mode = "source", name = "", imageProxyBase = "" } = {}) {
@@ -108,6 +135,7 @@ export function createLibraryStore(dataDir) {
       sourceUrl: String(url || "").trim(),
       mode: mode === "site" ? "site" : "source",
       status: "queued",
+      phase: "queued",
       imageProxyBase: String(imageProxyBase || ""),
       progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, failed: 0 },
       count: null,
@@ -120,29 +148,34 @@ export function createLibraryStore(dataDir) {
       finishedAt: null,
       subscribePath: `/library/${id}.xbs`,
     };
-    await writeJsonAtomic(jobPath(id), job);
+    await withLock(`job:${id}`, async () => {
+      await writeJsonAtomic(jobPath(id), job);
+    });
     await upsertIndexEntry(job);
     return job;
   }
 
   async function updateJob(id, patch = {}) {
-    const current = await getJob(id);
-    if (!current) return null;
-    // Progress-only writes must not clobber a terminal status written concurrently.
-    const terminal = current.status === "done" || current.status === "failed";
-    if (terminal && patch.status === undefined) {
-      return current;
-    }
-    const next = {
-      ...current,
-      ...patch,
-      id: current.id,
-      updatedAt: nowIso(),
-      progress: patch.progress ? { ...current.progress, ...patch.progress } : current.progress,
-    };
-    await writeJsonAtomic(jobPath(id), next);
-    await upsertIndexEntry(next);
-    return next;
+    return withLock(`job:${id}`, async () => {
+      const current = await readJson(jobPath(id), null);
+      if (!current) return null;
+      const terminal = current.status === "done" || current.status === "failed";
+      if (terminal && patch.status === undefined) {
+        return current;
+      }
+      const next = {
+        ...current,
+        ...patch,
+        id: current.id,
+        updatedAt: nowIso(),
+        progress: patch.progress ? { ...current.progress, ...patch.progress } : current.progress,
+      };
+      await writeJsonAtomic(jobPath(id), next);
+      return next;
+    }).then(async (next) => {
+      if (next) await upsertIndexEntry(next);
+      return next;
+    });
   }
 
   async function saveArtifacts(id, { xbs, json } = {}) {
@@ -162,7 +195,9 @@ export function createLibraryStore(dataDir) {
 
   async function deleteJob(id) {
     await ensure();
-    await rm(jobPath(id), { force: true });
+    await withLock(`job:${id}`, async () => {
+      await rm(jobPath(id), { force: true });
+    });
     await rm(artifactPath(id, "xbs"), { force: true });
     await rm(artifactPath(id, "json"), { force: true });
     await removeIndexEntry(id);
@@ -171,13 +206,7 @@ export function createLibraryStore(dataDir) {
 
   async function listRecoverableJobs() {
     const jobs = await listJobs();
-    const out = [];
-    for (const entry of jobs) {
-      if (entry.status !== "queued" && entry.status !== "running") continue;
-      const full = await getJob(entry.id);
-      if (full) out.push(full);
-    }
-    return out;
+    return jobs.filter((job) => job && (job.status === "queued" || job.status === "running"));
   }
 
   return {

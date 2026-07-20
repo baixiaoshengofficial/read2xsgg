@@ -66,6 +66,33 @@ function progressRatio(job) {
   return Math.max(0, Math.min(1, done / total));
 }
 
+function statusLabel(status) {
+  if (status === "queued") return "排队中";
+  if (status === "running") return "运行中";
+  if (status === "done") return "完成";
+  if (status === "failed") return "失败";
+  return status || "";
+}
+
+function phaseLabel(job) {
+  const phase = job.phase || "";
+  if (job.status === "queued") return "等待调度";
+  if (job.status === "done") return job.count != null ? `保留 ${job.count} 源` : "完成";
+  if (job.status === "failed") return job.error || "失败";
+  if (phase === "download") return "下载阅读源…";
+  if (phase === "convert") return "转换规则…";
+  if (phase === "verify") {
+    if (job.progress?.total) {
+      return `抽测 ${job.progress.done || 0}/${job.progress.total} · 保留 ${job.progress.kept || 0} · 跳过 ${job.progress.skipped || 0}`;
+    }
+    return "抽测中…";
+  }
+  if (phase === "analyze") return "识站分析…";
+  if (phase === "save") return "写入制品…";
+  if (job.status === "running") return "处理中…";
+  return "等待中";
+}
+
 function renderJobs(jobs) {
   if (!jobs?.length) {
     els.jobs.innerHTML = `<p class="empty">暂无任务。粘贴阅读源 URL 开始转换。</p>`;
@@ -74,13 +101,13 @@ function renderJobs(jobs) {
   els.jobs.innerHTML = jobs.map((job) => {
     const ratio = progressRatio(job);
     const pct = Math.round(ratio * 100);
-    const progressText = job.progress?.total
-      ? `${job.progress.done || 0}/${job.progress.total} · 保留 ${job.progress.kept || 0} · 跳过 ${job.progress.skipped || 0}`
-      : (job.status === "done" ? `保留 ${job.count ?? 0}` : "等待中");
+    const progressText = phaseLabel(job);
     const sub = job.status === "done"
       ? `<div class="meta">订阅：<code>${subscribeUrl(job)}</code></div>`
       : "";
-    const err = job.error ? `<div class="meta" style="color:var(--bad)">${escapeHtml(job.error)}</div>` : "";
+    const err = job.error && job.status === "failed"
+      ? `<div class="meta" style="color:var(--bad)">${escapeHtml(job.error)}</div>`
+      : "";
     const actions = [
       job.status === "done" ? `<button type="button" data-copy="${job.id}">复制订阅 URL</button>` : "",
       job.status === "failed" ? `<button type="button" data-retry="${job.id}">重试</button>` : "",
@@ -88,9 +115,9 @@ function renderJobs(jobs) {
     ].filter(Boolean).join("");
     return `
       <article class="job" data-id="${job.id}">
-        <p class="job-title"><span class="badge ${job.status}">${job.status}</span>${escapeHtml(job.title || job.id)}</p>
+        <p class="job-title"><span class="badge ${job.status}">${statusLabel(job.status)}</span>${escapeHtml(job.title || job.id)}</p>
         <p class="meta">${escapeHtml(job.sourceUrl || "")}</p>
-        <p class="meta">${progressText}${job.count != null && job.status === "done" ? ` · 共 ${job.count} 源` : ""}</p>
+        <p class="meta">${escapeHtml(progressText)}</p>
         <div class="progress" aria-hidden="true"><span style="width:${pct}%"></span></div>
         ${sub}
         ${err}

@@ -136,7 +136,14 @@ export async function convertOnlineSource(sourceUrl, config, imageProxyBase = ""
   }
 
   const count = Object.keys(converted.sources).length;
-  if (!count) throw new HttpError(422, "在线地址中没有可转换的阅读源");
+  if (!count) {
+    const reasons = (converted.skipped || [])
+      .map((item) => `${item.source}: ${item.reason}`)
+      .filter(Boolean)
+      .slice(0, 5)
+      .join("；");
+    throw new HttpError(422, reasons || "在线地址中没有可转换的阅读源");
+  }
   const buckets = skippedBuckets(converted.skipped);
   const json = Buffer.from(`${JSON.stringify(converted.sources, null, 2)}\n`, "utf8");
   const xbs = encodeXbs(json);
