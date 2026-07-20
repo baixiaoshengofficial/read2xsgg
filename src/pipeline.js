@@ -52,10 +52,12 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
         skipped.push({ source: name, reason: verified.reason || "rules-stale: empty-list" });
         continue;
       }
+      const preferKind = String(source?.sourceType || "").trim();
       const analyzed = await analyzeSite(host, {
         download,
         sourceName: name,
         timeoutMs: analyzeTimeoutMs,
+        preferKind: ["text", "comic", "audio", "video"].includes(preferKind) ? preferKind : "",
       });
       if (!analyzed.ok) {
         skipped.push({
@@ -64,9 +66,18 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
         });
         continue;
       }
-      // Keep the original display name; mark via warning.
-      analyzed.source.sourceName = name;
-      kept[name] = analyzed.source;
+      // Prefer a generated source matching the original type; keep display name.
+      const generated = analyzed.sources || {};
+      const matchName = Object.keys(generated).find((key) => generated[key]?.sourceType === preferKind);
+      const picked = (matchName && generated[matchName])
+        || analyzed.source
+        || Object.values(generated)[0];
+      if (!picked) {
+        skipped.push({ source: name, reason: analyzed.reason || "analyze-failed: 识站失败" });
+        continue;
+      }
+      picked.sourceName = name;
+      kept[name] = picked;
       fallbackCount += 1;
       if (analyzed.warning) warnings.push({ ...analyzed.warning, source: name });
       warnings.push({

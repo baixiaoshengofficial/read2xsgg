@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { detectKind, discoverNovel, novelDiscoveryToXiangse, analyzeSite } from "../src/siteAnalyze/index.js";
+import {
+  detectKind,
+  detectKinds,
+  discoverNovel,
+  discoverComic,
+  discoverMedia,
+  novelDiscoveryToXiangse,
+  analyzeSite,
+  validateXiangseSource,
+  runXbsPipeline,
+  downloadAsFetch,
+} from "../src/index.js";
 import { applyVerifyAndAnalyzeFallback } from "../src/pipeline.js";
 import { verifyConvertedSource } from "../src/verifySource.js";
 import { skippedBuckets } from "../src/converter.js";
@@ -28,10 +39,84 @@ const novelChapter = `<!doctype html><html><body>
 <div id="content"><p>${"正文内容。".repeat(40)}</p></div>
 </body></html>`;
 
+const comicHome = `<!doctype html><html><head><title>示例漫画网</title></head><body>
+<p>漫画 comic manga 阅读</p>
+<ul class="comic-list">
+  <li><a href="/comic/1.html">漫画甲</a></li>
+  <li><a href="/comic/2.html">漫画乙</a></li>
+  <li><a href="/comic/3.html">漫画丙</a></li>
+  <li><a href="/comic/4.html">漫画丁</a></li>
+</ul>
+</body></html>`;
+
+const comicDetail = `<!doctype html><html><body>
+<h1>漫画甲</h1>
+<div class="chapter-list">
+  <a href="/comic/1/1.html">第1话</a>
+  <a href="/comic/1/2.html">第2话</a>
+  <a href="/comic/1/3.html">第3话</a>
+</div>
+</body></html>`;
+
+const comicChapter = `<!doctype html><html><body>
+${'<img src="/img/1.jpg">'.repeat(8)}
+</body></html>`;
+
+const audioHome = `<!doctype html><html><head><title>示例听书网</title></head><body>
+<p>听书 有声</p>
+<ul class="audio-list">
+  <li><a href="/audio/1.html">有声甲</a></li>
+  <li><a href="/audio/2.html">有声乙</a></li>
+  <li><a href="/audio/3.html">有声丙</a></li>
+  <li><a href="/audio/4.html">有声丁</a></li>
+</ul>
+</body></html>`;
+
+const audioDetail = `<!doctype html><html><body>
+<h1>有声甲</h1>
+<div class="chapter-list">
+  <a href="/audio/1/1.mp3">第1集</a>
+  <a href="/audio/1/2.mp3">第2集</a>
+  <a href="/audio/1/3.mp3">第3集</a>
+</div>
+</body></html>`;
+
+const mixedHome = `<!doctype html><html><head><title>综合站点</title></head><body>
+<p>小说 漫画 comic 听书 有声</p>
+<ul class="list">
+  <li><a href="/book/1.html">第一本书</a></li>
+  <li><a href="/book/2.html">第二本书</a></li>
+  <li><a href="/book/3.html">第三本书</a></li>
+  <li><a href="/book/4.html">第四本书</a></li>
+</ul>
+<ul class="comic-list">
+  <li><a href="/comic/1.html">漫画甲</a></li>
+  <li><a href="/comic/2.html">漫画乙</a></li>
+  <li><a href="/comic/3.html">漫画丙</a></li>
+  <li><a href="/comic/4.html">漫画丁</a></li>
+</ul>
+<ul class="audio-list">
+  <li><a href="/audio/1.html">有声甲</a></li>
+  <li><a href="/audio/2.html">有声乙</a></li>
+  <li><a href="/audio/3.html">有声丙</a></li>
+  <li><a href="/audio/4.html">有声丁</a></li>
+</ul>
+</body></html>`;
+
 function fixtureDownload(url) {
   const href = String(url);
+  if (/\.(?:jpg|jpeg|png|webp|gif)(?:\?|$)/i.test(href)) {
+    return Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  }
+  if (/\/comic\/\d+\/\d+\.html/.test(href)) return Buffer.from(comicChapter);
+  if (/\/comic\/\d+\.html/.test(href)) return Buffer.from(comicDetail);
+  if (/\/audio\/\d+\/\d+\.mp3/.test(href)) return Buffer.from("ID3fakeaudio");
+  if (/\/audio\/\d+\.html/.test(href)) return Buffer.from(audioDetail);
   if (/\/book\/1\.html/.test(href)) return Buffer.from(novelDetail);
   if (/\/chapter\//.test(href)) return Buffer.from(novelChapter);
+  if (/mixed\.example/.test(href)) return Buffer.from(mixedHome);
+  if (/comic\.example/.test(href)) return Buffer.from(comicHome);
+  if (/audio\.example/.test(href)) return Buffer.from(audioHome);
   return Buffer.from(novelHome);
 }
 
@@ -46,6 +131,14 @@ test("detectKind 识别漫画站信号", () => {
   assert.equal(detectKind(html).kind, "comic");
 });
 
+test("detectKinds 混合站可同时命中多种类型", () => {
+  const kinds = detectKinds(mixedHome, "https://mixed.example/");
+  const set = new Set(kinds.map((item) => item.kind));
+  assert.ok(set.has("text"));
+  assert.ok(set.has("comic"));
+  assert.ok(set.has("audio"));
+});
+
 test("discoverNovel 从 HTML fixture 发现列表/目录/正文", async () => {
   const discovery = await discoverNovel("https://novel.example/", { download: fixtureDownload });
   assert.ok(discovery);
@@ -56,14 +149,56 @@ test("discoverNovel 从 HTML fixture 发现列表/目录/正文", async () => {
   assert.ok(discovery.chapterCount >= 2);
 });
 
+test("discoverComic 从 HTML fixture 发现漫画结构", async () => {
+  const discovery = await discoverComic("https://comic.example/", { download: fixtureDownload });
+  assert.ok(discovery);
+  assert.equal(discovery.kind, "comic");
+  assert.ok(discovery.imageCount >= 3);
+  assert.match(discovery.contentSelector, /urls/);
+});
+
+test("discoverMedia 从 HTML fixture 发现听书结构", async () => {
+  const discovery = await discoverMedia("https://audio.example/", "audio", { download: fixtureDownload });
+  assert.ok(discovery);
+  assert.equal(discovery.kind, "audio");
+  assert.ok(discovery.chapterCount >= 2);
+});
+
 test("novelDiscoveryToXiangse 生成可导入的最小香色源", async () => {
   const discovery = await discoverNovel("https://novel.example/", { download: fixtureDownload });
   const source = novelDiscoveryToXiangse(discovery, { sourceName: "识站示例" });
   assert.equal(source.sourceName, "识站示例");
   assert.equal(source.sourceType, "text");
+  assert.equal(source.sourceUrl, "https://novel.example");
+  assert.equal(source.miniAppVersion, "2.56.1");
   assert.ok(source.bookWorld["站点首页"].list);
   assert.ok(source.chapterList.list);
   assert.equal(source.chapterContent.content, "//*[@id='content']");
+  const structural = validateXiangseSource(source);
+  assert.equal(structural.ok, true, structural.errors.join("; "));
+});
+
+test("识站产物通过香色结构校验与动作链（分类→正文）", async () => {
+  const result = await analyzeSite("https://mixed.example/", {
+    download: fixtureDownload,
+    sourceName: "综合站",
+  });
+  assert.equal(result.ok, true, result.reason);
+  assert.ok(Object.keys(result.sources).length >= 2);
+  for (const [name, source] of Object.entries(result.sources)) {
+    const structural = validateXiangseSource(source);
+    assert.equal(structural.ok, true, `${name}: ${structural.errors.join("; ")}`);
+    const report = result.runtimeReports?.[name]
+      || await runXbsPipeline(source, {
+        fetchImpl: downloadAsFetch(fixtureDownload),
+        fetchMedia: source.sourceType !== "text",
+      });
+    assert.equal(report.ok, true, `${name}: ${report.error}`);
+    assert.ok(report.steps.bookWorld.listCount >= 1, `${name} 分类列表为空`);
+    assert.ok(report.steps.bookDetail?.requestUrl, `${name} 缺少详情请求`);
+    assert.ok(report.steps.chapterList.listCount >= 1, `${name} 章节为空`);
+    assert.ok(report.steps.chapterContent.itemCount > 0, `${name} 正文为空`);
+  }
 });
 
 test("analyzeSite 对小说 fixture 返回成功源", async () => {
@@ -72,15 +207,40 @@ test("analyzeSite 对小说 fixture 返回成功源", async () => {
   assert.equal(result.kind, "text");
   assert.ok(result.source.chapterContent.content);
   assert.match(result.warning.message, /fallback:site-analyze/);
+  assert.equal(Object.keys(result.sources).length, 1);
 });
 
-test("analyzeSite 对漫画信号拒绝生成", async () => {
-  const comicHome = `<html><body>${'<img src="c.jpg">'.repeat(40)}<p>漫画阅读</p></body></html>`;
-  const result = await analyzeSite("https://comic.example/", {
-    download: async () => Buffer.from(comicHome),
+test("analyzeSite 对漫画 fixture 生成漫画源", async () => {
+  const result = await analyzeSite("https://comic.example/", { download: fixtureDownload });
+  assert.equal(result.ok, true);
+  assert.ok(result.kinds.includes("comic"));
+  const comic = Object.values(result.sources).find((item) => item.sourceType === "comic");
+  assert.ok(comic);
+  assert.match(comic.chapterContent.content, /urls/);
+});
+
+test("analyzeSite 混合站每种类型各出一条", async () => {
+  const result = await analyzeSite("https://mixed.example/", {
+    download: fixtureDownload,
+    sourceName: "综合站",
+  });
+  assert.equal(result.ok, true);
+  const types = new Set(Object.values(result.sources).map((item) => item.sourceType));
+  assert.ok(types.has("text"));
+  assert.ok(types.has("comic"));
+  assert.ok(types.has("audio"));
+  assert.ok(result.sources["综合站·小说"]);
+  assert.ok(result.sources["综合站·漫画"]);
+  assert.ok(result.sources["综合站·听书"]);
+});
+
+test("analyzeSite 图片堆但无列表结构时跳过漫画", async () => {
+  const comicOnlyImages = `<html><body>${'<img src="c.jpg">'.repeat(40)}<p>漫画阅读</p></body></html>`;
+  const result = await analyzeSite("https://empty-comic.example/", {
+    download: async () => Buffer.from(comicOnlyImages),
   });
   assert.equal(result.ok, false);
-  assert.match(result.reason, /漫画|comic/i);
+  assert.match(result.reason, /analyze-failed/);
 });
 
 test("verifyConvertedSource 在空列表时返回 rules-stale", async () => {

@@ -156,9 +156,10 @@ async function main() {
       timeoutMs: config.analyzeTimeoutMs,
     });
     if (!analyzed.ok) throw new Error(analyzed.reason || "自动识站失败");
-    await writeOutputs(options, { [analyzed.source.sourceName]: analyzed.source }, {
-      warnings: analyzed.warning ? [analyzed.warning] : [],
-      fallbackCount: 1,
+    const sources = analyzed.sources || { [analyzed.source.sourceName]: analyzed.source };
+    await writeOutputs(options, sources, {
+      warnings: analyzed.warnings || (analyzed.warning ? [analyzed.warning] : []),
+      fallbackCount: Object.keys(sources).length,
     });
     return;
   }

@@ -8,7 +8,20 @@ export { compileComicExtractionPlan, decodeComicExtractionPlan, encodeComicExtra
 export { compileMediaExtractionPlan, decodeMediaExtractionPlan, encodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
 export { bridgeTocUrl, compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, compileTextBridgePlan, decodeBridgePlan, encodeBridgePlan, executeBridgePlan } from "./bridgePlan.js";
 export { hasUnsupportedLegadoRuntime, legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
-export { analyzeSite, detectKind, discoverNovel, novelDiscoveryToXiangse } from "./siteAnalyze/index.js";
+export {
+  analyzeSite,
+  detectKind,
+  detectKinds,
+  discoverNovel,
+  discoverComic,
+  discoverMedia,
+  novelDiscoveryToXiangse,
+  comicDiscoveryToXiangse,
+  mediaDiscoveryToXiangse,
+  discoveryToXiangse,
+  kindLabel,
+} from "./siteAnalyze/index.js";
 export { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
 export { resolveBookTargetUrl, verifyConvertedSource, verifyConvertedSources } from "./verifySource.js";
+export { downloadAsFetch, ruleUsesForbiddenSinglePipeJs, validateXiangseSource } from "./xiangseValidate.js";
 export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadSource, filterReachableSources, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaUrls, pageTocUrl, serverConfig, sourceUrlCandidates, startServer } from "./server.js";

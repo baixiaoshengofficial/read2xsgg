@@ -103,12 +103,30 @@ docker compose pull
 docker compose up -d
 ```
 
-## 在线 URL 转换
+## 在线订阅（两种用法）
 
-香色闺阁会检查链接是否以 `.xbs` 结尾，因此推荐下面这种**最好手拼**的写法：
+香色闺阁会检查链接是否以 `.xbs` 结尾。本站只需要记两种手拼路径：
+
+### 1. 网站识站 `/url/`
+
+直接给小说站首页，自动探测列表/目录/正文并生成香色源：
 
 ```text
-{转换站}/xbs/{去掉 https:// 后的阅读源地址}.xbs
+{转换站}/url/{去掉 https:// 后的网站主机}.xbs
+```
+
+例如网站是 `https://www.novel-site.example/`：
+
+```text
+https://xs.chenqinfeng.de/url/www.novel-site.example.xbs
+```
+
+### 2. 阅读源转换 `/source/`
+
+给阅读（Legado）书源 JSON 地址，探活 → 转换 → 抽测，失败则识站回退：
+
+```text
+{转换站}/source/{去掉 https:// 后的阅读源地址}.xbs
 ```
 
 例如阅读源是：
@@ -120,27 +138,16 @@ https://www.yckceo.com/yuedu/shuyuans/json/id/1193.json
 对应订阅地址：
 
 ```text
-https://xs.example.com/xbs/www.yckceo.com/yuedu/shuyuans/json/id/1193.json.xbs
+https://xs.chenqinfeng.de/source/www.yckceo.com/yuedu/shuyuans/json/id/1193.json.xbs
 ```
 
 单个书源示例（爱丽丝书屋）：
 
 ```text
-https://xs.example.com/xbs/www.yckceo.com/yuedu/shuyuan/json/id/7585.json.xbs
+https://xs.chenqinfeng.de/source/www.yckceo.com/yuedu/shuyuan/json/id/7585.json.xbs
 ```
 
-也可以用短查询参数（路径本身带 `.xbs`，一般不用编码）：
-
-```text
-https://xs.example.com/x.xbs?u=https://www.yckceo.com/yuedu/shuyuans/json/id/1193.json
-```
-
-旧接口仍然可用：
-
-```text
-http://localhost:3000/convert.xbs?url=https://example.com/legado.json
-http://localhost:3000/url/https://example.com/legado.json.xbs
-```
+兼容别名（旧订阅可继续用）：`/xbs/...`、`/x.xbs?u=...`、`/convert.xbs?url=...`、`/analyze.xbs?url=...`。
 
 查看转换后的 JSON 和兼容性告警：
 
@@ -195,7 +202,7 @@ flowchart LR
   verify -->|失败| analyze[自动识站]
   analyze -->|成功| xbs
   analyze -->|失败| skip2[rules-stale]
-  siteUrl[网站 URL] --> analyzeDirect["/analyze 直接识站"]
+  siteUrl[网站 URL] --> analyzeDirect["/url/ 直接识站"]
   analyzeDirect --> xbs
 ```
 
@@ -209,9 +216,10 @@ Compose **默认开启** origin 探活与转换后抽测回退：
 直接识站（不经过阅读源）：
 
 ```bash
-# HTTP
+# HTTP（推荐手拼）
+curl -OJ "https://xs.chenqinfeng.de/url/www.novel-site.example.xbs"
+# 兼容查询参数
 curl "https://xs.example/analyze/json?url=https://www.novel-site.example/"
-curl -OJ "https://xs.example/analyze.xbs?url=https://www.novel-site.example/"
 
 # CLI
 npm run convert -- --analyze https://www.novel-site.example/ -o site.xbs --json site.json
@@ -223,7 +231,12 @@ npm run convert -- --analyze https://www.novel-site.example/ -o site.xbs --json 
 npm run convert -- legado.json --verify --analyze-fallback -o sources.xbs --report report.json
 ```
 
-识站 MVP 目前主要覆盖常见**小说 HTML 模板**；漫画/音频/视频会识别类型但通常拒绝自动生成，避免乱源。登录墙、强 JS 渲染站仍无法保证。
+识站会对首页做多类型信号检测；**每种能发现可用列表/目录/正文结构的类型各出一条源**（命名如 `站点·小说` / `站点·漫画` / `站点·听书` / `站点·影视`）。导出前会做两道校验：
+
+1. **结构校验**：`sourceUrl` / `sourceType` / `miniAppVersion`、分类/搜索/详情/章节/正文必填字段、禁止单竖线 `|@js:`
+2. **动作链实测**：用与香色相同的选择器执行器跑通 分类列表 → 详情 → 章节 → 正文（漫画/音视频还会拉一条媒体 URL）
+
+任一关失败则丢弃该类型，并在 JSON 的 `skippedKinds` 中说明原因。登录墙、强 JS 渲染站仍无法保证。
 
 响应头 `X-Converted-Count` / `X-Skipped-Count` / `X-Skipped-Buckets` / `X-Fallback-Count` 便于观察：有多少是规则转换通过，有多少是识站回退。分桶包括 `dead-origin`、`core-chain`、`rules-stale`、`analyze-failed`、`imageDecode`、`login`、`media`。
 

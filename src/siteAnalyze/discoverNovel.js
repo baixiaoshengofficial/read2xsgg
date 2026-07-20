@@ -1,4 +1,13 @@
-import { JSDOM } from "jsdom";
+import {
+  absolute,
+  classContainsXPath,
+  listSelectorFromLinks,
+  loadDocument,
+  pageAnchors,
+  scoreLinkCluster,
+  visibleText,
+  xpathForElement,
+} from "./domUtil.js";
 
 const BOOK_HREF = /(?:\/(?:book|novel|info|xiaoshuo|story|article)\/|\/\d{3,}\.html?$|\/read\/\d+)/i;
 const CHAPTER_HREF = /(?:\/(?:chapter|chapters|read|book)\/|\/\d+\.html?$)/i;
@@ -14,89 +23,6 @@ const CONTENT_SELECTORS = [
   "#htmlContent",
   "article",
 ];
-
-function absolute(href, baseUrl) {
-  try { return new URL(String(href || "").trim(), baseUrl).toString(); } catch { return ""; }
-}
-
-function visibleText(node) {
-  return String(node?.textContent || "").replace(/\s+/g, " ").trim();
-}
-
-function scoreLinkCluster(links, baseUrl) {
-  const samePathPrefix = new Map();
-  for (const link of links) {
-    let pathname = "";
-    try { pathname = new URL(link.href, baseUrl).pathname; } catch { continue; }
-    const parts = pathname.split("/").filter(Boolean);
-    // Cluster by the first path segment (e.g. /book/1.html and /book/2.html
-    // share "book"). Using two segments made every numbered page its own bucket.
-    const key = parts[0] || "/";
-    const bucket = samePathPrefix.get(key) || [];
-    bucket.push(link);
-    samePathPrefix.set(key, bucket);
-  }
-  let best = [];
-  for (const bucket of samePathPrefix.values()) {
-    if (bucket.length > best.length) best = bucket;
-  }
-  return best;
-}
-
-function xpathForElement(el, document) {
-  if (!el || el.nodeType !== 1) return "";
-  if (el.id) {
-    const safeId = String(el.id).replace(/'/g, "");
-    if (safeId && document.querySelectorAll(`[id="${cssEscapeFallback(safeId)}"]`).length === 1) {
-      return `//*[@id='${safeId}']`;
-    }
-  }
-  const tag = el.tagName.toLowerCase();
-  const parent = el.parentElement;
-  if (!parent || parent === document.documentElement) return `//${tag}`;
-  const siblings = [...parent.children].filter((node) => node.tagName === el.tagName);
-  if (siblings.length === 1) {
-    const parentPath = xpathForElement(parent, document);
-    return parentPath ? `${parentPath}/${tag}` : `//${tag}`;
-  }
-  const index = siblings.indexOf(el) + 1;
-  const parentPath = xpathForElement(parent, document);
-  return parentPath ? `${parentPath}/${tag}[${index}]` : `//${tag}[${index}]`;
-}
-
-function cssEscapeFallback(value) {
-  return String(value).replace(/(["\\])/g, "\\$1");
-}
-
-function classContainsXPath(className) {
-  return `//*[contains(concat(' ', normalize-space(@class), ' '), ' ${className} ')]`;
-}
-
-function listSelectorFromLinks(links, document) {
-  if (!links.length) return "";
-  const parents = new Map();
-  for (const link of links) {
-    const parent = link.parentElement;
-    if (!parent) continue;
-    const key = parent.className || parent.id || parent.tagName;
-    const bucket = parents.get(parent) || [];
-    bucket.push(link);
-    parents.set(parent, bucket);
-  }
-  let bestParent = null;
-  let bestCount = 0;
-  for (const [parent, bucket] of parents) {
-    if (bucket.length > bestCount) {
-      bestParent = parent;
-      bestCount = bucket.length;
-    }
-  }
-  if (!bestParent) return "//a";
-  if (bestParent.id) return `//*[@id='${bestParent.id}']//a`;
-  const className = String(bestParent.className || "").trim().split(/\s+/).find(Boolean);
-  if (className) return `${classContainsXPath(className)}//a`;
-  return `${xpathForElement(bestParent, document)}//a`;
-}
 
 function findContentSelector(document) {
   for (const selector of CONTENT_SELECTORS) {
@@ -131,7 +57,7 @@ function findContentSelector(document) {
  * Heuristic novel-site discovery from live HTML pages.
  * Returns selectors + sample URLs, or null when confidence is too low.
  */
-export async function discoverNovel(originUrl, { download, maxPages = 4 } = {}) {
+export async function discoverNovel(originUrl, { download, maxPages = 4, homeHtml = "" } = {}) {
   if (typeof download !== "function") throw new TypeError("discoverNovel 需要 download");
   let origin;
   try {
@@ -140,16 +66,9 @@ export async function discoverNovel(originUrl, { download, maxPages = 4 } = {}) 
     return null;
   }
   const homeUrl = `${origin.protocol}//${origin.host}/`;
-  const homeBuf = await download(homeUrl);
-  const homeHtml = homeBuf.toString("utf8");
-  const homeDom = new JSDOM(homeHtml, { url: homeUrl });
-  const { document } = homeDom.window;
-
-  const anchors = [...document.querySelectorAll("a[href]")].map((a) => ({
-    href: absolute(a.getAttribute("href"), homeUrl),
-    text: visibleText(a),
-    el: a,
-  })).filter((item) => item.href && item.href.startsWith(origin.protocol));
+  const html = homeHtml || (await download(homeUrl)).toString("utf8");
+  const document = loadDocument(html, homeUrl);
+  const anchors = pageAnchors(document, homeUrl, origin.origin);
 
   const bookLinks = anchors.filter((item) => BOOK_HREF.test(item.href) && item.text.length >= 2 && item.text.length <= 80);
   const cluster = scoreLinkCluster(bookLinks.length ? bookLinks : anchors.filter((a) => a.text.length >= 2), homeUrl)
@@ -160,15 +79,9 @@ export async function discoverNovel(originUrl, { download, maxPages = 4 } = {}) 
   const detailUrl = cluster.find((item) => BOOK_HREF.test(item.href))?.href || cluster[0].href;
   if (!detailUrl) return null;
 
-  const detailBuf = await download(detailUrl);
-  const detailHtml = detailBuf.toString("utf8");
-  const detailDom = new JSDOM(detailHtml, { url: detailUrl });
-  const detailDoc = detailDom.window.document;
-  const detailAnchors = [...detailDoc.querySelectorAll("a[href]")].map((a) => ({
-    href: absolute(a.getAttribute("href"), detailUrl),
-    text: visibleText(a),
-    el: a,
-  })).filter((item) => item.href && item.text);
+  const detailHtml = (await download(detailUrl)).toString("utf8");
+  const detailDoc = loadDocument(detailHtml, detailUrl);
+  const detailAnchors = pageAnchors(detailDoc, detailUrl, origin.origin);
 
   let chapterLinks = detailAnchors.filter((item) => CHAPTER_HREF.test(item.href) && item.text.length <= 60);
   if (chapterLinks.length < 3) {
@@ -180,9 +93,8 @@ export async function discoverNovel(originUrl, { download, maxPages = 4 } = {}) 
 
   let contentSelector = "";
   if (maxPages >= 3) {
-    const chapterBuf = await download(chapterUrl);
-    const chapterDom = new JSDOM(chapterBuf.toString("utf8"), { url: chapterUrl });
-    contentSelector = findContentSelector(chapterDom.window.document);
+    const chapterHtml = (await download(chapterUrl)).toString("utf8");
+    contentSelector = findContentSelector(loadDocument(chapterHtml, chapterUrl));
   }
   if (!contentSelector) contentSelector = "//*[@id='content']";
 
@@ -195,12 +107,12 @@ export async function discoverNovel(originUrl, { download, maxPages = 4 } = {}) 
     homeUrl,
     listUrl: homeUrl,
     listSelector,
-    bookNameSelector: ".",
-    detailUrlSelector: "./@href",
+    bookNameSelector: ".//a||normalize-space(/html/body/*)",
+    detailUrlSelector: ".//a/@href||//@href",
     detailSampleUrl: detailUrl,
     chapterListSelector,
-    chapterTitleSelector: ".",
-    chapterUrlSelector: "./@href",
+    chapterTitleSelector: "normalize-space(.//a)||normalize-space(/html/body/*)",
+    chapterUrlSelector: ".//a/@href||./@href||//@href",
     chapterSampleUrl: chapterUrl,
     contentSelector,
     bookCount: cluster.length,
@@ -208,4 +120,4 @@ export async function discoverNovel(originUrl, { download, maxPages = 4 } = {}) 
   };
 }
 
-export { cssEscapeFallback };
+export { absolute, cssEscapeFallback } from "./domUtil.js";

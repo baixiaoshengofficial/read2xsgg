@@ -899,26 +899,51 @@ export function sourceUrlCandidates(sourceUrl) {
   return result;
 }
 
-function sourceUrlFromRequest(request) {
+/**
+ * Parse public subscribe paths into either:
+ * - mode "source": Legado JSON → Xiangse ( /source/... /xbs/... )
+ * - mode "site": live website → analyze → Xiangse ( /url/... )
+ */
+function requestTargetFromRequest(request) {
   const rawUrl = request.url || "/";
   const pathOnly = rawUrl.split(/[?#]/, 1)[0];
 
-  // 推荐手拼：/xbs/www.example.com/legado.json.xbs
-  for (const prefix of ["/xbs/", "/x/", "/url/"]) {
+  // 网站识站：/url/{去掉 https:// 后的站点}.xbs
+  for (const prefix of ["/url/"]) {
     if (pathOnly.startsWith(prefix)) {
-      return { sourceUrl: normalizeEmbeddedSourceUrl(pathOnly.slice(prefix.length)), format: "xbs" };
+      const rest = pathOnly.slice(prefix.length);
+      return {
+        mode: "site",
+        siteUrl: normalizeEmbeddedSourceUrl(rest),
+        format: rest.endsWith(".xbs") ? "xbs" : "json",
+      };
+    }
+  }
+
+  // 阅读源转换：/source/{去掉 https:// 后的阅读源}.xbs
+  // /xbs/ /x/ 保留为兼容别名
+  for (const prefix of ["/source/", "/xbs/", "/x/"]) {
+    if (pathOnly.startsWith(prefix)) {
+      return { mode: "source", sourceUrl: normalizeEmbeddedSourceUrl(pathOnly.slice(prefix.length)), format: "xbs" };
     }
   }
   for (const prefix of ["/json/", "/j/"]) {
     if (pathOnly.startsWith(prefix)) {
-      return { sourceUrl: normalizeEmbeddedSourceUrl(pathOnly.slice(prefix.length)), format: "json" };
+      return { mode: "source", sourceUrl: normalizeEmbeddedSourceUrl(pathOnly.slice(prefix.length)), format: "json" };
     }
   }
 
   const parsed = new URL(rawUrl, "http://read2xsgg.local");
+  if (["/analyze", "/analyze.xbs", "/analyze/json"].includes(parsed.pathname)) {
+    const siteUrl = parsed.searchParams.get("u") || parsed.searchParams.get("url") || "";
+    return {
+      mode: "site",
+      siteUrl: siteUrl ? normalizeEmbeddedSourceUrl(siteUrl) : "",
+      format: parsed.pathname === "/analyze.xbs" ? "xbs" : "json",
+    };
+  }
   if (["/convert", "/convert.xbs", "/x.xbs", "/convert/json"].includes(parsed.pathname)) {
     let sourceUrl = "";
-    // /x.xbs?u=... 把 u= 后面整段都当阅读源（支持源地址自带 ?query，免编码）
     if (parsed.pathname === "/x.xbs") {
       const marker = rawUrl.includes("?u=") ? "?u=" : rawUrl.includes("&u=") ? "&u=" : "";
       sourceUrl = marker ? rawUrl.slice(rawUrl.indexOf(marker) + marker.length) : (parsed.searchParams.get("url") || "");
@@ -926,6 +951,7 @@ function sourceUrlFromRequest(request) {
       sourceUrl = parsed.searchParams.get("u") || parsed.searchParams.get("url") || "";
     }
     return {
+      mode: "source",
       sourceUrl: sourceUrl ? normalizeEmbeddedSourceUrl(sourceUrl) : "",
       format: parsed.pathname.endsWith("/json") || parsed.searchParams.get("format") === "json" ? "json" : "xbs",
     };
@@ -1065,14 +1091,14 @@ function help(config) {
     name: "read2xsgg",
     status: "ok",
     usage: {
-      easy: "/xbs/www.example.com/legado.json.xbs",
-      easyRule: "订阅地址 = {本站}/xbs/ + 去掉 https:// 后的阅读源地址 + .xbs",
+      site: "/url/www.novel-site.example.xbs",
+      siteRule: "识站订阅 = {本站}/url/ + 去掉 https:// 后的小说站主机（或主机/路径） + .xbs",
+      source: "/source/www.yckceo.com/yuedu/shuyuans/json/id/1193.json.xbs",
+      sourceRule: "阅读源订阅 = {本站}/source/ + 去掉 https:// 后的阅读源地址 + .xbs",
+      sourceAlias: "/xbs/www.example.com/legado.json.xbs",
       easyQuery: "/x.xbs?u=https://www.example.com/legado.json",
-      xbs: "/convert.xbs?url=https://www.example.com/legado.json",
-      path: "/url/https://www.example.com/legado.json.xbs",
+      convert: "/convert.xbs?url=https://www.example.com/legado.json",
       json: "/j/www.example.com/legado.json",
-      analyze: "/analyze.xbs?url=https://www.novel-site.example/",
-      analyzeJson: "/analyze/json?url=https://www.novel-site.example/",
       image: "/image/mwwz-aes?url=https://cdn.example.com/encrypted-image",
       health: "/healthz",
     },
@@ -1701,58 +1727,6 @@ export function createAppServer(options = {}) {
         return;
       }
 
-      // Direct site URL → auto analyze → Xiangse source (direction 1).
-      if (pathname === "/analyze" || pathname === "/analyze.xbs" || pathname === "/analyze/json") {
-        const url = new URL(request.url || "/", "http://read2xsgg.local");
-        const siteUrl = String(url.searchParams.get("url") || url.searchParams.get("u") || "").trim();
-        if (!siteUrl) throw new HttpError(400, "缺少网站 URL（?url=https://...）");
-        if (active >= config.maxConcurrent) throw new HttpError(429, "当前分析任务过多，请稍后重试");
-        active += 1;
-        let analyzed;
-        try {
-          const download = (target, headers = {}) => downloadSource(
-            target,
-            { ...config, fetchTimeoutMs: config.analyzeTimeoutMs },
-            headers,
-          );
-          analyzed = await analyzeSite(siteUrl, {
-            download,
-            timeoutMs: config.analyzeTimeoutMs,
-          });
-        } finally {
-          active -= 1;
-        }
-        if (!analyzed.ok) throw new HttpError(422, analyzed.reason || "自动识站失败");
-        const sources = { [analyzed.source.sourceName]: analyzed.source };
-        const json = Buffer.from(`${JSON.stringify(sources, null, 2)}\n`, "utf8");
-        const xbs = encodeXbs(json);
-        const headers = {
-          ...commonHeaders,
-          "X-Converted-Count": "1",
-          "X-Fallback-Count": "1",
-          "X-Analyze-Kind": analyzed.kind || "text",
-        };
-        if (pathname === "/analyze/json" || pathname === "/analyze") {
-          sendJson(response, 200, {
-            sources,
-            kind: analyzed.kind,
-            confidence: analyzed.confidence,
-            discovery: analyzed.discovery,
-            warnings: analyzed.warning ? [analyzed.warning] : [],
-          }, headers);
-          return;
-        }
-        response.writeHead(200, {
-          ...headers,
-          "Content-Type": "application/octet-stream",
-          "Content-Disposition": 'attachment; filename="analyzed.xbs"',
-          "Content-Length": xbs.length,
-        });
-        if (request.method === "HEAD") response.end();
-        else response.end(xbs);
-        return;
-      }
-
       const adapterTarget = adapterRequestFromRequest(request);
       if (adapterTarget) {
         if (!adapterTarget.sourceUrl) throw new HttpError(400, "缺少待解析页面 URL");
@@ -1866,11 +1840,65 @@ export function createAppServer(options = {}) {
         else response.end(image.buffer);
         return;
       }
-      const target = sourceUrlFromRequest(request);
+      const target = requestTargetFromRequest(request);
       if (!target) {
         sendJson(response, pathname === "/" ? 200 : 404, help(config), commonHeaders);
         return;
       }
+
+      // Direct site URL → auto analyze → Xiangse source (direction 1).
+      if (target.mode === "site") {
+        if (!target.siteUrl) throw new HttpError(400, "缺少网站 URL");
+        if (active >= config.maxConcurrent) throw new HttpError(429, "当前分析任务过多，请稍后重试");
+        active += 1;
+        let analyzed;
+        try {
+          const download = (targetUrl, headers = {}) => downloadSource(
+            targetUrl,
+            { ...config, fetchTimeoutMs: config.analyzeTimeoutMs },
+            headers,
+          );
+          analyzed = await analyzeSite(target.siteUrl, {
+            download,
+            timeoutMs: config.analyzeTimeoutMs,
+          });
+        } finally {
+          active -= 1;
+        }
+        if (!analyzed.ok) throw new HttpError(422, analyzed.reason || "自动识站失败");
+        const sources = analyzed.sources || { [analyzed.source.sourceName]: analyzed.source };
+        const count = Object.keys(sources).length;
+        const json = Buffer.from(`${JSON.stringify(sources, null, 2)}\n`, "utf8");
+        const xbs = encodeXbs(json);
+        const headers = {
+          ...commonHeaders,
+          "X-Converted-Count": String(count),
+          "X-Fallback-Count": String(count),
+          "X-Analyze-Kind": (analyzed.kinds || [analyzed.kind]).filter(Boolean).join(",") || "text",
+        };
+        if (target.format === "json") {
+          sendJson(response, 200, {
+            sources,
+            kind: analyzed.kind,
+            kinds: analyzed.kinds || [analyzed.kind],
+            confidence: analyzed.confidence,
+            discovery: analyzed.discovery,
+            skippedKinds: analyzed.skippedKinds || [],
+            warnings: analyzed.warnings || (analyzed.warning ? [analyzed.warning] : []),
+          }, headers);
+          return;
+        }
+        response.writeHead(200, {
+          ...headers,
+          "Content-Type": "application/octet-stream",
+          "Content-Disposition": 'attachment; filename="analyzed.xbs"',
+          "Content-Length": xbs.length,
+        });
+        if (request.method === "HEAD") response.end();
+        else response.end(xbs);
+        return;
+      }
+
       if (!target.sourceUrl) throw new HttpError(400, "缺少在线阅读源 URL");
 
       // The conversion may embed this server's public image-proxy URL in a

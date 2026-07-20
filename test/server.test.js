@@ -117,7 +117,7 @@ test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (
   assert.equal(converted["在线示例"].sourceName, "在线示例");
 
   const pathSourceUrl = `${upstreamBase}/source.json?token=path`;
-  const pathResponse = await fetch(`${appBase}/url/${encodeURIComponent(pathSourceUrl)}.xbs`);
+  const pathResponse = await fetch(`${appBase}/source/${encodeURIComponent(pathSourceUrl)}.xbs`);
   assert.equal(pathResponse.status, 200);
   assert.ok(pathResponse.url.endsWith(".xbs"));
   assert.equal(upstreamRequests.at(-1), "/source.json?token=path");
@@ -126,15 +126,19 @@ test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (
     "在线示例",
   );
 
-  // /xbs/{host}{path}.xbs — 去掉 https:// 后直接拼接
+  // /source/{host}{path}.xbs — 去掉 https:// 后直接拼接
   const upstreamUrl = new URL(`${upstreamBase}/source.json`);
-  const easyResponse = await fetch(`${appBase}/xbs/${upstreamUrl.host}${upstreamUrl.pathname}.xbs`);
+  const easyResponse = await fetch(`${appBase}/source/${upstreamUrl.host}${upstreamUrl.pathname}.xbs`);
   assert.equal(easyResponse.status, 200);
   assert.equal(upstreamRequests.at(-1), "/source.json");
   assert.equal(
     JSON.parse(decodeXbs(Buffer.from(await easyResponse.arrayBuffer())).toString("utf8"))["在线示例"].sourceName,
     "在线示例",
   );
+
+  // /xbs/ 仍为兼容别名
+  const aliasResponse = await fetch(`${appBase}/xbs/${upstreamUrl.host}${upstreamUrl.pathname}.xbs`);
+  assert.equal(aliasResponse.status, 200);
 
   // /x.xbs?u=完整地址 — 路径带 .xbs，查询参数通常无需编码
   const shortQuery = await fetch(`${appBase}/x.xbs?u=${upstreamBase}/source.json?token=short`);
@@ -151,6 +155,62 @@ test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (
   const debug = await jsonResponse.json();
   assert.equal(debug.sources["在线示例"].sourceName, "在线示例");
   assert.ok(Array.isArray(debug.warnings));
+});
+
+test("/url/ 对网站地址执行识站并返回 XBS", async (context) => {
+  const novelHome = `<!doctype html><html><head><title>示例小说网</title></head><body>
+<ul class="list">
+  <li><a href="/book/1.html">第一本书</a></li>
+  <li><a href="/book/2.html">第二本书</a></li>
+  <li><a href="/book/3.html">第三本书</a></li>
+  <li><a href="/book/4.html">第四本书</a></li>
+</ul>
+</body></html>`;
+  const novelDetail = `<!doctype html><html><body>
+<h1>第一本书</h1>
+<div class="chapter-list">
+  <a href="/chapter/1.html">第一章</a>
+  <a href="/chapter/2.html">第二章</a>
+  <a href="/chapter/3.html">第三章</a>
+</div>
+</body></html>`;
+  const novelChapter = `<!doctype html><html><body>
+<div id="content"><p>${"正文内容。".repeat(40)}</p></div>
+</body></html>`;
+
+  const upstream = createServer((request, response) => {
+    const path = request.url || "/";
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    if (/\/book\/1\.html/.test(path)) response.end(novelDetail);
+    else if (/\/chapter\//.test(path)) response.end(novelChapter);
+    else response.end(novelHome);
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({
+    config: { ...testServerConfig(), allowPrivateNetworks: true },
+  });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const site = new URL(upstreamBase);
+  const xbsResponse = await fetch(`${appBase}/url/${site.host}.xbs`);
+  assert.equal(xbsResponse.status, 200);
+  assert.equal(xbsResponse.headers.get("x-converted-count"), "1");
+  assert.equal(xbsResponse.headers.get("x-analyze-kind"), "text");
+  const sources = JSON.parse(decodeXbs(Buffer.from(await xbsResponse.arrayBuffer())).toString("utf8"));
+  const names = Object.keys(sources);
+  assert.equal(names.length, 1);
+  assert.equal(sources[names[0]].sourceType, "text");
+  assert.ok(sources[names[0]].chapterContent?.content);
+
+  const jsonResponse = await fetch(`${appBase}/url/${site.host}/`);
+  assert.equal(jsonResponse.status, 200);
+  const debug = await jsonResponse.json();
+  assert.equal(debug.kind, "text");
+  assert.ok(debug.sources);
 });
 
 test("同一在线源的并发转换会合并为一个上游任务", async (context) => {
