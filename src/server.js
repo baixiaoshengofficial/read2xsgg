@@ -52,12 +52,13 @@ export function serverConfig(environment = process.env) {
     maxCacheEntries: integer(environment.MAX_CACHE_ENTRIES, 100),
     allowPrivateNetworks: boolean(environment.ALLOW_PRIVATE_NETWORKS),
     allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS, true),
-    // 在线转换的默认目标是“导入即可用”。未显式配置环境变量时也要
-    // 排除死站和空链路；离线转换与单元测试可明确关闭预检。
-    preflightSources: boolean(environment.PREFLIGHT_SOURCES, true),
-    preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES, true),
+    // 深度预检会访问每个上游的列表、详情、目录和正文。聚合源可能
+    // 包含数百个站点，因此公开转换服务必须默认关闭，避免同步探测
+    // 耗尽 CPU/内存并拖死健康检查；需要发布精选源时可显式开启。
+    preflightSources: boolean(environment.PREFLIGHT_SOURCES, false),
+    preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES, false),
     preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 2_500),
-    preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 48),
+    preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 4),
     maxComicPages: integer(environment.MAX_COMIC_PAGES, 50),
     maxComicImages: integer(environment.MAX_COMIC_IMAGES, 2_000),
     comicPageConcurrency: integer(environment.COMIC_PAGE_CONCURRENCY, 4),
@@ -1625,6 +1626,7 @@ async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
 export function createAppServer(options = {}) {
   const config = { ...serverConfig(), ...(options.config ?? {}) };
   const cache = new Map();
+  const pendingConversions = new Map();
   let active = 0;
 
   return createServer(async (request, response) => {
@@ -1765,7 +1767,6 @@ export function createAppServer(options = {}) {
         return;
       }
       if (!target.sourceUrl) throw new HttpError(400, "缺少在线阅读源 URL");
-      if (active >= config.maxConcurrent) throw new HttpError(429, "当前转换任务过多，请稍后重试");
 
       // The conversion may embed this server's public image-proxy URL in a
       // recognised comic rule, so do not share it across distinct public hosts.
@@ -1777,13 +1778,22 @@ export function createAppServer(options = {}) {
       }
       if (converted) converted = converted.value;
       else {
-        active += 1;
-        try {
-          converted = await convertOnlineSource(target.sourceUrl, config, publicBaseUrl(request));
-          cacheSet(cache, cacheKey, converted, config);
-        } finally {
-          active -= 1;
+        let pending = pendingConversions.get(cacheKey);
+        if (!pending) {
+          if (active >= config.maxConcurrent) throw new HttpError(429, "当前转换任务过多，请稍后重试");
+          active += 1;
+          pending = convertOnlineSource(target.sourceUrl, config, publicBaseUrl(request))
+            .then((result) => {
+              cacheSet(cache, cacheKey, result, config);
+              return result;
+            })
+            .finally(() => {
+              active -= 1;
+              pendingConversions.delete(cacheKey);
+            });
+          pendingConversions.set(cacheKey, pending);
         }
+        converted = await pending;
       }
 
       const headers = {

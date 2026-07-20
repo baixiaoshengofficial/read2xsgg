@@ -148,6 +148,33 @@ test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (
   assert.ok(Array.isArray(debug.warnings));
 });
 
+test("同一在线源的并发转换会合并为一个上游任务", async (context) => {
+  let requests = 0;
+  const upstream = createServer((_request, response) => {
+    requests += 1;
+    setTimeout(() => {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify(source));
+    }, 50);
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({
+    config: { ...testServerConfig(), allowPrivateNetworks: true, cacheTtlMs: 0, maxConcurrent: 1 },
+  });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const sourceUrl = `${upstreamBase}/source.json`;
+  const requestUrl = `${appBase}/convert.xbs?url=${encodeURIComponent(sourceUrl)}`;
+  const [first, second] = await Promise.all([fetch(requestUrl), fetch(requestUrl)]);
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(requests, 1);
+});
+
 test("聚合源在线预检会跳过无法连接的上游站点", async (context) => {
   let upstreamBase = "";
   const upstream = createServer((request, response) => {
@@ -645,11 +672,14 @@ test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (
   assert.equal(response.status, 403);
 });
 
-test("DNS 透明代理兼容默认开启且可以显式关闭", () => {
+test("DNS 透明代理默认开启，资源密集型在线预检默认关闭", () => {
   assert.equal(serverConfig({}).allowDnsProxyNetworks, true);
-  assert.equal(serverConfig({}).preflightSources, true);
-  assert.equal(serverConfig({}).preflightDeep, true);
+  assert.equal(serverConfig({}).preflightSources, false);
+  assert.equal(serverConfig({}).preflightDeep, false);
+  assert.equal(serverConfig({}).preflightConcurrency, 4);
   assert.equal(serverConfig({ ALLOW_DNS_PROXY_NETWORKS: "false" }).allowDnsProxyNetworks, false);
+  assert.equal(serverConfig({ PREFLIGHT_SOURCES: "true", PREFLIGHT_DEEP_SOURCES: "true" }).preflightSources, true);
+  assert.equal(serverConfig({ PREFLIGHT_SOURCES: "true", PREFLIGHT_DEEP_SOURCES: "true" }).preflightDeep, true);
 });
 
 test("图片代理直通普通图片，并可解开已注册的 AES 图片", async (context) => {

@@ -46,7 +46,8 @@ docker compose up -d
 如果希望从当前源码重新构建：
 
 ```bash
-docker compose up -d --build
+docker build -t knighttools/read2xsgg:local .
+IMAGE_TAG=local docker compose up -d --pull never
 ```
 
 默认监听 `http://localhost:3000`，检查服务状态：
@@ -65,7 +66,7 @@ docker compose down
 修改宿主机端口：
 
 ```bash
-APP_PORT=8080 docker compose up -d --build
+APP_PORT=8080 docker compose up -d
 ```
 
 指定版本镜像：
@@ -219,10 +220,10 @@ Compose 支持通过环境变量调整：
 | `CORS_ORIGIN` | `*` | 允许的跨域来源 |
 | `ALLOW_PRIVATE_NETWORKS` | `false` | 是否允许抓取本机或内网 URL |
 | `ALLOW_DNS_PROXY_NETWORKS` | `true` | 允许域名经 Docker Desktop、Clash 等代理解析到 `198.18.0.0/15`；直接输入该网段 IP 仍会被拦截 |
-| `PREFLIGHT_SOURCES` | `true` | 聚合源转换前探测上游站点，跳过连接失败、5xx 或拒绝访问的源 |
-| `PREFLIGHT_DEEP_SOURCES` | `true` | 实测分类列表、第一本书、章节和正文；无法安全执行或结果为空的源不写入 XBS |
+| `PREFLIGHT_SOURCES` | `false` | 转换前探测上游站点；大型聚合源会产生大量外部请求，公开服务默认关闭，需要精选源时再显式开启 |
+| `PREFLIGHT_DEEP_SOURCES` | `false` | 实测分类列表、第一本书、章节和正文；仅在 `PREFLIGHT_SOURCES=true` 时生效 |
 | `PREFLIGHT_TIMEOUT_MS` | `2500` | 单个上游站点预检超时时间 |
-| `PREFLIGHT_CONCURRENCY` | `48` | 上游站点并发预检数量 |
+| `PREFLIGHT_CONCURRENCY` | `4` | 上游站点并发预检数量；不建议在小内存容器中调高 |
 | `MAX_COMIC_PAGES` | `50` | 单章 JSON 漫画接口最多聚合的分页数（含第一页） |
 | `MAX_COMIC_IMAGES` | `2000` | 单章最多返回的图片数 |
 | `COMIC_PAGE_CONCURRENCY` | `4` | 单章后续图片分页的并发请求数 |
