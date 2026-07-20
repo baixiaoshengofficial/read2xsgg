@@ -1,6 +1,7 @@
 node_modules/
 dist/
 data/
+.env
 *.xbs
 *.converted.json
 *.report.json

@@ -6,6 +6,9 @@ services:
     init: true
     ports:
       - "${APP_PORT:-3000}:3000"
+    env_file:
+      - path: .env
+        required: false
     environment:
       HOST: 0.0.0.0
       PORT: 3000
