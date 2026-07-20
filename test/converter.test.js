@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan, hasUnsupportedLegadoRuntime, inferResponseType } from "../src/index.js";
+import { compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, compileTextBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan, hasUnsupportedLegadoRuntime, htmlToPlainText, inferResponseType } from "../src/index.js";
 
 const sampleSource = {
   bookSourceName: "示例书源",
@@ -425,6 +425,22 @@ test("深度预检可以限制桥接结果数量而不遍历完整大目录", ()
     offset: 0,
     pageSize: 1,
   });
+});
+
+test("正文桥接输出纯文本，去掉 p/br 等 HTML 标签", () => {
+  assert.equal(
+    htmlToPlainText("<p>第一段</p><p>第二段<br/>续行</p>"),
+    "第一段\n第二段\n续行",
+  );
+  const plan = compileTextBridgePlan({
+    host: "https://novel.example",
+    responseFormatType: "html",
+    content: "//*[@id='content']",
+  });
+  const page = `<html><body><div id="content"><p>你好&nbsp;世界</p><p>第二段</p></div></body></html>`;
+  const output = executeBridgePlan(page, "https://novel.example/chapter/1", plan);
+  assert.equal(output.content, "你好 世界\n第二段");
+  assert.doesNotMatch(output.content, /<p>/i);
 });
 
 test("桥接按 offset/limit 分页，而不是丢弃后续条目", () => {

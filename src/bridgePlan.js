@@ -379,6 +379,40 @@ function nodeText(node, content = false) {
   return String(node.textContent || "").trim();
 }
 
+/**
+ * Xiangse novel reader expects plain text. Keep paragraph breaks from common
+ * block tags while dropping the rest of the markup.
+ */
+export function htmlToPlainText(value) {
+  let text = String(value || "");
+  if (!/<[a-z/!?]/i.test(text) && !/&(?:nbsp|lt|gt|amp|quot|apos|#)/i.test(text)) {
+    return text.trim();
+  }
+  return text
+    .replace(/<(?:script|style)[\s\S]*?<\/(?:script|style)>/gi, "")
+    .replace(/<(?:br|hr)\s*\/?>/gi, "\n")
+    .replace(/<\/(?:p|div|h[1-6]|li|tr|blockquote|section|article)>/gi, "\n")
+    .replace(/<(?:p|div|h[1-6]|li|tr|blockquote|section|article)\b[^>]*>/gi, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_m, hex) => {
+      const code = Number.parseInt(hex, 16);
+      return Number.isFinite(code) ? String.fromCharCode(code) : "";
+    })
+    .replace(/&#(\d+);/g, (_m, code) => {
+      const num = Number(code);
+      return Number.isFinite(num) ? String.fromCharCode(num) : "";
+    })
+    .replace(/&amp;/gi, "&")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function htmlSelect(rule, input, { list = false, content = false, maxNodes = Infinity } = {}) {
   if (!rule) return list ? [] : "";
   const itemInput = Boolean(input?.nodeType);
@@ -515,7 +549,13 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     try { input = JSON.parse(String(body || "")); } catch { throw new TypeError("上游响应不是规则声明的 JSON"); }
   }
   if (plan.kind === "text") {
-    return { content: transformed(plan, plan.fields.content, input, { content: plan.responseType === "html" }) };
+    let content = transformed(plan, plan.fields.content, input, { content: plan.responseType === "html" });
+    // Novel text adapters historically returned innerHTML; Xiangse shows tags
+    // literally unless we normalize to plain text with paragraph breaks.
+    if (plan.responseType === "html" || /<[a-z][\s\S]*>/i.test(String(content || ""))) {
+      content = htmlToPlainText(content);
+    }
+    return { content };
   }
   if (plan.kind === "detail") {
     const result = {};
