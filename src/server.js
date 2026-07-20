@@ -4,10 +4,14 @@ import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 import { JSDOM } from "jsdom";
-import { convertLegado, skippedBuckets } from "./converter.js";
-import { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
+import { convertOnlineSource } from "./convertOnline.js";
+import { createLibraryStore } from "./libraryStore.js";
+import { createJobWorker } from "./jobWorker.js";
 import { analyzeSite } from "./siteAnalyze/index.js";
 import { decodeTextBuffer } from "./charset.js";
 import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
@@ -25,7 +29,10 @@ import {
   executeBridgePlan,
 } from "./bridgePlan.js";
 
-class HttpError extends Error {
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_PUBLIC_DIR = path.resolve(MODULE_DIR, "../public");
+
+export class HttpError extends Error {
   constructor(status, message) {
     super(message);
     this.status = status;
@@ -85,6 +92,10 @@ export function serverConfig(environment = process.env) {
     corsOrigin: environment.CORS_ORIGIN || "*",
     mwwzDiscoveryUrl: environment.MWWZ_DISCOVERY_URL || "https://www.manwake.cc/",
     jmDiscoveryUrl: environment.JM_DISCOVERY_URL || "https://jmcomicqa.cc/",
+    dataDir: environment.DATA_DIR || "./data",
+    adminToken: String(environment.ADMIN_TOKEN || "").trim(),
+    jobConcurrency: integer(environment.JOB_CONCURRENCY, 1),
+    publicDir: environment.PUBLIC_DIR || "",
   };
 }
 
@@ -873,7 +884,7 @@ async function resolveJmMirror(config, sources) {
   return "";
 }
 
-async function adaptOnlineSources(input, config) {
+export async function adaptOnlineSources(input, config) {
   const sources = legacySourceList(input);
   const hasMwwz = sources.some(isMwwzSource);
   const jmSources = sources.filter(isJmSource);
@@ -1174,16 +1185,19 @@ function help(config) {
     commit: config.commit || "",
     status: "ok",
     usage: {
+      ui: "/ui/",
+      library: "/library/{id}.xbs",
       site: "/url/www.novel-site.example.xbs",
       siteRule: "识站订阅 = {本站}/url/ + 去掉 https:// 后的小说站主机（或主机/路径） + .xbs",
       source: "/source/www.yckceo.com/yuedu/shuyuans/json/id/1193.json.xbs",
-      sourceRule: "阅读源订阅 = {本站}/source/ + 去掉 https:// 后的阅读源地址 + .xbs",
+      sourceRule: "阅读源订阅 = {本站}/source/ + 去掉 https:// 后的阅读源地址 + .xbs；大聚合源建议用 /ui/ 异步转换",
       sourceAlias: "/xbs/www.example.com/legado.json.xbs",
       easyQuery: "/x.xbs?u=https://www.example.com/legado.json",
       convert: "/convert.xbs?url=https://www.example.com/legado.json",
       json: "/j/www.example.com/legado.json",
       image: "/image/mwwz-aes?url=https://cdn.example.com/encrypted-image",
       health: "/healthz",
+      jobs: "/api/jobs",
     },
     limits: {
       maxSourceBytes: config.maxSourceBytes,
@@ -1201,6 +1215,8 @@ function help(config) {
       analyzeFallback: config.analyzeFallback,
       verifyBudgetMs: config.verifyBudgetMs,
       verifyMaxSources: config.verifyMaxSources,
+      jobConcurrency: config.jobConcurrency,
+      adminConfigured: Boolean(config.adminToken),
       imageDecoders: supportedImageDecoders(),
     },
   };
@@ -1210,6 +1226,87 @@ function sendJson(response, status, value, headers = {}) {
   const body = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Content-Length": body.length, ...headers });
   response.end(body);
+}
+
+function readRequestBody(request, { maxBytes = 1_048_576 } = {}) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        reject(new HttpError(413, "请求体过大"));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("end", () => resolve(Buffer.concat(chunks)));
+    request.on("error", reject);
+  });
+}
+
+function adminAuthorized(request, config) {
+  const token = String(config.adminToken || "").trim();
+  if (!token) return false;
+  const header = String(request.headers.authorization || "");
+  if (header === `Bearer ${token}`) return true;
+  if (String(request.headers["x-admin-token"] || "") === token) return true;
+  return false;
+}
+
+function requireAdmin(request, config) {
+  if (!String(config.adminToken || "").trim()) {
+    throw new HttpError(503, "未配置 ADMIN_TOKEN，管理接口不可用");
+  }
+  if (!adminAuthorized(request, config)) {
+    throw new HttpError(401, "需要有效的管理口令");
+  }
+}
+
+function contentTypeForPublic(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".html") return "text/html; charset=utf-8";
+  if (ext === ".css") return "text/css; charset=utf-8";
+  if (ext === ".js") return "text/javascript; charset=utf-8";
+  if (ext === ".svg") return "image/svg+xml";
+  if (ext === ".png") return "image/png";
+  if (ext === ".ico") return "image/x-icon";
+  return "application/octet-stream";
+}
+
+async function servePublicFile(response, publicDir, relativePath, headers) {
+  const safe = path.normalize(relativePath).replace(/^(\.\.[/\\])+/, "");
+  const filePath = path.join(publicDir, safe);
+  if (!filePath.startsWith(path.resolve(publicDir))) {
+    throw new HttpError(403, "禁止访问");
+  }
+  let body;
+  try {
+    body = await readFile(filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") throw new HttpError(404, "页面不存在");
+    throw error;
+  }
+  response.writeHead(200, {
+    ...headers,
+    "Content-Type": contentTypeForPublic(filePath),
+    "Content-Length": body.length,
+    "Cache-Control": "no-cache",
+  });
+  response.end(body);
+}
+
+function libraryIdFromPath(pathname) {
+  const match = String(pathname || "").match(/^\/library\/([A-Za-z0-9_-]+)\.(xbs|json)$/i);
+  if (!match) return null;
+  return { id: match[1], format: match[2].toLowerCase() };
+}
+
+function jobIdFromPath(pathname) {
+  const match = String(pathname || "").match(/^\/api\/jobs\/([A-Za-z0-9_-]+)(?:\/(retry))?$/);
+  if (!match) return null;
+  return { id: match[1], action: match[2] || "" };
 }
 
 function jmAnchorEntries(fragment, baseUrl) {
@@ -1696,133 +1793,30 @@ function cacheSet(cache, key, value, config) {
   cache.set(key, { expiresAt: Date.now() + config.cacheTtlMs, value });
 }
 
-async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
-  let parsed;
-  let parseError;
-  let downloadError;
-  const candidates = sourceUrlCandidates(sourceUrl);
-  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
-    const candidate = candidates[candidateIndex];
-    let raw;
-    try {
-      raw = await downloadSource(candidate, config);
-    } catch (error) {
-      downloadError = error;
-      // shuyuans -> shuyuan is only a response-format fallback. A transient
-      // DNS/TLS/CDN failure must not silently turn an aggregate ID into an
-      // unrelated single source with the same numeric ID.
-      if (candidateIndex === 0) throw error;
-      continue;
-    }
-    try {
-      parsed = JSON.parse(raw.toString("utf8").replace(/^\uFEFF/, ""));
-      break;
-    } catch (error) {
-      parseError = error;
-    }
-  }
-  if (!parsed && parseError) throw new HttpError(422, `在线阅读源不是有效 JSON：${parseError.message}`);
-  if (!parsed && downloadError) throw downloadError;
-  if (!parsed) throw new HttpError(422, "在线阅读源不是有效 JSON");
-  parsed = await adaptOnlineSources(parsed, config);
-  let converted;
-  try {
-    converted = convertLegado(parsed, { imageProxyBase, omitNonPortable: true });
-  } catch (error) {
-    throw new HttpError(422, `无法转换在线阅读源：${error.message}`);
-  }
-  const preflight = await filterReachableSources(Object.values(converted.sources), config);
-  if (config.preflightSources) {
-    const reachableSources = new Set(preflight.input);
-    converted.sources = Object.fromEntries(Object.entries(converted.sources).filter(([, source]) => reachableSources.has(source)));
-  }
-  if (preflight.skipped.length) {
-    converted.skipped.unshift(...preflight.skipped);
-    converted.warnings.push(...preflight.skipped.map((item) => ({
-      source: item.source,
-      section: "source",
-      field: "availability",
-      message: `已从在线 XBS 跳过：${item.reason}`,
-      rule: "",
-    })));
-  }
-
-  const download = (url, headers = {}) => downloadSource(
-    url,
-    { ...config, fetchTimeoutMs: Math.max(config.preflightTimeoutMs, 1_000) },
-    headers,
-  );
-  const sourceCount = Object.keys(converted.sources).length;
-  const verifyEnabled = config.verifyConvertedSources
-    && sourceCount > 0
-    && sourceCount <= (config.verifyMaxSources || 50);
-  const gated = await applyVerifyAndAnalyzeFallback(converted.sources, {
-    download,
-    concurrency: config.preflightConcurrency,
-    timeoutMs: config.preflightTimeoutMs,
-    analyzeTimeoutMs: config.analyzeTimeoutMs,
-    enabled: verifyEnabled,
-    analyzeFallback: config.analyzeFallback,
-    budgetMs: config.verifyBudgetMs,
-  });
-  converted.sources = gated.sources;
-  if (!verifyEnabled && config.verifyConvertedSources && sourceCount > (config.verifyMaxSources || 50)) {
-    converted.warnings.push({
-      source: "",
-      section: "source",
-      field: "verify",
-      message: `源数量 ${sourceCount} 超过抽测上限 ${config.verifyMaxSources}，已跳过抽测直接保留转换结果`,
-      rule: "",
-    });
-  }
-  if (gated.skipped.length) {
-    converted.skipped.push(...gated.skipped);
-    converted.warnings.push(...gated.skipped.map((item) => ({
-      source: item.source,
-      section: "source",
-      field: "verify",
-      message: `已从在线 XBS 跳过：${item.reason}`,
-      rule: "",
-    })));
-  }
-  if (gated.warnings.length) converted.warnings.push(...gated.warnings);
-  if (gated.unverifiedCount) {
-    converted.warnings.push({
-      source: "",
-      section: "source",
-      field: "verify",
-      message: `抽测超时预算已用尽，另有 ${gated.unverifiedCount} 个源未抽测仍保留`,
-      rule: "",
-    });
-  }
-
-  const count = Object.keys(converted.sources).length;
-  if (!count) throw new HttpError(422, "在线地址中没有可转换的阅读源");
-  const buckets = skippedBuckets(converted.skipped);
-  const json = Buffer.from(`${JSON.stringify(converted.sources, null, 2)}\n`, "utf8");
-  const xbs = encodeXbs(json);
-  return {
-    ...converted,
-    count,
-    fallbackCount: gated.fallbackCount || 0,
-    skippedBuckets: buckets,
-    json,
-    xbs,
-    etag: `"${createHash("sha256").update(xbs).digest("hex")}"`,
-  };
-}
-
 export function createAppServer(options = {}) {
   const config = { ...serverConfig(), ...(options.config ?? {}) };
   const cache = new Map();
   const pendingConversions = new Map();
   let active = 0;
+  const publicDir = path.resolve(config.publicDir || DEFAULT_PUBLIC_DIR);
+  const store = options.store || createLibraryStore(config.dataDir);
+  const worker = options.worker || createJobWorker({
+    store,
+    config,
+    concurrency: config.jobConcurrency,
+    downloadSource,
+  });
+  if (options.recoverJobs === true) {
+    void store.ensure().then(() => worker.recover()).catch((error) => {
+      process.stderr.write(`library recover failed: ${error.message}\n`);
+    });
+  }
 
-  return createServer(async (request, response) => {
+  const server = createServer(async (request, response) => {
     const commonHeaders = {
       "Access-Control-Allow-Origin": config.corsOrigin,
-      "Access-Control-Allow-Methods": "GET,HEAD,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type,If-None-Match",
+      "Access-Control-Allow-Methods": "GET,HEAD,POST,DELETE,OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type,If-None-Match,Authorization,X-Admin-Token",
       "X-Content-Type-Options": "nosniff",
     };
     try {
@@ -1831,12 +1825,129 @@ export function createAppServer(options = {}) {
         response.end();
         return;
       }
-      if (!new Set(["GET", "HEAD"]).has(request.method)) throw new HttpError(405, "仅支持 GET、HEAD 和 OPTIONS");
+      const method = request.method || "GET";
+      const allowed = new Set(["GET", "HEAD", "POST", "DELETE"]);
+      if (!allowed.has(method)) throw new HttpError(405, "仅支持 GET、HEAD、POST、DELETE 和 OPTIONS");
       const pathname = new URL(request.url || "/", "http://read2xsgg.local").pathname;
       if (pathname === "/healthz") {
         sendJson(response, 200, { status: "ok" }, commonHeaders);
         return;
       }
+
+      if (pathname === "/ui" || pathname === "/ui/") {
+        await servePublicFile(response, publicDir, "index.html", commonHeaders);
+        return;
+      }
+      if (pathname.startsWith("/ui/")) {
+        const rel = pathname.slice("/ui/".length) || "index.html";
+        await servePublicFile(response, publicDir, rel, commonHeaders);
+        return;
+      }
+
+      const libraryTarget = libraryIdFromPath(pathname);
+      if (libraryTarget) {
+        if (!["GET", "HEAD"].includes(method)) throw new HttpError(405, "订阅地址仅支持 GET/HEAD");
+        const job = await store.getJob(libraryTarget.id);
+        if (!job) throw new HttpError(404, "书库条目不存在");
+        if (job.status !== "done") throw new HttpError(409, `转换尚未完成（${job.status}）`);
+        const body = await store.readArtifact(libraryTarget.id, libraryTarget.format === "json" ? "json" : "xbs");
+        if (!body) throw new HttpError(404, "制品不存在");
+        if (libraryTarget.format === "json") {
+          response.writeHead(200, {
+            ...commonHeaders,
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Length": body.length,
+            "Cache-Control": "public, max-age=60",
+            "X-Converted-Count": String(job.count || 0),
+          });
+          if (method === "HEAD") response.end();
+          else response.end(body);
+          return;
+        }
+        response.writeHead(200, {
+          ...commonHeaders,
+          "Content-Type": "application/octet-stream",
+          "Content-Disposition": `attachment; filename="library-${libraryTarget.id}.xbs"`,
+          "Content-Length": body.length,
+          "Cache-Control": "public, max-age=60",
+          "X-Converted-Count": String(job.count || 0),
+        });
+        if (method === "HEAD") response.end();
+        else response.end(body);
+        return;
+      }
+
+      if (pathname === "/api/jobs" || pathname.startsWith("/api/jobs/")) {
+        requireAdmin(request, config);
+        if (pathname === "/api/jobs") {
+          if (method === "GET" || method === "HEAD") {
+            const jobs = await store.listJobs();
+            sendJson(response, 200, { jobs }, commonHeaders);
+            return;
+          }
+          if (method === "POST") {
+            const raw = await readRequestBody(request);
+            let body = {};
+            try {
+              body = raw.length ? JSON.parse(raw.toString("utf8")) : {};
+            } catch {
+              throw new HttpError(400, "请求体必须是 JSON");
+            }
+            const url = String(body.url || body.u || "").trim();
+            if (!url) throw new HttpError(400, "缺少 url");
+            let normalized;
+            try {
+              normalized = normalizeRemoteUrl(url);
+            } catch (error) {
+              throw new HttpError(400, error.message || "url 无效");
+            }
+            const mode = body.mode === "site" ? "site" : "source";
+            const job = await store.createJob({
+              url: normalized,
+              mode,
+              name: body.name || "",
+              imageProxyBase: publicBaseUrl(request),
+            });
+            worker.enqueue(job.id);
+            sendJson(response, 202, job, commonHeaders);
+            return;
+          }
+          throw new HttpError(405, "不支持的方法");
+        }
+
+        const jobRoute = jobIdFromPath(pathname);
+        if (!jobRoute) throw new HttpError(404, "任务不存在");
+        if (jobRoute.action === "retry") {
+          if (method !== "POST") throw new HttpError(405, "重试仅支持 POST");
+          const job = await store.getJob(jobRoute.id);
+          if (!job) throw new HttpError(404, "任务不存在");
+          const next = await store.updateJob(jobRoute.id, {
+            status: "queued",
+            error: "",
+            finishedAt: null,
+            progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, failed: 0 },
+          });
+          worker.enqueue(jobRoute.id);
+          sendJson(response, 202, next, commonHeaders);
+          return;
+        }
+        if (method === "GET" || method === "HEAD") {
+          const job = await store.getJob(jobRoute.id);
+          if (!job) throw new HttpError(404, "任务不存在");
+          sendJson(response, 200, job, commonHeaders);
+          return;
+        }
+        if (method === "DELETE") {
+          const job = await store.getJob(jobRoute.id);
+          if (!job) throw new HttpError(404, "任务不存在");
+          await store.deleteJob(jobRoute.id);
+          sendJson(response, 200, { ok: true, id: jobRoute.id }, commonHeaders);
+          return;
+        }
+        throw new HttpError(405, "不支持的方法");
+      }
+
+      if (!["GET", "HEAD"].includes(method)) throw new HttpError(405, "该路径仅支持 GET、HEAD 和 OPTIONS");
 
       const adapterTarget = adapterRequestFromRequest(request);
       if (adapterTarget) {
@@ -2109,12 +2220,17 @@ export function createAppServer(options = {}) {
       sendJson(response, status, { error: error.message || "服务器内部错误" }, commonHeaders);
     }
   });
+
+  server.libraryStore = store;
+  server.jobWorker = worker;
+  return server;
 }
 
 export function startServer(config = serverConfig()) {
-  const server = createAppServer({ config });
+  const server = createAppServer({ config, recoverJobs: true });
   server.listen(config.port, config.host, () => {
     process.stdout.write(`read2xsgg listening on http://${config.host}:${config.port}\n`);
+    process.stdout.write(`webui: http://${config.host}:${config.port}/ui/\n`);
   });
   return server;
 }

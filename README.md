@@ -17,6 +17,7 @@
 - 对无法无损翻译的阅读 JS、`imageDecode`、登录 UI、递归 JSONPath、详情 `init` 等规则生成结构化告警。
 - 输入既可以是本地文件、URL，也可以来自标准输入。
 - 提供 HTTP 在线转换服务，香色闺阁可以直接订阅转换 URL。
+- 提供 WebUI 源管理：异步完整抽测后生成稳定的 `/library/{id}.xbs` 订阅地址。
 - 提供受 SSRF 防护的图片代理与可扩展解码器：普通图片直通，已内置猕猴桃漫画的 AES-CBC 图片解码。
 - 为没有可移植发现页的源自动补充“站点首页”或“搜索入口”分类，避免源已导入但无法在香色的切换站点列表中选中。
 - 提供 Docker Compose 一键部署、健康检查、缓存、并发控制和 SSRF 防护。
@@ -105,7 +106,35 @@ docker compose up -d
 
 ## 在线订阅（两种用法）
 
-香色闺阁会检查链接是否以 `.xbs` 结尾。本站只需要记两种手拼路径：
+香色闺阁会检查链接是否以 `.xbs` 结尾。本站支持同步直转，也支持 WebUI 异步完整抽测后再订阅。
+
+### 0. WebUI 异步源管理（推荐大聚合源）
+
+大合集（几十上百个源）同步 `/source/` 会受抽测预算限制；WebUI 在后台做**完整抽测 + 识站回退**，完成后给出稳定订阅地址。
+
+1. 配置管理口令并启动：
+
+```bash
+ADMIN_TOKEN=your-secret docker compose up -d
+```
+
+2. 打开 `{本站}/ui/`，填写同一口令，粘贴阅读源 JSON URL（或选「网站识站」）。
+3. 等待任务变为 `done`，复制公开订阅地址：
+
+```text
+{本站}/library/{id}.xbs
+```
+
+管理 API（需 `Authorization: Bearer $ADMIN_TOKEN` 或 `X-Admin-Token`）：
+
+- `POST /api/jobs` — `{ "url", "mode": "source"|"site", "name?" }`
+- `GET /api/jobs` / `GET /api/jobs/:id`
+- `POST /api/jobs/:id/retry`
+- `DELETE /api/jobs/:id`
+
+制品落在 `DATA_DIR`（Compose 默认 volume `read2xsgg-data` → `/data`）。未设置 `ADMIN_TOKEN` 时管理接口返回 503。
+
+同步路径仍然可用；大聚合建议优先走 WebUI。
 
 ### 1. 网站识站 `/url/`
 
@@ -121,9 +150,9 @@ docker compose up -d
 https://xs.chenqinfeng.de/url/www.novel-site.example.xbs
 ```
 
-### 2. 阅读源转换 `/source/`
+### 2. 阅读源转换 `/source/`（同步直转）
 
-给阅读（Legado）书源 JSON 地址，探活 → 转换 → 抽测，失败则识站回退：
+给阅读（Legado）书源 JSON 地址，探活 → 转换 → 有限抽测（大源可能跳过/截断抽测预算）。适合少量源；**大聚合请用 WebUI**。
 
 ```text
 {转换站}/source/{去掉 https:// 后的阅读源地址}.xbs
@@ -206,11 +235,14 @@ flowchart LR
   analyzeDirect --> xbs
 ```
 
-Compose **默认开启** origin 探活与转换后抽测回退：
+Compose **默认同步路径**开启 origin 探活与抽测（大源有预算/上限）；WebUI 异步任务始终完整抽测并默认识站回退：
 
 - `PREFLIGHT_SOURCES=true`
 - `VERIFY_CONVERTED_SOURCES=true`
-- `ANALYZE_FALLBACK=true`
+- `ANALYZE_FALLBACK=false`（同步路径默认关；异步任务仍会识站回退）
+- `VERIFY_BUDGET_MS=20000` / `VERIFY_MAX_SOURCES=50`（仅同步 `/source`）
+- `ADMIN_TOKEN=`（WebUI / `/api/jobs` 必需）
+- `DATA_DIR=/data`
 - `PREFLIGHT_DEEP_SOURCES=false`（全链路深检仍为 opt-in）
 
 直接识站（不经过阅读源）：

@@ -30,7 +30,10 @@ export {
   kindLabel,
   withNovelHtmlStripped,
 } from "./siteAnalyze/index.js";
+export { convertOnlineSource } from "./convertOnline.js";
+export { createLibraryStore } from "./libraryStore.js";
+export { createJobWorker } from "./jobWorker.js";
 export { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
 export { resolveBookTargetUrl, verifyConvertedSource, verifyConvertedSources } from "./verifySource.js";
 export { downloadAsFetch, ruleUsesForbiddenSinglePipeJs, validateXiangseSource } from "./xiangseValidate.js";
-export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadSource, filterReachableSources, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaUrls, pageText, pageTocUrl, serverConfig, sourceUrlCandidates, startServer } from "./server.js";
+export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadSource, filterReachableSources, HttpError, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaUrls, pageText, pageTocUrl, serverConfig, sourceUrlCandidates, startServer } from "./server.js";

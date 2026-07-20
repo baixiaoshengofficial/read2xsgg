@@ -9,6 +9,8 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 3000
+      DATA_DIR: /data
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       FETCH_TIMEOUT_MS: ${FETCH_TIMEOUT_MS:-15000}
       MAX_SOURCE_BYTES: ${MAX_SOURCE_BYTES:-33554432}
       MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-26214400}
@@ -23,12 +25,17 @@ services:
       PREFLIGHT_TIMEOUT_MS: ${PREFLIGHT_TIMEOUT_MS:-3000}
       PREFLIGHT_CONCURRENCY: ${PREFLIGHT_CONCURRENCY:-4}
       VERIFY_CONVERTED_SOURCES: ${VERIFY_CONVERTED_SOURCES:-true}
-      ANALYZE_FALLBACK: ${ANALYZE_FALLBACK:-true}
+      ANALYZE_FALLBACK: ${ANALYZE_FALLBACK:-false}
       ANALYZE_TIMEOUT_MS: ${ANALYZE_TIMEOUT_MS:-8000}
+      VERIFY_BUDGET_MS: ${VERIFY_BUDGET_MS:-20000}
+      VERIFY_MAX_SOURCES: ${VERIFY_MAX_SOURCES:-50}
+      JOB_CONCURRENCY: ${JOB_CONCURRENCY:-1}
       MAX_COMIC_PAGES: ${MAX_COMIC_PAGES:-50}
       MAX_COMIC_IMAGES: ${MAX_COMIC_IMAGES:-2000}
       COMIC_PAGE_CONCURRENCY: ${COMIC_PAGE_CONCURRENCY:-4}
       CORS_ORIGIN: ${CORS_ORIGIN:-*}
+    volumes:
+      - read2xsgg-data:/data
     read_only: true
     tmpfs:
       - /tmp:size=16m,noexec,nosuid,nodev
@@ -42,3 +49,6 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+volumes:
+  read2xsgg-data:
