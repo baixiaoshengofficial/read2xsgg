@@ -5,6 +5,7 @@ import { decoderForLegadoImageRule } from "./imageDecoder.js";
 import { compileComicExtractionPlan, encodeComicExtractionPlan } from "./comicPlan.js";
 import { compileMediaExtractionPlan, encodeMediaExtractionPlan } from "./mediaPlan.js";
 import { hasUnsupportedLegadoRuntime } from "./legadoJs.js";
+import { compileBookBridgePlan, compileChapterBridgePlan, compileTextBridgePlan, encodeBridgePlan } from "./bridgePlan.js";
 
 const EMPTY_ACTIONS = {
   relatedWord: { actionID: "relatedWord", parserID: "DOM" },
@@ -222,6 +223,90 @@ function runtimeAdapterRequestInfo(endpoint) {
     'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
     `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
   ].join("\n");
+}
+
+function bridgeRequestInfo(requestInfo, endpoint) {
+  const source = String(requestInfo || "").trim();
+  if (!source) return "";
+  if (source === "%@result") return runtimeAdapterRequestInfo(endpoint);
+  if (/^@js:/i.test(source)) {
+    const effectiveSource = source.replace(/\bPOST\s*:\s*false\b/g, "");
+    if (/\b(?:POST|httpParams|requestBody|webView)\b/.test(effectiveSource)) return "";
+    return [
+      "@js:",
+      "var u = (function () {",
+      source.replace(/^@js:\s*/i, ""),
+      "}).call(this);",
+      'if (u && typeof u == "object") u = u.url || "";',
+      'u = String(u || "").trim();',
+      `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
+    ].join("\n");
+  }
+  // The adapter reads everything after `url=` verbatim, so target query
+  // parameters may remain unescaped and XSGG can still substitute placeholders.
+  return `${endpoint}${source}`;
+}
+
+function bridgeEndpoint(base, type, plan) {
+  return `${String(base).replace(/\/$/, "")}/adapter/${type}?plan=${encodeBridgePlan(plan)}&url=`;
+}
+
+function bridgeBookAction(action, bridgeBase, headers) {
+  if (!action?.list || !action?.bookName || !action?.detailUrl || !action?.requestInfo) return action;
+  const plan = compileBookBridgePlan(action, headers);
+  if (!plan.list || !plan.fields.name || !plan.fields.url) return action;
+  const endpoint = bridgeEndpoint(bridgeBase, "books", plan);
+  const requestInfo = bridgeRequestInfo(action.requestInfo, endpoint);
+  if (!requestInfo) return action;
+  return {
+    ...commonAction(action.actionID || "bookWorld", action.host, "json"),
+    requestInfo,
+    list: "data",
+    bookName: "name",
+    detailUrl: "url",
+    author: "author",
+    desc: "desc",
+    cat: "cat",
+    lastChapterTitle: "lastChapterTitle",
+    cover: "cover",
+    status: "status",
+    wordCount: "wordCount",
+    ...(action.moreKeys ? { moreKeys: action.moreKeys } : {}),
+    ...(action._sIndex !== undefined ? { _sIndex: action._sIndex } : {}),
+  };
+}
+
+function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {} } = {}) {
+  if (!action?.list || !action?.title || !action?.url) return action;
+  const plan = compileChapterBridgePlan(action, { tocSelector, headers });
+  if (!plan.list || !plan.fields.title || !plan.fields.url) return action;
+  const endpoint = bridgeEndpoint(bridgeBase, "chapters", plan);
+  const requestInfo = tocSelector
+    ? runtimeAdapterRequestInfo(endpoint)
+    : bridgeRequestInfo(action.requestInfo || "%@result", endpoint);
+  if (!requestInfo) return action;
+  return {
+    ...commonAction("chapterList", action.host, "json"),
+    requestInfo,
+    list: "data",
+    title: "title",
+    url: "url",
+    updateTime: "updateTime",
+  };
+}
+
+function bridgeTextAction(action, bridgeBase, headers) {
+  if (!action?.content || /^@js:/i.test(String(action.content).trim())) return action;
+  const plan = compileTextBridgePlan(action, headers);
+  if (!plan.fields.content) return action;
+  const endpoint = bridgeEndpoint(bridgeBase, "text", plan);
+  const requestInfo = bridgeRequestInfo(action.requestInfo || "%@result", endpoint);
+  if (!requestInfo) return action;
+  return {
+    ...commonAction("chapterContent", action.host, "json"),
+    requestInfo,
+    content: "content",
+  };
 }
 
 function tocLinkHint(rule) {
@@ -487,6 +572,10 @@ function parseExploreEntries(exploreUrl, warningFor) {
 function compactCategoryTemplate(value, host) {
   let template = String(value || "").trim();
   if (!template || /^(?:@js:|<js>)/i.test(template) || /,\s*\{[\s\S]*\}\s*$/.test(template)) return "";
+  // requestFilters can substitute page numbers but cannot represent Legado's
+  // page-1-vs-later `<first,following>` branch. Keep these as individual
+  // actions so convertRequest() can emit the correct conditional URL.
+  if (/<[^<>]*,[^<>]*>/.test(template)) return "";
   template = template
     .replace(/^\{\{\s*(?:Get|get)\(\s*["']url["']\s*\)\s*\}\}/i, "")
     .replace(/^\{\{\s*(?:baseUrl|bookSourceUrl)\s*\}\}/i, "");
@@ -873,6 +962,21 @@ function convertOne(source, warnings, options = {}) {
     converted.chapterContent.content += `|@js:\n${body}\nreturn result;`;
   }
 
+  if (options.imageProxyBase) {
+    converted.bookWorld = Object.fromEntries(Object.entries(converted.bookWorld || {}).map(([title, action]) => ([
+      title,
+      bridgeBookAction(action, options.imageProxyBase, headers),
+    ])));
+    converted.searchBook = bridgeBookAction(converted.searchBook, options.imageProxyBase, headers);
+    converted.chapterList = bridgeChapterAction(converted.chapterList, options.imageProxyBase, {
+      tocSelector: bookDetail.tocUrl || "",
+      headers,
+    });
+    if (resolvedType === "text") {
+      converted.chapterContent = bridgeTextAction(converted.chapterContent, options.imageProxyBase, headers);
+    }
+  }
+
   if (!source.searchUrl) warningForSource("searchUrl", source.searchUrl)("缺少 searchUrl，转换后的源不能搜索");
   if (!converted.searchBook.list) warningForSource("ruleSearch.bookList", searchRules.bookList)("缺少搜索列表规则");
   if (!converted.chapterList.list) warningForSource("ruleToc.chapterList", tocRules.chapterList)("缺少目录列表规则");
@@ -941,6 +1045,20 @@ export function portableConvertedSource(source) {
   return { portable: Boolean(source?.sourceUrl && world && search && detail && toc && content), world, search, detail, toc, content };
 }
 
+function nonPortableOnlineMediaReason(source, converted) {
+  if (!new Set(["audio", "video"]).has(converted?.sourceType)) return "";
+  const contentRules = getRules(source, "ruleContent", "contentRule");
+  if (contentRules.sourceRegex) {
+    return "正文依赖阅读 WebView 网络拦截（sourceRegex），HTTP 转换器无法可靠取得媒体流";
+  }
+  const toc = converted?.chapterList || {};
+  const serverParsed = /\/adapter\/chapters\?/i.test(String(toc.requestInfo || ""));
+  if (!serverParsed && [toc.title, toc.url].some((rule) => /^@js:/i.test(String(rule || "").trim()))) {
+    return "章节标题或媒体 URL 仍依赖客户端 JavaScript，未能编译为服务器 JSON 规则";
+  }
+  return "";
+}
+
 export function convertLegado(input, options = {}) {
   const warnings = [];
   const sources = {};
@@ -949,6 +1067,18 @@ export function convertLegado(input, options = {}) {
     if (!source || typeof source !== "object") continue;
     const converted = convertOne(source, warnings, options);
     if (options.omitNonPortable) {
+      const mediaReason = nonPortableOnlineMediaReason(source, converted);
+      if (mediaReason) {
+        skipped.push({ source: converted.sourceName, reason: mediaReason });
+        warnings.push({
+          source: converted.sourceName,
+          section: "source",
+          field: "compatibility",
+          message: `已从在线 XBS 跳过，避免导入不可播放媒体源：${mediaReason}`,
+          rule: "",
+        });
+        continue;
+      }
       sanitizeConvertedActions(converted, warnings);
       converted.bookWorld = Object.fromEntries(Object.entries(converted.bookWorld || {}).filter(([, action]) => (
         completePortableAction(action, ["requestInfo", "list", "bookName", "detailUrl"])

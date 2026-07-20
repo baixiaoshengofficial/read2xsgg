@@ -240,7 +240,15 @@ function legadoHtmlToXPath(selector) {
   if (source.startsWith("//") || source.startsWith("(") || source.startsWith("/html") || source.startsWith("/text()") || source.startsWith("/@")) {
     return source;
   }
-  if (/^@css:/i.test(source)) return cssToXPath(source.replace(/^@css:/i, ""));
+  if (/^@css:/i.test(source)) {
+    const css = source.replace(/^@css:/i, "");
+    const property = css.match(/@([A-Za-z_$][\w$-]*)$/)?.[1] || "";
+    if (property && (RELATIVE_PROPERTIES.has(property) || property.startsWith("data-"))) {
+      const path = cssToXPath(css.slice(0, -(property.length + 1)));
+      return `${path}${propertyToXPath(property)}`;
+    }
+    return cssToXPath(css);
+  }
 
   // Bare relative properties used inside list/detail items (very common in ruleToc).
   if (RELATIVE_PROPERTIES.has(source) || (source.startsWith("@") && RELATIVE_PROPERTIES.has(source.slice(1)))) {

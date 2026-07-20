@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { gzipSync } from "node:zlib";
 import test from "node:test";
-import { convertLegado, runXbsPipeline } from "../src/index.js";
+import { convertLegado, createAppServer, runXbsPipeline } from "../src/index.js";
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -17,8 +18,8 @@ function close(server) {
 test("香色动作链执行器验证分类、详情、章节和正文", async (context) => {
   const upstream = createServer((request, response) => {
     if (request.url === "/category/12?page=2") {
-      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      response.end('<section class="book"><h2>测试作品</h2><a href="/detail/1">详情</a></section>');
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Encoding": "gzip" });
+      response.end(gzipSync('<section class="book"><h2><span>测试作品</span></h2><a href="/detail/1">详情</a></section>'));
     } else if (request.url === "/detail/1") {
       response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       response.end('<h1>测试作品</h1><div id="chapters"><a href="/chapter/1">第一章</a><a href="/chapter/2">第二章</a></div>');
@@ -32,6 +33,9 @@ test("香色动作链执行器验证分类、详情、章节和正文", async (c
   });
   const base = await listen(upstream);
   context.after(() => close(upstream));
+  const bridge = createAppServer({ config: { allowPrivateNetworks: true, cacheTtlMs: 0 } });
+  const bridgeBase = await listen(bridge);
+  context.after(() => close(bridge));
 
   const legado = {
     bookSourceName: "运行时测试",
@@ -47,7 +51,11 @@ test("香色动作链执行器验证分类、详情、章节和正文", async (c
     ruleToc: { chapterList: "#chapters a", chapterName: "a@text", chapterUrl: "a@href" },
     ruleContent: { content: "#content@html" },
   };
-  const converted = convertLegado(legado, { omitNonPortable: true }).sources["运行时测试"];
+  const converted = convertLegado(legado, { imageProxyBase: bridgeBase, omitNonPortable: true }).sources["运行时测试"];
+  assert.equal(converted.bookWorld["分类"].responseFormatType, "json");
+  assert.equal(converted.bookWorld["分类"].list, "data");
+  assert.match(converted.chapterList.requestInfo, /\/adapter\/chapters/);
+  assert.match(converted.chapterContent.requestInfo, /\/adapter\/text/);
   const report = await runXbsPipeline(converted, { filter: "分类 12", pageIndex: 2 });
   assert.equal(report.ok, true, report.error);
   assert.equal(report.steps.bookWorld.listCount, 1);

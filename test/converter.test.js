@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { convertLegado, convertRequest, convertRule, decodeXbs, encodeXbs } from "../src/index.js";
+import { compileBookBridgePlan, compileChapterBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan } from "../src/index.js";
 
 const sampleSource = {
   bookSourceName: "示例书源",
@@ -103,6 +103,11 @@ test("相对属性 text/href 与 CSS 目录规则不会被误判为 JSON", () =>
   assert.equal(convertRule("@text"), "/text()");
   assert.equal(convertRule("a@text"), "//a/text()");
   assert.equal(
+    convertRule("@css:p.dec>a@href"),
+    "//p[contains(concat(' ', normalize-space(@class), ' '), ' dec ')]/a/@href",
+  );
+  assert.equal(convertRule("@css:img@src"), "//img/@src");
+  assert.equal(
     convertRule("a[href~=/read/\\d+]"),
     "//a[contains(@href, '/read/')]",
   );
@@ -150,6 +155,11 @@ test("GET/POST 请求模板转换", () => {
   assert.match(jsonPost.requestInfo, /params\.pageIndex/);
   assert.match(jsonPost.requestInfo, /POST:true/);
   assert.match(jsonPost.requestInfo, /"Content-Type":\s*"application\/json"/);
+
+  const branch = convertRequest("/tuijian<,/page/{{page}}>").requestInfo;
+  const branchRequest = new Function("config", "params", branch.replace(/^@js:\s*/, ""));
+  assert.equal(branchRequest({}, { pageIndex: 1 }).url, "/tuijian");
+  assert.equal(branchRequest({}, { pageIndex: 3 }).url, "/tuijian/page/3");
 });
 
 test("XBS 加解密无损往返", () => {
@@ -268,21 +278,81 @@ test("漫蛙适配使用 config.host 的 API 详情与 HTML 目录", () => {
   const { sources } = convertLegado(source, { imageProxyBase: "https://xs.example.com" });
   const converted = sources["漫蛙"];
   assert.match(converted.searchBook.requestInfo, /config\.host/);
-  assert.match(converted.searchBook.detailUrl, /config\.host.*api\/comic/);
+  assert.equal(converted.searchBook.detailUrl, "url");
   assert.match(converted.bookWorld["热血"].detailUrl, /config\.host.*api\/comic/);
-  assert.match(converted.chapterList.requestInfo, /config\.host.*\/comic\//);
-  assert.match(converted.chapterList.url, /config\.host.*\/api\/comic\/image\//);
-  assert.match(converted.chapterList.url, /\/\/@href\|\|@js:/);
-  assert.doesNotMatch(converted.chapterList.url, /replace\(new RegExp/);
-  const chapterUrlScript = converted.chapterList.url.split("||@js:")[1];
-  assert.equal(
-    new Function("result", "config", chapterUrlScript)("/comic/13827/2101951", converted.chapterList),
-    "https://www.mwwz.cc/api/comic/image/2101951?page=1",
+  const searchPlan = decodeBridgePlan(converted.searchBook.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)[1]);
+  assert.deepEqual(
+    executeBridgePlan(JSON.stringify({ data: { list: [{ id: 13827, title: "测试漫画" }] } }), "https://www.mwwz.cc/api/search", searchPlan),
+    { data: [{ name: "测试漫画", url: "https://www.mwwz.cc/api/comic/13827" }] },
+  );
+  assert.match(converted.chapterList.requestInfo, /adapter\/chapters\?plan=/);
+  assert.equal(converted.chapterList.responseFormatType, "json");
+  assert.equal(converted.chapterList.list, "data");
+  assert.equal(converted.chapterList.url, "url");
+  const chapterPlan = decodeBridgePlan(converted.chapterList.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)[1]);
+  assert.equal(chapterPlan.fields.url.matchTemplate.hostPrefix, true);
+  assert.deepEqual(
+    executeBridgePlan('<div id="chapter-grid-container"><a href="/comic/13827/2101951"><span class="name">第一话</span></a></div>', "https://www.mwwz.cc/comic/13827", chapterPlan),
+    { data: [{ title: "第一话", url: "https://www.mwwz.cc/api/comic/image/2101951?page=1" }] },
+  );
+  const attributeTitlePlan = {
+    ...chapterPlan,
+    fields: { ...chapterPlan.fields, title: "/@data-title" },
+  };
+  assert.deepEqual(
+    executeBridgePlan('<div id="chapter-grid-container"><a data-title="属性标题" href="/comic/13827/2101951"></a></div>', "https://www.mwwz.cc/comic/13827", attributeTitlePlan),
+    { data: [{ title: "属性标题", url: "https://www.mwwz.cc/api/comic/image/2101951?page=1" }] },
   );
   assert.equal(converted.bookDetail.tocUrl, undefined);
   assert.equal(converted.bookDetail.desc, "data/intro");
   assert.equal(converted.chapterContent.responseFormatType, "json");
   assert.match(converted.chapterContent.content, /^data\/images\|@js:/);
+});
+
+test("章节 URL 的 split + 模板赋值由安全桥接计划执行", () => {
+  const plan = compileChapterBridgePlan({
+    host: "https://comic.example",
+    responseFormatType: "html",
+    list: "//*[@id='chapters']//a",
+    title: "/@data-title",
+    url: '//@href|@js:\na=result.split("/")[3];b=`https://api.example/image/${a}?count=true`',
+  });
+  assert.deepEqual(
+    executeBridgePlan(
+      '<div id="chapters"><a href="/comic/42/9001" data-title="第一话"></a></div>',
+      "https://comic.example/comic/42",
+      plan,
+    ),
+    { data: [{ title: "第一话", url: "https://api.example/image/9001?count=true" }] },
+  );
+});
+
+test("JSON 数组递归路径和纯字段 URL 模板由桥接计划展开", () => {
+  const plan = compileBookBridgePlan({
+    host: "https://video.example",
+    responseFormatType: "json",
+    list: "blocks/models||models",
+    bookName: '@js:\nif (String(result.status)==="public") result=String(result.username);',
+    detailUrl: '@js:\nreturn ("https://video.example/model/" + String(result.username) + "/cam");',
+  });
+  assert.deepEqual(
+    executeBridgePlan(JSON.stringify({ blocks: [{ models: [{ username: "alice", status: "public" }] }] }), "https://video.example", plan),
+    { data: [{ name: "alice", url: "https://video.example/model/alice/cam" }] },
+  );
+});
+
+test("深度预检可以限制桥接结果数量而不遍历完整大目录", () => {
+  const plan = compileChapterBridgePlan({
+    host: "https://example.com",
+    responseFormatType: "html",
+    list: "//a",
+    title: "/text()",
+    url: "/@href",
+  });
+  const html = Array.from({ length: 2000 }, (_, index) => `<a href="/${index}">第 ${index} 章</a>`).join("");
+  assert.deepEqual(executeBridgePlan(html, "https://example.com", plan, { limit: 1 }), {
+    data: [{ title: "第 0 章", url: "https://example.com/0" }],
+  });
 });
 
 test("Mustache {{@sel}} 与 Get('url') 请求可转换", () => {
@@ -404,18 +474,17 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
   assert.match(sources["禁漫测试"].chapterContent.requestInfo, /params\.queryInfo/);
   assert.ok(warnings.some((warning) => warning.message.includes("id-md5-reverse-tiles")));
   const chapterList = sources["禁漫测试"].chapterList;
-  assert.equal(chapterList.responseFormatType, "html");
+  assert.equal(chapterList.responseFormatType, "json");
   assert.match(sources["禁漫测试"].bookDetail.requestInfo, /params\.queryInfo/);
   assert.match(chapterList.requestInfo, /params\.queryInfo/);
   const requestFunction = new Function("config", "params", "result", chapterList.requestInfo.replace(/^@js:\s*/, ""));
-  assert.equal(
+  assert.match(
     requestFunction({ host: "https://jm.example.com" }, { queryInfo: { detailUrl: "/album/1/中文" } }, "%@result"),
-    "https://jm.example.com/album/1/%E4%B8%AD%E6%96%87",
+    /adapter\/chapters\?plan=.*url=https%3A%2F%2Fjm\.example\.com%2Falbum%2F1%2F%25E4%25B8%25AD%25E6%2596%2587/,
   );
-  assert.match(chapterList.list, /btn-toolbar/);
-  assert.match(chapterList.list, /reading/);
-  assert.match(chapterList.title, /h3\/text/);
-  assert.equal(chapterList.url, "//@href");
+  assert.equal(chapterList.list, "data");
+  assert.equal(chapterList.title, "title");
+  assert.equal(chapterList.url, "url");
 });
 
 test("MD5 分块倒序图片规则通过通用正文与解码代理转换", () => {
@@ -612,9 +681,11 @@ test("有分类 URL 但发现规则为空时复用搜索列表规则", () => {
   const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example" });
   const converted = sources["图片分类复用"];
   const world = converted.bookWorld["美图"];
-  assert.match(world.list, /masonry-item/);
-  assert.equal(world.bookName, "//h5");
-  assert.equal(world.detailUrl, "//a/@href");
+  assert.equal(world.responseFormatType, "json");
+  assert.equal(world.list, "data");
+  assert.equal(world.bookName, "name");
+  assert.equal(world.detailUrl, "url");
+  assert.match(world.requestInfo, /adapter\/books\?plan=/);
   assert.match(converted.chapterList.url, /params\.queryInfo/);
   assert.ok(warnings.some((warning) => warning.message.includes("搜索规则补齐")));
   assert.ok(warnings.some((warning) => warning.message.includes("当前详情页作为章节地址")));
@@ -651,7 +722,7 @@ test("HTML 详情独立目录链接通过通用跳转器请求", () => {
   source.ruleBookInfo.tocUrl = '//span[text()="章节目录"]/parent::a/@href';
   const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example" });
   const request = sources["独立目录页"].chapterList.requestInfo;
-  assert.match(request, /convert\.example\/adapter\/toc\?hint=/);
+  assert.match(request, /convert\.example\/adapter\/chapters\?plan=/);
   assert.match(request, /encodeURIComponent\(u\)/);
 });
 

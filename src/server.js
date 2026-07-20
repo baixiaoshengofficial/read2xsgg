@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 import { JSDOM } from "jsdom";
 import { convertLegado } from "./converter.js";
 import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
@@ -11,6 +12,14 @@ import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comic
 import { decodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
 import { encodeXbs } from "./xbs.js";
 import { parseHeaders } from "./requests.js";
+import {
+  bridgeTocUrl,
+  compileBookBridgePlan,
+  compileChapterBridgePlan,
+  compileTextBridgePlan,
+  decodeBridgePlan,
+  executeBridgePlan,
+} from "./bridgePlan.js";
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -43,6 +52,7 @@ export function serverConfig(environment = process.env) {
     allowPrivateNetworks: boolean(environment.ALLOW_PRIVATE_NETWORKS),
     allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS, true),
     preflightSources: boolean(environment.PREFLIGHT_SOURCES),
+    preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES),
     preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 2_500),
     preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 48),
     corsOrigin: environment.CORS_ORIGIN || "*",
@@ -151,7 +161,23 @@ function requestBuffer(url, resolved, config, { maxBytes = config.maxSourceBytes
         }
         chunks.push(chunk);
       });
-      response.on("end", () => resolve({ buffer: Buffer.concat(chunks, length), headers: response.headers }));
+      response.on("end", () => {
+        let buffer = Buffer.concat(chunks, length);
+        const encoding = String(response.headers["content-encoding"] || "").toLowerCase();
+        try {
+          if (encoding.includes("gzip")) buffer = gunzipSync(buffer, { maxOutputLength: maxBytes });
+          else if (encoding.includes("deflate")) buffer = inflateSync(buffer, { maxOutputLength: maxBytes });
+          else if (encoding.includes("br")) buffer = brotliDecompressSync(buffer, { maxOutputLength: maxBytes });
+        } catch (error) {
+          reject(new HttpError(502, `${label}解压失败：${error.message}`));
+          return;
+        }
+        if (buffer.length > maxBytes) {
+          reject(new HttpError(413, `${label}解压后超过大小限制 ${maxBytes} 字节`));
+          return;
+        }
+        resolve({ buffer, headers: response.headers });
+      });
       response.on("error", reject);
     });
     request.setTimeout(config.fetchTimeoutMs, () => request.destroy(new HttpError(504, `${label}超时（${config.fetchTimeoutMs}ms）`)));
@@ -160,7 +186,7 @@ function requestBuffer(url, resolved, config, { maxBytes = config.maxSourceBytes
   });
 }
 
-export async function downloadSource(sourceUrl, config = serverConfig()) {
+export async function downloadSource(sourceUrl, config = serverConfig(), headers = {}) {
   let current;
   try {
     current = new URL(sourceUrl);
@@ -169,7 +195,7 @@ export async function downloadSource(sourceUrl, config = serverConfig()) {
   }
   for (let redirects = 0; redirects <= config.maxRedirects; redirects += 1) {
     const resolved = await resolveTarget(current, config);
-    const result = await requestBuffer(current, resolved, config, { label: "下载阅读源" });
+    const result = await requestBuffer(current, resolved, config, { label: "下载阅读源", headers });
     if (result.buffer) return result.buffer;
     if (redirects === config.maxRedirects) throw new HttpError(502, `阅读源重定向次数超过 ${config.maxRedirects}`);
     current = result.redirect;
@@ -239,11 +265,184 @@ async function sourceOriginReachable(source, config) {
   return false;
 }
 
+function firstRequestFilter(action) {
+  const raw = action?.moreKeys?.requestFilters;
+  if (!raw) return "";
+  if (Array.isArray(raw)) return String(raw[0]?.items?.[0]?.value || "");
+  if (raw && typeof raw === "object") return String(Object.values(raw)[0] || "");
+  const line = String(raw).split(/\r?\n/).find((item) => item.includes("::")) || "";
+  return line.slice(line.indexOf("::") + 2).trim();
+}
+
+function declarativeBridgeAction(action, type) {
+  const requestInfo = String(action?.requestInfo || "");
+  const match = requestInfo.match(new RegExp(`/adapter/${type}\\?plan=([A-Za-z0-9_-]+)&url=`));
+  if (!match) return null;
+  try {
+    return { plan: decodeBridgePlan(match[1]), requestInfo };
+  } catch {
+    return null;
+  }
+}
+
+function declarativeBookTarget(action, bridge) {
+  if (!bridge || /^@js:/i.test(bridge.requestInfo.trim())) return "";
+  const marker = "&url=";
+  const index = bridge.requestInfo.indexOf(marker);
+  const embedded = index >= 0;
+  let target = (embedded ? bridge.requestInfo.slice(index + marker.length) : bridge.requestInfo)
+    .replaceAll("%@filter", firstRequestFilter(action))
+    .replaceAll("%@pageIndex", "1")
+    .replaceAll("%@offset", "0")
+    .replaceAll("%@keyWord", "");
+  if (!target || /%@|\{\{|<[^>]*>/.test(target)) return "";
+  if (embedded) {
+    try { target = decodeURIComponent(target); } catch { return ""; }
+  }
+  try { return new URL(target, bridge.plan.host).toString(); } catch { return ""; }
+}
+
+function actionHeaders(source, action) {
+  return { ...(source?.httpHeaders || {}), ...(action?.httpHeaders || {}) };
+}
+
+function executableBookAction(source, action) {
+  const bridged = declarativeBridgeAction(action, "books");
+  if (bridged) return bridged;
+  const requestInfo = String(action?.requestInfo || "");
+  if (!requestInfo || /^@js:/i.test(requestInfo.trim())) return null;
+  try {
+    const plan = compileBookBridgePlan(action, actionHeaders(source, action));
+    if (!plan.list || !plan.fields.name || !plan.fields.url) return null;
+    return { plan, requestInfo };
+  } catch {
+    return null;
+  }
+}
+
+function executableChapterAction(source) {
+  const action = source?.chapterList;
+  const bridged = declarativeBridgeAction(action, "chapters");
+  if (bridged) return bridged;
+  let tocSelector = "";
+  const requestInfo = String(action?.requestInfo || "");
+  const selector = requestInfo.match(/\/adapter\/toc\?[^"'`\s]*?selector=([^&"'`\s]+)/)?.[1];
+  if (selector) {
+    try { tocSelector = decodeURIComponent(selector); } catch { return null; }
+  }
+  try {
+    const plan = compileChapterBridgePlan(action, { tocSelector, headers: actionHeaders(source, action) });
+    if (!plan.list || !plan.fields.title || !plan.fields.url) return null;
+    return { plan, requestInfo };
+  } catch {
+    return null;
+  }
+}
+
+async function executeDeclarativeUrl(plan, targetUrl, config, { chapters = false, limit = Infinity } = {}) {
+  const page = await downloadSource(targetUrl, config, plan.headers);
+  const text = page.toString("utf8");
+  if (chapters && plan.tocSelector) {
+    const tocUrl = bridgeTocUrl(text, targetUrl, plan);
+    if (tocUrl) {
+      try {
+        const tocPage = await downloadSource(tocUrl, config, plan.headers);
+        const output = executeBridgePlan(tocPage.toString("utf8"), tocUrl, plan, { limit });
+        if (Array.isArray(output.data) && output.data.length) return output;
+      } catch {
+        // The normal adapter also falls back to chapters embedded in details.
+      }
+    }
+  }
+  return executeBridgePlan(text, targetUrl, plan, { limit });
+}
+
+function encodedAdapterPlan(action, endpoint) {
+  const requestInfo = String(action?.requestInfo || "");
+  if (!new RegExp(`/adapter/${endpoint.replace("/", "\\/")}\\?`).test(requestInfo)) return null;
+  const match = requestInfo.match(/(?:[?&])plan=([A-Za-z0-9_-]+)/);
+  return match?.[1] || "";
+}
+
+async function sourceContentReachable(source, chapterUrl, config) {
+  let textAction = declarativeBridgeAction(source?.chapterContent, "text");
+  if (!textAction && source?.sourceType === "text") {
+    try {
+      const plan = compileTextBridgePlan(source.chapterContent, actionHeaders(source, source.chapterContent));
+      if (plan.fields.content) textAction = { plan };
+    } catch {
+      // An unrepresentable native text action is not safe to claim as usable.
+    }
+  }
+  if (textAction) {
+    const output = await executeDeclarativeUrl(textAction.plan, chapterUrl, config);
+    return String(output?.content || "").trim().length > 0;
+  }
+  if (source?.sourceType === "text") return false;
+
+  const imagePlan = encodedAdapterPlan(source?.chapterContent, "images");
+  if (imagePlan !== null) {
+    const page = await downloadSource(chapterUrl, config);
+    return pageImageUrls(page.toString("utf8"), chapterUrl, decodeComicExtractionPlan(imagePlan)).length > 0;
+  }
+
+  const mediaPlan = encodedAdapterPlan(source?.chapterContent, "media");
+  if (mediaPlan !== null) {
+    const kind = source?.sourceType === "video" ? "video" : "audio";
+    const plan = decodeMediaExtractionPlan(mediaPlan, kind);
+    const direct = pageMediaUrls("", chapterUrl, plan);
+    if (direct.length) return true;
+    const page = await downloadSource(chapterUrl, config);
+    return pageMediaUrls(page.toString("utf8"), chapterUrl, plan).length > 0;
+  }
+
+  // Native JM and other fully portable XSGG actions do not expose a safe
+  // server-side plan. Their static action-chain gate remains authoritative.
+  return true;
+}
+
+async function sourceBridgeChainReachable(source, config) {
+  if (!config.preflightDeep) return true;
+  const chapterBridge = executableChapterAction(source);
+  if (!chapterBridge) return false;
+  // This runs while generating an aggregate XBS and must stay below normal
+  // reverse-proxy timeouts. One real category/book chain is enough to reject
+  // dead selectors; the standalone validator performs the exhaustive retries.
+  const worlds = Object.values(source?.bookWorld || {}).slice(0, 1);
+  const deepConfig = { ...config, fetchTimeoutMs: config.preflightTimeoutMs };
+  for (const action of worlds) {
+    const bookBridge = executableBookAction(source, action);
+    const targetUrl = declarativeBookTarget(action, bookBridge);
+    if (!bookBridge || !targetUrl) continue;
+    try {
+      const books = await executeDeclarativeUrl(bookBridge.plan, targetUrl, deepConfig, { limit: 3 });
+      for (const book of (books.data || []).slice(0, 3)) {
+        if (!book?.url) continue;
+        try {
+          const chapters = await executeDeclarativeUrl(chapterBridge.plan, book.url, deepConfig, { chapters: true, limit: 2 });
+          for (const chapter of (chapters.data || []).slice(0, 2)) {
+            if (chapter?.url && await sourceContentReachable(source, chapter.url, deepConfig)) return true;
+          }
+        } catch {
+          // Try another book because fresh/deleted entries often have no toc.
+        }
+      }
+    } catch {
+      // Try another category action before declaring the source unusable.
+    }
+  }
+  // If a source has a server-bridge chapter rule but none of its category
+  // requests can be represented and exercised safely, importing it would only
+  // recreate the previous "visible source, empty category" failure mode.
+  return false;
+}
+
 export async function filterReachableSources(input, config) {
   const sources = legacySourceList(input);
   if (!config.preflightSources || !sources.length) return { input, skipped: [] };
   const results = new Array(sources.length);
   const originTasks = new Map();
+  const deepTasks = new Map();
   let cursor = 0;
   const workers = Array.from({ length: Math.min(config.preflightConcurrency, sources.length) }, async () => {
     while (cursor < sources.length) {
@@ -257,7 +456,22 @@ export async function filterReachableSources(input, config) {
         // Invalid URLs intentionally remain unique and fail the probe.
       }
       if (!originTasks.has(key)) originTasks.set(key, sourceOriginReachable(source, config));
-      results[index] = await originTasks.get(key);
+      const originReachable = await originTasks.get(key);
+      if (!originReachable) {
+        results[index] = false;
+        continue;
+      }
+      // Aggregates often contain renamed copies of exactly the same source.
+      // Share their expensive list→chapter→content probe while keeping the
+      // original entries and names intact in the converted output.
+      const chainKey = JSON.stringify([
+        Object.entries(source?.bookWorld || {})[0] || null,
+        source?.chapterList || null,
+        source?.chapterContent || null,
+        source?.httpHeaders || null,
+      ]);
+      if (!deepTasks.has(chainKey)) deepTasks.set(chainKey, sourceBridgeChainReachable(source, config));
+      results[index] = await deepTasks.get(chainKey);
     }
   });
   await Promise.all(workers);
@@ -265,7 +479,7 @@ export async function filterReachableSources(input, config) {
   const skipped = [];
   sources.forEach((source, index) => {
     if (results[index]) reachable.push(source);
-    else skipped.push({ source: String(source?.bookSourceName || source?.sourceName || source?.name || "未命名书源"), reason: "上游站点无法访问或拒绝访问" });
+    else skipped.push({ source: String(source?.bookSourceName || source?.sourceName || source?.name || "未命名书源"), reason: "上游站点不可访问，或核心分类/章节链路没有数据" });
   });
   return { input: reachable, skipped };
 }
@@ -627,22 +841,35 @@ function adapterRequestFromRequest(request) {
     : parsed.pathname === "/adapter/images" || parsed.pathname === "/adapter/jm/images" ? "page-images"
       : parsed.pathname === "/adapter/media" ? "page-media"
         : parsed.pathname === "/adapter/toc" ? "toc-redirect"
+          : parsed.pathname === "/adapter/books" ? "bridge-books"
+            : parsed.pathname === "/adapter/chapters" ? "bridge-chapters"
+              : parsed.pathname === "/adapter/text" ? "bridge-text"
       : "";
   if (!type) return null;
   let extractionPlan;
+  let bridgePlan;
   try {
     extractionPlan = type === "page-media"
       ? decodeMediaExtractionPlan(parsed.searchParams.get("plan") || "", parsed.searchParams.get("kind") || "audio")
       : type === "page-images" ? decodeComicExtractionPlan(parsed.searchParams.get("plan") || "") : null;
+    if (type.startsWith("bridge-")) bridgePlan = decodeBridgePlan(parsed.searchParams.get("plan") || "");
   } catch (error) {
     throw new HttpError(400, error.message);
   }
+  const rawRequestUrl = String(request.url || "");
+  const rawMarker = rawRequestUrl.indexOf("&url=") >= 0 ? "&url=" : "?url=";
+  const rawIndex = rawRequestUrl.indexOf(rawMarker);
+  let rawSourceUrl = rawIndex >= 0 ? rawRequestUrl.slice(rawIndex + rawMarker.length) : "";
+  if (/^https?%3A/i.test(rawSourceUrl) || /^%2F/i.test(rawSourceUrl)) {
+    try { rawSourceUrl = decodeURIComponent(rawSourceUrl); } catch { /* validate below */ }
+  }
   return {
     type,
-    sourceUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "",
+    sourceUrl: type.startsWith("bridge-") ? rawSourceUrl : (parsed.searchParams.get("url") || parsed.searchParams.get("u") || ""),
     hint: parsed.searchParams.get("hint") || "",
     selector: parsed.searchParams.get("selector") || "",
     extractionPlan,
+    bridgePlan,
   };
 }
 
@@ -1196,7 +1423,46 @@ export function createAppServer(options = {}) {
       if (adapterTarget) {
         if (!adapterTarget.sourceUrl) throw new HttpError(400, "缺少待解析页面 URL");
         if (active >= config.maxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
-        const sourceUrl = normalizeRemoteUrl(adapterTarget.sourceUrl);
+        let requestedSourceUrl = adapterTarget.sourceUrl;
+        if (adapterTarget.bridgePlan) {
+          try {
+            requestedSourceUrl = new URL(requestedSourceUrl, adapterTarget.bridgePlan.host).toString();
+          } catch {
+            throw new HttpError(400, "规则桥接目标 URL 无效");
+          }
+        }
+        const sourceUrl = normalizeRemoteUrl(requestedSourceUrl);
+        if (adapterTarget.type.startsWith("bridge-")) {
+          active += 1;
+          let output;
+          try {
+            let pageUrl = sourceUrl;
+            let page = await downloadSource(pageUrl, config, adapterTarget.bridgePlan.headers);
+            if (adapterTarget.type === "bridge-chapters" && adapterTarget.bridgePlan.tocSelector) {
+              const tocUrl = bridgeTocUrl(page.toString("utf8"), pageUrl, adapterTarget.bridgePlan);
+              if (tocUrl) {
+                try {
+                  const tocPageUrl = normalizeRemoteUrl(tocUrl);
+                  const tocPage = await downloadSource(tocPageUrl, config, adapterTarget.bridgePlan.headers);
+                  const tocOutput = executeBridgePlan(tocPage.toString("utf8"), tocPageUrl, adapterTarget.bridgePlan);
+                  if (Array.isArray(tocOutput.data) && tocOutput.data.length) output = tocOutput;
+                } catch {
+                  // A number of Legado sources keep a stale or optional tocUrl
+                  // while their chapter list still exists on the detail page.
+                  // Fall through and parse the detail response with the same rule.
+                }
+              }
+            }
+            if (!output) output = executeBridgePlan(page.toString("utf8"), pageUrl, adapterTarget.bridgePlan);
+          } catch (error) {
+            if (error instanceof HttpError) throw error;
+            throw new HttpError(422, `规则桥接解析失败：${error.message}`);
+          } finally {
+            active -= 1;
+          }
+          sendJson(response, 200, output, { ...commonHeaders, "Cache-Control": "public, max-age=120" });
+          return;
+        }
         if (adapterTarget.type === "toc-redirect") {
           active += 1;
           let targetUrl;

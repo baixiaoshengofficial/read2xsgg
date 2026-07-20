@@ -6,5 +6,6 @@ export { decodeXbs, encodeXbs } from "./xbs.js";
 export { decodeImage, decoderForLegadoImageRule, imageMimeType, supportedImageDecoders } from "./imageDecoder.js";
 export { compileComicExtractionPlan, decodeComicExtractionPlan, encodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
 export { compileMediaExtractionPlan, decodeMediaExtractionPlan, encodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
+export { bridgeTocUrl, compileBookBridgePlan, compileChapterBridgePlan, compileTextBridgePlan, decodeBridgePlan, encodeBridgePlan, executeBridgePlan } from "./bridgePlan.js";
 export { hasUnsupportedLegadoRuntime, legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
 export { createAppServer, downloadImage, downloadSource, filterReachableSources, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaUrls, pageTocUrl, serverConfig, sourceUrlCandidates, startServer } from "./server.js";

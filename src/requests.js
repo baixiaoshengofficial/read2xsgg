@@ -146,6 +146,21 @@ function rewriteGetTemplates(url, warn) {
   return expressionForTemplate(url, { warn });
 }
 
+function legadoPageBranchExpression(url, warn) {
+  const source = String(url || "");
+  const branch = source.match(/<([^<>]*),([^<>]*)>/);
+  if (!branch || !/\bpage\b|\{\{\s*page/i.test(branch[0])) return "";
+  const before = source.slice(0, branch.index);
+  const after = source.slice(branch.index + branch[0].length);
+  const first = expressionForTemplate(branch[1], { warn });
+  const following = expressionForTemplate(branch[2], { warn });
+  return [
+    expressionForTemplate(before, { warn }),
+    `(params.pageIndex === 1 ? (${first}) : (${following}))`,
+    expressionForTemplate(after, { warn }),
+  ].join(" + ");
+}
+
 export function convertRequest(request, { headers = {}, warn = () => {}, fallback = "%@result" } = {}) {
   if (!request || request === "-") return { requestInfo: fallback };
   if (typeof request !== "string") return { requestInfo: fallback };
@@ -172,6 +187,21 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
   const encoding = /gbk|gb2312|gb18030/.test(charset)
     ? { requestParamsEncode: "2147485234", responseEncode: "2147485234" }
     : {};
+
+  // Legado's `<first,following>` URL branch chooses the text before the comma
+  // on page 1 and the text after it on later pages. Leaving the angle brackets
+  // in a URL makes clients percent-encode them and request a non-existent path.
+  const pageBranchExpr = legadoPageBranchExpression(url, warn);
+  if (pageBranchExpr) {
+    const lines = ["@js:", `let url = ${pageBranchExpr};`];
+    if (options.body) lines.push(`let hp = ${objectLiteralFromBody(String(options.body), warn)};`);
+    const result = ["url:url", `POST:${method === "POST"}`];
+    if (options.body) result.push("httpParams:hp");
+    if (Object.keys(mergedHeaders).length) result.push(`httpHeaders:${objectLiteralFromHeaders(mergedHeaders, warn)}`);
+    if (options.webView) result.push("webView:true");
+    lines.push(`return {${result.join(",")}};`);
+    return { requestInfo: lines.join("\n"), ...encoding };
+  }
 
   // {{Get('url')}}/path?q={{key}} 这类：先归一成表达式，再走标准 @js 请求对象。
   const getUrlExpr = rewriteGetTemplates(url, warn);

@@ -3,7 +3,7 @@ import { createCipheriv, createHash } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
-import { createAppServer, decodeXbs, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageTocUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
+import { createAppServer, decodeBridgePlan, decodeXbs, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageTocUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
 
 const source = {
   bookSourceName: "在线示例",
@@ -412,17 +412,20 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
   assert.deepEqual(Object.keys(jm.bookWorld), ["全部", "短篇"]);
   assert.equal(jm.bookWorld["全部"].moreKeys.pageSize, 80);
   assert.match(jm.bookWorld["全部"].requestInfo, /albums\?o=mr&page=/);
-  assert.match(jm.bookWorld["全部"].list, /list-col/);
+  assert.equal(jm.bookWorld["全部"].list, "data");
+  const worldPlan = decodeBridgePlan(jm.bookWorld["全部"].requestInfo.match(/plan=([A-Za-z0-9_-]+)/)[1]);
+  assert.match(worldPlan.list, /list-col/);
   assert.match(jm.bookDetail.requestInfo, /params\.queryInfo/);
   assert.match(jm.chapterContent.requestInfo, /params\.queryInfo/);
   assert.equal(jm.chapterContent.responseFormatType, "json");
   assert.match(jm.chapterContent.requestInfo, /adapter\/images/);
   assert.doesNotMatch(JSON.stringify(jm.bookDetail), /java\.|Packages/);
   assert.doesNotMatch(JSON.stringify(jm.searchBook), /java\.|Packages/);
-  assert.equal(jm.chapterList.responseFormatType, "html");
+  assert.equal(jm.chapterList.responseFormatType, "json");
   assert.match(jm.chapterList.requestInfo, /params\.queryInfo/);
-  assert.match(jm.chapterList.list, /btn-toolbar/);
-  assert.equal(jm.chapterList.url, "//@href");
+  assert.match(jm.chapterList.requestInfo, /adapter\/chapters/);
+  assert.equal(jm.chapterList.list, "data");
+  assert.equal(jm.chapterList.url, "url");
   const imageRequest = new Function("config", "params", "result", jm.chapterContent.requestInfo.replace(/^@js:\s*/, ""));
   const imageResponse = await fetch(imageRequest({ host: upstreamBase }, { queryInfo: { url: "/photo/11" } }, ""));
   assert.equal(imageResponse.status, 200);

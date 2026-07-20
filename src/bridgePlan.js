@@ -1,0 +1,400 @@
+import { JSDOM } from "jsdom";
+
+const MAX_PLAN_BYTES = 24 * 1024;
+const FIELD_NAMES = new Set([
+  "name", "url", "author", "desc", "cat", "lastChapterTitle", "cover", "status", "wordCount",
+  "title", "updateTime", "content",
+]);
+
+function selectorOnly(rule) {
+  const value = String(rule || "").trim();
+  if (!value || /^@js:/i.test(value)) return "";
+  return value.split(/\|\|?\s*@js:/i, 1)[0].trim().slice(0, 4096);
+}
+
+function safeRegexPattern(value) {
+  const pattern = String(value || "");
+  if (!pattern || pattern.length > 256) return "";
+  // Reject the most common catastrophic nested-quantifier forms. Bridge plans
+  // are public input and must never become an arbitrary regex execution API.
+  if (/\((?:[^()]|\\.)*(?:\||[+*?{])(?:[^()]|\\.)*\)[+*?{]/.test(pattern)) return "";
+  try { new RegExp(pattern); } catch { return ""; }
+  return pattern;
+}
+
+function splitTemplateTransform(script) {
+  const split = String(script || "").match(
+    /(?:\bvar\s+)?([A-Za-z_$][\w$]*)\s*=\s*result\.split\(\s*(["'])([\s\S]*?)\2\s*\)\s*\[\s*(\d{1,2})\s*\]/,
+  );
+  if (!split || split[3].length !== 1) return null;
+  const index = Number(split[4]);
+  if (!Number.isInteger(index) || index > 32) return null;
+  const variable = split[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const template = String(script).match(new RegExp(
+    `\`((?:\\\\.|[^\`])*)\\$\\{\\s*${variable}\\s*\\}((?:\\\\.|[^\`])*)\``,
+  ));
+  if (!template || template[1].includes("${") || template[2].includes("${")) return null;
+  const delimiter = split[3].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const classDelimiter = split[3].replace(/[\\\]^-]/g, "\\$&");
+  const segments = Array.from({ length: index }, () => `[^${classDelimiter}]*${delimiter}`).join("");
+  const pattern = safeRegexPattern(`^${segments}([^${classDelimiter}]*)`);
+  if (!pattern) return null;
+  return {
+    pattern,
+    prefix: template[1].replace(/\\`/g, "`").slice(0, 2048),
+    suffix: template[2].replace(/\\`/g, "`").slice(0, 2048),
+    hostPrefix: false,
+  };
+}
+
+function hostResultTransform(script) {
+  const template = String(script || "").match(
+    /return\s+config\.host\s*\+\s*("(?:\\.|[^"\\])*")\s*\+\s*String\(result(?:\s*\|\|\s*"")?\)([\s\S]*?);/i,
+  );
+  if (!template) return null;
+  try {
+    return {
+      pattern: /\[\^\\d\]/.test(template[2]) ? "^[\\s\\S]*?(\\d+)[\\s\\S]*$" : "^([\\s\\S]+)$",
+      prefix: JSON.parse(template[1]),
+      suffix: "",
+      hostPrefix: true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeField(rule) {
+  if (rule && typeof rule === "object" && !Array.isArray(rule)) {
+    const selector = selectorOnly(rule.selector);
+    if (!selector) return null;
+    const replacements = Array.isArray(rule.replacements) ? rule.replacements.map((item) => {
+      const pattern = safeRegexPattern(item?.pattern);
+      return pattern ? { pattern, replacement: String(item?.replacement || "").slice(0, 1024) } : null;
+    }).filter(Boolean).slice(0, 8) : [];
+    let matchTemplate = null;
+    const matchPattern = safeRegexPattern(rule.matchTemplate?.pattern);
+    if (matchPattern) {
+      matchTemplate = {
+        pattern: matchPattern,
+        prefix: String(rule.matchTemplate?.prefix || "").slice(0, 2048),
+        suffix: String(rule.matchTemplate?.suffix || "").slice(0, 2048),
+        hostPrefix: Boolean(rule.matchTemplate?.hostPrefix),
+      };
+    }
+    return { selector, replacements, hostPrefix: Boolean(rule.hostPrefix), matchTemplate };
+  }
+  const source = String(rule || "").trim();
+  const selector = selectorOnly(source);
+  if (!selector) return null;
+  const replacements = [];
+  const script = source.slice(selector.length);
+  for (const match of script.matchAll(/\.replace\(new RegExp\(("(?:\\.|[^"\\])*")\s*,\s*"g"\)\s*,\s*("(?:\\.|[^"\\])*")\)/g)) {
+    try {
+      const pattern = safeRegexPattern(JSON.parse(match[1]));
+      if (pattern) replacements.push({ pattern, replacement: JSON.parse(match[2]) });
+    } catch {
+      // Ignore non-generated postprocessors.
+    }
+  }
+  let matchTemplate = null;
+  const template = script.match(/match\(\/((?:\\.|[^/])+)\/[gimuy]*\)[\s\S]*?return\s+m\s*\?\s*(config\.host\s*\+\s*)?("(?:\\.|[^"\\])*")\s*\+\s*m\[1\]\s*\+\s*("(?:\\.|[^"\\])*")/i);
+  if (template) {
+    try {
+      const pattern = safeRegexPattern(template[1]);
+      if (pattern) matchTemplate = {
+        pattern,
+        prefix: JSON.parse(template[3]),
+        suffix: JSON.parse(template[4]),
+        hostPrefix: Boolean(template[2]),
+      };
+    } catch {
+      // Keep the base selector when the generated template is malformed.
+    }
+  }
+  if (!matchTemplate) matchTemplate = hostResultTransform(script);
+  if (!matchTemplate) matchTemplate = splitTemplateTransform(script);
+  return {
+    selector,
+    replacements: replacements.slice(0, 8),
+    hostPrefix: /return\s+config\.host\s*\+/i.test(script),
+    matchTemplate,
+  };
+}
+
+function normalizePlan(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError("规则桥接计划无效");
+  const kind = ["books", "chapters", "text"].includes(value.kind) ? value.kind : "";
+  if (!kind) throw new TypeError("规则桥接计划类型无效");
+  const fields = {};
+  for (const [name, rule] of Object.entries(value.fields || {})) {
+    if (!FIELD_NAMES.has(name)) continue;
+    const field = normalizeField(rule);
+    if (field) fields[name] = field;
+  }
+  const headers = {};
+  for (const [name, headerValue] of Object.entries(value.headers || {})) {
+    if (!/^(?:user-agent|referer|origin|accept-language)$/i.test(name)) continue;
+    headers[name] = String(headerValue).slice(0, 2048);
+  }
+  return {
+    version: 1,
+    kind,
+    host: /^https?:\/\//i.test(String(value.host || "")) ? String(value.host).slice(0, 2048) : "",
+    responseType: value.responseType === "json" ? "json" : "html",
+    list: selectorOnly(value.list),
+    tocSelector: selectorOnly(value.tocSelector),
+    fields,
+    headers,
+  };
+}
+
+export function encodeBridgePlan(plan) {
+  const normalized = normalizePlan(plan);
+  const json = JSON.stringify(normalized);
+  if (Buffer.byteLength(json) > MAX_PLAN_BYTES) throw new TypeError("规则桥接计划过大");
+  return Buffer.from(json, "utf8").toString("base64url");
+}
+
+export function decodeBridgePlan(encoded) {
+  const value = String(encoded || "");
+  if (!value || value.length > MAX_PLAN_BYTES * 2 || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new TypeError("规则桥接计划编码无效");
+  }
+  try {
+    return normalizePlan(JSON.parse(Buffer.from(value, "base64url").toString("utf8")));
+  } catch (error) {
+    if (error instanceof TypeError) throw error;
+    throw new TypeError("规则桥接计划不是有效 JSON");
+  }
+}
+
+function inferredScriptField(rule, preferredNames = []) {
+  const source = String(rule || "").trim();
+  if (!/^@js:/i.test(source)) return rule;
+  const concatenated = source.match(
+    /return\s+\(?\s*("(?:\\.|[^"\\])*")\s*\+\s*String\(result\.([A-Za-z_$][\w$]*)\)\s*\+\s*("(?:\\.|[^"\\])*")\s*\)?\s*;/i,
+  );
+  if (concatenated) {
+    try {
+      return {
+        selector: concatenated[2],
+        matchTemplate: {
+          pattern: "^([\\s\\S]+)$",
+          prefix: JSON.parse(concatenated[1]),
+          suffix: JSON.parse(concatenated[3]),
+        },
+      };
+    } catch {
+      return "";
+    }
+  }
+  const fields = [...source.matchAll(/\bresult\.([A-Za-z_$][\w$]*)/g)].map((match) => match[1]);
+  for (const preferred of preferredNames) {
+    const field = fields.find((name) => preferred.test(name));
+    if (field) return field;
+  }
+  return "";
+}
+
+export function compileBookBridgePlan(action, headers = {}) {
+  return normalizePlan({
+    kind: "books",
+    host: action.host,
+    responseType: action.responseFormatType,
+    list: action.list,
+    fields: {
+      name: inferredScriptField(action.bookName, [/^(?:book)?name$/i, /title/i, /username/i]),
+      url: inferredScriptField(action.detailUrl, [/url/i, /id/i, /username/i]),
+      author: action.author,
+      desc: action.desc,
+      cat: action.cat,
+      lastChapterTitle: action.lastChapterTitle,
+      cover: action.cover,
+      status: action.status,
+      wordCount: action.wordCount,
+    },
+    headers,
+  });
+}
+
+export function compileChapterBridgePlan(action, { tocSelector = "", headers = {} } = {}) {
+  return normalizePlan({
+    kind: "chapters",
+    host: action.host,
+    responseType: action.responseFormatType,
+    list: action.list,
+    tocSelector,
+    fields: { title: action.title, url: action.url, updateTime: action.updateTime },
+    headers,
+  });
+}
+
+export function compileTextBridgePlan(action, headers = {}) {
+  return normalizePlan({
+    kind: "text",
+    host: action.host,
+    responseType: action.responseFormatType,
+    fields: { content: action.content },
+    headers,
+  });
+}
+
+function xpathValues(document, expression, context = document) {
+  const view = document.defaultView;
+  const type = /^\s*(?:string|normalize-space)\s*\(/.test(expression)
+    ? view.XPathResult.STRING_TYPE : view.XPathResult.ANY_TYPE;
+  const result = document.evaluate(expression, context, null, type, null);
+  if (result.resultType === view.XPathResult.STRING_TYPE) return [result.stringValue];
+  if (result.resultType === view.XPathResult.NUMBER_TYPE) return [String(result.numberValue)];
+  if (result.resultType === view.XPathResult.BOOLEAN_TYPE) return [String(result.booleanValue)];
+  const values = [];
+  let node;
+  while ((node = result.iterateNext())) values.push(node);
+  return values;
+}
+
+function htmlDocument(value) {
+  return new JSDOM(String(value || "")).window.document;
+}
+
+function nodeText(node, content = false) {
+  if (node == null) return "";
+  if (typeof node === "string") return node.trim();
+  if (node.nodeType === 2 || node.nodeType === 3) return String(node.nodeValue || "").trim();
+  if (node.nodeType === 9) return String(node.documentElement?.textContent || "").trim();
+  if (content && node.innerHTML !== undefined) return String(node.innerHTML || "").trim();
+  return String(node.textContent || "").trim();
+}
+
+function htmlSelect(rule, input, { list = false, content = false } = {}) {
+  if (!rule) return list ? [] : "";
+  const itemInput = Boolean(input?.nodeType);
+  // List fields must be evaluated relative to the matched item. Reusing its
+  // owner document avoids constructing a new JSDOM for every field of every
+  // book/chapter (large catalogues commonly contain thousands of chapters).
+  const document = itemInput ? (input.ownerDocument || input) : htmlDocument(input);
+  for (const alternative of String(rule).split(/\s*\|\|\s*/).filter(Boolean)) {
+    try {
+      let expression = alternative;
+      if (itemInput) {
+        // Converted Legado fields begin with document-style `//`, while their
+        // semantics inside a book/chapter item are descendant-or-self. Bare
+        // `/@attr` and `/text()` fields refer directly to the current item.
+        if (expression.startsWith("//@")) expression = `descendant-or-self::*/${expression.slice(2)}`;
+        else if (expression.startsWith("//")) expression = `descendant-or-self::${expression.slice(2)}`;
+        else if (/^\/(?:@|text\(\)|node\(\))/.test(expression)) expression = `.${expression}`;
+        else if (expression.startsWith("(.//")) expression = `(descendant-or-self::${expression.slice(4)}`;
+      }
+      const selected = xpathValues(document, expression, itemInput ? input : document);
+      if (!selected.length) continue;
+      if (list) return selected.filter((item) => item?.nodeType === 1);
+      const values = selected.map((item) => nodeText(item, content)).filter(Boolean);
+      if (values.length) return content ? values.join("\n") : values[0];
+    } catch {
+      // Try the next declarative alternative.
+    }
+  }
+  return list ? [] : "";
+}
+
+function jsonPathSingle(input, path) {
+  let value = input;
+  const normalized = String(path || "").trim().replace(/^@json:/i, "").replace(/^\$\.?/, "")
+    .replace(/\[\*\]/g, "").replace(/\[(\d+)\]/g, "/$1").replace(/\./g, "/");
+  for (const key of normalized.split("/").filter(Boolean)) {
+    if (Array.isArray(value) && !/^\d+$/.test(key)) {
+      value = value.flatMap((item) => {
+        const child = item?.[key];
+        if (Array.isArray(child)) return child;
+        return child === undefined || child === null ? [] : [child];
+      });
+    } else {
+      value = value?.[key];
+    }
+  }
+  return value;
+}
+
+function jsonPath(input, path) {
+  for (const alternative of String(path || "").split(/\s*\|\|\s*/).filter(Boolean)) {
+    const value = jsonPathSingle(input, alternative);
+    if (value !== undefined && value !== null && value !== ""
+      && (!Array.isArray(value) || value.length)) return value;
+  }
+  return undefined;
+}
+
+function select(plan, rule, input, options = {}) {
+  const field = normalizeField(rule);
+  if (!field) return options.list ? [] : "";
+  if (plan.responseType === "json") {
+    const value = field.selector ? jsonPath(input, field.selector) : input;
+    if (options.list) return Array.isArray(value) ? value : [];
+    if (Array.isArray(value)) return value.map((item) => String(item ?? "")).filter(Boolean).join("\n");
+    return value == null ? "" : String(value).trim();
+  }
+  return htmlSelect(field.selector, input, options);
+}
+
+function transformed(plan, rule, input, options = {}) {
+  const field = normalizeField(rule);
+  let value = select(plan, field, input, options);
+  if (Array.isArray(value)) return value;
+  for (const replacement of field?.replacements || []) {
+    value = String(value).replace(new RegExp(replacement.pattern, "g"), replacement.replacement);
+  }
+  if (field?.matchTemplate) {
+    const match = String(value).match(new RegExp(field.matchTemplate.pattern));
+    if (match) value = `${field.matchTemplate.hostPrefix ? plan.host : ""}${field.matchTemplate.prefix}${match[1] || ""}${field.matchTemplate.suffix}`;
+  }
+  if (field?.hostPrefix && value && !/^https?:\/\//i.test(value)) value = `${plan.host}${value}`;
+  return value;
+}
+
+function absolute(value, baseUrl) {
+  const source = String(value || "").trim();
+  if (!source) return "";
+  try { return new URL(source, baseUrl).toString(); } catch { return ""; }
+}
+
+export function bridgeTocUrl(page, baseUrl, plan) {
+  if (!plan.tocSelector || plan.responseType !== "html") return "";
+  const value = htmlSelect(plan.tocSelector, page);
+  return absolute(value, baseUrl);
+}
+
+export function executeBridgePlan(body, baseUrl, rawPlan, { limit = Infinity } = {}) {
+  const plan = normalizePlan(rawPlan);
+  let input = body;
+  if (plan.responseType === "json") {
+    try { input = JSON.parse(String(body || "")); } catch { throw new TypeError("上游响应不是规则声明的 JSON"); }
+  }
+  if (plan.kind === "text") {
+    return { content: transformed(plan, plan.fields.content, input, { content: plan.responseType === "html" }) };
+  }
+  const items = plan.responseType === "json"
+    ? (() => {
+      const value = jsonPath(input, plan.list);
+      return Array.isArray(value) ? value : [];
+    })()
+    : htmlSelect(plan.list, input, { list: true });
+  const results = [];
+  const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : items.length;
+  if (boundedLimit === 0) return { data: results };
+  for (const item of items) {
+    const row = {};
+    for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item);
+    if (plan.kind === "books") {
+      row.url = absolute(row.url, baseUrl);
+      if (row.cover) row.cover = absolute(row.cover, baseUrl);
+      if (!row.name || !row.url) continue;
+    } else {
+      row.url = absolute(row.url, baseUrl);
+      if (!row.title || !row.url) continue;
+    }
+    results.push(row);
+    if (results.length >= boundedLimit) break;
+  }
+  return { data: results };
+}
