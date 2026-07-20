@@ -1017,3 +1017,88 @@ test("JSON 音视频正文通过通用提取器兼容上游字段改名", () => 
   assert.match(converted.chapterContent.requestInfo, /\/adapter\/media\?kind=audio/);
   assert.match(converted.chapterContent.content, /payload\.url/);
 });
+
+test("在线质量门槛跳过未知 imageDecode 漫画", () => {
+  const source = {
+    bookSourceName: "花屏漫画",
+    bookSourceUrl: "https://comic.example.com/",
+    bookSourceType: 2,
+    searchUrl: "/search?q={{key}}",
+    exploreUrl: "分类::/list?page={{page}}",
+    ruleSearch: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleExplore: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: "img@src", imageDecode: "JavaImporter(); unknownScramble(result);" },
+  };
+  const { sources, skipped, skippedBuckets: buckets } = convertLegado(source, {
+    omitNonPortable: true,
+    imageProxyBase: "https://convert.example",
+  });
+  assert.equal(sources["花屏漫画"], undefined);
+  assert.ok(skipped.some((item) => /未知 imageDecode/.test(item.reason)));
+  assert.equal(buckets.imageDecode, 1);
+});
+
+test("在线质量门槛：识别了解码器但缺少代理时跳过", () => {
+  const source = {
+    bookSourceName: "缺代理漫画",
+    bookSourceUrl: "https://comic.example.com/",
+    bookSourceType: 2,
+    searchUrl: "/search?q={{key}}",
+    exploreUrl: "分类::/list?page={{page}}",
+    ruleSearch: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleExplore: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: {
+      content: "img@src",
+      imageDecode: "var iv = result.slice(0, 16); var key = java.strToBytes('0123456789abcdef0123456789abcdef'); var cipher = java.createSymmetricCrypto(\"AES/CBC/PKCS5Padding\", key, iv); return cipher.decrypt(result.slice(16));",
+    },
+  };
+  const { sources, skipped } = convertLegado(source, { omitNonPortable: true });
+  assert.equal(sources["缺代理漫画"], undefined);
+  assert.ok(skipped.some((item) => /缺少图片解码代理/.test(item.reason)));
+});
+
+test("在线质量门槛跳过未适配的登录分流 Get 源", () => {
+  const source = {
+    bookSourceName: "分流小说",
+    bookSourceUrl: "https://novel.example.com/",
+    bookSourceType: 0,
+    loginUrl: "https://novel.example.com/login",
+    searchUrl: "{{Get('url')}}/search?q={{key}}&page={{page}}",
+    exploreUrl: "分类::{{Get('url')}}/list?page={{page}}",
+    ruleSearch: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleExplore: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter a", chapterName: "text", chapterUrl: "href##(.*)##$1/?shunt={{Get('shunt')}}" },
+    ruleContent: { content: "#content@html" },
+  };
+  const { sources, skipped, skippedBuckets: buckets } = convertLegado(source, { omitNonPortable: true });
+  assert.equal(sources["分流小说"], undefined);
+  assert.ok(skipped.some((item) => /登录\/分流变量 Get/.test(item.reason)));
+  assert.equal(buckets.login, 1);
+});
+
+test("在线质量门槛跳过依赖 sourceRegex 的有声源", () => {
+  const source = {
+    bookSourceName: "拦截有声",
+    bookSourceUrl: "https://audio.example.com/",
+    bookSourceType: 1,
+    searchUrl: "/search?q={{key}}",
+    exploreUrl: "分类::/list?page={{page}}",
+    ruleSearch: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleExplore: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: "audio@src", sourceRegex: ".*\\.mp3.*" },
+  };
+  const { sources, skipped, skippedBuckets: buckets } = convertLegado(source, {
+    omitNonPortable: true,
+    imageProxyBase: "https://convert.example",
+  });
+  assert.equal(sources["拦截有声"], undefined);
+  assert.ok(skipped.some((item) => /sourceRegex/.test(item.reason)));
+  assert.equal(buckets.media, 1);
+});

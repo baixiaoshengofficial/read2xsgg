@@ -6,7 +6,7 @@ import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 import { JSDOM } from "jsdom";
-import { convertLegado } from "./converter.js";
+import { convertLegado, skippedBuckets } from "./converter.js";
 import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
 import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
 import { decodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
@@ -52,12 +52,11 @@ export function serverConfig(environment = process.env) {
     maxCacheEntries: integer(environment.MAX_CACHE_ENTRIES, 100),
     allowPrivateNetworks: boolean(environment.ALLOW_PRIVATE_NETWORKS),
     allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS, true),
-    // 深度预检会访问每个上游的列表、详情、目录和正文。聚合源可能
-    // 包含数百个站点，因此公开转换服务必须默认关闭，避免同步探测
-    // 耗尽 CPU/内存并拖死健康检查；需要发布精选源时可显式开启。
-    preflightSources: boolean(environment.PREFLIGHT_SOURCES, false),
+    // Origin 探活默认开启：过滤明显死站，避免「能导入却点不开」。
+    // 深度预检（分类→章节→正文）成本高，聚合源默认关闭；精选发布可显式开启。
+    preflightSources: boolean(environment.PREFLIGHT_SOURCES, true),
     preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES, false),
-    preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 2_500),
+    preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 3_000),
     preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 4),
     maxComicPages: integer(environment.MAX_COMIC_PAGES, 50),
     maxComicImages: integer(environment.MAX_COMIC_IMAGES, 2_000),
@@ -575,7 +574,14 @@ export async function filterReachableSources(input, config) {
   const skipped = [];
   sources.forEach((source, index) => {
     if (results[index]) reachable.push(source);
-    else skipped.push({ source: String(source?.bookSourceName || source?.sourceName || source?.name || "未命名书源"), reason: "上游站点不可访问，或核心分类/章节链路没有数据" });
+    else {
+      skipped.push({
+        source: String(source?.bookSourceName || source?.sourceName || source?.name || "未命名书源"),
+        reason: config.preflightDeep
+          ? "上游站点不可访问，或核心分类/章节链路没有数据"
+          : "上游站点不可访问",
+      });
+    }
   });
   return { input: reachable, skipped };
 }
@@ -1618,9 +1624,17 @@ async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
   }
   const count = Object.keys(converted.sources).length;
   if (!count) throw new HttpError(422, "在线地址中没有可转换的阅读源");
+  const buckets = skippedBuckets(converted.skipped);
   const json = Buffer.from(`${JSON.stringify(converted.sources, null, 2)}\n`, "utf8");
   const xbs = encodeXbs(json);
-  return { ...converted, count, json, xbs, etag: `"${createHash("sha256").update(xbs).digest("hex")}"` };
+  return {
+    ...converted,
+    count,
+    skippedBuckets: buckets,
+    json,
+    xbs,
+    etag: `"${createHash("sha256").update(xbs).digest("hex")}"`,
+  };
 }
 
 export function createAppServer(options = {}) {
@@ -1802,6 +1816,7 @@ export function createAppServer(options = {}) {
         "Cache-Control": `public, max-age=${Math.floor(config.cacheTtlMs / 1000)}`,
         "X-Converted-Count": String(converted.count),
         "X-Skipped-Count": String(converted.skipped?.length || 0),
+        "X-Skipped-Buckets": JSON.stringify(converted.skippedBuckets || {}),
         "X-Warning-Count": String(converted.warnings.length),
       };
       if (request.headers["if-none-match"] === converted.etag) {
@@ -1810,7 +1825,12 @@ export function createAppServer(options = {}) {
         return;
       }
       if (target.format === "json") {
-        sendJson(response, 200, { sources: converted.sources, warnings: converted.warnings, skipped: converted.skipped || [] }, headers);
+        sendJson(response, 200, {
+          sources: converted.sources,
+          warnings: converted.warnings,
+          skipped: converted.skipped || [],
+          skippedBuckets: converted.skippedBuckets || {},
+        }, headers);
         return;
       }
       const filename = `read2xsgg-${createHash("sha256").update(target.sourceUrl).digest("hex").slice(0, 12)}.xbs`;

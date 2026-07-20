@@ -183,11 +183,19 @@ node ./bin/server.js
 
 ### 大型混合源验证
 
-`1197.json` 这类聚合源同时包含小说、漫画、音频、视频，以及只能在阅读 Android 运行时执行的规则。在线转换会先检查分类、搜索、详情、目录和正文五段核心链路；仍含 Android 专用运行时、必要字段缺失或无法转换的条目不会写进 XBS。Compose 默认还会实际请求第一组分类、第一本书、章节目录和正文；漫画还必须解析到图片地址。连接失败、返回 5xx、选择器为空或正文为空的条目都会跳过。因此输出数量会随源文件内容和站点存活状态变化，不能把输入条目数当作可用源数量。
+`1197.json` 这类聚合源同时包含小说、漫画、音频、视频，以及只能在阅读 Android 运行时执行的规则。在线转换会先检查分类、搜索、详情、目录和正文五段核心链路；仍含 Android 专用运行时、必要字段缺失、未知 `imageDecode`、未适配登录分流，或无法转换的条目不会写进 XBS。
+
+Compose **默认开启 origin 探活**（`PREFLIGHT_SOURCES=true`）：转换前探测每个源的 `sourceUrl` 是否可达，死站会被跳过。**深度预检默认关闭**（`PREFLIGHT_DEEP_SOURCES=false`），避免对数百个上游做分类→正文实测拖垮服务；需要精选可用源时再显式打开：
+
+```bash
+PREFLIGHT_DEEP_SOURCES=true docker compose up -d
+```
+
+因此输出数量会随源文件内容和站点存活状态变化，不能把输入条目数当作可用源数量。
 
 大型聚合源第一次转换需要逐站验收，可能持续几十秒；同一订阅地址会按 `CACHE_TTL_SECONDS` 缓存结果。在线 XBS 中的书籍、章节、正文和图片规则会继续调用转换服务的 `/adapter/*` 与 `/image/*`，所以导入香色后也必须保持转换服务在线。升级镜像后应删除旧源并重新导入，让香色取得最新规则。
 
-响应头 `X-Converted-Count` 是本次实际写入的源数量，`X-Skipped-Count` 是跳过数量。JSON 调试接口还会返回 `skipped` 和 `warnings`，用于定位具体源在哪一段被过滤。
+响应头 `X-Converted-Count` 是本次实际写入的源数量，`X-Skipped-Count` 是跳过数量，`X-Skipped-Buckets` 是按原因分桶的 JSON（如 `dead-origin`、`core-chain`、`imageDecode`、`login`、`media`）。JSON 调试接口还会返回 `skipped`、`skippedBuckets` 和 `warnings`，用于定位具体源在哪一段被过滤。
 
 `npm test` 只运行可重复的离线测试；需要检查真实上游的详情、目录和正文时运行 `npm run test:live`。这样上游临时断线不会让 GitHub Actions 每次推送都误报失败。
 
@@ -200,6 +208,8 @@ npm run validate:xbs -- source.xbs 禁漫大王🎃
 # 并发抽测聚合 XBS 中前 20 个源（不下载正文媒体文件）
 npm run validate:xbs -- source.xbs --all --limit 20 --concurrency 4 --no-media
 ```
+
+对 `1197`（828 条）在 `omitNonPortable` + 在线 `imageProxyBase` 下约保留 428 条（跳过约 400：`core-chain` 为主，另有 `media` / `imageDecode` / `login`）。本地 `validate:xbs --all --limit 30 --concurrency 4 --no-media` 抽测基线约 **12/30 通过**；目标是导入后可用率明显高于「形状门槛过宽且预检全关」的旧行为，而不是接近 828。
 
 本机 Docker 发布脚本默认先执行包括离线动作链在内的完整测试，测试失败不会构建或推送镜像。只有明确设置 `SKIP_VALIDATION=1` 才会跳过该门槛。
 
@@ -220,9 +230,9 @@ Compose 支持通过环境变量调整：
 | `CORS_ORIGIN` | `*` | 允许的跨域来源 |
 | `ALLOW_PRIVATE_NETWORKS` | `false` | 是否允许抓取本机或内网 URL |
 | `ALLOW_DNS_PROXY_NETWORKS` | `true` | 允许域名经 Docker Desktop、Clash 等代理解析到 `198.18.0.0/15`；直接输入该网段 IP 仍会被拦截 |
-| `PREFLIGHT_SOURCES` | `false` | 转换前探测上游站点；大型聚合源会产生大量外部请求，公开服务默认关闭，需要精选源时再显式开启 |
-| `PREFLIGHT_DEEP_SOURCES` | `false` | 实测分类列表、第一本书、章节和正文；仅在 `PREFLIGHT_SOURCES=true` 时生效 |
-| `PREFLIGHT_TIMEOUT_MS` | `2500` | 单个上游站点预检超时时间 |
+| `PREFLIGHT_SOURCES` | `true` | 转换前探测上游站点是否可达（origin）；设为 `false` 可跳过探活以加快转换，但会死站也会进入 XBS |
+| `PREFLIGHT_DEEP_SOURCES` | `false` | 实测分类列表、第一本书、章节和正文；仅在 `PREFLIGHT_SOURCES=true` 时生效。聚合源成本高，默认关闭 |
+| `PREFLIGHT_TIMEOUT_MS` | `3000` | 单个上游站点预检超时时间 |
 | `PREFLIGHT_CONCURRENCY` | `4` | 上游站点并发预检数量；不建议在小内存容器中调高 |
 | `MAX_COMIC_PAGES` | `50` | 单章 JSON 漫画接口最多聚合的分页数（含第一页） |
 | `MAX_COMIC_IMAGES` | `2000` | 单章最多返回的图片数 |

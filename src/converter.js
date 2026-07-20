@@ -1238,14 +1238,73 @@ function nonPortableOnlineMediaReason(source, converted) {
   if (!new Set(["audio", "video"]).has(converted?.sourceType)) return "";
   const contentRules = getRules(source, "ruleContent", "contentRule");
   if (contentRules.sourceRegex) {
-    return "正文依赖阅读 WebView 网络拦截（sourceRegex），HTTP 转换器无法可靠取得媒体流";
+    return "正文依赖阅读 WebView 网络拦截（sourceRegex），香色无 sourceRegex，HTTP 转换器无法可靠取得媒体流";
   }
   const toc = converted?.chapterList || {};
   const serverParsed = /\/adapter\/chapters\?/i.test(String(toc.requestInfo || ""));
   if (!serverParsed && [toc.title, toc.url].some((rule) => /^@js:/i.test(String(rule || "").trim()))) {
     return "章节标题或媒体 URL 仍依赖客户端 JavaScript，未能编译为服务器 JSON 规则";
   }
+  if (!String(converted?.chapterContent?.content || "").trim()) {
+    return "有声/视频缺少可播放正文，且章节链接不是可识别的媒体直链";
+  }
   return "";
+}
+
+function hasAdaptedMirrorHost(source) {
+  const blob = [
+    source?.bookSourceUrl,
+    source?.bookSourceName,
+    source?.loginUrl,
+    source?.ruleContent?.imageDecode,
+  ].join("\n");
+  // 在线适配可能把 bookSourceUrl 改写成临时镜像域名，因此同时看名称/登录脚本/解扰特征。
+  if (/(?:jmcomic|18comic|comic18j|mwwz|manwake|漫蛙|禁漫)/i.test(blob)) return true;
+  if (/BitmapFactory|Canvas\s*\(\s*img\s*\)|GLOBAL_IMAGE_ROUTES|api\/comic\/image/i.test(blob)) return true;
+  const decoder = decoderForLegadoImageRule(source?.ruleContent?.imageDecode);
+  if (!decoder) return false;
+  return decoder === "jm-scramble"
+    || decoder === "mwwz-aes"
+    || String(decoder).startsWith("id-md5-reverse-tiles")
+    || String(decoder).startsWith("aes-cbc-prefix-iv-");
+}
+
+function sourceUsesLoginGet(source) {
+  const blob = [
+    source?.searchUrl,
+    source?.exploreUrl,
+    JSON.stringify(source?.ruleSearch || {}),
+    JSON.stringify(source?.ruleToc || {}),
+    JSON.stringify(source?.ruleContent || {}),
+    JSON.stringify(source?.ruleBookInfo || {}),
+  ].join("\n");
+  return /\{\{\s*(?:Get|get)\s*\(/i.test(blob) || /(?:^|[^.\w])Get\s*\(/i.test(blob);
+}
+
+function nonPortableImageDecodeReason(source, options = {}) {
+  const contentRules = getRules(source, "ruleContent", "contentRule");
+  if (!contentRules.imageDecode) return "";
+  const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode);
+  if (!imageDecoder) {
+    return "未知 imageDecode，漫画图片将花屏";
+  }
+  if (!options.imageProxyBase) {
+    return "已识别 imageDecode，但缺少图片解码代理（imageProxyBase），在线转换才能安全导出";
+  }
+  return "";
+}
+
+function nonPortableLoginReason(source) {
+  if (!(source?.loginUrl || source?.loginUi || source?.loginCheckJs)) return "";
+  if (hasAdaptedMirrorHost(source)) return "";
+  if (!sourceUsesLoginGet(source)) return "";
+  return "依赖登录/分流变量 Get(...)，香色无法复现阅读登录 UI";
+}
+
+function nonPortableOmitReason(source, converted, options = {}) {
+  return nonPortableOnlineMediaReason(source, converted)
+    || nonPortableImageDecodeReason(source, options)
+    || nonPortableLoginReason(source);
 }
 
 export function convertLegado(input, options = {}) {
@@ -1256,14 +1315,14 @@ export function convertLegado(input, options = {}) {
     if (!source || typeof source !== "object") continue;
     const converted = convertOne(source, warnings, options);
     if (options.omitNonPortable) {
-      const mediaReason = nonPortableOnlineMediaReason(source, converted);
+      const mediaReason = nonPortableOmitReason(source, converted, options);
       if (mediaReason) {
         skipped.push({ source: converted.sourceName, reason: mediaReason });
         warnings.push({
           source: converted.sourceName,
           section: "source",
           field: "compatibility",
-          message: `已从在线 XBS 跳过，避免导入不可播放媒体源：${mediaReason}`,
+          message: `已从在线 XBS 跳过，避免导入不可用源：${mediaReason}`,
           rule: "",
         });
         continue;
@@ -1314,5 +1373,21 @@ export function convertLegado(input, options = {}) {
     seenWarnings.add(key);
     return true;
   });
-  return { sources, warnings: uniqueWarnings, skipped };
+  return { sources, warnings: uniqueWarnings, skipped, skippedBuckets: skippedBuckets(skipped) };
+}
+
+/** 将 skipped 条目按原因分桶，便于聚合源质量报告。 */
+export function skippedBuckets(skipped = []) {
+  const buckets = {};
+  for (const item of skipped) {
+    const reason = String(item?.reason || "unknown");
+    let key = "other";
+    if (/上游站点不可访问|没有数据|dead-origin/i.test(reason)) key = "dead-origin";
+    else if (/imageDecode|花屏|解码代理/i.test(reason)) key = "imageDecode";
+    else if (/登录|分流|Get\s*\(/i.test(reason)) key = "login";
+    else if (/sourceRegex|媒体流|可播放|媒体/i.test(reason)) key = "media";
+    else if (/核心链路/i.test(reason)) key = "core-chain";
+    buckets[key] = (buckets[key] || 0) + 1;
+  }
+  return buckets;
 }

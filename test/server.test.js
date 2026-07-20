@@ -3,7 +3,7 @@ import { createCipheriv, createHash } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
-import { chapterPageCandidates, compileBookBridgePlan, createAppServer, decodeBridgePlan, decodeXbs, encodeBridgePlan, filterReachableSources, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageTocUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
+import { chapterPageCandidates, compileBookBridgePlan, createAppServer, decodeBridgePlan, decodeXbs, encodeBridgePlan, filterReachableSources, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageTocUrl, serverConfig, skippedBuckets, sourceUrlCandidates } from "../src/index.js";
 
 const source = {
   bookSourceName: "在线示例",
@@ -672,15 +672,33 @@ test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (
   assert.equal(response.status, 403);
 });
 
-test("DNS 透明代理默认开启，资源密集型在线预检默认关闭", () => {
+test("DNS 透明代理默认开启，origin 探活默认开启，深度预检默认关闭", () => {
   assert.equal(serverConfig({}).maxSourceBytes, 32 * 1024 * 1024);
   assert.equal(serverConfig({}).allowDnsProxyNetworks, true);
-  assert.equal(serverConfig({}).preflightSources, false);
+  assert.equal(serverConfig({}).preflightSources, true);
   assert.equal(serverConfig({}).preflightDeep, false);
+  assert.equal(serverConfig({}).preflightTimeoutMs, 3000);
   assert.equal(serverConfig({}).preflightConcurrency, 4);
   assert.equal(serverConfig({ ALLOW_DNS_PROXY_NETWORKS: "false" }).allowDnsProxyNetworks, false);
+  assert.equal(serverConfig({ PREFLIGHT_SOURCES: "false" }).preflightSources, false);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "true", PREFLIGHT_DEEP_SOURCES: "true" }).preflightSources, true);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "true", PREFLIGHT_DEEP_SOURCES: "true" }).preflightDeep, true);
+});
+
+test("skippedBuckets 按原因分桶", () => {
+  assert.deepEqual(skippedBuckets([
+    { source: "a", reason: "上游站点不可访问" },
+    { source: "b", reason: "未知 imageDecode，漫画图片将花屏" },
+    { source: "c", reason: "依赖登录/分流变量 Get(...)，香色无法复现阅读登录 UI" },
+    { source: "d", reason: "香色核心链路不可执行：world, content" },
+    { source: "e", reason: "正文依赖阅读 WebView 网络拦截（sourceRegex），香色无 sourceRegex，HTTP 转换器无法可靠取得媒体流" },
+  ]), {
+    "dead-origin": 1,
+    imageDecode: 1,
+    login: 1,
+    "core-chain": 1,
+    media: 1,
+  });
 });
 
 test("图片代理直通普通图片，并可解开已注册的 AES 图片", async (context) => {
