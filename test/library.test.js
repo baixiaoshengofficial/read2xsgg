@@ -139,3 +139,71 @@ test("serverConfig 暴露 dataDir / adminToken / jobConcurrency", () => {
   assert.equal(serverConfig({ ADMIN_TOKEN: "x", DATA_DIR: "/data", JOB_CONCURRENCY: "2" }).dataDir, "/data");
   assert.equal(serverConfig({ ADMIN_TOKEN: "x", DATA_DIR: "/data", JOB_CONCURRENCY: "2" }).jobConcurrency, 2);
 });
+
+test("删除运行中任务会释放队列槽位并启动下一个", async () => {
+  const { createJobWorker } = await import("../src/index.js");
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-cancel-"));
+  const store = createLibraryStore(dir);
+  let releaseHang;
+  const hang = new Promise((resolve) => { releaseHang = resolve; });
+  let started = 0;
+  const downloadSource = async () => {
+    started += 1;
+    if (started === 1) {
+      await hang;
+      return Buffer.from("<html><title>slow</title></html>");
+    }
+    return Buffer.from("<html><title>fast</title><body><a href='/a'>A</a></body></html>");
+  };
+  const worker = createJobWorker({
+    store,
+    config: serverConfig({
+      PREFLIGHT_SOURCES: "false",
+      VERIFY_CONVERTED_SOURCES: "false",
+      ANALYZE_FALLBACK: "false",
+      ALLOW_PRIVATE_NETWORKS: "true",
+      ANALYZE_TIMEOUT_MS: "2000",
+    }),
+    concurrency: 1,
+    downloadSource,
+  });
+
+  try {
+    const first = await store.createJob({ url: "https://example.com/slow", name: "slow", mode: "site" });
+    const second = await store.createJob({ url: "https://example.com/fast", name: "fast", mode: "site" });
+    worker.enqueue(first.id);
+    worker.enqueue(second.id);
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(started, 1);
+    assert.equal((await store.getJob(first.id)).status, "running");
+    assert.equal((await store.getJob(second.id)).status, "queued");
+
+    worker.cancel(first.id);
+    await store.deleteJob(first.id);
+    await worker.syncQueued();
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(started, 2, "second job should start after cancel");
+    releaseHang();
+    await new Promise((r) => setTimeout(r, 300));
+    const secondJob = await store.getJob(second.id);
+    assert.ok(secondJob);
+    assert.notEqual(secondJob.status, "queued");
+  } finally {
+    releaseHang?.();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("进度回写不会覆盖 done 状态", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-race-"));
+  try {
+    const store = createLibraryStore(dir);
+    const job = await store.createJob({ url: "https://example.com/a.json" });
+    await store.updateJob(job.id, { status: "done", count: 3 });
+    const again = await store.updateJob(job.id, { progress: { done: 1, total: 10 } });
+    assert.equal(again.status, "done");
+    assert.equal(again.count, 3);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

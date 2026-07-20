@@ -13,16 +13,20 @@ import { encodeXbs } from "./xbs.js";
  * @param {boolean} [options.fullVerify] - When true, ignore verifyMaxSources / verifyBudgetMs
  *   so async library jobs can finish thorough verify+analyze.
  * @param {(progress: object) => void} [options.onProgress]
+ * @param {typeof downloadSource} [options.downloadSource]
+ * @param {Function} [options.adaptOnlineSources]
+ * @param {Function} [options.filterReachableSources]
+ * @param {Function} [options.sourceUrlCandidates]
+ * @param {new (status: number, message: string) => Error} [options.HttpError]
  */
 export async function convertOnlineSource(sourceUrl, config, imageProxyBase = "", options = {}) {
   // Lazy import avoids a circular dependency with server.js.
-  const {
-    adaptOnlineSources,
-    downloadSource,
-    filterReachableSources,
-    HttpError,
-    sourceUrlCandidates,
-  } = await import("./server.js");
+  const server = await import("./server.js");
+  const downloadSource = options.downloadSource || server.downloadSource;
+  const adaptOnlineSources = options.adaptOnlineSources || server.adaptOnlineSources;
+  const filterReachableSources = options.filterReachableSources || server.filterReachableSources;
+  const HttpError = options.HttpError || server.HttpError;
+  const sourceUrlCandidates = options.sourceUrlCandidates || server.sourceUrlCandidates;
 
   const fullVerify = Boolean(options.fullVerify);
   const onProgress = options.onProgress || null;

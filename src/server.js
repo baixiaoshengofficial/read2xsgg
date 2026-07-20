@@ -1909,6 +1909,7 @@ export function createAppServer(options = {}) {
               imageProxyBase: publicBaseUrl(request),
             });
             worker.enqueue(job.id);
+            void worker.syncQueued?.();
             sendJson(response, 202, job, commonHeaders);
             return;
           }
@@ -1925,8 +1926,10 @@ export function createAppServer(options = {}) {
             status: "queued",
             error: "",
             finishedAt: null,
+            startedAt: null,
             progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, failed: 0 },
           });
+          worker.cancel?.(jobRoute.id);
           worker.enqueue(jobRoute.id);
           sendJson(response, 202, next, commonHeaders);
           return;
@@ -1940,7 +1943,9 @@ export function createAppServer(options = {}) {
         if (method === "DELETE") {
           const job = await store.getJob(jobRoute.id);
           if (!job) throw new HttpError(404, "任务不存在");
+          worker.cancel?.(jobRoute.id);
           await store.deleteJob(jobRoute.id);
+          void worker.syncQueued?.();
           sendJson(response, 200, { ok: true, id: jobRoute.id }, commonHeaders);
           return;
         }

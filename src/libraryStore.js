@@ -128,6 +128,11 @@ export function createLibraryStore(dataDir) {
   async function updateJob(id, patch = {}) {
     const current = await getJob(id);
     if (!current) return null;
+    // Progress-only writes must not clobber a terminal status written concurrently.
+    const terminal = current.status === "done" || current.status === "failed";
+    if (terminal && patch.status === undefined) {
+      return current;
+    }
     const next = {
       ...current,
       ...patch,
