@@ -1,11 +1,32 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  comicPageUrls,
   compileComicExtractionPlan,
   decodeComicExtractionPlan,
   encodeComicExtractionPlan,
   pageImageUrls,
 } from "../src/index.js";
+
+test("JSON 漫画分页元数据会生成同端点的后续页", () => {
+  const payload = JSON.stringify({
+    data: {
+      images: [{ url: "/comic/001.webp" }],
+      pagination: { current_page: 1, page_size: 25, total: 207, total_pages: 9 },
+    },
+  });
+  assert.deepEqual(comicPageUrls(payload, "https://api.example/images/7?quality=high&page=1"), [
+    "https://api.example/images/7?quality=high&page=2",
+    "https://api.example/images/7?quality=high&page=3",
+    "https://api.example/images/7?quality=high&page=4",
+    "https://api.example/images/7?quality=high&page=5",
+    "https://api.example/images/7?quality=high&page=6",
+    "https://api.example/images/7?quality=high&page=7",
+    "https://api.example/images/7?quality=high&page=8",
+    "https://api.example/images/7?quality=high&page=9",
+  ]);
+  assert.deepEqual(comicPageUrls(payload, "https://api.example/images/7"), []);
+});
 
 test("漫画正文规则编译为安全的字段和属性提示", () => {
   const plan = compileComicExtractionPlan(`
@@ -14,11 +35,12 @@ test("漫画正文规则编译为安全的字段和属性提示", () => {
     {{@class.reader@tag.img@data-original}}
     node.getAttribute("data-file")
     @js:process.exit(1)
-  `);
+  `, { Referer: "https://comic.example/", Host: "evil.example", "X-Test": "a\r\nb" });
   assert.deepEqual(plan, {
     version: 1,
     properties: ["pageSrc", "imageUrl"],
     attributes: ["data-original", "data-file"],
+    headers: { Referer: "https://comic.example/", "X-Test": "a b" },
   });
   assert.deepEqual(decodeComicExtractionPlan(encodeComicExtractionPlan(plan)), plan);
   assert.doesNotMatch(Buffer.from(encodeComicExtractionPlan(plan), "base64url").toString("utf8"), /process\.exit/);

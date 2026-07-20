@@ -10,6 +10,7 @@
 - 支持单个书源、书源数组，以及常见的 `sources` / `bookSources` 包装格式。
 - 按阅读 `bookSourceType` 映射香色 `sourceType`：`0→text`、`1→audio`、`2→comic`、`4→video`；对历史源中误标为 `0` / `3` 的类型，会结合分组和正文能力推断小说、漫画、音频或视频，真正的文件下载源仍按 text 输出并告警。
 - 转换搜索、详情、目录、正文和发现页规则；漫画正文由通用图片桥接提取，音频和视频正文由通用媒体桥接输出香色播放用的 `{url, httpHeaders, forbidCache}` JSON。
+- 生成的选择器后处理统一使用香色 2.56.1 实测可执行的 `selector||@js:` 语法，不再输出会被当成普通选择器的单竖线 `selector|@js:`。
 - 转换 XPath、JSONPath、阅读的 Jsoup 链式选择器、常见 CSS，以及 `{{@sel}}` / `{{Get('url')}}` 一类 Mustache 模板（登录分流回退为 `config.host`）。
 - 转换 GET、POST、请求头、表单参数、关键字/页码模板和 GBK 编码配置。
 - 原生生成 XXTEA 加密的 `.xbs`，不依赖外部转换程序。
@@ -167,7 +168,7 @@ node ./bin/server.js
 
 `/image` 会直通 JPEG、PNG、GIF、WebP 等常见图片，并尝试已注册的解码能力。在线转换不会按站点域名选择解码器，而是分析阅读源 `imageDecode` 中的算法：AES-CBC 前缀 IV 会自动提取 16/24/32 字节密钥；MD5 分块倒序会自动提取取模数和偏移量；书号/图片号分块会按规则形态启用对应能力。旧的 `/image/mwwz-aes`、`/image/jm-scramble` 地址仅作为兼容别名保留。代理只会返回验证过图片文件头的结果，且与在线转换一样禁止访问内网地址。
 
-在线转换时，所有漫画正文都会使用规则驱动的通用桥接。转换器先把阅读 `ruleContent.content` 编译成一个不含可执行代码的提取计划，自动识别 JSON/JavaScript 属性（如 `imageUrl`、`pageSrc`、`url`）和 HTML 属性（如 `src`、`data-original`、`data-src`）；服务端再按该计划解析 HTML、JSON API、Next/React 分片脚本、`img/source` 标签或纯 URL 列表，最后返回香色原生的 `{urls:[...]}`。没有明确字段提示时，会自动发现包含图片 URL 的属性组并选择最可信的连续序列。整个过程不使用站点域名作为判断条件，也不会执行阅读源携带的任意 JavaScript。
+在线转换时，所有漫画正文都会使用规则驱动的通用桥接。转换器先把阅读 `ruleContent.content` 编译成一个不含可执行代码的提取计划，自动识别 JSON/JavaScript 属性（如 `imageUrl`、`pageSrc`、`url`）和 HTML 属性（如 `src`、`data-original`、`data-src`）；服务端再按该计划解析 HTML、JSON API、Next/React 分片脚本、`img/source` 标签或纯 URL 列表，最后返回香色原生的 `{urls:[...]}`。对于带 `page` / `pageIndex` 等查询参数的 JSON 漫画接口，还会自动识别 `current_page`、`total_pages`、`total`、`page_size` 及其驼峰别名，并发拉取、按页序去重合并全部图片。没有明确字段提示时，会自动发现包含图片 URL 的属性组并选择最可信的连续序列。原阅读源的 User-Agent、Referer、Cookie 等请求头会经过清理后随安全提取计划传给正文上游；Host、Content-Length 和连接级请求头不会透传。整个过程不使用站点域名作为判断条件，也不会执行阅读源携带的任意 JavaScript。
 
 提取图片序列后，编译器会继续按 `imageDecode` 的算法能力选择参数化解码器。代理地址会从本次转换 URL 自动推导：优先使用 `Forwarded` 或 `X-Forwarded-Host` / `X-Forwarded-Proto`，公网域名默认使用 HTTPS；无需配置对外基础 URL。反向代理应保留 `Host`，并传递主机和协议头。
 
@@ -218,10 +219,13 @@ Compose 支持通过环境变量调整：
 | `CORS_ORIGIN` | `*` | 允许的跨域来源 |
 | `ALLOW_PRIVATE_NETWORKS` | `false` | 是否允许抓取本机或内网 URL |
 | `ALLOW_DNS_PROXY_NETWORKS` | `true` | 允许域名经 Docker Desktop、Clash 等代理解析到 `198.18.0.0/15`；直接输入该网段 IP 仍会被拦截 |
-| `PREFLIGHT_SOURCES` | `true`（Compose） | 聚合源转换前探测上游站点，跳过连接失败、5xx 或拒绝访问的源 |
-| `PREFLIGHT_DEEP_SOURCES` | `true`（Compose） | 实测分类列表、第一本书、章节和正文；无法安全执行或结果为空的源不写入 XBS |
+| `PREFLIGHT_SOURCES` | `true` | 聚合源转换前探测上游站点，跳过连接失败、5xx 或拒绝访问的源 |
+| `PREFLIGHT_DEEP_SOURCES` | `true` | 实测分类列表、第一本书、章节和正文；无法安全执行或结果为空的源不写入 XBS |
 | `PREFLIGHT_TIMEOUT_MS` | `2500` | 单个上游站点预检超时时间 |
 | `PREFLIGHT_CONCURRENCY` | `48` | 上游站点并发预检数量 |
+| `MAX_COMIC_PAGES` | `50` | 单章 JSON 漫画接口最多聚合的分页数（含第一页） |
+| `MAX_COMIC_IMAGES` | `2000` | 单章最多返回的图片数 |
+| `COMIC_PAGE_CONCURRENCY` | `4` | 单章后续图片分页的并发请求数 |
 
 服务默认禁止访问回环、内网、链路本地和保留地址，以降低公开部署时的 SSRF 风险。如果只在可信内网使用，并且阅读源本身位于局域网，可以这样开启：
 
@@ -296,3 +300,5 @@ const xbs = encodeXbs(sources);
 ## XBS 兼容性
 
 `.xbs` 的编码/解码实现与开源项目 [xbsrebuild](https://github.com/ne1llee/xbsrebuild) 的格式兼容。测试覆盖了加解密往返；项目本身不会联网提交或执行书源中的脚本。
+
+规则字段同时经过本项目动作链验收器和独立的香色 2.56.1 HTTP 规则模拟器验证。生成器只发布 `||@js:` 后处理形式；单竖线 `|@js:` 即使能在部分资料中看到，也不会作为转换结果输出。真实 App 的 WebView、登录态和系统网络环境仍可能与 HTTP 模拟器不同，遇到这类源会在预检或兼容性报告中明确跳过/告警，而不是把它标成已验证可用。

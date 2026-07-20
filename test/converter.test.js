@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { compileBookBridgePlan, compileChapterBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan } from "../src/index.js";
+import { compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan } from "../src/index.js";
 
 const sampleSource = {
   bookSourceName: "示例书源",
@@ -64,6 +64,7 @@ test("转换一个完整的 HTML 阅读源", () => {
   assert.match(converted.chapterContent.content, /new RegExp\("广告\.\*"/);
   assert.equal(converted.chapterContent.nextPageUrl, "//a[contains(normalize-space(.), '下一页')]/@href");
   assert.deepEqual(Object.keys(converted.bookWorld), ["玄幻", "都市"]);
+  assert.doesNotMatch(JSON.stringify(converted), /(^|[^|])\|@js:/);
   assert.equal(warnings.length, 0);
 });
 
@@ -287,7 +288,7 @@ test("漫蛙适配使用 config.host 的 API 详情与 HTML 目录", () => {
   );
   assert.match(converted.chapterList.requestInfo, /adapter\/chapters\?plan=/);
   assert.equal(converted.chapterList.responseFormatType, "json");
-  assert.equal(converted.chapterList.list, "data");
+  assert.equal(converted.chapterList.list, "$.data");
   assert.equal(converted.chapterList.url, "url");
   const chapterPlan = decodeBridgePlan(converted.chapterList.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)[1]);
   assert.equal(chapterPlan.fields.url.matchTemplate.hostPrefix, true);
@@ -304,9 +305,13 @@ test("漫蛙适配使用 config.host 的 API 详情与 HTML 目录", () => {
     { data: [{ title: "属性标题", url: "https://www.mwwz.cc/api/comic/image/2101951?page=1" }] },
   );
   assert.equal(converted.bookDetail.tocUrl, undefined);
-  assert.equal(converted.bookDetail.desc, "data/intro");
+  assert.equal(converted.bookDetail.responseFormatType, "json");
+  assert.match(converted.bookDetail.requestInfo, /adapter\/detail\?plan=/);
+  assert.equal(converted.bookDetail.bookName, "$.name");
+  assert.equal(converted.bookDetail.desc, "$.desc");
   assert.equal(converted.chapterContent.responseFormatType, "json");
-  assert.match(converted.chapterContent.content, /^data\/images\|@js:/);
+  assert.match(converted.chapterContent.requestInfo, /adapter\/images\?/);
+  assert.match(converted.chapterContent.content, /^\$\.urls\|\|@js:/);
 });
 
 test("章节 URL 的 split + 模板赋值由安全桥接计划执行", () => {
@@ -341,6 +346,24 @@ test("JSON 数组递归路径和纯字段 URL 模板由桥接计划展开", () =
   );
 });
 
+test("详情桥接把 HTML 元数据归一为香色 JSON 字段", () => {
+  const plan = compileDetailBridgePlan({
+    host: "https://book.example",
+    responseFormatType: "html",
+    bookName: "//h1",
+    author: "//*[@class='author']",
+    cover: "//img/@src",
+  });
+  assert.deepEqual(
+    executeBridgePlan(
+      '<h1>测试书</h1><span class="author">作者甲</span><img src="/cover.jpg">',
+      "https://book.example/detail/1",
+      plan,
+    ),
+    { name: "测试书", author: "作者甲", cover: "https://book.example/cover.jpg" },
+  );
+});
+
 test("深度预检可以限制桥接结果数量而不遍历完整大目录", () => {
   const plan = compileChapterBridgePlan({
     host: "https://example.com",
@@ -365,7 +388,7 @@ test("Mustache {{@sel}} 与 Get('url') 请求可转换", () => {
   );
   assert.match(multi, /novel-content/);
   assert.match(multi, /data-original/);
-  assert.match(multi, /\|@js:/);
+  assert.match(multi, /\|\|@js:/);
 
   const req = convertRequest(
     "{{Get('url')}}/search/photos?search_query={{key}}&page={{page}}",
@@ -441,11 +464,11 @@ test("可识别的 AES 图片规则通过公开代理改写为香色图片正文
   };
   const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example.com/" });
   const content = sources["AES 漫画"].chapterContent.content;
-  assert.match(content, /^data\/images\|@js:/);
+  assert.match(content, /^\$\.urls\|\|@js:/);
   assert.match(content, /https:\/\/convert\.example\.com\/image\/aes-cbc-prefix-iv-[A-Za-z0-9_-]+\?url=/);
-  assert.equal(sources["AES 漫画"].chapterContent.requestInfo, "%@result");
+  assert.match(sources["AES 漫画"].chapterContent.requestInfo, /adapter\/images\?plan=/);
   assert.match(content, /JSON\.stringify\(\{urls:/);
-  assert.match(content, /encodeURIComponent\(url\)/);
+  assert.match(content, /encodeURIComponent\(String\(url/);
   assert.doesNotMatch(content, /<img src=/);
   assert.doesNotMatch(content, /source\.getVariable|JSON\.parse\(src\)/);
   assert.ok(warnings.some((warning) => warning.message.includes("图片解码代理")));
@@ -467,7 +490,7 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
   };
   const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example.com" });
   const content = sources["禁漫测试"].chapterContent.content;
-  assert.match(content, /^urls\|@js:/);
+  assert.match(content, /^\$\.urls\|\|@js:/);
   assert.match(content, /https:\/\/convert\.example\.com\/image\/id-md5-reverse-tiles\?url=/);
   assert.match(content, /encodeURIComponent\(String\(url/);
   assert.doesNotMatch(content, /baseUrl/);
@@ -482,7 +505,15 @@ test("禁漫 Canvas 图片规则通过图片代理改写为可移植的图片标
     requestFunction({ host: "https://jm.example.com" }, { queryInfo: { detailUrl: "/album/1/中文" } }, "%@result"),
     /adapter\/chapters\?plan=.*url=https%3A%2F%2Fjm\.example\.com%2Falbum%2F1%2F%25E4%25B8%25AD%25E6%2596%2587/,
   );
-  assert.equal(chapterList.list, "data");
+  assert.doesNotMatch(
+    requestFunction(
+      { host: "https://jm.example.com" },
+      { queryInfo: { detailUrl: "/album/1/中文" } },
+      "https://convert.example/adapter/detail?plan=stale",
+    ),
+    /adapter%2Fdetail/,
+  );
+  assert.equal(chapterList.list, "$.data");
   assert.equal(chapterList.title, "title");
   assert.equal(chapterList.url, "url");
 });
@@ -682,7 +713,7 @@ test("有分类 URL 但发现规则为空时复用搜索列表规则", () => {
   const converted = sources["图片分类复用"];
   const world = converted.bookWorld["美图"];
   assert.equal(world.responseFormatType, "json");
-  assert.equal(world.list, "data");
+  assert.equal(world.list, "$.data");
   assert.equal(world.bookName, "name");
   assert.equal(world.detailUrl, "url");
   assert.match(world.requestInfo, /adapter\/books\?plan=/);

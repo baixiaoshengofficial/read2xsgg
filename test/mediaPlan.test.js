@@ -11,10 +11,11 @@ test("媒体提取计划只保留安全字段和属性提示", () => {
   const plan = compileMediaExtractionPlan(`
     @js:var url = JSON.parse(src).data.playPath; java.lang.Runtime.getRuntime().exec('bad');
     audio@data-url
-  `, "audio");
+  `, "audio", { "User-Agent": "AudioClient/1", "Content-Length": "999" });
   assert.equal(plan.kind, "audio");
   assert.ok(plan.properties.includes("playPath"));
   assert.ok(plan.attributes.includes("data-url"));
+  assert.deepEqual(plan.headers, { "User-Agent": "AudioClient/1" });
   assert.deepEqual(decodeMediaExtractionPlan(encodeMediaExtractionPlan(plan), "audio"), plan);
   assert.doesNotMatch(Buffer.from(encodeMediaExtractionPlan(plan), "base64url").toString("utf8"), /Runtime|exec|bad/);
 });

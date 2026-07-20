@@ -299,7 +299,7 @@ function jsonPathToXsgg(path, warn) {
     .replace(/^\/+|\/+$/g, "");
   if (!jsSuffix) return converted;
   return converted
-    ? (jsSuffix.startsWith("@js:") ? `${converted}|${jsSuffix}` : `${converted}||${jsSuffix}`)
+    ? `${converted}||${jsSuffix}`
     : jsSuffix;
 }
 
@@ -326,7 +326,7 @@ function appendRegexReplacement(converted, suffix, warn) {
   } catch {
     warn("清理正则无法解析，已原样写入转换结果");
   }
-  return `${converted}|@js:\nreturn String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(safeReplacement)});`;
+  return `${converted}||@js:\nreturn String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(safeReplacement)});`;
 }
 
 /**
@@ -508,8 +508,10 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
       return head;
     }
     warn("阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查");
-    // 香色：xpath 后处理用单竖线 |@js:；|| 表示备选规则
-    return script.startsWith("@js:") ? `${head}|${script}` : `${head}||${script}`;
+    // 2.56.1 的公开可用源与独立模拟器统一使用 `selector||@js:`。
+    // 单管道虽然出现在部分旧文档中，但真实客户端上会出现只执行选择器、
+    // 不把结果交给 JS 的兼容差异，因此发布产物固定使用双管道。
+    return `${head}||${script}`;
   }
 
   // Apply ## cleanup to the whole rule (including && combinations) before splitting.

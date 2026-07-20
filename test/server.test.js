@@ -3,7 +3,7 @@ import { createCipheriv, createHash } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
-import { createAppServer, decodeBridgePlan, decodeXbs, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageTocUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
+import { chapterPageCandidates, compileBookBridgePlan, createAppServer, decodeBridgePlan, decodeXbs, encodeBridgePlan, filterReachableSources, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageTocUrl, serverConfig, sourceUrlCandidates } from "../src/index.js";
 
 const source = {
   bookSourceName: "在线示例",
@@ -33,6 +33,10 @@ function listen(server) {
 
 function close(server) {
   return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+}
+
+function testServerConfig() {
+  return serverConfig({ PREFLIGHT_SOURCES: "false", PREFLIGHT_DEEP_SOURCES: "false" });
 }
 
 test("手拼阅读源地址可还原为完整 URL", () => {
@@ -65,6 +69,16 @@ test("yckceo 复数接口解析失败时可回退到直接 JSON 接口", () => {
   assert.deepEqual(sourceUrlCandidates("https://example.com/source.json"), ["https://example.com/source.json"]);
 });
 
+test("深度预检为 JSON API 详情尝试同源 HTML 章节页", () => {
+  assert.deepEqual(chapterPageCandidates("https://comic.example/api/comic/123?from=list"), [
+    "https://comic.example/api/comic/123?from=list",
+    "https://comic.example/comic/123",
+  ]);
+  assert.deepEqual(chapterPageCandidates("https://comic.example/comic/123"), [
+    "https://comic.example/comic/123",
+  ]);
+});
+
 test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (context) => {
   const upstreamRequests = [];
   const upstream = createServer((request, response) => {
@@ -74,7 +88,7 @@ test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (
   });
   const upstreamBase = await listen(upstream);
   const app = createAppServer({
-    config: { ...serverConfig({}), allowPrivateNetworks: true, cacheTtlMs: 60_000 },
+    config: { ...testServerConfig(), allowPrivateNetworks: true, cacheTtlMs: 60_000 },
   });
   const appBase = await listen(app);
   context.after(async () => {
@@ -150,7 +164,7 @@ test("聚合源在线预检会跳过无法连接的上游站点", async (context
   upstreamBase = await listen(upstream);
   const app = createAppServer({
     config: {
-      ...serverConfig({}),
+      ...testServerConfig(),
       allowPrivateNetworks: true,
       preflightSources: true,
       preflightTimeoutMs: 250,
@@ -173,8 +187,86 @@ test("聚合源在线预检会跳过无法连接的上游站点", async (context
   assert.deepEqual(payload.skipped.map((item) => item.source), ["不可访问"]);
 });
 
+test("深度预检可安全解析搜索 JS URL，并从 API 详情回退到 HTML 目录", async (context) => {
+  let upstreamBase = "";
+  const requests = [];
+  const upstream = createServer((request, response) => {
+    requests.push(request.url);
+    if (request.url === "/search?keyword=%E5%B0%8F%E8%AF%B4&page=1") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: [{ name: "测试书", url: `${upstreamBase}/api/book/1` }] }));
+      return;
+    }
+    if (request.url === "/api/book/1") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: { name: "测试书" } }));
+      return;
+    }
+    if (request.url === "/book/1") {
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end('<div id="chapters"><a href="/chapter/1">第一章</a></div>');
+      return;
+    }
+    if (request.url === "/chapter/1") {
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end('<article id="content">可读正文</article>');
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "text/plain" });
+    response.end("ok");
+  });
+  upstreamBase = await listen(upstream);
+  context.after(() => close(upstream));
+  const searchShape = {
+    host: upstreamBase,
+    responseFormatType: "json",
+    list: "$.data",
+    bookName: "$.name",
+    detailUrl: "$.url",
+  };
+  const searchPlan = encodeBridgePlan(compileBookBridgePlan(searchShape));
+  const convertedSource = {
+    sourceName: "API/HTML 混合源",
+    sourceUrl: upstreamBase,
+    sourceType: "text",
+    bookWorld: {},
+    searchBook: {
+      ...searchShape,
+      requestInfo: [
+        "@js:",
+        'let url = config.host + "/search?keyword=" + encodeURIComponent(params.keyWord) + "&page=" + params.pageIndex;',
+        `return "http://bridge.example/adapter/books?plan=${searchPlan}&url=" + encodeURIComponent(url);`,
+      ].join("\n"),
+    },
+    chapterList: {
+      host: upstreamBase,
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      list: "//*[@id='chapters']//a",
+      title: ".",
+      url: "//@href",
+    },
+    chapterContent: {
+      host: upstreamBase,
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      content: "//*[@id='content']",
+    },
+  };
+  const result = await filterReachableSources([convertedSource], {
+    ...testServerConfig(),
+    allowPrivateNetworks: true,
+    preflightSources: true,
+    preflightDeep: true,
+    preflightTimeoutMs: 1_000,
+    preflightConcurrency: 1,
+  });
+  assert.equal(result.input.length, 1, JSON.stringify(requests));
+  assert.deepEqual(result.skipped, []);
+});
+
 test("在线抓取默认禁止访问本机和内网地址", async (context) => {
-  const app = createAppServer({ config: { ...serverConfig({}), allowPrivateNetworks: false } });
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: false } });
   const appBase = await listen(app);
   context.after(() => close(app));
 
@@ -189,7 +281,7 @@ test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", as
     response.end(JSON.stringify({ data: { trackUrl: "/media/chapter.m4a" } }));
   });
   const upstreamBase = await listen(upstream);
-  const app = createAppServer({ config: { ...serverConfig({}), allowPrivateNetworks: true } });
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true } });
   const appBase = await listen(app);
   context.after(async () => {
     await close(app);
@@ -209,6 +301,54 @@ test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", as
   assert.deepEqual(await video.json(), { url: direct });
 });
 
+test("通用漫画适配端点聚合 JSON API 的全部分页", async (context) => {
+  const requestedPages = [];
+  const requestedReferers = [];
+  const upstream = createServer((request, response) => {
+    const url = new URL(request.url || "/", "http://upstream.local");
+    const page = Number(url.searchParams.get("page") || 1);
+    requestedPages.push(page);
+    requestedReferers.push(request.headers.referer);
+    const images = page === 1
+      ? [{ url: "/pages/001.webp" }, { url: "/pages/002.webp" }]
+      : [{ url: `/pages/00${page + 1}.webp` }];
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({
+      data: { images, pagination: { current_page: page, page_size: 2, total: 6, total_pages: 3 } },
+    }));
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({
+    config: { ...testServerConfig(), allowPrivateNetworks: true, comicPageConcurrency: 2 },
+  });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const plan = Buffer.from(JSON.stringify({
+    version: 1,
+    properties: ["url"],
+    attributes: [],
+    headers: { Referer: "https://comic.example/reader" },
+  })).toString("base64url");
+  const response = await fetch(
+    `${appBase}/adapter/images?plan=${plan}&url=${encodeURIComponent(`${upstreamBase}/api/images?id=7&page=1`)}`,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    urls: [
+      `${upstreamBase}/pages/001.webp`,
+      `${upstreamBase}/pages/002.webp`,
+      `${upstreamBase}/pages/003.webp`,
+      `${upstreamBase}/pages/004.webp`,
+    ],
+  });
+  assert.deepEqual(requestedPages.sort(), [1, 2, 3]);
+  assert.deepEqual(requestedReferers, Array(3).fill("https://comic.example/reader"));
+});
+
 test("通用目录跳转器从详情页选择章节目录而不是开始阅读", async (context) => {
   const html = `
     <a href="/novel/read/1"><span>开始阅读</span></a>
@@ -225,7 +365,7 @@ test("通用目录跳转器从详情页选择章节目录而不是开始阅读",
     response.end(html);
   });
   const upstreamBase = await listen(upstream);
-  const app = createAppServer({ config: { ...serverConfig({}), allowPrivateNetworks: true } });
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true } });
   const appBase = await listen(app);
   context.after(async () => {
     await close(app);
@@ -254,7 +394,7 @@ test("图片代理地址从本次 HTTPS 转换请求自动推导", async (contex
     response.end(JSON.stringify(encryptedComicSource));
   });
   const upstreamBase = await listen(upstream);
-  const app = createAppServer({ config: { ...serverConfig({}), allowPrivateNetworks: true } });
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true } });
   const appBase = await listen(app);
   context.after(async () => {
     await close(app);
@@ -307,7 +447,7 @@ test("在线转换会发现并写入可用的漫蛙镜像", async (context) => {
   });
   upstreamBase = await listen(upstream);
   const app = createAppServer({
-    config: { ...serverConfig({}), allowPrivateNetworks: true, mwwzDiscoveryUrl: `${upstreamBase}/release` },
+    config: { ...testServerConfig(), allowPrivateNetworks: true, mwwzDiscoveryUrl: `${upstreamBase}/release` },
   });
   const appBase = await listen(app);
   context.after(async () => {
@@ -395,7 +535,7 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
   });
   upstreamBase = await listen(upstream);
   const app = createAppServer({
-    config: { ...serverConfig({}), allowPrivateNetworks: true, jmDiscoveryUrl: `${upstreamBase}/release` },
+    config: { ...testServerConfig(), allowPrivateNetworks: true, jmDiscoveryUrl: `${upstreamBase}/release` },
   });
   const appBase = await listen(app);
   context.after(async () => {
@@ -412,7 +552,7 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
   assert.deepEqual(Object.keys(jm.bookWorld), ["全部", "短篇"]);
   assert.equal(jm.bookWorld["全部"].moreKeys.pageSize, 80);
   assert.match(jm.bookWorld["全部"].requestInfo, /albums\?o=mr&page=/);
-  assert.equal(jm.bookWorld["全部"].list, "data");
+  assert.equal(jm.bookWorld["全部"].list, "$.data");
   const worldPlan = decodeBridgePlan(jm.bookWorld["全部"].requestInfo.match(/plan=([A-Za-z0-9_-]+)/)[1]);
   assert.match(worldPlan.list, /list-col/);
   assert.match(jm.bookDetail.requestInfo, /params\.queryInfo/);
@@ -424,7 +564,7 @@ test("禁漫在线转换固化可用镜像和动态分类", async (context) => {
   assert.equal(jm.chapterList.responseFormatType, "json");
   assert.match(jm.chapterList.requestInfo, /params\.queryInfo/);
   assert.match(jm.chapterList.requestInfo, /adapter\/chapters/);
-  assert.equal(jm.chapterList.list, "data");
+  assert.equal(jm.chapterList.list, "$.data");
   assert.equal(jm.chapterList.url, "url");
   const imageRequest = new Function("config", "params", "result", jm.chapterContent.requestInfo.replace(/^@js:\s*/, ""));
   const imageResponse = await fetch(imageRequest({ host: upstreamBase }, { queryInfo: { url: "/photo/11" } }, ""));
@@ -496,7 +636,7 @@ test("禁漫镜像候选兼容发布页无协议域名和源内备用地址", ()
 
 test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (context) => {
   const app = createAppServer({
-    config: { ...serverConfig({}), allowPrivateNetworks: false, allowDnsProxyNetworks: true },
+    config: { ...testServerConfig(), allowPrivateNetworks: false, allowDnsProxyNetworks: true },
   });
   const appBase = await listen(app);
   context.after(() => close(app));
@@ -507,6 +647,8 @@ test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (
 
 test("DNS 透明代理兼容默认开启且可以显式关闭", () => {
   assert.equal(serverConfig({}).allowDnsProxyNetworks, true);
+  assert.equal(serverConfig({}).preflightSources, true);
+  assert.equal(serverConfig({}).preflightDeep, true);
   assert.equal(serverConfig({ ALLOW_DNS_PROXY_NETWORKS: "false" }).allowDnsProxyNetworks, false);
 });
 
@@ -545,7 +687,7 @@ test("图片代理直通普通图片，并可解开已注册的 AES 图片", asy
   });
   const upstreamBase = await listen(upstream);
   const app = createAppServer({
-    config: { ...serverConfig({}), allowPrivateNetworks: true, maxImageBytes: 1024 },
+    config: { ...testServerConfig(), allowPrivateNetworks: true, maxImageBytes: 1024 },
   });
   const appBase = await listen(app);
   context.after(async () => {

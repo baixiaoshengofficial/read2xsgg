@@ -46,6 +46,9 @@ test("顶层 JavaScript 模板直接改写而不会被二次包装成字符串",
 
 test("无法移植的 Android API 仍会被明确识别", () => {
   assert.equal(hasUnsupportedLegadoRuntime('@js:\nreturn java.ajax(source.getKey());'), true);
+  assert.equal(hasUnsupportedLegadoRuntime('@js:\nreturn JSON.parse(src).data;'), true);
+  assert.equal(hasUnsupportedLegadoRuntime('@js:\nreturn baseUrl + "/2";'), true);
+  assert.equal(hasUnsupportedLegadoRuntime('@js:\nlet baseUrl = result.url; return baseUrl + "/2";'), false);
 });
 
 test("列表开头的 Android 前处理不会吞掉后续 JSONPath", () => {

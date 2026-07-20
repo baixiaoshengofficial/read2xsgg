@@ -82,6 +82,20 @@ export function rewriteLegadoJavaScript(value) {
 }
 
 export function hasUnsupportedLegadoRuntime(value) {
-  return /\b(?:java\.|Packages\b|android\.|org\.jsoup|source\.(?:get|set|key|variable)|book\.(?:name|author|kind|url)|cookie\.|javaScript\.)|<js>|\{\{/i
-    .test(String(value || ""));
+  const source = String(value || "");
+  if (/\b(?:java\.|Packages\b|android\.|org\.jsoup|source\.(?:get|set|key|variable)|book\.(?:name|author|kind|url)|cookie\.|javaScript\.)|<js>|\{\{/i.test(source)) {
+    return true;
+  }
+  const marker = source.search(/@js:/i);
+  if (marker < 0) return false;
+  const script = source.slice(marker + 4);
+  // `src`（原始响应）和 `baseUrl`（阅读当前页）是 Legado 字段脚本的
+  // 隐式全局量，不在香色公开的 config/params/result 合约中。局部声明
+  // 同名变量时保留脚本，否则在线源必须桥接或删除该可选字段。
+  const usesUndeclared = (name) => {
+    // 属性名（item.src / params.baseUrl）不是隐式全局量。
+    if (!new RegExp(`(^|[^\\w$.])${name}\\b`).test(script)) return false;
+    return !new RegExp(`\\b(?:var|let|const)\\s+${name}\\b`).test(script);
+  };
+  return usesUndeclared("src") || usesUndeclared("baseUrl");
 }

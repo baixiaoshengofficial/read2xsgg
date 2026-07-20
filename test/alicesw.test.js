@@ -17,12 +17,12 @@ test("alicesw：详情保持 /novel/，目录兼容 section-list|mulu_list，cha
   const c = sources["爱丽丝书屋"];
 
   // 搜索不落地到目录页
-  assert.doesNotMatch(c.searchBook.detailUrl, /\|@js:/);
+  assert.doesNotMatch(c.searchBook.detailUrl, /\|\|?@js:/);
   assert.match(c.searchBook.detailUrl, /\/\/h5\/\/a\/@href|\/\/h5\/a\/@href/);
 
   // 封面可绝对化
   assert.match(c.bookDetail.cover, /og:image/);
-  assert.match(c.bookDetail.cover, /\|@js:/);
+  assert.match(c.bookDetail.cover, /\|\|@js:/);
 
   // 最新章
   assert.match(c.bookDetail.lastChapterTitle, /\/book\//);

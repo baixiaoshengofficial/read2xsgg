@@ -6,7 +6,7 @@
 
 | 文件 | 来源 | 用途 |
 |------|------|------|
-| [香色闺阁书源规则.md](./香色闺阁书源规则.md) | [urzeye/xiangseguige-source-editor](https://github.com/urzeye/xiangseguige-source-editor)（基于 IPA 反解整理） | 字段定义、requestInfo、`@js:` / `\|\|@js:` / `\|@js:` |
+| [香色闺阁书源规则.md](./香色闺阁书源规则.md) | [urzeye/xiangseguige-source-editor](https://github.com/urzeye/xiangseguige-source-editor)（基于 IPA 反解整理） | 字段定义、requestInfo、`@js:` / `\|\|@js:`；转换器发布结果统一使用双竖线后处理 |
 | [XBS_JSON_CODING_RULES.md](./XBS_JSON_CODING_RULES.md) | [lindongjiang/xiangseSkill](https://github.com/lindongjiang/xiangseSkill)（StandarReader 2.56.1） | 实战编码约束、queryInfo、列表相对 XPath |
 
 ## 与本仓库直接相关的条款（摘要）
@@ -49,4 +49,4 @@ url:   //a/@href
 1. `searchBook.detailUrl` 保持 `/novel/{id}.html`（封面 / 最新章在详情页）
 2. `chapterList.requestInfo` 按 §七用 `result`（详情 URL）改写成 `/other/chapters/id/{id}.html`
 3. `list` = `section-list/li || mulu_list/li`
-4. 封面优先 `og:image`（手机端），并 `|@js:` 补全绝对地址
+4. 封面优先 `og:image`（手机端），并 `||@js:` 补全绝对地址

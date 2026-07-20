@@ -124,7 +124,7 @@ function normalizeField(rule) {
 
 function normalizePlan(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError("规则桥接计划无效");
-  const kind = ["books", "chapters", "text"].includes(value.kind) ? value.kind : "";
+  const kind = ["books", "detail", "chapters", "text"].includes(value.kind) ? value.kind : "";
   if (!kind) throw new TypeError("规则桥接计划类型无效");
   const fields = {};
   for (const [name, rule] of Object.entries(value.fields || {})) {
@@ -206,6 +206,25 @@ export function compileBookBridgePlan(action, headers = {}) {
     fields: {
       name: inferredScriptField(action.bookName, [/^(?:book)?name$/i, /title/i, /username/i]),
       url: inferredScriptField(action.detailUrl, [/url/i, /id/i, /username/i]),
+      author: action.author,
+      desc: action.desc,
+      cat: action.cat,
+      lastChapterTitle: action.lastChapterTitle,
+      cover: action.cover,
+      status: action.status,
+      wordCount: action.wordCount,
+    },
+    headers,
+  });
+}
+
+export function compileDetailBridgePlan(action, headers = {}) {
+  return normalizePlan({
+    kind: "detail",
+    host: action.host,
+    responseType: action.responseFormatType,
+    fields: {
+      name: action.bookName,
       author: action.author,
       desc: action.desc,
       cat: action.cat,
@@ -372,6 +391,14 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit = Infinity } =
   }
   if (plan.kind === "text") {
     return { content: transformed(plan, plan.fields.content, input, { content: plan.responseType === "html" }) };
+  }
+  if (plan.kind === "detail") {
+    const result = {};
+    for (const [name, rule] of Object.entries(plan.fields)) {
+      result[name] = transformed(plan, rule, input, { content: false });
+    }
+    if (result.cover) result.cover = absolute(result.cover, baseUrl);
+    return result;
   }
   const items = plan.responseType === "json"
     ? (() => {

@@ -16,6 +16,7 @@ import {
   bridgeTocUrl,
   compileBookBridgePlan,
   compileChapterBridgePlan,
+  compileDetailBridgePlan,
   compileTextBridgePlan,
   decodeBridgePlan,
   executeBridgePlan,
@@ -51,10 +52,15 @@ export function serverConfig(environment = process.env) {
     maxCacheEntries: integer(environment.MAX_CACHE_ENTRIES, 100),
     allowPrivateNetworks: boolean(environment.ALLOW_PRIVATE_NETWORKS),
     allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS, true),
-    preflightSources: boolean(environment.PREFLIGHT_SOURCES),
-    preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES),
+    // 在线转换的默认目标是“导入即可用”。未显式配置环境变量时也要
+    // 排除死站和空链路；离线转换与单元测试可明确关闭预检。
+    preflightSources: boolean(environment.PREFLIGHT_SOURCES, true),
+    preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES, true),
     preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 2_500),
     preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 48),
+    maxComicPages: integer(environment.MAX_COMIC_PAGES, 50),
+    maxComicImages: integer(environment.MAX_COMIC_IMAGES, 2_000),
+    comicPageConcurrency: integer(environment.COMIC_PAGE_CONCURRENCY, 4),
     corsOrigin: environment.CORS_ORIGIN || "*",
     mwwzDiscoveryUrl: environment.MWWZ_DISCOVERY_URL || "https://www.manwake.cc/",
     jmDiscoveryUrl: environment.JM_DISCOVERY_URL || "https://jmcomicqa.cc/",
@@ -285,8 +291,66 @@ function declarativeBridgeAction(action, type) {
   }
 }
 
-function declarativeBookTarget(action, bridge) {
-  if (!bridge || /^@js:/i.test(bridge.requestInfo.trim())) return "";
+function safeGeneratedRequestTarget(requestInfo, host, { keyWord = "", pageIndex = 1, offset = 0, filter = "" } = {}) {
+  const source = String(requestInfo || "");
+  const expression = source.match(/\b(?:var|let|const)\s+url\s*=\s*([^;\r\n]{1,4096})\s*;/)?.[1];
+  if (!expression) return "";
+  const parts = [];
+  let start = 0;
+  let quote = "";
+  let escaped = false;
+  let depth = 0;
+  for (let index = 0; index < expression.length; index += 1) {
+    const character = expression[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === '"' || character === "'") quote = character;
+    else if (character === "(") depth += 1;
+    else if (character === ")") depth -= 1;
+    else if (character === "+" && depth === 0) {
+      parts.push(expression.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  if (quote || depth !== 0) return "";
+  parts.push(expression.slice(start).trim());
+  let result = "";
+  const values = {
+    "config.host": host,
+    "params.keyWord": keyWord,
+    "params.pageIndex": String(pageIndex),
+    "params.offset": String(offset),
+    "params.filter": filter,
+    "encodeURIComponent(params.keyWord)": encodeURIComponent(keyWord),
+  };
+  for (const part of parts) {
+    if (Object.hasOwn(values, part)) {
+      result += values[part];
+      continue;
+    }
+    if (/^"(?:\\.|[^"\\])*"$/.test(part)) {
+      try { result += JSON.parse(part); } catch { return ""; }
+      continue;
+    }
+    const single = part.match(/^'((?:\\.|[^'\\])*)'$/);
+    if (single) {
+      result += single[1].replace(/\\'/g, "'").replace(/\\\\/g, "\\");
+      continue;
+    }
+    return "";
+  }
+  try { return new URL(result, host).toString(); } catch { return ""; }
+}
+
+function declarativeBookTarget(action, bridge, values = {}) {
+  if (!bridge) return "";
+  if (/^@js:/i.test(bridge.requestInfo.trim())) {
+    return safeGeneratedRequestTarget(bridge.requestInfo, bridge.plan.host, values);
+  }
   const marker = "&url=";
   const index = bridge.requestInfo.indexOf(marker);
   const embedded = index >= 0;
@@ -357,6 +421,30 @@ async function executeDeclarativeUrl(plan, targetUrl, config, { chapters = false
   return executeBridgePlan(text, targetUrl, plan, { limit });
 }
 
+/**
+ * A common mixed API/web source shape returns `/api/book/123` from its JSON
+ * list while the chapter selector is declared for `/book/123` HTML. Generated
+ * XSGG requestInfo performs that rewrite at runtime; deep preflight must try the
+ * same same-origin, declarative fallback without evaluating source JavaScript.
+ */
+export function chapterPageCandidates(value) {
+  let parsed;
+  try {
+    parsed = new URL(String(value || ""));
+  } catch {
+    return [];
+  }
+  const candidates = [parsed.toString()];
+  if (/(?:^|\/)api\//i.test(parsed.pathname)) {
+    const page = new URL(parsed);
+    page.pathname = page.pathname.replace(/(^|\/)api\//i, "$1");
+    page.search = "";
+    page.hash = "";
+    if (!candidates.includes(page.toString())) candidates.push(page.toString());
+  }
+  return candidates;
+}
+
 function encodedAdapterPlan(action, endpoint) {
   const requestInfo = String(action?.requestInfo || "");
   if (!new RegExp(`/adapter/${endpoint.replace("/", "\\/")}\\?`).test(requestInfo)) return null;
@@ -382,8 +470,9 @@ async function sourceContentReachable(source, chapterUrl, config) {
 
   const imagePlan = encodedAdapterPlan(source?.chapterContent, "images");
   if (imagePlan !== null) {
-    const page = await downloadSource(chapterUrl, config);
-    return pageImageUrls(page.toString("utf8"), chapterUrl, decodeComicExtractionPlan(imagePlan)).length > 0;
+    const plan = decodeComicExtractionPlan(imagePlan);
+    const page = await downloadSource(chapterUrl, config, plan.headers);
+    return pageImageUrls(page.toString("utf8"), chapterUrl, plan).length > 0;
   }
 
   const mediaPlan = encodedAdapterPlan(source?.chapterContent, "media");
@@ -392,7 +481,7 @@ async function sourceContentReachable(source, chapterUrl, config) {
     const plan = decodeMediaExtractionPlan(mediaPlan, kind);
     const direct = pageMediaUrls("", chapterUrl, plan);
     if (direct.length) return true;
-    const page = await downloadSource(chapterUrl, config);
+    const page = await downloadSource(chapterUrl, config, plan.headers);
     return pageMediaUrls(page.toString("utf8"), chapterUrl, plan).length > 0;
   }
 
@@ -408,23 +497,29 @@ async function sourceBridgeChainReachable(source, config) {
   // This runs while generating an aggregate XBS and must stay below normal
   // reverse-proxy timeouts. One real category/book chain is enough to reject
   // dead selectors; the standalone validator performs the exhaustive retries.
-  const worlds = Object.values(source?.bookWorld || {}).slice(0, 1);
+  const worlds = [
+    ...Object.values(source?.bookWorld || {}).slice(0, 1),
+    ...(source?.searchBook ? [source.searchBook] : []),
+  ];
+  const keyWord = source?.sourceType === "comic" ? "漫画" : "小说";
   const deepConfig = { ...config, fetchTimeoutMs: config.preflightTimeoutMs };
   for (const action of worlds) {
     const bookBridge = executableBookAction(source, action);
-    const targetUrl = declarativeBookTarget(action, bookBridge);
+    const targetUrl = declarativeBookTarget(action, bookBridge, { keyWord });
     if (!bookBridge || !targetUrl) continue;
     try {
       const books = await executeDeclarativeUrl(bookBridge.plan, targetUrl, deepConfig, { limit: 3 });
       for (const book of (books.data || []).slice(0, 3)) {
         if (!book?.url) continue;
-        try {
-          const chapters = await executeDeclarativeUrl(chapterBridge.plan, book.url, deepConfig, { chapters: true, limit: 2 });
-          for (const chapter of (chapters.data || []).slice(0, 2)) {
-            if (chapter?.url && await sourceContentReachable(source, chapter.url, deepConfig)) return true;
+        for (const chapterPageUrl of chapterPageCandidates(book.url)) {
+          try {
+            const chapters = await executeDeclarativeUrl(chapterBridge.plan, chapterPageUrl, deepConfig, { chapters: true, limit: 2 });
+            for (const chapter of (chapters.data || []).slice(0, 2)) {
+              if (chapter?.url && await sourceContentReachable(source, chapter.url, deepConfig)) return true;
+            }
+          } catch {
+            // Try the next safe same-origin detail-page candidate.
           }
-        } catch {
-          // Try another book because fresh/deleted entries often have no toc.
         }
       }
     } catch {
@@ -842,6 +937,7 @@ function adapterRequestFromRequest(request) {
       : parsed.pathname === "/adapter/media" ? "page-media"
         : parsed.pathname === "/adapter/toc" ? "toc-redirect"
           : parsed.pathname === "/adapter/books" ? "bridge-books"
+            : parsed.pathname === "/adapter/detail" ? "bridge-detail"
             : parsed.pathname === "/adapter/chapters" ? "bridge-chapters"
               : parsed.pathname === "/adapter/text" ? "bridge-text"
       : "";
@@ -971,6 +1067,9 @@ function help(config) {
       fetchTimeoutMs: config.fetchTimeoutMs,
       allowPrivateNetworks: config.allowPrivateNetworks,
       allowDnsProxyNetworks: config.allowDnsProxyNetworks,
+      preflightSources: config.preflightSources,
+      preflightDeep: config.preflightDeep,
+      preflightTimeoutMs: config.preflightTimeoutMs,
       imageDecoders: supportedImageDecoders(),
     },
   };
@@ -1220,6 +1319,134 @@ export function pageImageUrls(page, baseUrl, extractionPlan = null) {
       .map((item) => item.value);
   }
   return largest;
+}
+
+const PAGE_QUERY_KEYS = new Set([
+  "page", "p", "pageindex", "pageidx", "pageno", "pagenum", "pagenumber",
+]);
+
+function normalizedPaginationKey(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function paginationNumber(object, names) {
+  if (!object || typeof object !== "object" || Array.isArray(object)) return null;
+  const wanted = new Set(names.map(normalizedPaginationKey));
+  for (const [key, value] of Object.entries(object)) {
+    if (!wanted.has(normalizedPaginationKey(key))) continue;
+    const number = Number(value);
+    if (Number.isFinite(number) && number >= 0) return Math.floor(number);
+  }
+  return null;
+}
+
+function paginationMetadata(document, requestedPage) {
+  let root;
+  try {
+    root = JSON.parse(String(document || ""));
+  } catch {
+    return null;
+  }
+  let best = null;
+  const visit = (value, depth = 0) => {
+    if (!value || typeof value !== "object" || depth > 8) return;
+    if (!Array.isArray(value)) {
+      const current = paginationNumber(value, ["current_page", "currentPage", "page", "pageIndex", "pageNo", "pageNum"]);
+      const directPages = paginationNumber(value, ["total_pages", "totalPages", "page_count", "pageCount", "last_page", "lastPage"]);
+      const total = paginationNumber(value, ["total", "total_count", "totalCount", "record_count", "recordCount"]);
+      const pageSize = paginationNumber(value, ["page_size", "pageSize", "per_page", "perPage", "limit"]);
+      const totalPages = directPages || (total !== null && pageSize ? Math.ceil(total / pageSize) : null);
+      if (totalPages !== null && totalPages > 1) {
+        const effectiveCurrent = current ?? requestedPage;
+        if (effectiveCurrent !== null && effectiveCurrent >= 0 && totalPages > effectiveCurrent) {
+          const score = (directPages ? 8 : 4)
+            + (current !== null ? 2 : 0)
+            + (current === requestedPage ? 4 : 0)
+            + (total !== null && pageSize ? 1 : 0);
+          if (!best || score > best.score) best = { current: effectiveCurrent, totalPages, score };
+        }
+      }
+    }
+    for (const child of Array.isArray(value) ? value : Object.values(value)) visit(child, depth + 1);
+  };
+  visit(root);
+  return best;
+}
+
+/**
+ * Discover subsequent JSON comic API pages from conventional pagination
+ * metadata. Only an existing page-like query parameter is changed, so data
+ * returned by an untrusted source cannot redirect the adapter to another host.
+ */
+export function comicPageUrls(page, requestUrl, maxPages = 50) {
+  let parsed;
+  try {
+    parsed = new URL(String(requestUrl || ""));
+  } catch {
+    return [];
+  }
+  let pageKey = "";
+  let requestedPage = null;
+  for (const [key, value] of parsed.searchParams) {
+    if (!PAGE_QUERY_KEYS.has(normalizedPaginationKey(key))) continue;
+    const number = Number(value);
+    if (!Number.isInteger(number) || number < 0) continue;
+    pageKey = key;
+    requestedPage = number;
+    break;
+  }
+  if (!pageKey) return [];
+  const metadata = paginationMetadata(page, requestedPage);
+  if (!metadata) return [];
+  const pageLimit = Math.max(1, Number.parseInt(maxPages, 10) || 50);
+  const lastPage = Math.min(metadata.totalPages, metadata.current + pageLimit - 1);
+  const urls = [];
+  for (let value = metadata.current + 1; value <= lastPage; value += 1) {
+    const next = new URL(parsed);
+    next.searchParams.set(pageKey, String(value));
+    urls.push(next.toString());
+  }
+  return urls;
+}
+
+async function downloadComicImageSequence(sourceUrl, config, extractionPlan) {
+  if (/\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(sourceUrl)) return [sourceUrl];
+  const maxPages = Number.isInteger(config.maxComicPages) ? config.maxComicPages : 50;
+  const maxImages = Number.isInteger(config.maxComicImages) ? config.maxComicImages : 2_000;
+  const concurrency = Number.isInteger(config.comicPageConcurrency) ? config.comicPageConcurrency : 4;
+  const firstPage = await downloadSource(sourceUrl, config, extractionPlan?.headers);
+  const firstText = firstPage.toString("utf8");
+  const firstImages = pageImageUrls(firstText, sourceUrl, extractionPlan);
+  const followingPages = comicPageUrls(firstText, sourceUrl, maxPages);
+  if (!followingPages.length) return firstImages.slice(0, maxImages);
+
+  const pageResults = Array.from({ length: followingPages.length }, () => []);
+  let cursor = 0;
+  const workerCount = Math.min(concurrency, followingPages.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (cursor < followingPages.length) {
+      const index = cursor;
+      cursor += 1;
+      const pageUrl = followingPages[index];
+      try {
+        const body = await downloadSource(pageUrl, config, extractionPlan?.headers);
+        pageResults[index] = pageImageUrls(body.toString("utf8"), pageUrl, extractionPlan);
+      } catch {
+        // Preserve all successfully decoded pages. A transient later-page error
+        // should not make an otherwise readable chapter completely unavailable.
+      }
+    }
+  });
+  await Promise.all(workers);
+  const seen = new Set();
+  const images = [];
+  for (const url of [firstImages, ...pageResults].flat()) {
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    images.push(url);
+    if (images.length >= maxImages) break;
+  }
+  return images;
 }
 
 // Backward-compatible export for callers that previously used the JM-specific name.
@@ -1486,8 +1713,11 @@ export function createAppServer(options = {}) {
           if (adapterTarget.type === "page-media") {
             values = pageMediaUrls("", sourceUrl, adapterTarget.extractionPlan);
           }
+          if (!values?.length && adapterTarget.type === "page-images") {
+            values = await downloadComicImageSequence(sourceUrl, config, adapterTarget.extractionPlan);
+          }
           if (!values?.length) {
-            const detailPage = await downloadSource(sourceUrl, config);
+            const detailPage = await downloadSource(sourceUrl, config, adapterTarget.extractionPlan?.headers);
             values = adapterTarget.type === "jm-chapters"
               ? jmChapterEntries(detailPage.toString("utf8"), sourceUrl)
               : adapterTarget.type === "page-media"

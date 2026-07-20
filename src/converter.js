@@ -5,7 +5,13 @@ import { decoderForLegadoImageRule } from "./imageDecoder.js";
 import { compileComicExtractionPlan, encodeComicExtractionPlan } from "./comicPlan.js";
 import { compileMediaExtractionPlan, encodeMediaExtractionPlan } from "./mediaPlan.js";
 import { hasUnsupportedLegadoRuntime } from "./legadoJs.js";
-import { compileBookBridgePlan, compileChapterBridgePlan, compileTextBridgePlan, encodeBridgePlan } from "./bridgePlan.js";
+import {
+  compileBookBridgePlan,
+  compileChapterBridgePlan,
+  compileDetailBridgePlan,
+  compileTextBridgePlan,
+  encodeBridgePlan,
+} from "./bridgePlan.js";
 
 const EMPTY_ACTIONS = {
   relatedWord: { actionID: "relatedWord", parserID: "DOM" },
@@ -92,7 +98,7 @@ function wrapComicImageContent(contentRule) {
   if (!/@(?:src|data-original|data-src)\b/i.test(contentRule) && !/\/@(?:src|data-original|data-src)\b/i.test(contentRule)) {
     return contentRule;
   }
-  if (/\|@js:/.test(contentRule)) return contentRule;
+  if (/\|\|?\s*@js:/i.test(contentRule)) return contentRule;
   const wrapJs = [
     "@js:",
     "var text = String(result || \"\").trim();",
@@ -107,7 +113,7 @@ function wrapComicImageContent(contentRule) {
     "  return line;",
     "}).filter(Boolean).join(\"\\n\");",
   ].join("\n");
-  return `${contentRule}|${wrapJs}`;
+  return `${contentRule}||${wrapJs}`;
 }
 
 /**
@@ -135,11 +141,12 @@ function wrapMediaContent(contentRule) {
     "  forbidCache: true",
     "});",
   ].join("\n");
-  if (/\|@js:/.test(contentRule)) {
-    // 已有后处理：在末尾再叠一层播放包装（香色多段 |@js 取最后 result 链）
-    return `${contentRule}|${wrapJs}`;
+  if (/\|\|?\s*@js:/i.test(contentRule)) {
+    // 香色公开样例中没有串联多个 @js 后处理器；保留现有脚本，避免把
+    // 第二段 `||@js:` 当作第一段 JavaScript 的源码。
+    return contentRule;
   }
-  return `${contentRule}|${wrapJs}`;
+  return `${contentRule}||${wrapJs}`;
 }
 
 /** Audio/video sources often put the playable URL directly in chapterUrl. */
@@ -163,7 +170,7 @@ function directMediaContent() {
 function proxiedJsonImageContent(imageProxyBase, decoder) {
   const endpoint = `${String(imageProxyBase).replace(/\/$/, "")}/image/${decoder}?url=`;
   return [
-    "data/images|@js:",
+    "$.data.images||@js:",
     "var images = Array.isArray(result) ? result : [];",
     `var endpoint = ${JSON.stringify(endpoint)};`,
     "var urls = images.map(function (item) {",
@@ -177,7 +184,7 @@ function proxiedJsonImageContent(imageProxyBase, decoder) {
 
 /** Replace Legado's baseUrl/src image-wrapper JS with portable 香色 image markup. */
 function proxiedLineImageContent(contentRule, imageProxyBase, decoder) {
-  const selector = String(contentRule || "").split("|@js:", 1)[0];
+  const selector = String(contentRule || "").split(/\|\|?\s*@js:/i, 1)[0];
   const endpoint = `${String(imageProxyBase).replace(/\/$/, "")}/image/${decoder}?url=`;
   const proxyJs = [
     "@js:",
@@ -193,16 +200,19 @@ function proxiedLineImageContent(contentRule, imageProxyBase, decoder) {
     "var urls = text.split(/\\r?\\n+/).map(function (line) { return line.trim(); }).filter(function (url) { return /^https?:\\/\\//i.test(url); });",
     "return urls.length ? urls.map(toImage).join(\"\\n\") : text;",
   ].join("\n");
-  return selector ? `${selector}|${proxyJs}` : proxyJs;
+  return selector ? `${selector}||${proxyJs}` : proxyJs;
 }
 
 function nativeJmRequestInfo() {
   return [
     "@js:",
-    'var u = (typeof result == "string") ? result : "";',
+    'var q = (params && params.queryInfo) || {};',
+    // chapterUrl/url changes with the active action; detailUrl remains the
+    // book page for the whole chain and must therefore be the last fallback.
+    'var u = q.chapterUrl || q.url || q.detailUrl || "";',
+    'if (!u) u = (typeof result == "string") ? result : "";',
     'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
     'if (u == "%@result") u = "";',
-    'if (!u && params && params.queryInfo) u = params.queryInfo.detailUrl || params.queryInfo.url || "";',
     'u = String(u || "").trim();',
     'if (u.indexOf("//") == 0) u = "https:" + u;',
     'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
@@ -214,10 +224,11 @@ function nativeJmRequestInfo() {
 function runtimeAdapterRequestInfo(endpoint) {
   return [
     "@js:",
-    'var u = (typeof result == "string") ? result : "";',
+    'var q = (params && params.queryInfo) || {};',
+    'var u = q.chapterUrl || q.url || q.detailUrl || "";',
+    'if (!u) u = (typeof result == "string") ? result : "";',
     'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
     'if (u == "%@result") u = "";',
-    'if (!u && params && params.queryInfo) u = params.queryInfo.detailUrl || params.queryInfo.url || "";',
     'u = String(u || "").trim();',
     'if (u.indexOf("//") == 0) u = "https:" + u;',
     'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
@@ -234,9 +245,11 @@ function bridgeRequestInfo(requestInfo, endpoint) {
     if (/\b(?:POST|httpParams|requestBody|webView)\b/.test(effectiveSource)) return "";
     return [
       "@js:",
-      "var u = (function () {",
+      'var q = (params && params.queryInfo) || {};',
+      'var seed = q.chapterUrl || q.url || q.detailUrl || result || "";',
+      "var u = (function (result) {",
       source.replace(/^@js:\s*/i, ""),
-      "}).call(this);",
+      "}).call(this, seed);",
       'if (u && typeof u == "object") u = u.url || "";',
       'u = String(u || "").trim();',
       `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
@@ -261,7 +274,7 @@ function bridgeBookAction(action, bridgeBase, headers) {
   return {
     ...commonAction(action.actionID || "bookWorld", action.host, "json"),
     requestInfo,
-    list: "data",
+    list: "$.data",
     bookName: "name",
     detailUrl: "url",
     author: "author",
@@ -273,6 +286,27 @@ function bridgeBookAction(action, bridgeBase, headers) {
     wordCount: "wordCount",
     ...(action.moreKeys ? { moreKeys: action.moreKeys } : {}),
     ...(action._sIndex !== undefined ? { _sIndex: action._sIndex } : {}),
+  };
+}
+
+function bridgeDetailAction(action, bridgeBase, headers) {
+  if (!action?.bookName || !action?.requestInfo) return action;
+  const plan = compileDetailBridgePlan(action, headers);
+  if (!plan.fields.name) return action;
+  const endpoint = bridgeEndpoint(bridgeBase, "detail", plan);
+  const requestInfo = bridgeRequestInfo(action.requestInfo, endpoint);
+  if (!requestInfo) return action;
+  return {
+    ...commonAction("bookDetail", action.host, "json"),
+    requestInfo,
+    bookName: "$.name",
+    author: "$.author",
+    desc: "$.desc",
+    cat: "$.cat",
+    lastChapterTitle: "$.lastChapterTitle",
+    cover: "$.cover",
+    status: "$.status",
+    wordCount: "$.wordCount",
   };
 }
 
@@ -288,7 +322,7 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
   return {
     ...commonAction("chapterList", action.host, "json"),
     requestInfo,
-    list: "data",
+    list: "$.data",
     title: "title",
     url: "url",
     updateTime: "updateTime",
@@ -305,7 +339,7 @@ function bridgeTextAction(action, bridgeBase, headers) {
   return {
     ...commonAction("chapterContent", action.host, "json"),
     requestInfo,
-    content: "content",
+    content: "$.content",
   };
 }
 
@@ -353,7 +387,7 @@ function proxiedHtmlComicChapterContent(host, imageProxyBase, decoder = "auto", 
     ...commonAction("chapterContent", host, "json"),
     requestInfo: runtimeAdapterRequestInfo(endpoint),
     content: [
-      "urls|@js:",
+      "$.urls||@js:",
       'var images = Array.isArray(result) ? result : [];',
       `var endpoint = ${JSON.stringify(imageEndpoint)};`,
       'var urls = images.map(function (url) { return endpoint + encodeURIComponent(String(url || "")); }).filter(Boolean);',
@@ -737,9 +771,9 @@ function convertOne(source, warnings, options = {}) {
   const tocRules = getRules(source, "ruleToc", "tocRule");
   const contentRules = getRules(source, "ruleContent", "contentRule");
   const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode);
-  const comicExtractionPlan = compileComicExtractionPlan(contentRules.content);
+  const comicExtractionPlan = compileComicExtractionPlan(contentRules.content, headers);
   const mediaExtractionPlan = (resolvedType === "audio" || resolvedType === "video")
-    ? compileMediaExtractionPlan(`${contentRules.content || ""}\n${tocRules.chapterUrl || ""}`, resolvedType)
+    ? compileMediaExtractionPlan(`${contentRules.content || ""}\n${tocRules.chapterUrl || ""}`, resolvedType, headers)
     : null;
   const isJmComic = resolvedType === "comic" && (
     ["jm-scramble", "id-md5-reverse-tiles"].includes(imageDecoder)
@@ -777,7 +811,7 @@ function convertOne(source, warnings, options = {}) {
   // plan compiled from the original content rule and can parse HTML, JSON,
   // hydration scripts or plain URL lists without checking the source domain.
   const useHtmlComicImageAdapter = resolvedType === "comic" && Boolean(options.imageProxyBase)
-    && Boolean(contentRules.content) && !isPrefixAesDecoder;
+    && Boolean(contentRules.content);
   const contentWarningFor = createWarningCollector(warnings, sourceName, "chapterContent");
 
   const bookDetail = {
@@ -951,15 +985,15 @@ function convertOne(source, warnings, options = {}) {
     contentWarningFor("content", contentRules.content)("正文为 JSON 媒体接口或依赖阅读 Android API，已改由通用媒体提取器解析播放地址");
   }
 
-  // apply replaceRegex / replaceRegex array onto content field
-  // 香色后处理语法是「xpath|@js:」（单竖线）；「||@js:」会被当成备选规则导致正文为空。
+  // apply replaceRegex / replaceRegex array onto content field. 2.56.1 的
+  // 可用参考源统一用 `selector||@js:` 传递选择器结果。
   const replaceRegex = contentRules.replaceRegex ?? contentRules.replace;
   if (converted.chapterContent.content && replaceRegex) {
     const patterns = Array.isArray(replaceRegex) ? replaceRegex : [replaceRegex];
     const body = patterns
       .map((pattern) => `result = String(result).replace(new RegExp(${JSON.stringify(String(pattern))}, "g"), "");`)
       .join("\n");
-    converted.chapterContent.content += `|@js:\n${body}\nreturn result;`;
+    converted.chapterContent.content += `||@js:\n${body}\nreturn result;`;
   }
 
   if (options.imageProxyBase) {
@@ -968,6 +1002,7 @@ function convertOne(source, warnings, options = {}) {
       bridgeBookAction(action, options.imageProxyBase, headers),
     ])));
     converted.searchBook = bridgeBookAction(converted.searchBook, options.imageProxyBase, headers);
+    converted.bookDetail = bridgeDetailAction(converted.bookDetail, options.imageProxyBase, headers);
     converted.chapterList = bridgeChapterAction(converted.chapterList, options.imageProxyBase, {
       tocSelector: bookDetail.tocUrl || "",
       headers,
@@ -1006,6 +1041,12 @@ function sanitizePortableAction(action, requiredFields, warnings, sourceName, se
       message: "该可选字段仍依赖阅读 Android 运行时，已删除字段并保留可执行的核心动作",
       rule: value,
     });
+  }
+  if (!cleaned.nextPageUrl && cleaned.moreKeys && typeof cleaned.moreKeys === "object") {
+    const moreKeys = { ...cleaned.moreKeys };
+    delete moreKeys.maxPage;
+    if (Object.keys(moreKeys).length) cleaned.moreKeys = moreKeys;
+    else delete cleaned.moreKeys;
   }
   return cleaned;
 }

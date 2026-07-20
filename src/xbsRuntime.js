@@ -4,7 +4,10 @@ import { decodeXbs } from "./xbs.js";
 
 function splitPostScript(rule) {
   const source = String(rule || "").trim();
-  const match = source.match(/\|\|?\s*@js:/i);
+  // Match the 2.56.1-compatible form used by the maintained public corpus.
+  // Keeping the validator strict prevents generated single-pipe rules from
+  // passing our tests while producing empty fields in the real client.
+  const match = source.match(/\|\|\s*@js:/i);
   if (!match) return { selector: source, script: "" };
   return {
     selector: source.slice(0, match.index).trim(),

@@ -53,7 +53,7 @@ test("香色动作链执行器验证分类、详情、章节和正文", async (c
   };
   const converted = convertLegado(legado, { imageProxyBase: bridgeBase, omitNonPortable: true }).sources["运行时测试"];
   assert.equal(converted.bookWorld["分类"].responseFormatType, "json");
-  assert.equal(converted.bookWorld["分类"].list, "data");
+  assert.equal(converted.bookWorld["分类"].list, "$.data");
   assert.match(converted.chapterList.requestInfo, /\/adapter\/chapters/);
   assert.match(converted.chapterContent.requestInfo, /\/adapter\/text/);
   const report = await runXbsPipeline(converted, { filter: "分类 12", pageIndex: 2 });

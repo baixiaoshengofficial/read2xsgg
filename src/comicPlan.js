@@ -2,6 +2,7 @@ const MAX_HINTS = 16;
 const SAFE_NAME = /^[A-Za-z_$][\w$-]{0,63}$/;
 const URL_PROPERTY = /(?:url|uri|src|source|image|img|pic|picture|file|path)/i;
 const URL_ATTRIBUTE = /(?:src|source|original|lazy|url|file|style)/i;
+const BLOCKED_HEADERS = /^(?:host|content-length|transfer-encoding|connection|te|trailer|upgrade|proxy-|sec-websocket-)/i;
 
 function uniqueNames(values, matcher) {
   const result = [];
@@ -14,12 +15,26 @@ function uniqueNames(values, matcher) {
   return result;
 }
 
+function safeHeaders(value) {
+  const result = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return result;
+  for (const [rawName, rawValue] of Object.entries(value)) {
+    const name = String(rawName || "").trim();
+    const headerValue = String(rawValue ?? "").replace(/[\r\n]+/g, " ").trim();
+    if (!name || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || BLOCKED_HEADERS.test(name)) continue;
+    if (!headerValue || headerValue.length > 2_048) continue;
+    result[name] = headerValue;
+    if (Object.keys(result).length >= 16) break;
+  }
+  return result;
+}
+
 /**
  * Compile the portable part of a Legado comic-content rule into declarative
  * extraction hints. The plan contains no executable JavaScript or regex from
  * the source, so an online source cannot inject code into the converter.
  */
-export function compileComicExtractionPlan(rule) {
+export function compileComicExtractionPlan(rule, headers = {}) {
   const source = String(rule || "");
   const properties = [];
   const attributes = [];
@@ -44,19 +59,23 @@ export function compileComicExtractionPlan(rule) {
     if (URL_ATTRIBUTE.test(match[1])) addAttribute(match[1]);
   }
 
+  const normalizedHeaders = safeHeaders(headers);
   return {
     version: 1,
     properties: uniqueNames(properties, URL_PROPERTY),
     attributes: uniqueNames(attributes, URL_ATTRIBUTE),
+    ...(Object.keys(normalizedHeaders).length ? { headers: normalizedHeaders } : {}),
   };
 }
 
 export function normalizeComicExtractionPlan(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return { version: 1, properties: [], attributes: [] };
+  const headers = safeHeaders(value.headers);
   return {
     version: 1,
     properties: uniqueNames(Array.isArray(value.properties) ? value.properties : [], URL_PROPERTY),
     attributes: uniqueNames(Array.isArray(value.attributes) ? value.attributes : [], URL_ATTRIBUTE),
+    ...(Object.keys(headers).length ? { headers } : {}),
   };
 }
 
@@ -69,7 +88,7 @@ export function encodeComicExtractionPlan(plan) {
 export function decodeComicExtractionPlan(value) {
   const encoded = String(value || "");
   if (!encoded) return normalizeComicExtractionPlan(null);
-  if (encoded.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(encoded)) throw new TypeError("漫画提取计划编码无效");
+  if (encoded.length > 8192 || !/^[A-Za-z0-9_-]+$/.test(encoded)) throw new TypeError("漫画提取计划编码无效");
   let parsed;
   try {
     parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
