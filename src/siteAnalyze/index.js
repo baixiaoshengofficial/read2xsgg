@@ -196,4 +196,5 @@ export {
   mediaDiscoveryToXiangse,
   discoveryToXiangse,
   kindLabel,
+  withNovelHtmlStripped,
 } from "./toXiangse.js";

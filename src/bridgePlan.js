@@ -1,4 +1,5 @@
 import { JSDOM } from "jsdom";
+import { isXiangseGbkEncode } from "./charset.js";
 
 const MAX_PLAN_BYTES = 24 * 1024;
 const FIELD_NAMES = new Set([
@@ -66,6 +67,15 @@ function hostResultTransform(script) {
 
 function normalizeField(rule) {
   if (rule && typeof rule === "object" && !Array.isArray(rule)) {
+    if (rule.constant && /^https?:\/\//i.test(String(rule.constant))) {
+      return {
+        selector: ".",
+        constant: String(rule.constant).slice(0, 2048),
+        replacements: [],
+        hostPrefix: false,
+        matchTemplate: null,
+      };
+    }
     const selector = selectorOnly(rule.selector);
     if (!selector) return null;
     const replacements = Array.isArray(rule.replacements) ? rule.replacements.map((item) => {
@@ -85,6 +95,15 @@ function normalizeField(rule) {
     return { selector, replacements, hostPrefix: Boolean(rule.hostPrefix), matchTemplate };
   }
   const source = String(rule || "").trim();
+  if (/^https?:\/\//i.test(source) && !/[|@]|##/.test(source.split(/\s/, 1)[0])) {
+    return {
+      selector: ".",
+      constant: source.slice(0, 2048),
+      replacements: [],
+      hostPrefix: false,
+      matchTemplate: null,
+    };
+  }
   const selector = selectorOnly(source);
   if (!selector) return null;
   const replacements = [];
@@ -130,7 +149,11 @@ function normalizePlan(value) {
   for (const [name, rule] of Object.entries(value.fields || {})) {
     if (!FIELD_NAMES.has(name)) continue;
     const field = normalizeField(rule);
-    if (field) fields[name] = field;
+    if (field) {
+      fields[name] = field.constant
+        ? { constant: field.constant }
+        : field;
+    }
   }
   const headers = {};
   for (const [name, headerValue] of Object.entries(value.headers || {})) {
@@ -144,6 +167,9 @@ function normalizePlan(value) {
     responseType: value.responseType === "json" ? "json" : "html",
     list: selectorOnly(value.list),
     tocSelector: selectorOnly(value.tocSelector),
+    charset: /^(?:gbk|utf-8)$/i.test(String(value.charset || "").trim())
+      ? String(value.charset).trim().toLowerCase()
+      : "",
     fields,
     headers,
   };
@@ -241,11 +267,18 @@ function inferredScriptField(rule, preferredNames = []) {
   return "";
 }
 
+function planCharset(action) {
+  if (isXiangseGbkEncode(action)) return "gbk";
+  const charset = String(action?.charset || "").trim().toLowerCase();
+  return charset === "gbk" || charset === "utf-8" ? charset : "";
+}
+
 export function compileBookBridgePlan(action, headers = {}) {
   return normalizePlan({
     kind: "books",
     host: action.host,
     responseType: action.responseFormatType,
+    charset: planCharset(action),
     list: action.list,
     fields: {
       name: inferredScriptField(action.bookName, [/^(?:book)?name$/i, /title/i, /username/i]),
@@ -254,7 +287,7 @@ export function compileBookBridgePlan(action, headers = {}) {
       desc: action.desc,
       cat: action.cat,
       lastChapterTitle: action.lastChapterTitle,
-      cover: action.cover,
+      cover: inferredScriptField(action.cover, [/cover/i, /pic/i, /img/i, /icon/i]) || action.cover,
       status: action.status,
       wordCount: action.wordCount,
     },
@@ -267,13 +300,14 @@ export function compileDetailBridgePlan(action, headers = {}) {
     kind: "detail",
     host: action.host,
     responseType: action.responseFormatType,
+    charset: planCharset(action),
     fields: {
       name: action.bookName,
       author: action.author,
       desc: action.desc,
       cat: action.cat,
       lastChapterTitle: action.lastChapterTitle,
-      cover: action.cover,
+      cover: inferredScriptField(action.cover, [/cover/i, /pic/i, /img/i, /icon/i]) || action.cover,
       status: action.status,
       wordCount: action.wordCount,
     },
@@ -286,6 +320,7 @@ export function compileChapterBridgePlan(action, { tocSelector = "", headers = {
     kind: "chapters",
     host: action.host,
     responseType: action.responseFormatType,
+    charset: planCharset(action),
     list: action.list,
     tocSelector,
     fields: {
@@ -302,12 +337,13 @@ export function compileTextBridgePlan(action, headers = {}) {
     kind: "text",
     host: action.host,
     responseType: action.responseFormatType,
+    charset: planCharset(action),
     fields: { content: action.content },
     headers,
   });
 }
 
-function xpathValues(document, expression, context = document) {
+function xpathValues(document, expression, context = document, { maxNodes = Infinity } = {}) {
   const view = document.defaultView;
   const type = /^\s*(?:string|normalize-space)\s*\(/.test(expression)
     ? view.XPathResult.STRING_TYPE : view.XPathResult.ANY_TYPE;
@@ -316,13 +352,22 @@ function xpathValues(document, expression, context = document) {
   if (result.resultType === view.XPathResult.NUMBER_TYPE) return [String(result.numberValue)];
   if (result.resultType === view.XPathResult.BOOLEAN_TYPE) return [String(result.booleanValue)];
   const values = [];
+  const cap = Number.isFinite(maxNodes) ? Math.max(0, Math.floor(maxNodes)) : Infinity;
   let node;
-  while ((node = result.iterateNext())) values.push(node);
+  while ((node = result.iterateNext())) {
+    values.push(node);
+    if (values.length >= cap) break;
+  }
   return values;
 }
 
 function htmlDocument(value) {
-  return new JSDOM(String(value || "")).window.document;
+  // Prefer a lean parse: scripts/styles are irrelevant for selector extraction
+  // and dominate CPU/memory on large catalogue pages.
+  return new JSDOM(String(value || ""), {
+    contentType: "text/html",
+    pretendToBeVisual: false,
+  }).window.document;
 }
 
 function nodeText(node, content = false) {
@@ -334,7 +379,7 @@ function nodeText(node, content = false) {
   return String(node.textContent || "").trim();
 }
 
-function htmlSelect(rule, input, { list = false, content = false } = {}) {
+function htmlSelect(rule, input, { list = false, content = false, maxNodes = Infinity } = {}) {
   if (!rule) return list ? [] : "";
   const itemInput = Boolean(input?.nodeType);
   // List fields must be evaluated relative to the matched item. Reusing its
@@ -353,7 +398,9 @@ function htmlSelect(rule, input, { list = false, content = false } = {}) {
         else if (/^\/(?:@|text\(\)|node\(\))/.test(expression)) expression = `.${expression}`;
         else if (expression.startsWith("(.//")) expression = `(descendant-or-self::${expression.slice(4)}`;
       }
-      const selected = xpathValues(document, expression, itemInput ? input : document);
+      const selected = xpathValues(document, expression, itemInput ? input : document, {
+        maxNodes: list ? maxNodes : (itemInput ? 8 : 32),
+      });
       if (!selected.length) continue;
       if (list) return selected.filter((item) => item?.nodeType === 1);
       const values = selected.map((item) => nodeText(item, content)).filter(Boolean);
@@ -395,6 +442,7 @@ function jsonPath(input, path) {
 function select(plan, rule, input, options = {}) {
   const field = normalizeField(rule);
   if (!field) return options.list ? [] : "";
+  if (field.constant) return field.constant;
   if (plan.responseType === "json") {
     const value = field.selector ? jsonPath(input, field.selector) : input;
     if (options.list) return Array.isArray(value) ? value : [];
@@ -431,7 +479,36 @@ export function bridgeTocUrl(page, baseUrl, plan) {
   return absolute(value, baseUrl);
 }
 
-export function executeBridgePlan(body, baseUrl, rawPlan, { limit = Infinity } = {}) {
+/** Per-response defaults. Full catalogues are served via page/offset, not truncation. */
+export const DEFAULT_BRIDGE_LIMITS = Object.freeze({
+  books: 40,
+  chapters: 100,
+  scanMultiplier: 6,
+  maxScanBooks: 2_000,
+  maxScanChapters: 12_000,
+  maxPageSize: 200,
+});
+
+function resolvePageSize(kind, limit, overrides = {}) {
+  const defaults = { ...DEFAULT_BRIDGE_LIMITS, ...overrides };
+  const hard = defaults.maxPageSize;
+  if (Number.isFinite(limit)) return Math.max(0, Math.min(hard, Math.floor(limit)));
+  if (kind === "books") return Math.min(hard, defaults.books);
+  if (kind === "chapters") return Math.min(hard, defaults.chapters);
+  return Math.min(hard, defaults.books);
+}
+
+function resolveBridgeScanCap(kind, needValid, overrides = {}) {
+  const defaults = { ...DEFAULT_BRIDGE_LIMITS, ...overrides };
+  if (!Number.isFinite(needValid)) {
+    return kind === "books" ? defaults.maxScanBooks : defaults.maxScanChapters;
+  }
+  const scaled = needValid * defaults.scanMultiplier;
+  const hard = kind === "books" ? defaults.maxScanBooks : defaults.maxScanChapters;
+  return Math.min(hard, Math.max(needValid + 16, scaled));
+}
+
+export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, limits } = {}) {
   const plan = normalizePlan(rawPlan);
   let input = body;
   if (plan.responseType === "json") {
@@ -448,15 +525,23 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit = Infinity } =
     if (result.cover) result.cover = absolute(result.cover, baseUrl);
     return result;
   }
+  const pageSize = resolvePageSize(plan.kind, limit, limits);
+  const start = Math.max(0, Math.floor(Number(offset)) || 0);
+  const needValid = start + Math.max(pageSize, 0) + 1; // +1 to detect hasMore
+  const scanCap = resolveBridgeScanCap(plan.kind, needValid, limits);
   const items = plan.responseType === "json"
     ? (() => {
       const value = jsonPath(input, plan.list);
-      return Array.isArray(value) ? value : [];
+      const list = Array.isArray(value) ? value : [];
+      return Number.isFinite(scanCap) ? list.slice(0, scanCap) : list;
     })()
-    : htmlSelect(plan.list, input, { list: true });
-  const results = [];
-  const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : items.length;
-  if (boundedLimit === 0) return { data: results };
+    : htmlSelect(plan.list, input, { list: true, maxNodes: scanCap });
+  const page = [];
+  if (pageSize === 0) {
+    return { data: page, hasMore: false, offset: start, pageSize };
+  }
+  let seenValid = 0;
+  let hasMore = false;
   for (const item of items) {
     const row = {};
     for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item);
@@ -468,8 +553,26 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit = Infinity } =
       row.url = absolute(row.url, baseUrl);
       if (!row.title || !row.url) continue;
     }
-    results.push(row);
-    if (results.length >= boundedLimit) break;
+    if (seenValid < start) {
+      seenValid += 1;
+      continue;
+    }
+    if (page.length < pageSize) {
+      page.push(row);
+      seenValid += 1;
+      continue;
+    }
+    hasMore = true;
+    break;
   }
-  return { data: results };
+  if (!hasMore && page.length >= pageSize && items.length >= scanCap) {
+    // Hit scan ceiling with a full page — later pages may still exist.
+    hasMore = true;
+  }
+  return {
+    data: page,
+    hasMore,
+    offset: start,
+    pageSize,
+  };
 }

@@ -17,16 +17,25 @@ import { verifyConvertedSource } from "../src/verifySource.js";
 import { skippedBuckets } from "../src/converter.js";
 import { encodeBridgePlan } from "../src/bridgePlan.js";
 
-const novelHome = `<!doctype html><html><head><title>示例小说网</title></head><body>
+const novelHome = `<!doctype html><html><head><title>示例小说网</title>
+<meta charset="utf-8">
+</head><body>
+<form action="/search.php" method="get" class="search-form">
+  <input type="text" name="searchkey" placeholder="搜索书名">
+  <button type="submit">搜索</button>
+</form>
 <ul class="list">
-  <li><a href="/book/1.html">第一本书</a></li>
-  <li><a href="/book/2.html">第二本书</a></li>
-  <li><a href="/book/3.html">第三本书</a></li>
-  <li><a href="/book/4.html">第四本书</a></li>
+  <li><img src="/cover/1.jpg" alt=""><a href="/book/1.html">第一本书</a></li>
+  <li><img src="/cover/2.jpg" alt=""><a href="/book/2.html">第二本书</a></li>
+  <li><img src="/cover/3.jpg" alt=""><a href="/book/3.html">第三本书</a></li>
+  <li><img src="/cover/4.jpg" alt=""><a href="/book/4.html">第四本书</a></li>
 </ul>
 </body></html>`;
 
-const novelDetail = `<!doctype html><html><body>
+const novelDetail = `<!doctype html><html><head>
+<meta property="og:image" content="/cover/1.jpg">
+</head><body>
+<div class="imgbox"><img src="/cover/1.jpg" alt="封面"></div>
 <h1>第一本书</h1>
 <div class="chapter-list">
   <a href="/chapter/1.html">第一章</a>
@@ -41,15 +50,19 @@ const novelChapter = `<!doctype html><html><body>
 
 const comicHome = `<!doctype html><html><head><title>示例漫画网</title></head><body>
 <p>漫画 comic manga 阅读</p>
+<form action="/comic/search" method="get">
+  <input name="q" placeholder="搜索漫画">
+</form>
 <ul class="comic-list">
-  <li><a href="/comic/1.html">漫画甲</a></li>
-  <li><a href="/comic/2.html">漫画乙</a></li>
-  <li><a href="/comic/3.html">漫画丙</a></li>
-  <li><a href="/comic/4.html">漫画丁</a></li>
+  <li><img data-src="/cover/c1.jpg" alt=""><a href="/comic/1.html">漫画甲</a></li>
+  <li><img data-src="/cover/c2.jpg" alt=""><a href="/comic/2.html">漫画乙</a></li>
+  <li><img data-src="/cover/c3.jpg" alt=""><a href="/comic/3.html">漫画丙</a></li>
+  <li><img data-src="/cover/c4.jpg" alt=""><a href="/comic/4.html">漫画丁</a></li>
 </ul>
 </body></html>`;
 
 const comicDetail = `<!doctype html><html><body>
+<div class="cover"><img src="/cover/c1.jpg" alt="封面"></div>
 <h1>漫画甲</h1>
 <div class="chapter-list">
   <a href="/comic/1/1.html">第1话</a>
@@ -83,17 +96,18 @@ const audioDetail = `<!doctype html><html><body>
 
 const mixedHome = `<!doctype html><html><head><title>综合站点</title></head><body>
 <p>小说 漫画 comic 听书 有声</p>
+<form action="/search.php" method="get"><input name="searchkey" placeholder="搜索"></form>
 <ul class="list">
-  <li><a href="/book/1.html">第一本书</a></li>
-  <li><a href="/book/2.html">第二本书</a></li>
-  <li><a href="/book/3.html">第三本书</a></li>
-  <li><a href="/book/4.html">第四本书</a></li>
+  <li><img src="/cover/1.jpg" alt=""><a href="/book/1.html">第一本书</a></li>
+  <li><img src="/cover/2.jpg" alt=""><a href="/book/2.html">第二本书</a></li>
+  <li><img src="/cover/3.jpg" alt=""><a href="/book/3.html">第三本书</a></li>
+  <li><img src="/cover/4.jpg" alt=""><a href="/book/4.html">第四本书</a></li>
 </ul>
 <ul class="comic-list">
-  <li><a href="/comic/1.html">漫画甲</a></li>
-  <li><a href="/comic/2.html">漫画乙</a></li>
-  <li><a href="/comic/3.html">漫画丙</a></li>
-  <li><a href="/comic/4.html">漫画丁</a></li>
+  <li><img data-src="/cover/c1.jpg" alt=""><a href="/comic/1.html">漫画甲</a></li>
+  <li><img data-src="/cover/c2.jpg" alt=""><a href="/comic/2.html">漫画乙</a></li>
+  <li><img data-src="/cover/c3.jpg" alt=""><a href="/comic/3.html">漫画丙</a></li>
+  <li><img data-src="/cover/c4.jpg" alt=""><a href="/comic/4.html">漫画丁</a></li>
 </ul>
 <ul class="audio-list">
   <li><a href="/audio/1.html">有声甲</a></li>
@@ -110,6 +124,8 @@ function fixtureDownload(url) {
   }
   if (/\/comic\/\d+\/\d+\.html/.test(href)) return Buffer.from(comicChapter);
   if (/\/comic\/\d+\.html/.test(href)) return Buffer.from(comicDetail);
+  if (/\/comic\/search/.test(href)) return Buffer.from(comicHome);
+  if (/\/search\.php/.test(href)) return Buffer.from(novelHome);
   if (/\/audio\/\d+\/\d+\.mp3/.test(href)) return Buffer.from("ID3fakeaudio");
   if (/\/audio\/\d+\.html/.test(href)) return Buffer.from(audioDetail);
   if (/\/book\/1\.html/.test(href)) return Buffer.from(novelDetail);
@@ -145,6 +161,9 @@ test("discoverNovel 从 HTML fixture 发现列表/目录/正文", async () => {
   assert.match(discovery.listSelector, /list|a/i);
   assert.ok(discovery.chapterListSelector);
   assert.equal(discovery.contentSelector, "//*[@id='content']");
+  assert.match(discovery.listCoverSelector, /img\/@/);
+  assert.match(discovery.detailCoverSelector, /og:image|imgbox|cover/);
+  assert.match(discovery.searchRequestInfo, /searchkey=%@keyWord|params\.keyWord/);
   assert.ok(discovery.bookCount >= 3);
   assert.ok(discovery.chapterCount >= 2);
 });
@@ -172,10 +191,28 @@ test("novelDiscoveryToXiangse 生成可导入的最小香色源", async () => {
   assert.equal(source.sourceUrl, "https://novel.example");
   assert.equal(source.miniAppVersion, "2.56.1");
   assert.ok(source.bookWorld["站点首页"].list);
+  assert.match(source.bookWorld["站点首页"].cover, /img\/@/);
+  assert.match(source.bookDetail.cover, /og:image|imgbox|cover/);
+  assert.match(source.searchBook.requestInfo, /searchkey=%@keyWord|params\.keyWord/);
   assert.ok(source.chapterList.list);
-  assert.equal(source.chapterContent.content, "//*[@id='content']");
+  assert.match(source.chapterContent.content, /\/\/\*\[@id='content'\]/);
+  assert.match(source.chapterContent.content, /\|\|@js:/);
+  assert.match(source.chapterContent.content, /replace\(\/<\[\^>\]\+>/);
   const structural = validateXiangseSource(source);
   assert.equal(structural.ok, true, structural.errors.join("; "));
+});
+
+test("小说正文后处理会去掉 HTML 标签并保留换行", async () => {
+  const { withNovelHtmlStripped } = await import("../src/siteAnalyze/toXiangse.js");
+  const rule = withNovelHtmlStripped("//*[@id='content']");
+  const script = rule.split(/\|\|\s*@js:/i, 2)[1];
+  const html = "<div><p>第一段</p><br/><p>第二段&nbsp;<b>加粗</b></p><script>x()</script></div>";
+  const text = new Function("config", "params", "result", script)({}, {}, html);
+  assert.equal(text.includes("<"), false);
+  assert.equal(text.includes(">"), false);
+  assert.match(text, /第一段/);
+  assert.match(text, /第二段\s+加粗/);
+  assert.doesNotMatch(text, /x\(\)/);
 });
 
 test("识站产物通过香色结构校验与动作链（分类→正文）", async () => {

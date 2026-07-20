@@ -1,5 +1,6 @@
 import { convertRule, inferResponseType } from "./selectors.js";
 import { convertRequest, parseHeaders, parseLooseJson } from "./requests.js";
+import { detectLegadoCharset, xiangseEncodeFields } from "./charset.js";
 import { adaptLegadoSource, bookDetailRequestInfoOverride, chapterListRequestInfoOverride } from "./siteAdapters.js";
 import { decoderForLegadoImageRule } from "./imageDecoder.js";
 import { compileComicExtractionPlan, encodeComicExtractionPlan } from "./comicPlan.js";
@@ -221,6 +222,31 @@ function nativeJmRequestInfo() {
 }
 
 /** Generic action URL resolver for clients that leave %@result as a literal. */
+function actionPageSize(action, fallback = 20) {
+  const configured = Number(action?.moreKeys?.pageSize);
+  return Number.isInteger(configured) && configured > 0 ? Math.min(200, configured) : fallback;
+}
+
+function requestHasUpstreamPaging(requestInfo, action = null) {
+  const source = String(requestInfo || "");
+  if (/%@pageIndex\b|params\.pageIndex\b/.test(source)) return true;
+  if (action?.nextPageUrl) return true;
+  return false;
+}
+
+function adapterEndpointWithPaging(endpoint, { pageSize = 20, serverPaging = false } = {}) {
+  const base = String(endpoint || "").replace(/&url=$/, "").replace(/\?url=$/, "?");
+  const join = base.includes("?") ? "&" : "?";
+  if (serverPaging) {
+    return `${base}${join}page=%@pageIndex&pageSize=${pageSize}&slice=1&url=`;
+  }
+  return `${base}${join}pageSize=${pageSize}&url=`;
+}
+
+function finalizeAdapterUrlExpression(endpoint) {
+  return `(${JSON.stringify(endpoint)}).replace(/%@pageIndex/g, String((params && params.pageIndex) || 1))`;
+}
+
 function runtimeAdapterRequestInfo(endpoint) {
   return [
     "@js:",
@@ -232,14 +258,17 @@ function runtimeAdapterRequestInfo(endpoint) {
     'u = String(u || "").trim();',
     'if (u.indexOf("//") == 0) u = "https:" + u;',
     'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
-    `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
+    `return ${finalizeAdapterUrlExpression(endpoint)} + encodeURIComponent(u);`,
   ].join("\n");
 }
 
-function bridgeRequestInfo(requestInfo, endpoint) {
+function bridgeRequestInfo(requestInfo, endpoint, { pageSize = 20, serverPaging = false } = {}) {
   const source = String(requestInfo || "").trim();
   if (!source) return "";
-  if (source === "%@result") return runtimeAdapterRequestInfo(endpoint);
+  const pagedEndpoint = adapterEndpointWithPaging(endpoint, { pageSize, serverPaging });
+  if (source === "%@result") return runtimeAdapterRequestInfo(pagedEndpoint);
+  // POST / httpParams / webView cannot be safely re-fetched by the GET-only
+  // adapter. Keep the native Xiangse request (caller skips bridging on "").
   if (/^@js:/i.test(source)) {
     const effectiveSource = source.replace(/\bPOST\s*:\s*false\b/g, "");
     if (/\b(?:POST|httpParams|requestBody|webView)\b/.test(effectiveSource)) return "";
@@ -252,13 +281,13 @@ function bridgeRequestInfo(requestInfo, endpoint) {
       "}).call(this, seed);",
       'if (u && typeof u == "object") u = u.url || "";',
       'u = String(u || "").trim();',
-      `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
+      `return ${finalizeAdapterUrlExpression(pagedEndpoint)} + encodeURIComponent(u);`,
     ].join("\n");
   }
   // Plain request templates still carry 香色 placeholders. Substitute them in
   // @js before encoding; a literal `%@pageIndex` inside `url=` is invalid
   // percent-encoding and the adapter rejects the whole category request.
-  if (/%@(?:pageIndex|keyWord|filter|offset)\b/.test(source)) {
+  if (/%@(?:pageIndex|keyWord|filter|offset)\b/.test(source) || serverPaging) {
     return [
       "@js:",
       `var u = ${JSON.stringify(source)};`,
@@ -270,16 +299,24 @@ function bridgeRequestInfo(requestInfo, endpoint) {
       'u = String(u || "").trim();',
       'if (u.indexOf("//") == 0) u = "https:" + u;',
       'else if (u && !/^https?:\\/\\//i.test(u)) u = (config.host || "") + (u.charAt(0) == "/" ? u : "/" + u);',
-      `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
+      `return ${finalizeAdapterUrlExpression(pagedEndpoint)} + encodeURIComponent(u);`,
     ].join("\n");
   }
   // The adapter reads everything after `url=` verbatim, so target query
   // parameters may remain unescaped and XSGG can still substitute placeholders.
-  return `${endpoint}${source}`;
+  return `${pagedEndpoint}${source}`;
 }
 
 function bridgeEndpoint(base, type, plan) {
   return `${String(base).replace(/\/$/, "")}/adapter/${type}?plan=${encodeBridgePlan(plan)}&url=`;
+}
+
+function preserveEncode(from, to) {
+  if (!from || !to) return to;
+  const out = { ...to };
+  if (from.requestParamsEncode) out.requestParamsEncode = from.requestParamsEncode;
+  if (from.responseEncode) out.responseEncode = from.responseEncode;
+  return out;
 }
 
 function bridgeBookAction(action, bridgeBase, headers) {
@@ -287,9 +324,16 @@ function bridgeBookAction(action, bridgeBase, headers) {
   const plan = compileBookBridgePlan(action, { ...headers, ...(action.httpHeaders || {}) });
   if (!plan.list || !plan.fields.name || !plan.fields.url) return action;
   const endpoint = bridgeEndpoint(bridgeBase, "books", plan);
-  const requestInfo = bridgeRequestInfo(action.requestInfo, endpoint);
+  const pageSize = actionPageSize(action, 20);
+  const serverPaging = !requestHasUpstreamPaging(action.requestInfo, action);
+  const requestInfo = bridgeRequestInfo(action.requestInfo, endpoint, { pageSize, serverPaging });
   if (!requestInfo) return action;
-  return {
+  const moreKeys = {
+    ...(action.moreKeys || {}),
+    pageSize,
+    ...(serverPaging ? { maxPage: Number(action.moreKeys?.maxPage) > 0 ? action.moreKeys.maxPage : 200 } : {}),
+  };
+  return preserveEncode(action, {
     ...commonAction(action.actionID || "bookWorld", action.host, "json"),
     requestInfo,
     list: "$.data",
@@ -299,12 +343,12 @@ function bridgeBookAction(action, bridgeBase, headers) {
     desc: "desc",
     cat: "cat",
     lastChapterTitle: "lastChapterTitle",
-    cover: "cover",
+    ...(plan.fields.cover ? { cover: "cover" } : {}),
     status: "status",
     wordCount: "wordCount",
-    ...(action.moreKeys ? { moreKeys: action.moreKeys } : {}),
+    moreKeys,
     ...(action._sIndex !== undefined ? { _sIndex: action._sIndex } : {}),
-  };
+  });
 }
 
 function bridgeDetailAction(action, bridgeBase, headers) {
@@ -314,7 +358,7 @@ function bridgeDetailAction(action, bridgeBase, headers) {
   const endpoint = bridgeEndpoint(bridgeBase, "detail", plan);
   const requestInfo = bridgeRequestInfo(action.requestInfo, endpoint);
   if (!requestInfo) return action;
-  return {
+  return preserveEncode(action, {
     ...commonAction("bookDetail", action.host, "json"),
     requestInfo,
     bookName: "$.name",
@@ -322,10 +366,10 @@ function bridgeDetailAction(action, bridgeBase, headers) {
     desc: "$.desc",
     cat: "$.cat",
     lastChapterTitle: "$.lastChapterTitle",
-    cover: "$.cover",
+    ...(plan.fields.cover ? { cover: "$.cover" } : {}),
     status: "$.status",
     wordCount: "$.wordCount",
-  };
+  });
 }
 
 function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {} } = {}) {
@@ -336,18 +380,25 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
   });
   if (!plan.list || !plan.fields.title || !plan.fields.url) return action;
   const endpoint = bridgeEndpoint(bridgeBase, "chapters", plan);
+  const pageSize = actionPageSize(action, 100);
+  const serverPaging = !requestHasUpstreamPaging(action.requestInfo || "%@result", action);
   const requestInfo = tocSelector
-    ? runtimeAdapterRequestInfo(endpoint)
-    : bridgeRequestInfo(action.requestInfo || "%@result", endpoint);
+    ? runtimeAdapterRequestInfo(adapterEndpointWithPaging(endpoint, { pageSize, serverPaging }))
+    : bridgeRequestInfo(action.requestInfo || "%@result", endpoint, { pageSize, serverPaging });
   if (!requestInfo) return action;
-  return {
+  return preserveEncode(action, {
     ...commonAction("chapterList", action.host, "json"),
     requestInfo,
     list: "$.data",
     title: "title",
     url: "url",
     updateTime: "updateTime",
-  };
+    moreKeys: {
+      ...(action.moreKeys || {}),
+      pageSize,
+      ...(serverPaging ? { maxPage: Number(action.moreKeys?.maxPage) > 0 ? action.moreKeys.maxPage : 300 } : {}),
+    },
+  });
 }
 
 function bridgeTextAction(action, bridgeBase, headers) {
@@ -357,11 +408,11 @@ function bridgeTextAction(action, bridgeBase, headers) {
   const endpoint = bridgeEndpoint(bridgeBase, "text", plan);
   const requestInfo = bridgeRequestInfo(action.requestInfo || "%@result", endpoint);
   if (!requestInfo) return action;
-  return {
+  return preserveEncode(action, {
     ...commonAction("chapterContent", action.host, "json"),
     requestInfo,
     content: "$.content",
-  };
+  });
 }
 
 function tocLinkHint(rule) {
@@ -625,6 +676,17 @@ function portableKindRule(rule, responseType, warningFor, initPath = "") {
   return convertRule(rule, { responseType, warn: warningFor("kind", rule) });
 }
 
+function portableCoverRule(rule) {
+  const source = String(rule ?? "").trim();
+  if (!source) return "";
+  const quoted = source.match(/^@js:\s*['"](https?:\/\/[^'"]+)['"]\s*;?\s*$/i);
+  if (quoted) return quoted[1];
+  const returned = source.match(/^@js:\s*return\s*\(?\s*['"](https?:\/\/[^'"]+)['"]\s*\)?\s*;?\s*$/i);
+  if (returned) return returned[1];
+  if (/^https?:\/\//i.test(source) && !/[|@]|##/.test(source)) return source;
+  return "";
+}
+
 function mapBookRules(rules, responseType, warningFor, { initPath = "", listContext = false } = {}) {
   const mapping = {
     bookList: "list",
@@ -641,6 +703,13 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
   const result = {};
   for (const [from, to] of Object.entries(mapping)) {
     if (rules[from] !== undefined && rules[from] !== "") {
+      if (from === "coverUrl") {
+        const constantCover = portableCoverRule(rules[from]);
+        if (constantCover) {
+          result[to] = constantCover;
+          continue;
+        }
+      }
       if (from === "kind") {
         const convertedKind = portableKindRule(rules[from], responseType, warningFor, initPath);
         if (listContext && /^\s*@js:/i.test(convertedKind) && /(?:\bjava\.|\bPackages\b|\bsource\.|\bbook\.)/i.test(convertedKind)) {
@@ -881,6 +950,9 @@ function buildBookWorld(source, context) {
       }
       rules[key] = value;
     }
+  } else if (exploreRules.coverUrl && !searchRules.coverUrl) {
+    // 分类入口借用了搜索请求，但仍可沿用发现页的封面规则（常见为 img@src）。
+    rules.coverUrl = exploreRules.coverUrl;
   }
   const effectiveCoreComplete = Boolean(rules.bookList && rules.name && rules.bookUrl);
   if (entries.length && !exploreCoreComplete && effectiveCoreComplete && !useSearchRulesOnly) {
@@ -1119,7 +1191,7 @@ function convertOne(source, warnings, options = {}) {
           responseType: contentResponseType,
           warn: contentWarningFor("nextContentUrl", contentRules.nextContentUrl || contentRules.nextUrl),
         }),
-        moreKeys: { maxPage: 999 },
+        moreKeys: { maxPage: 50 },
       } : {}),
     },
     bookWorld: buildBookWorld(source, context),
@@ -1192,6 +1264,19 @@ function convertOne(source, warnings, options = {}) {
     }
   }
 
+  // Propagate site charset (often only declared on searchUrl) to every action so
+  // Xiangse and /adapter bridges decode GBK pages instead of UTF-8 mojibake.
+  const encoding = xiangseEncodeFields(detectLegadoCharset(source));
+  if (Object.keys(encoding).length) {
+    converted.searchBook = { ...converted.searchBook, ...encoding };
+    converted.bookDetail = { ...converted.bookDetail, ...encoding };
+    converted.chapterList = { ...converted.chapterList, ...encoding };
+    converted.chapterContent = { ...converted.chapterContent, ...encoding };
+    converted.bookWorld = Object.fromEntries(Object.entries(converted.bookWorld || {}).map(([title, action]) => (
+      [title, { ...action, ...encoding }]
+    )));
+  }
+
   if (options.imageProxyBase) {
     converted.bookWorld = Object.fromEntries(Object.entries(converted.bookWorld || {}).map(([title, action]) => ([
       title,
@@ -1238,7 +1323,14 @@ function sanitizePortableAction(action, requiredFields, warnings, sourceName, se
       rule: value,
     });
   }
-  if (!cleaned.nextPageUrl && cleaned.moreKeys && typeof cleaned.moreKeys === "object") {
+  // Only chapter content used maxPage without nextPageUrl as a stale Legado leftover.
+  // bookWorld/search/chapterList may intentionally set maxPage for adapter-side paging.
+  if (
+    section === "chapterContent"
+    && !cleaned.nextPageUrl
+    && cleaned.moreKeys
+    && typeof cleaned.moreKeys === "object"
+  ) {
     const moreKeys = { ...cleaned.moreKeys };
     delete moreKeys.maxPage;
     if (Object.keys(moreKeys).length) cleaned.moreKeys = moreKeys;

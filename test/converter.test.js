@@ -330,7 +330,7 @@ test("漫蛙适配使用 config.host 的 API 详情与 HTML 目录", () => {
   const searchPlan = decodeBridgePlan(converted.searchBook.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)[1]);
   assert.deepEqual(
     executeBridgePlan(JSON.stringify({ data: { list: [{ id: 13827, title: "测试漫画" }] } }), "https://www.mwwz.cc/api/search", searchPlan),
-    { data: [{ name: "测试漫画", url: "https://www.mwwz.cc/api/comic/13827" }] },
+    { data: [{ name: "测试漫画", url: "https://www.mwwz.cc/api/comic/13827" }], hasMore: false, offset: 0, pageSize: 40 },
   );
   assert.match(converted.chapterList.requestInfo, /adapter\/chapters\?plan=/);
   assert.equal(converted.chapterList.responseFormatType, "json");
@@ -340,7 +340,7 @@ test("漫蛙适配使用 config.host 的 API 详情与 HTML 目录", () => {
   assert.equal(chapterPlan.fields.url.matchTemplate.hostPrefix, true);
   assert.deepEqual(
     executeBridgePlan('<div id="chapter-grid-container"><a href="/comic/13827/2101951"><span class="name">第一话</span></a></div>', "https://www.mwwz.cc/comic/13827", chapterPlan),
-    { data: [{ title: "第一话", url: "https://www.mwwz.cc/api/comic/image/2101951?page=1" }] },
+    { data: [{ title: "第一话", url: "https://www.mwwz.cc/api/comic/image/2101951?page=1" }], hasMore: false, offset: 0, pageSize: 100 },
   );
   const attributeTitlePlan = {
     ...chapterPlan,
@@ -348,7 +348,7 @@ test("漫蛙适配使用 config.host 的 API 详情与 HTML 目录", () => {
   };
   assert.deepEqual(
     executeBridgePlan('<div id="chapter-grid-container"><a data-title="属性标题" href="/comic/13827/2101951"></a></div>', "https://www.mwwz.cc/comic/13827", attributeTitlePlan),
-    { data: [{ title: "属性标题", url: "https://www.mwwz.cc/api/comic/image/2101951?page=1" }] },
+    { data: [{ title: "属性标题", url: "https://www.mwwz.cc/api/comic/image/2101951?page=1" }], hasMore: false, offset: 0, pageSize: 100 },
   );
   assert.equal(converted.bookDetail.tocUrl, undefined);
   assert.equal(converted.bookDetail.responseFormatType, "json");
@@ -374,7 +374,7 @@ test("章节 URL 的 split + 模板赋值由安全桥接计划执行", () => {
       "https://comic.example/comic/42",
       plan,
     ),
-    { data: [{ title: "第一话", url: "https://api.example/image/9001?count=true" }] },
+    { data: [{ title: "第一话", url: "https://api.example/image/9001?count=true" }], hasMore: false, offset: 0, pageSize: 100 },
   );
 });
 
@@ -388,7 +388,7 @@ test("JSON 数组递归路径和纯字段 URL 模板由桥接计划展开", () =
   });
   assert.deepEqual(
     executeBridgePlan(JSON.stringify({ blocks: [{ models: [{ username: "alice", status: "public" }] }] }), "https://video.example", plan),
-    { data: [{ name: "alice", url: "https://video.example/model/alice/cam" }] },
+    { data: [{ name: "alice", url: "https://video.example/model/alice/cam" }], hasMore: false, offset: 0, pageSize: 40 },
   );
 });
 
@@ -421,9 +421,82 @@ test("深度预检可以限制桥接结果数量而不遍历完整大目录", ()
   const html = Array.from({ length: 2000 }, (_, index) => `<a href="/${index}">第 ${index} 章</a>`).join("");
   assert.deepEqual(executeBridgePlan(html, "https://example.com", plan, { limit: 1 }), {
     data: [{ title: "第 0 章", url: "https://example.com/0" }],
+    hasMore: true,
+    offset: 0,
+    pageSize: 1,
   });
 });
 
+test("桥接按 offset/limit 分页，而不是丢弃后续条目", () => {
+  const bookPlan = compileBookBridgePlan({
+    host: "https://example.com",
+    responseFormatType: "html",
+    list: "//a",
+    bookName: "/text()",
+    detailUrl: "/@href",
+  });
+  const bookHtml = Array.from({ length: 90 }, (_, index) => `<a href="/b/${index}">书 ${index}</a>`).join("");
+  const page1 = executeBridgePlan(bookHtml, "https://example.com", bookPlan, { limit: 20, offset: 0 });
+  const page2 = executeBridgePlan(bookHtml, "https://example.com", bookPlan, { limit: 20, offset: 20 });
+  const page5 = executeBridgePlan(bookHtml, "https://example.com", bookPlan, { limit: 20, offset: 80 });
+  assert.equal(page1.data.length, 20);
+  assert.equal(page1.data[0].name, "书 0");
+  assert.equal(page1.hasMore, true);
+  assert.equal(page2.data[0].name, "书 20");
+  assert.equal(page2.hasMore, true);
+  assert.equal(page5.data.length, 10);
+  assert.equal(page5.data[0].name, "书 80");
+  assert.equal(page5.hasMore, false);
+
+  const chapterPlan = compileChapterBridgePlan({
+    host: "https://example.com",
+    responseFormatType: "html",
+    list: "//a",
+    title: "/text()",
+    url: "/@href",
+  });
+  const chapterHtml = Array.from({ length: 250 }, (_, index) => `<a href="/c/${index}">第 ${index} 章</a>`).join("");
+  const chapters = executeBridgePlan(chapterHtml, "https://example.com", chapterPlan, {
+    limit: 100,
+    offset: 100,
+  });
+  assert.equal(chapters.data.length, 100);
+  assert.equal(chapters.data[0].title, "第 100 章");
+  assert.equal(chapters.hasMore, true);
+});
+
+test("无上游分页时桥接请求会注入 page/pageSize/slice 供客户端翻页", () => {
+  const source = {
+    bookSourceName: "无分页站",
+    bookSourceUrl: "https://nopage.example.com",
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: {
+      bookList: "class.item@tag.li",
+      name: "tag.a@text",
+      bookUrl: "tag.a@href",
+      checkKeyWord: "测试",
+    },
+    exploreUrl: "首页::https://nopage.example.com/list.html",
+    ruleExplore: {
+      bookList: "class.item@tag.li",
+      name: "tag.a@text",
+      bookUrl: "tag.a@href",
+    },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: "class.list@tag.a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: "id.content@text" },
+  };
+  const { sources } = convertLegado(source, {
+    omitNonPortable: true,
+    imageProxyBase: "https://convert.example",
+  });
+  const world = Object.values(sources["无分页站"].bookWorld)[0];
+  assert.match(world.requestInfo, /page=%@pageIndex/);
+  assert.match(world.requestInfo, /slice=1/);
+  assert.match(world.requestInfo, /pageSize=20/);
+  assert.equal(world.moreKeys.pageSize, 20);
+  assert.ok(world.moreKeys.maxPage >= 200);
+});
 test("Mustache {{@sel}} 与 Get('url') 请求可转换", () => {
   assert.equal(
     convertRule("{{@class.video-title@text}}"),
@@ -1148,7 +1221,9 @@ test("桥接分类 URL 会替换 %@pageIndex，避免适配器把占位符当成
   assert.match(world.requestInfo, /%@pageIndex/);
   assert.match(world.requestInfo, /encodeURIComponent\(u\)/);
   assert.match(world.requestInfo, /params\.pageIndex/);
-  assert.doesNotMatch(world.requestInfo, /&url=.*%@pageIndex/);
+  // Upstream page token stays in the `u = "..."` template and is replaced at
+  // runtime; the adapter url= suffix itself must not keep a literal %@pageIndex.
+  assert.doesNotMatch(world.requestInfo, /&url=(?:(?!\)\.replace)[\s\S])*%@pageIndex/);
 });
 
 test("空 URL 的不可移植 POST 搜索会被跳过", () => {
@@ -1202,4 +1277,58 @@ test("JSON 章节 @js 标题/URL 模板会编译进桥接计划", () => {
   assert.equal(plan.fields.title.selector, "name");
   assert.equal(plan.fields.url.selector, "id");
   assert.equal(plan.fields.url.matchTemplate.prefix, "/chapter/");
+});
+
+test("静态 @js 封面与发现页封面在搜索入口分类中保留", () => {
+  const staticCover = {
+    bookSourceName: "静态封面源",
+    bookSourceUrl: "https://cover.example.com",
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: {
+      bookList: "class.item@tag.li",
+      name: "tag.a@text",
+      bookUrl: "tag.a@href",
+      checkKeyWord: "测试",
+      coverUrl: "@js:'https://cdn.example.com/nocover.jpg'",
+    },
+    ruleBookInfo: { name: "h1@text", coverUrl: "div.imgbox@tag.img@src" },
+    ruleToc: { chapterList: "class.list@tag.a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: "id.content@text" },
+  };
+  const { sources: staticSources } = convertLegado(staticCover, {
+    omitNonPortable: true,
+    imageProxyBase: "https://convert.example",
+  });
+  const world = Object.values(staticSources["静态封面源"].bookWorld)[0];
+  assert.equal(world.cover, "cover");
+  const plan = decodeBridgePlan(String(world.requestInfo).match(/plan=([^&]+)/)[1]);
+  assert.equal(plan.fields.cover.constant, "https://cdn.example.com/nocover.jpg");
+
+  const exploreCover = {
+    bookSourceName: "发现封面源",
+    bookSourceUrl: "https://explore-cover.example.com",
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: {
+      bookList: "class.item@tag.li",
+      name: "tag.a@text",
+      bookUrl: "tag.a@href",
+      checkKeyWord: "测试",
+    },
+    ruleExplore: {
+      bookList: "class.item@tag.li",
+      name: "tag.a@text",
+      bookUrl: "tag.a@href",
+      coverUrl: "img@src",
+    },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: "class.list@tag.a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: "id.content@text" },
+  };
+  const { sources: exploreSources } = convertLegado(exploreCover, {
+    omitNonPortable: true,
+    imageProxyBase: "https://convert.example",
+  });
+  const exploreWorld = Object.values(exploreSources["发现封面源"].bookWorld)[0];
+  const explorePlan = decodeBridgePlan(String(exploreWorld.requestInfo).match(/plan=([^&]+)/)[1]);
+  assert.match(explorePlan.fields.cover.selector, /img\/@src/);
 });

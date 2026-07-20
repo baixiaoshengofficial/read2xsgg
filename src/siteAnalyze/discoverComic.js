@@ -1,3 +1,5 @@
+import { detailCoverSelector, listCoverSelectorFromLinks } from "./coverSelectors.js";
+import { discoverSearchRequest } from "./discoverSearch.js";
 import {
   listSelectorFromLinks,
   loadDocument,
@@ -40,12 +42,15 @@ export async function discoverComic(originUrl, { download, homeHtml = "" } = {})
   ).slice(0, 30);
   if (cluster.length < 3) return null;
 
-  const listSelector = listSelectorFromLinks(cluster.map((item) => item.el), document);
+  const listLinks = cluster.map((item) => item.el);
+  const listSelector = listSelectorFromLinks(listLinks, document);
+  const listCoverSelector = listCoverSelectorFromLinks(listLinks);
   const detailUrl = cluster.find((item) => COMIC_HREF.test(item.href))?.href || cluster[0].href;
   if (!detailUrl) return null;
 
   const detailHtml = (await download(detailUrl)).toString("utf8");
   const detailDoc = loadDocument(detailHtml, detailUrl);
+  const detailCover = detailCoverSelector(detailDoc);
   const detailAnchors = pageAnchors(detailDoc, detailUrl, origin.origin);
 
   let chapterLinks = detailAnchors.filter((item) => CHAPTER_HREF.test(item.href) && item.text.length <= 60);
@@ -64,6 +69,7 @@ export async function discoverComic(originUrl, { download, homeHtml = "" } = {})
   if (imageCount(chapterDoc) < 3) return null;
 
   const title = visibleText(document.querySelector("title")).slice(0, 40) || origin.host;
+  const search = discoverSearchRequest(document, homeUrl, { html });
   return {
     kind: "comic",
     host: `${origin.protocol}//${origin.host}`,
@@ -73,6 +79,13 @@ export async function discoverComic(originUrl, { download, homeHtml = "" } = {})
     listSelector,
     bookNameSelector: ".//a||normalize-space(/html/body/*)",
     detailUrlSelector: ".//a/@href||//@href",
+    listCoverSelector,
+    detailCoverSelector: detailCover,
+    searchRequestInfo: search?.requestInfo || "",
+    searchEncode: {
+      ...(search?.requestParamsEncode ? { requestParamsEncode: search.requestParamsEncode } : {}),
+      ...(search?.responseEncode ? { responseEncode: search.responseEncode } : {}),
+    },
     detailSampleUrl: detailUrl,
     chapterListSelector,
     chapterTitleSelector: "normalize-space(.//a)||normalize-space(/html/body/*)",

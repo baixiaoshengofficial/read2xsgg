@@ -9,6 +9,7 @@ import { JSDOM } from "jsdom";
 import { convertLegado, skippedBuckets } from "./converter.js";
 import { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
 import { analyzeSite } from "./siteAnalyze/index.js";
+import { decodeTextBuffer } from "./charset.js";
 import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
 import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
 import { decodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
@@ -67,6 +68,14 @@ export function serverConfig(environment = process.env) {
     maxComicPages: integer(environment.MAX_COMIC_PAGES, 50),
     maxComicImages: integer(environment.MAX_COMIC_IMAGES, 2_000),
     comicPageConcurrency: integer(environment.COMIC_PAGE_CONCURRENCY, 4),
+    // Bridge adapters page large catalogues (missing upstream pagination) via
+    // page/pageSize/slice instead of dropping the tail.
+    maxBridgeBookPageSize: integer(environment.MAX_BRIDGE_BOOK_PAGE_SIZE, 40),
+    maxBridgeChapterPageSize: integer(environment.MAX_BRIDGE_CHAPTER_PAGE_SIZE, 100),
+    maxBridgeHtmlBytes: integer(environment.MAX_BRIDGE_HTML_BYTES, 2 * 1024 * 1024),
+    // Back-compat aliases
+    maxBridgeBooks: integer(environment.MAX_BRIDGE_BOOKS, integer(environment.MAX_BRIDGE_BOOK_PAGE_SIZE, 40)),
+    maxBridgeChapters: integer(environment.MAX_BRIDGE_CHAPTERS, integer(environment.MAX_BRIDGE_CHAPTER_PAGE_SIZE, 100)),
     corsOrigin: environment.CORS_ORIGIN || "*",
     mwwzDiscoveryUrl: environment.MWWZ_DISCOVERY_URL || "https://www.manwake.cc/",
     jmDiscoveryUrl: environment.JM_DISCOVERY_URL || "https://jmcomicqa.cc/",
@@ -208,11 +217,26 @@ export async function downloadSource(sourceUrl, config = serverConfig(), headers
   for (let redirects = 0; redirects <= config.maxRedirects; redirects += 1) {
     const resolved = await resolveTarget(current, config);
     const result = await requestBuffer(current, resolved, config, { label: "下载阅读源", headers });
-    if (result.buffer) return result.buffer;
+    if (result.buffer) {
+      Object.defineProperty(result.buffer, "httpHeaders", {
+        value: result.headers || {},
+        enumerable: false,
+        configurable: true,
+      });
+      return result.buffer;
+    }
     if (redirects === config.maxRedirects) throw new HttpError(502, `阅读源重定向次数超过 ${config.maxRedirects}`);
     current = result.redirect;
   }
   throw new HttpError(502, "下载阅读源失败");
+}
+
+/** Decode a downloaded page with plan/source charset hint (fixes GBK mojibake). */
+export function pageText(buffer, charsetHint = "") {
+  return decodeTextBuffer(buffer, {
+    headers: buffer?.httpHeaders || {},
+    charsetHint,
+  });
 }
 
 function probeRequest(url, resolved, config, headers = {}, method = "HEAD") {
@@ -409,22 +433,69 @@ function executableChapterAction(source) {
   }
 }
 
-async function executeDeclarativeUrl(plan, targetUrl, config, { chapters = false, limit = Infinity } = {}) {
+function bridgeExecuteLimits(config = {}) {
+  return {
+    books: config.maxBridgeBookPageSize || config.maxBridgeBooks,
+    chapters: config.maxBridgeChapterPageSize || config.maxBridgeChapters,
+  };
+}
+
+function bridgePageOptions(adapterTarget, config = {}) {
+  const kind = adapterTarget?.type === "bridge-chapters" ? "chapters" : "books";
+  const defaults = bridgeExecuteLimits(config);
+  const fallback = kind === "chapters" ? defaults.chapters : defaults.books;
+  const requested = Number.parseInt(String(adapterTarget?.pageSize || ""), 10);
+  const pageSize = Number.isInteger(requested) && requested > 0
+    ? Math.min(200, requested)
+    : fallback;
+  const page = Math.max(1, Number.parseInt(String(adapterTarget?.page || "1"), 10) || 1);
+  const slice = adapterTarget?.slice === true;
+  return {
+    limit: pageSize,
+    offset: slice ? (page - 1) * pageSize : 0,
+    page,
+    pageSize,
+    slice,
+    limits: defaults,
+  };
+}
+
+function prepareBridgeHtml(buffer, charsetHint = "", maxBytes = 2 * 1024 * 1024) {
+  let text = pageText(buffer, charsetHint);
+  if (Buffer.byteLength(text, "utf8") > maxBytes) {
+    // Keep the head of the document where lists usually live; truncating mid-tag
+    // is acceptable because JSDOM recovers and we already cap extracted rows.
+    text = Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
+  }
+  // Drop script/style payloads before DOM construction — they inflate CPU without
+  // helping XPath book/chapter extraction.
+  return text
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "");
+}
+
+async function executeDeclarativeUrl(plan, targetUrl, config, { chapters = false, limit, offset = 0 } = {}) {
   const page = await downloadSource(targetUrl, config, plan.headers);
-  const text = page.toString("utf8");
+  const text = prepareBridgeHtml(page, plan.charset, config.maxBridgeHtmlBytes);
+  const options = { limit, offset, limits: bridgeExecuteLimits(config) };
   if (chapters && plan.tocSelector) {
     const tocUrl = bridgeTocUrl(text, targetUrl, plan);
     if (tocUrl) {
       try {
         const tocPage = await downloadSource(tocUrl, config, plan.headers);
-        const output = executeBridgePlan(tocPage.toString("utf8"), tocUrl, plan, { limit });
+        const output = executeBridgePlan(
+          prepareBridgeHtml(tocPage, plan.charset, config.maxBridgeHtmlBytes),
+          tocUrl,
+          plan,
+          options,
+        );
         if (Array.isArray(output.data) && output.data.length) return output;
       } catch {
-        // The normal adapter also falls back to chapters embedded in details.
+        // The normal adapter also falls through to chapters embedded in details.
       }
     }
   }
-  return executeBridgePlan(text, targetUrl, plan, { limit });
+  return executeBridgePlan(text, targetUrl, plan, options);
 }
 
 /**
@@ -1005,6 +1076,9 @@ function adapterRequestFromRequest(request) {
     selector: parsed.searchParams.get("selector") || "",
     extractionPlan,
     bridgePlan,
+    page: parsed.searchParams.get("page") || "1",
+    pageSize: parsed.searchParams.get("pageSize") || "",
+    slice: parsed.searchParams.get("slice") === "1",
   };
 }
 
@@ -1105,6 +1179,9 @@ function help(config) {
     limits: {
       maxSourceBytes: config.maxSourceBytes,
       maxImageBytes: config.maxImageBytes,
+      maxBridgeBookPageSize: config.maxBridgeBookPageSize,
+      maxBridgeChapterPageSize: config.maxBridgeChapterPageSize,
+      maxBridgeHtmlBytes: config.maxBridgeHtmlBytes,
       fetchTimeoutMs: config.fetchTimeoutMs,
       allowPrivateNetworks: config.allowPrivateNetworks,
       allowDnsProxyNetworks: config.allowDnsProxyNetworks,
@@ -1745,14 +1822,42 @@ export function createAppServer(options = {}) {
           let output;
           try {
             let pageUrl = sourceUrl;
-            let page = await downloadSource(pageUrl, config, adapterTarget.bridgePlan.headers);
+            const charset = adapterTarget.bridgePlan.charset || "";
+            const htmlBudget = config.maxBridgeHtmlBytes;
+            const paging = bridgePageOptions(adapterTarget, config);
+            const htmlCacheKey = `bridge-html:${adapterTarget.type}:${pageUrl}:${charset}:${adapterTarget.bridgePlan?.list || ""}`;
+            let html = "";
+            const cachedHtml = config.cacheTtlMs > 0 ? cache.get(htmlCacheKey) : null;
+            if (cachedHtml && cachedHtml.expiresAt > Date.now()) {
+              html = cachedHtml.value;
+            } else {
+              if (cachedHtml) cache.delete(htmlCacheKey);
+              const page = await downloadSource(pageUrl, config, adapterTarget.bridgePlan.headers);
+              html = prepareBridgeHtml(page, charset, htmlBudget);
+              cacheSet(cache, htmlCacheKey, html, config);
+            }
             if (adapterTarget.type === "bridge-chapters" && adapterTarget.bridgePlan.tocSelector) {
-              const tocUrl = bridgeTocUrl(page.toString("utf8"), pageUrl, adapterTarget.bridgePlan);
+              const tocUrl = bridgeTocUrl(html, pageUrl, adapterTarget.bridgePlan);
               if (tocUrl) {
                 try {
                   const tocPageUrl = normalizeRemoteUrl(tocUrl);
-                  const tocPage = await downloadSource(tocPageUrl, config, adapterTarget.bridgePlan.headers);
-                  const tocOutput = executeBridgePlan(tocPage.toString("utf8"), tocPageUrl, adapterTarget.bridgePlan);
+                  const tocCacheKey = `bridge-html:${adapterTarget.type}:toc:${tocPageUrl}:${charset}`;
+                  let tocHtml = "";
+                  const cachedToc = config.cacheTtlMs > 0 ? cache.get(tocCacheKey) : null;
+                  if (cachedToc && cachedToc.expiresAt > Date.now()) {
+                    tocHtml = cachedToc.value;
+                  } else {
+                    if (cachedToc) cache.delete(tocCacheKey);
+                    const tocPage = await downloadSource(tocPageUrl, config, adapterTarget.bridgePlan.headers);
+                    tocHtml = prepareBridgeHtml(tocPage, charset, htmlBudget);
+                    cacheSet(cache, tocCacheKey, tocHtml, config);
+                  }
+                  const tocOutput = executeBridgePlan(
+                    tocHtml,
+                    tocPageUrl,
+                    adapterTarget.bridgePlan,
+                    paging,
+                  );
                   if (Array.isArray(tocOutput.data) && tocOutput.data.length) output = tocOutput;
                 } catch {
                   // A number of Legado sources keep a stale or optional tocUrl
@@ -1761,7 +1866,9 @@ export function createAppServer(options = {}) {
                 }
               }
             }
-            if (!output) output = executeBridgePlan(page.toString("utf8"), pageUrl, adapterTarget.bridgePlan);
+            if (!output) {
+              output = executeBridgePlan(html, pageUrl, adapterTarget.bridgePlan, paging);
+            }
           } catch (error) {
             if (error instanceof HttpError) throw error;
             throw new HttpError(422, `规则桥接解析失败：${error.message}`);
