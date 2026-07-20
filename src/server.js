@@ -7,6 +7,8 @@ import { isIP } from "node:net";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 import { JSDOM } from "jsdom";
 import { convertLegado, skippedBuckets } from "./converter.js";
+import { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
+import { analyzeSite } from "./siteAnalyze/index.js";
 import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
 import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
 import { decodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
@@ -58,6 +60,10 @@ export function serverConfig(environment = process.env) {
     preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES, false),
     preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 3_000),
     preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 4),
+    // 转换后抽测列表+目录；失败则回退自动识站（小说 HTML 启发式）。
+    verifyConvertedSources: boolean(environment.VERIFY_CONVERTED_SOURCES, true),
+    analyzeFallback: boolean(environment.ANALYZE_FALLBACK, true),
+    analyzeTimeoutMs: integer(environment.ANALYZE_TIMEOUT_MS, 8_000),
     maxComicPages: integer(environment.MAX_COMIC_PAGES, 50),
     maxComicImages: integer(environment.MAX_COMIC_IMAGES, 2_000),
     comicPageConcurrency: integer(environment.COMIC_PAGE_CONCURRENCY, 4),
@@ -1065,6 +1071,8 @@ function help(config) {
       xbs: "/convert.xbs?url=https://www.example.com/legado.json",
       path: "/url/https://www.example.com/legado.json.xbs",
       json: "/j/www.example.com/legado.json",
+      analyze: "/analyze.xbs?url=https://www.novel-site.example/",
+      analyzeJson: "/analyze/json?url=https://www.novel-site.example/",
       image: "/image/mwwz-aes?url=https://cdn.example.com/encrypted-image",
       health: "/healthz",
     },
@@ -1077,6 +1085,8 @@ function help(config) {
       preflightSources: config.preflightSources,
       preflightDeep: config.preflightDeep,
       preflightTimeoutMs: config.preflightTimeoutMs,
+      verifyConvertedSources: config.verifyConvertedSources,
+      analyzeFallback: config.analyzeFallback,
       imageDecoders: supportedImageDecoders(),
     },
   };
@@ -1622,6 +1632,33 @@ async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
       rule: "",
     })));
   }
+
+  const download = (url, headers = {}) => downloadSource(
+    url,
+    { ...config, fetchTimeoutMs: Math.max(config.preflightTimeoutMs, 1_000) },
+    headers,
+  );
+  const gated = await applyVerifyAndAnalyzeFallback(converted.sources, {
+    download,
+    concurrency: config.preflightConcurrency,
+    timeoutMs: config.preflightTimeoutMs,
+    analyzeTimeoutMs: config.analyzeTimeoutMs,
+    enabled: config.verifyConvertedSources,
+    analyzeFallback: config.analyzeFallback,
+  });
+  converted.sources = gated.sources;
+  if (gated.skipped.length) {
+    converted.skipped.push(...gated.skipped);
+    converted.warnings.push(...gated.skipped.map((item) => ({
+      source: item.source,
+      section: "source",
+      field: "verify",
+      message: `已从在线 XBS 跳过：${item.reason}`,
+      rule: "",
+    })));
+  }
+  if (gated.warnings.length) converted.warnings.push(...gated.warnings);
+
   const count = Object.keys(converted.sources).length;
   if (!count) throw new HttpError(422, "在线地址中没有可转换的阅读源");
   const buckets = skippedBuckets(converted.skipped);
@@ -1630,6 +1667,7 @@ async function convertOnlineSource(sourceUrl, config, imageProxyBase = "") {
   return {
     ...converted,
     count,
+    fallbackCount: gated.fallbackCount || 0,
     skippedBuckets: buckets,
     json,
     xbs,
@@ -1662,6 +1700,59 @@ export function createAppServer(options = {}) {
         sendJson(response, 200, { status: "ok" }, commonHeaders);
         return;
       }
+
+      // Direct site URL → auto analyze → Xiangse source (direction 1).
+      if (pathname === "/analyze" || pathname === "/analyze.xbs" || pathname === "/analyze/json") {
+        const url = new URL(request.url || "/", "http://read2xsgg.local");
+        const siteUrl = String(url.searchParams.get("url") || url.searchParams.get("u") || "").trim();
+        if (!siteUrl) throw new HttpError(400, "缺少网站 URL（?url=https://...）");
+        if (active >= config.maxConcurrent) throw new HttpError(429, "当前分析任务过多，请稍后重试");
+        active += 1;
+        let analyzed;
+        try {
+          const download = (target, headers = {}) => downloadSource(
+            target,
+            { ...config, fetchTimeoutMs: config.analyzeTimeoutMs },
+            headers,
+          );
+          analyzed = await analyzeSite(siteUrl, {
+            download,
+            timeoutMs: config.analyzeTimeoutMs,
+          });
+        } finally {
+          active -= 1;
+        }
+        if (!analyzed.ok) throw new HttpError(422, analyzed.reason || "自动识站失败");
+        const sources = { [analyzed.source.sourceName]: analyzed.source };
+        const json = Buffer.from(`${JSON.stringify(sources, null, 2)}\n`, "utf8");
+        const xbs = encodeXbs(json);
+        const headers = {
+          ...commonHeaders,
+          "X-Converted-Count": "1",
+          "X-Fallback-Count": "1",
+          "X-Analyze-Kind": analyzed.kind || "text",
+        };
+        if (pathname === "/analyze/json" || pathname === "/analyze") {
+          sendJson(response, 200, {
+            sources,
+            kind: analyzed.kind,
+            confidence: analyzed.confidence,
+            discovery: analyzed.discovery,
+            warnings: analyzed.warning ? [analyzed.warning] : [],
+          }, headers);
+          return;
+        }
+        response.writeHead(200, {
+          ...headers,
+          "Content-Type": "application/octet-stream",
+          "Content-Disposition": 'attachment; filename="analyzed.xbs"',
+          "Content-Length": xbs.length,
+        });
+        if (request.method === "HEAD") response.end();
+        else response.end(xbs);
+        return;
+      }
+
       const adapterTarget = adapterRequestFromRequest(request);
       if (adapterTarget) {
         if (!adapterTarget.sourceUrl) throw new HttpError(400, "缺少待解析页面 URL");
@@ -1817,6 +1908,7 @@ export function createAppServer(options = {}) {
         "X-Converted-Count": String(converted.count),
         "X-Skipped-Count": String(converted.skipped?.length || 0),
         "X-Skipped-Buckets": JSON.stringify(converted.skippedBuckets || {}),
+        "X-Fallback-Count": String(converted.fallbackCount || 0),
         "X-Warning-Count": String(converted.warnings.length),
       };
       if (request.headers["if-none-match"] === converted.etag) {
@@ -1830,6 +1922,7 @@ export function createAppServer(options = {}) {
           warnings: converted.warnings,
           skipped: converted.skipped || [],
           skippedBuckets: converted.skippedBuckets || {},
+          fallbackCount: converted.fallbackCount || 0,
         }, headers);
         return;
       }

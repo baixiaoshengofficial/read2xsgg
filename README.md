@@ -183,33 +183,49 @@ node ./bin/server.js
 
 ### 大型混合源验证
 
-`1197.json` 这类聚合源同时包含小说、漫画、音频、视频，以及只能在阅读 Android 运行时执行的规则。在线转换会先检查分类、搜索、详情、目录和正文五段核心链路；仍含 Android 专用运行时、必要字段缺失、未知 `imageDecode`、未适配登录分流，或无法转换的条目不会写进 XBS。
+在线转换管线现在是：**探活 → 按阅读规则转换 → 抽测列表/目录 → 失败则自动识站回退 → 仍失败则跳过**。
 
-Compose **默认开启 origin 探活**（`PREFLIGHT_SOURCES=true`）：转换前探测每个源的 `sourceUrl` 是否可达，死站会被跳过。**深度预检默认关闭**（`PREFLIGHT_DEEP_SOURCES=false`），避免对数百个上游做分类→正文实测拖垮服务；需要精选可用源时再显式打开：
-
-```bash
-PREFLIGHT_DEEP_SOURCES=true docker compose up -d
+```mermaid
+flowchart LR
+  legado[阅读源] --> probe[探活]
+  probe -->|死站| skip1[跳过]
+  probe --> convert[规则转换]
+  convert --> verify[抽测列表和目录]
+  verify -->|通过| xbs[写入 XBS]
+  verify -->|失败| analyze[自动识站]
+  analyze -->|成功| xbs
+  analyze -->|失败| skip2[rules-stale]
+  siteUrl[网站 URL] --> analyzeDirect["/analyze 直接识站"]
+  analyzeDirect --> xbs
 ```
 
-因此输出数量会随源文件内容和站点存活状态变化，不能把输入条目数当作可用源数量。
+Compose **默认开启** origin 探活与转换后抽测回退：
 
-大型聚合源第一次转换需要逐站验收，可能持续几十秒；同一订阅地址会按 `CACHE_TTL_SECONDS` 缓存结果。在线 XBS 中的书籍、章节、正文和图片规则会继续调用转换服务的 `/adapter/*` 与 `/image/*`，所以导入香色后也必须保持转换服务在线。升级镜像后应删除旧源并重新导入，让香色取得最新规则。
+- `PREFLIGHT_SOURCES=true`
+- `VERIFY_CONVERTED_SOURCES=true`
+- `ANALYZE_FALLBACK=true`
+- `PREFLIGHT_DEEP_SOURCES=false`（全链路深检仍为 opt-in）
 
-响应头 `X-Converted-Count` 是本次实际写入的源数量，`X-Skipped-Count` 是跳过数量，`X-Skipped-Buckets` 是按原因分桶的 JSON（如 `dead-origin`、`core-chain`、`imageDecode`、`login`、`media`）。JSON 调试接口还会返回 `skipped`、`skippedBuckets` 和 `warnings`，用于定位具体源在哪一段被过滤。
-
-`npm test` 只运行可重复的离线测试；需要检查真实上游的详情、目录和正文时运行 `npm run test:live`。这样上游临时断线不会让 GitHub Actions 每次推送都误报失败。
-
-转换器还提供香色动作链验收器。它会真正执行“分类 → 分类列表 → 详情 → 章节目录 → 正文 → 首个媒体文件”，并在分类首条是刚上架、已删除或尚无章节的坏数据时最多换 5 本复测；全部候选都失败才返回非零退出码：
+直接识站（不经过阅读源）：
 
 ```bash
-# 验证指定源
-npm run validate:xbs -- source.xbs 禁漫大王🎃
+# HTTP
+curl "https://xs.example/analyze/json?url=https://www.novel-site.example/"
+curl -OJ "https://xs.example/analyze.xbs?url=https://www.novel-site.example/"
 
-# 并发抽测聚合 XBS 中前 20 个源（不下载正文媒体文件）
-npm run validate:xbs -- source.xbs --all --limit 20 --concurrency 4 --no-media
+# CLI
+npm run convert -- --analyze https://www.novel-site.example/ -o site.xbs --json site.json
 ```
 
-对 `1197`（828 条）在 `omitNonPortable` + 在线 `imageProxyBase` 下约保留 420+ 条（跳过约 400：`core-chain` 为主，另有 `media` / `imageDecode` / `login`）。本地 `validate:xbs --all --limit 30 --concurrency 4 --no-media` 抽测仍会受上游 502/504 影响；本轮重点修复的是「能导入但列表/目录为空」的转换缺陷（负索引 CSS、JSON 误判 HTML、`%@pageIndex` 坏编码、章节 `@js` 模板未进桥接等），而不是把通过率冲到接近 828。
+阅读源本地转换若要启用抽测+回退：
+
+```bash
+npm run convert -- legado.json --verify --analyze-fallback -o sources.xbs --report report.json
+```
+
+识站 MVP 目前主要覆盖常见**小说 HTML 模板**；漫画/音频/视频会识别类型但通常拒绝自动生成，避免乱源。登录墙、强 JS 渲染站仍无法保证。
+
+响应头 `X-Converted-Count` / `X-Skipped-Count` / `X-Skipped-Buckets` / `X-Fallback-Count` 便于观察：有多少是规则转换通过，有多少是识站回退。分桶包括 `dead-origin`、`core-chain`、`rules-stale`、`analyze-failed`、`imageDecode`、`login`、`media`。
 
 本机 Docker 发布脚本默认先执行包括离线动作链在内的完整测试，测试失败不会构建或推送镜像。只有明确设置 `SKIP_VALIDATION=1` 才会跳过该门槛。
 
@@ -232,8 +248,11 @@ Compose 支持通过环境变量调整：
 | `ALLOW_DNS_PROXY_NETWORKS` | `true` | 允许域名经 Docker Desktop、Clash 等代理解析到 `198.18.0.0/15`；直接输入该网段 IP 仍会被拦截 |
 | `PREFLIGHT_SOURCES` | `true` | 转换前探测上游站点是否可达（origin）；设为 `false` 可跳过探活以加快转换，但会死站也会进入 XBS |
 | `PREFLIGHT_DEEP_SOURCES` | `false` | 实测分类列表、第一本书、章节和正文；仅在 `PREFLIGHT_SOURCES=true` 时生效。聚合源成本高，默认关闭 |
-| `PREFLIGHT_TIMEOUT_MS` | `3000` | 单个上游站点预检超时时间 |
-| `PREFLIGHT_CONCURRENCY` | `4` | 上游站点并发预检数量；不建议在小内存容器中调高 |
+| `PREFLIGHT_TIMEOUT_MS` | `3000` | 单个上游站点预检/抽测超时时间 |
+| `PREFLIGHT_CONCURRENCY` | `4` | 上游站点并发预检/抽测数量；不建议在小内存容器中调高 |
+| `VERIFY_CONVERTED_SOURCES` | `true` | 转换后抽测分类列表与目录是否非空；失败才进入识站回退或跳过 |
+| `ANALYZE_FALLBACK` | `true` | 抽测失败时用启发式识站生成小说源；设为 `false` 则直接跳过 |
+| `ANALYZE_TIMEOUT_MS` | `8000` | 自动识站单次页面下载超时 |
 | `MAX_COMIC_PAGES` | `50` | 单章 JSON 漫画接口最多聚合的分页数（含第一页） |
 | `MAX_COMIC_IMAGES` | `2000` | 单章最多返回的图片数 |
 | `COMIC_PAGE_CONCURRENCY` | `4` | 单章后续图片分页的并发请求数 |

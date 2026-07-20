@@ -36,7 +36,12 @@ function close(server) {
 }
 
 function testServerConfig() {
-  return serverConfig({ PREFLIGHT_SOURCES: "false", PREFLIGHT_DEEP_SOURCES: "false" });
+  return serverConfig({
+    PREFLIGHT_SOURCES: "false",
+    PREFLIGHT_DEEP_SOURCES: "false",
+    VERIFY_CONVERTED_SOURCES: "false",
+    ANALYZE_FALLBACK: "false",
+  });
 }
 
 test("手拼阅读源地址可还原为完整 URL", () => {
@@ -679,8 +684,11 @@ test("DNS 透明代理默认开启，origin 探活默认开启，深度预检默
   assert.equal(serverConfig({}).preflightDeep, false);
   assert.equal(serverConfig({}).preflightTimeoutMs, 3000);
   assert.equal(serverConfig({}).preflightConcurrency, 4);
+  assert.equal(serverConfig({}).verifyConvertedSources, true);
+  assert.equal(serverConfig({}).analyzeFallback, true);
   assert.equal(serverConfig({ ALLOW_DNS_PROXY_NETWORKS: "false" }).allowDnsProxyNetworks, false);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "false" }).preflightSources, false);
+  assert.equal(serverConfig({ VERIFY_CONVERTED_SOURCES: "false" }).verifyConvertedSources, false);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "true", PREFLIGHT_DEEP_SOURCES: "true" }).preflightSources, true);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "true", PREFLIGHT_DEEP_SOURCES: "true" }).preflightDeep, true);
 });

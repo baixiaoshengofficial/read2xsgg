@@ -1451,6 +1451,8 @@ export function skippedBuckets(skipped = []) {
     else if (/sourceRegex|媒体流|可播放|媒体/i.test(reason)) key = "media";
     else if (/有效 URL|请求地址为空|不可移植/i.test(reason)) key = "core-chain";
     else if (/核心链路/i.test(reason)) key = "core-chain";
+    else if (/rules-stale/i.test(reason)) key = "rules-stale";
+    else if (/analyze-failed/i.test(reason)) key = "analyze-failed";
     buckets[key] = (buckets[key] || 0) + 1;
   }
   return buckets;
