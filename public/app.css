@@ -31,6 +31,27 @@ body {
   padding: 2.5rem 0 4rem;
 }
 
+/* 登录态：整页垂直居中，登录块水平居中 */
+.shell.is-login {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding-top: 1.5rem;
+  padding-bottom: 1.5rem;
+}
+
+.shell.is-login .hero {
+  text-align: center;
+  margin-bottom: 1.25rem;
+}
+
+.shell.is-login .lede {
+  margin-left: auto;
+  margin-right: auto;
+}
+
 .hero {
   margin-bottom: 1.75rem;
 }
@@ -74,7 +95,10 @@ body {
 }
 
 .login-panel {
+  width: 100%;
   max-width: 28rem;
+  margin-left: auto;
+  margin-right: auto;
 }
 
 .login-panel button[type="submit"] {

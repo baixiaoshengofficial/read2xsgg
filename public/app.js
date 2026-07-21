@@ -62,9 +62,15 @@ async function api(path, options = {}) {
   return data;
 }
 
+function shell() {
+  return document.querySelector(".shell");
+}
+
 function showLogin(message = "", ok = false) {
   els.login.hidden = false;
   els.app.hidden = true;
+  shell()?.classList.add("is-login");
+  document.title = "登录 · read2xsgg";
   els.heroTitle.textContent = "登录";
   els.heroLede.innerHTML = "请输入部署时在 <code>.env</code> 中配置的 <code>ADMIN_TOKEN</code> 后进入。";
   els.token.value = "";
@@ -79,6 +85,8 @@ function showLogin(message = "", ok = false) {
 function showApp() {
   els.login.hidden = true;
   els.app.hidden = false;
+  shell()?.classList.remove("is-login");
+  document.title = "源管理 · read2xsgg";
   els.heroTitle.textContent = "源管理";
   els.heroLede.textContent = "异步完整抽测转换，完成后生成可订阅的稳定 XBS 地址。同步直转路径仍然可用。";
   els.loginStatus.hidden = true;
