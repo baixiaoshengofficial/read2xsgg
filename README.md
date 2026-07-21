@@ -167,6 +167,8 @@ https://xs.chenqinfeng.de/url/www.novel-site.example.xbs
 
 给阅读（Legado）书源 JSON 地址，探活 → 转换 → 有限抽测（大源可能跳过/截断抽测预算）。适合少量源；**大聚合请用 WebUI**。
 
+同步转换结果也会写入 `DATA_DIR/conversions`，因此服务或容器重启后可直接复用；有效期沿用 `CACHE_TTL_SECONDS`（默认 300 秒）。需要长期稳定且可管理的订阅请使用 WebUI 生成的 `/library/{id}.xbs`。
+
 ```text
 {转换站}/source/{去掉 https:// 后的阅读源地址}.xbs
 ```
@@ -260,6 +262,7 @@ Compose **默认同步路径**开启 origin 探活、抽测与识站修复；仅
 - `PREFLIGHT_CONCURRENCY=8`（探活与抽测共用并发；同源识站结果会复用）
 - `ADMIN_TOKEN`（写在 `.env`，WebUI / `/api/jobs` 必需）
 - `DATA_DIR=/data`
+- `CACHE_TTL_SECONDS=300`（同步转换结果的内存与磁盘缓存有效期）
 - `PREFLIGHT_DEEP_SOURCES=false`（全链路深检仍为 opt-in）
 
 直接识站（不经过阅读源）：

@@ -45,6 +45,66 @@ test("libraryStore 持久化任务与制品", async () => {
   }
 });
 
+test("同步转换结果写入 DATA_DIR，服务重启后可直接复用", async (context) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-conversion-cache-"));
+  const json = Buffer.from('{"演示源":{"sourceName":"演示源"}}\n');
+  const xbs = encodeXbs(json);
+  const converted = {
+    sources: JSON.parse(json.toString("utf8")),
+    warnings: [],
+    skipped: [],
+    skippedBuckets: {},
+    fallbackCount: 0,
+    unverifiedCount: 0,
+    count: 1,
+    json,
+    xbs,
+    etag: '"fixture"',
+  };
+  const config = {
+    ...serverConfig({ DATA_DIR: dir, CACHE_TTL_SECONDS: "60" }),
+    dataDir: dir,
+    cacheTtlMs: 60_000,
+  };
+  const stableOrigin = {
+    "X-Forwarded-Host": "converter.example",
+    "X-Forwarded-Proto": "https",
+  };
+  let calls = 0;
+  let app = createAppServer({
+    config,
+    recoverJobs: false,
+    convertOnlineSource: async () => {
+      calls += 1;
+      return converted;
+    },
+  });
+  let base = await listen(app);
+  context.after(async () => {
+    await close(app).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const target = "https://example.com/legado.json";
+  const first = await fetch(`${base}/convert.xbs?url=${encodeURIComponent(target)}`, { headers: stableOrigin });
+  assert.equal(first.status, 200);
+  assert.equal(calls, 1);
+  await close(app);
+
+  app = createAppServer({
+    config,
+    recoverJobs: false,
+    convertOnlineSource: async () => {
+      throw new Error("重启后不应重新下载和转换");
+    },
+  });
+  base = await listen(app);
+  const restored = await fetch(`${base}/convert.xbs?url=${encodeURIComponent(target)}`, { headers: stableOrigin });
+  assert.equal(restored.status, 200);
+  assert.deepEqual(Buffer.from(await restored.arrayBuffer()), xbs);
+  assert.equal(calls, 1);
+});
+
 test("管理 API 需要 ADMIN_TOKEN；公开 /library 仅 done 可取", async (context) => {
   const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-api-"));
   const store = createLibraryStore(dir);

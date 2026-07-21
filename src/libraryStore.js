@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -8,6 +8,10 @@ function nowIso() {
 
 function newJobId() {
   return randomBytes(8).toString("hex");
+}
+
+function contentHash(value) {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 async function readJson(filePath, fallback = null) {
@@ -52,12 +56,14 @@ export function createLibraryStore(dataDir) {
   const root = path.resolve(dataDir || "./data");
   const jobsDir = path.join(root, "jobs");
   const artifactsDir = path.join(root, "artifacts");
+  const conversionsDir = path.join(root, "conversions");
   const indexPath = path.join(root, "index.json");
   const withLock = createLockMap();
 
   async function ensure() {
     await mkdir(jobsDir, { recursive: true });
     await mkdir(artifactsDir, { recursive: true });
+    await mkdir(conversionsDir, { recursive: true });
     await withLock("index", async () => {
       const index = await readJson(indexPath, null);
       if (!index) await writeJsonAtomic(indexPath, { version: 1, jobs: [] });
@@ -70,6 +76,14 @@ export function createLibraryStore(dataDir) {
 
   function artifactPath(id, ext) {
     return path.join(artifactsDir, `${id}.${ext}`);
+  }
+
+  function conversionId(key) {
+    return createHash("sha256").update(String(key || "")).digest("hex");
+  }
+
+  function conversionPath(key, ext) {
+    return path.join(conversionsDir, `${conversionId(key)}.${ext}`);
   }
 
   async function readIndexUnlocked() {
@@ -193,6 +207,57 @@ export function createLibraryStore(dataDir) {
     }
   }
 
+  /**
+   * Persist the synchronous conversion cache separately from user-managed
+   * library jobs. The metadata is written last, so readers never accept a
+   * partially-written pair of JSON/XBS artifacts after an interrupted write.
+   */
+  async function saveConversion(key, result, { expiresAt = 0 } = {}) {
+    if (!key || !result?.xbs || !result?.json) return;
+    await ensure();
+    const id = conversionId(key);
+    await withLock(`conversion:${id}`, async () => {
+      await writeFile(conversionPath(key, "xbs"), result.xbs);
+      await writeFile(conversionPath(key, "json"), result.json);
+      await writeJsonAtomic(conversionPath(key, "meta.json"), {
+        version: 1,
+        savedAt: nowIso(),
+        expiresAt: Number(expiresAt) || 0,
+        xbsHash: contentHash(result.xbs),
+        jsonHash: contentHash(result.json),
+        etag: String(result.etag || ""),
+        count: Number(result.count) || 0,
+        warnings: Array.isArray(result.warnings) ? result.warnings : [],
+        skipped: Array.isArray(result.skipped) ? result.skipped : [],
+        skippedBuckets: result.skippedBuckets && typeof result.skippedBuckets === "object" ? result.skippedBuckets : {},
+        fallbackCount: Number(result.fallbackCount) || 0,
+        unverifiedCount: Number(result.unverifiedCount) || 0,
+      });
+    });
+  }
+
+  async function readConversion(key) {
+    if (!key) return null;
+    const id = conversionId(key);
+    return withLock(`conversion:${id}`, async () => {
+      const meta = await readJson(conversionPath(key, "meta.json"), null);
+      if (!meta || meta.version !== 1) return null;
+      try {
+        const [xbs, json] = await Promise.all([
+          readFile(conversionPath(key, "xbs")),
+          readFile(conversionPath(key, "json")),
+        ]);
+        if (!meta.xbsHash || !meta.jsonHash || meta.xbsHash !== contentHash(xbs) || meta.jsonHash !== contentHash(json)) return null;
+        const sources = JSON.parse(json.toString("utf8"));
+        if (!sources || typeof sources !== "object" || Array.isArray(sources)) return null;
+        return { ...meta, xbs, json, sources };
+      } catch (error) {
+        if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
+        throw error;
+      }
+    });
+  }
+
   async function deleteJob(id) {
     await ensure();
     await withLock(`job:${id}`, async () => {
@@ -218,6 +283,8 @@ export function createLibraryStore(dataDir) {
     updateJob,
     saveArtifacts,
     readArtifact,
+    saveConversion,
+    readConversion,
     deleteJob,
     listRecoverableJobs,
   };

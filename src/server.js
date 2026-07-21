@@ -2046,6 +2046,14 @@ function cacheSet(cache, key, value, config) {
   cache.set(key, { expiresAt: Date.now() + config.cacheTtlMs, value });
 }
 
+function conversionCacheExpiry(config) {
+  return config.cacheTtlMs > 0 ? Date.now() + config.cacheTtlMs : 0;
+}
+
+function conversionCacheExpired(item) {
+  return Boolean(item?.expiresAt) && item.expiresAt <= Date.now();
+}
+
 export function createAppServer(options = {}) {
   const config = { ...serverConfig(), ...(options.config ?? {}) };
   const cache = new Map();
@@ -2053,6 +2061,7 @@ export function createAppServer(options = {}) {
   let active = 0;
   const publicDir = path.resolve(config.publicDir || DEFAULT_PUBLIC_DIR);
   const store = options.store || createLibraryStore(config.dataDir);
+  const convertRemoteSource = options.convertOnlineSource || convertOnlineSource;
   const worker = options.worker || createJobWorker({
     store,
     config,
@@ -2457,28 +2466,36 @@ export function createAppServer(options = {}) {
       // recognised comic rule, so do not share it across distinct public hosts.
       const cacheKey = `${target.sourceUrl}\n${publicBaseUrl(request)}`;
       let converted = cache.get(cacheKey);
-      if (converted && converted.expiresAt <= Date.now()) {
+      if (converted && conversionCacheExpired(converted)) {
         cache.delete(cacheKey);
         converted = undefined;
       }
       if (converted) converted = converted.value;
       else {
-        let pending = pendingConversions.get(cacheKey);
-        if (!pending) {
-          if (active >= config.maxConcurrent) throw new HttpError(429, "当前转换任务过多，请稍后重试");
-          active += 1;
-          pending = convertOnlineSource(target.sourceUrl, config, publicBaseUrl(request))
-            .then((result) => {
-              cacheSet(cache, cacheKey, result, config);
-              return result;
-            })
-            .finally(() => {
-              active -= 1;
-              pendingConversions.delete(cacheKey);
-            });
-          pendingConversions.set(cacheKey, pending);
+        const persisted = await store.readConversion?.(cacheKey);
+        if (persisted && !conversionCacheExpired(persisted)) {
+          converted = persisted;
+          cacheSet(cache, cacheKey, converted, config);
         }
-        converted = await pending;
+        if (!converted) {
+          let pending = pendingConversions.get(cacheKey);
+          if (!pending) {
+            if (active >= config.maxConcurrent) throw new HttpError(429, "当前转换任务过多，请稍后重试");
+            active += 1;
+            pending = convertRemoteSource(target.sourceUrl, config, publicBaseUrl(request))
+              .then(async (result) => {
+                await store.saveConversion?.(cacheKey, result, { expiresAt: conversionCacheExpiry(config) });
+                cacheSet(cache, cacheKey, result, config);
+                return result;
+              })
+              .finally(() => {
+                active -= 1;
+                pendingConversions.delete(cacheKey);
+              });
+            pendingConversions.set(cacheKey, pending);
+          }
+          converted = await pending;
+        }
       }
 
       const headers = {
