@@ -2,6 +2,7 @@ import { convertRule, inferResponseType } from "./selectors.js";
 import { convertRequest, parseHeaders, parseLooseJson } from "./requests.js";
 import { detectLegadoCharset, xiangseEncodeFields } from "./charset.js";
 import { adaptLegadoSource, bookDetailRequestInfoOverride, chapterListRequestInfoOverride } from "./siteAdapters.js";
+import { isLrtsSource, lrtsListenPathContent } from "./lrtsAdapter.js";
 import { decoderForLegadoImageRule } from "./imageDecoder.js";
 import { compileComicExtractionPlan, encodeComicExtractionPlan } from "./comicPlan.js";
 import { compileMediaExtractionPlan, encodeMediaExtractionPlan } from "./mediaPlan.js";
@@ -320,6 +321,25 @@ function preserveEncode(from, to) {
 
 function bridgeBookAction(action, bridgeBase, headers) {
   if (!action?.list || !action?.bookName || !action?.detailUrl || !action?.requestInfo) return action;
+  const lrtsFilters = String(action?.moreKeys?.requestFilters || "");
+  if (/\/adapter\/lrts-books\?/i.test(lrtsFilters) || /\/adapter\/lrts-books\?/i.test(String(action.requestInfo))) {
+    return preserveEncode(action, {
+      ...commonAction(action.actionID || "bookWorld", action.host, "json"),
+      requestInfo: action.requestInfo,
+      list: "$.data",
+      bookName: "name",
+      detailUrl: "url",
+      author: "author",
+      desc: "desc",
+      cat: "cat",
+      lastChapterTitle: "lastChapterTitle",
+      cover: "cover",
+      status: "status",
+      wordCount: "wordCount",
+      moreKeys: action.moreKeys,
+      ...(action._sIndex !== undefined ? { _sIndex: action._sIndex } : {}),
+    });
+  }
   const plan = compileBookBridgePlan(action, { ...headers, ...(action.httpHeaders || {}) });
   if (!plan.list || !plan.fields.name || !plan.fields.url) return action;
   const endpoint = bridgeEndpoint(bridgeBase, "books", plan);
@@ -950,6 +970,16 @@ function listPageSizeForRequest(template, configured) {
   const numeric = Number(configured);
   if (Number.isInteger(numeric) && numeric > 0) return Math.min(200, numeric);
   const source = String(template || "");
+  const querySize = source.match(/[?&]pageSize=(\d{1,3})\b/i);
+  if (querySize) {
+    const parsed = Number(querySize[1]);
+    if (Number.isInteger(parsed) && parsed > 0) return Math.min(200, parsed);
+  }
+  const dsize = source.match(/[?&]dsize=(\d{1,3})\b/i);
+  if (dsize) {
+    const parsed = Number(dsize[1]);
+    if (Number.isInteger(parsed) && parsed > 0) return Math.min(200, parsed);
+  }
   if (/__READ2XSGG_PAGE__|\{\{\s*page\s*\}\}|%@pageIndex|params\.pageIndex/i.test(source)) {
     return 10;
   }
@@ -1459,7 +1489,17 @@ function convertOne(source, warnings, options = {}) {
     ].join("\n");
     tocWarningFor("chapterUrl", tocRules.chapterUrl)("单章节图片源没有 chapterUrl，已使用当前详情页作为章节地址");
   }
-  if ((resolvedType === "audio" || resolvedType === "video") && options.imageProxyBase && mediaRuleNeedsServer) {
+  if ((resolvedType === "audio" || resolvedType === "video") && isLrtsSource(source)
+    && /getListenPath/i.test(String(tocRules.chapterUrl || ""))) {
+    converted.chapterContent = {
+      ...commonAction("chapterContent", host, "json"),
+      requestInfo: "%@result",
+      content: lrtsListenPathContent(),
+    };
+    contentWarningFor("content", contentRules.content)(
+      "懒人听书 getListenPath 接口已改为直接解析 JSON path 播放地址",
+    );
+  } else if ((resolvedType === "audio" || resolvedType === "video") && options.imageProxyBase && mediaRuleNeedsServer) {
     converted.chapterContent = proxiedMediaChapterContent(
       host,
       options.imageProxyBase,

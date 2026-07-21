@@ -66,7 +66,15 @@ export async function convertOnlineSource(sourceUrl, config, imageProxyBase = ""
   if (!parsed && parseError) throw new HttpError(422, `在线阅读源不是有效 JSON：${parseError.message}`);
   if (!parsed && downloadError) throw downloadError;
   if (!parsed) throw new HttpError(422, "在线阅读源不是有效 JSON");
-  parsed = await adaptOnlineSources(parsed, config);
+  parsed = await adaptOnlineSources(parsed, {
+    ...config,
+    imageProxyBase,
+    download: (url, headers = {}) => downloadSource(
+      url,
+      { ...config, fetchTimeoutMs: Math.max(config.preflightTimeoutMs, 1_000) },
+      headers,
+    ),
+  });
 
   emit({ phase: "convert", done: 0, total: 0, kept: 0, skipped: 0, unverified: 0 });
   let converted;

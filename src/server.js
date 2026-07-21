@@ -13,6 +13,7 @@ import { convertOnlineSource } from "./convertOnline.js";
 import { createLibraryStore } from "./libraryStore.js";
 import { createJobWorker } from "./jobWorker.js";
 import { analyzeSite } from "./siteAnalyze/index.js";
+import { isLrtsSource, enrichLrtsSource, fetchLrtsResourceBooks } from "./lrtsAdapter.js";
 import { decodeTextBuffer } from "./charset.js";
 import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
 import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
@@ -1004,7 +1005,8 @@ export async function adaptOnlineSources(input, config) {
   const sources = legacySourceList(input);
   const hasMwwz = sources.some(isMwwzSource);
   const jmSources = sources.filter(isJmSource);
-  if (!hasMwwz && !jmSources.length) return input;
+  const hasLrts = sources.some(isLrtsSource);
+  if (!hasMwwz && !jmSources.length && !hasLrts) return input;
   const mwwzMirror = hasMwwz ? await resolveMwwzMirror(config) : "";
   const jmMirror = jmSources.length ? await resolveJmMirror(config, jmSources) : "";
 
@@ -1042,6 +1044,13 @@ export async function adaptOnlineSources(input, config) {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
         Referer: `${jmMirror}/`,
       });
+    }
+    if (isLrtsSource(source) && typeof config.download === "function" && config.imageProxyBase) {
+      const enriched = await enrichLrtsSource(source, {
+        download: config.download,
+        imageProxyBase: config.imageProxyBase,
+      });
+      Object.assign(source, enriched);
     }
   }
   return cloned;
@@ -1183,6 +1192,7 @@ function mediaProxyRequestFromRequest(request) {
 function adapterRequestFromRequest(request) {
   const parsed = new URL(request.url || "/", "http://read2xsgg.local");
   const type = parsed.pathname === "/adapter/jm/chapters" ? "jm-chapters"
+    : parsed.pathname === "/adapter/lrts-books" ? "lrts-books"
     : parsed.pathname === "/adapter/images" || parsed.pathname === "/adapter/jm/images" ? "page-images"
       : parsed.pathname === "/adapter/media" ? "page-media"
         : parsed.pathname === "/adapter/toc" ? "toc-redirect"
@@ -1212,6 +1222,7 @@ function adapterRequestFromRequest(request) {
   return {
     type,
     sourceUrl: type.startsWith("bridge-") ? rawSourceUrl : (parsed.searchParams.get("url") || parsed.searchParams.get("u") || ""),
+    entityId: parsed.searchParams.get("entityId") || "",
     hint: parsed.searchParams.get("hint") || "",
     selector: parsed.searchParams.get("selector") || "",
     extractionPlan,
@@ -2202,6 +2213,23 @@ export function createAppServer(options = {}) {
 
       const adapterTarget = adapterRequestFromRequest(request);
       if (adapterTarget) {
+        if (adapterTarget.type === "lrts-books") {
+          if (!adapterTarget.entityId) throw new HttpError(400, "缺少 entityId");
+          if (active >= config.maxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
+          active += 1;
+          try {
+            const output = await fetchLrtsResourceBooks(
+              adapterTarget.entityId,
+              adapterTarget.page,
+              adapterTarget.pageSize || 20,
+              (url, headers = {}) => downloadSource(url, config, headers),
+            );
+            sendJson(response, 200, output, commonHeaders);
+          } finally {
+            active -= 1;
+          }
+          return;
+        }
         if (!adapterTarget.sourceUrl) throw new HttpError(400, "缺少待解析页面 URL");
         if (active >= config.maxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
         let requestedSourceUrl = adapterTarget.sourceUrl;
