@@ -2,10 +2,16 @@ import { convertRule, inferResponseType } from "./selectors.js";
 import { convertRequest, parseHeaders, parseLooseJson } from "./requests.js";
 import { detectLegadoCharset, xiangseEncodeFields } from "./charset.js";
 import { adaptLegadoSource, bookDetailRequestInfoOverride, chapterListRequestInfoOverride } from "./siteAdapters.js";
-import { isLrtsSource, lrtsListenPathContent } from "./lrtsAdapter.js";
 import { decoderForLegadoImageRule } from "./imageDecoder.js";
 import { compileComicExtractionPlan, encodeComicExtractionPlan } from "./comicPlan.js";
-import { compileMediaExtractionPlan, encodeMediaExtractionPlan } from "./mediaPlan.js";
+import {
+  compileMediaExtractionPlan,
+  encodeMediaExtractionPlan,
+  mediaPlanHasResolution,
+  mediaRuleNeedsPortabilityWarning,
+  MEDIA_PORTABILITY_WARNING,
+} from "./mediaPlan.js";
+import { encodeCatalogPlan, normalizeCatalogPlan } from "./catalogPlan.js";
 import { hasUnsupportedLegadoRuntime } from "./legadoJs.js";
 import {
   compileBookBridgePlan,
@@ -76,6 +82,43 @@ function minimumAppVersion(source) {
 function isDetailUrlAlias(rule) {
   const value = String(rule ?? "").trim();
   return /^(?:baseUrl|-|%@result)$/i.test(value);
+}
+
+function normalizeLegadoReplaceRegex(pattern) {
+  let source = String(pattern ?? "").trim();
+  let replacement = "";
+  // Legado content.replaceRegex often stores `##pattern` or `##pattern##replacement`.
+  if (source.startsWith("##")) {
+    const rest = source.slice(2);
+    const parts = rest.split("##");
+    source = parts[0] || "";
+    replacement = (parts[1] || "").replace(/#+$/, "");
+  }
+  return { source, replacement };
+}
+
+function compileReplaceRegexStatement(pattern, warn) {
+  const { source, replacement } = normalizeLegadoReplaceRegex(pattern);
+  if (!source) return "";
+  if (/\{\{\s*book\.durChapterTitle\s*\}\}/i.test(source)) {
+    warn("正文 replaceRegex 含章节标题模板，已改为香色 queryInfo.chapterTitle 运行时替换");
+    const template = source.replace(/\{\{\s*book\.durChapterTitle\s*\}\}/gi, "__READ2XSGG_CHAPTER_TITLE__");
+    return [
+      'var __chapterTitle = String((params.queryInfo && (params.queryInfo.chapterTitle || params.queryInfo.chapterName || params.queryInfo.title)) || "");',
+      `var __replacePat = ${JSON.stringify(template)}.replace(/__READ2XSGG_CHAPTER_TITLE__/g, __chapterTitle.replace(/[.*+?^$\{}()|[\\]\\\\]/g, "\\\\$&"));`,
+      `result = String(result).replace(new RegExp(__replacePat, "g"), ${JSON.stringify(replacement)});`,
+    ].join("\n");
+  }
+  if (/\{\{/.test(source)) {
+    warn("正文 replaceRegex 含无法移植的阅读模板，已忽略该清理规则");
+    return "";
+  }
+  try {
+    new RegExp(source);
+  } catch {
+    warn("正文 replaceRegex 无法解析，已原样写入转换结果");
+  }
+  return `result = String(result).replace(new RegExp(${JSON.stringify(source)}, "g"), ${JSON.stringify(replacement)});`;
 }
 
 /**
@@ -321,8 +364,9 @@ function preserveEncode(from, to) {
 
 function bridgeBookAction(action, bridgeBase, headers) {
   if (!action?.list || !action?.bookName || !action?.detailUrl || !action?.requestInfo) return action;
-  const lrtsFilters = String(action?.moreKeys?.requestFilters || "");
-  if (/\/adapter\/lrts-books\?/i.test(lrtsFilters) || /\/adapter\/lrts-books\?/i.test(String(action.requestInfo))) {
+  const catalogFilters = String(action?.moreKeys?.requestFilters || "");
+  // Declarative /adapter/catalog plans already return normalized JSON book rows.
+  if (/\/adapter\/catalog\?/i.test(catalogFilters) || /\/adapter\/catalog\?/i.test(String(action.requestInfo))) {
     return preserveEncode(action, {
       ...commonAction(action.actionID || "bookWorld", action.host, "json"),
       requestInfo: action.requestInfo,
@@ -455,16 +499,60 @@ function tocLinkHint(rule) {
 
 /**
  * Strip trailing Legado request options (`,{headers:{...}}`) and return them.
+ * Also recognizes the common cover-image idiom that appends the same options via
+ * JavaScript string concatenation: `result.cover + ',{"headers":{"Referer":"..."}}'`.
  */
 function splitLegadoUrlOptions(rule) {
   const source = String(rule || "").trim();
-  const match = source.match(/^(.*?)(,\s*\{[\s\S]*\})\s*$/);
-  if (!match) return { url: source, options: {} };
-  return { url: match[1].trim(), options: parseLooseJson(match[2].replace(/^,\s*/, ""), () => {}) };
+  if (!source) return { url: "", options: {} };
+
+  const trailing = source.match(/^(.*?)(,\s*\{[\s\S]*\})\s*$/);
+  if (trailing) {
+    return { url: trailing[1].trim(), options: parseLooseJson(trailing[2].replace(/^,\s*/, ""), () => {}) };
+  }
+
+  const concat = source.match(
+    /^(.*?)\s*\+\s*(['"]),(\{\s*"headers?"\s*:\s*\{[\s\S]*?\}\s*\})\2\s*;?\s*$/i,
+  );
+  if (concat) {
+    return {
+      url: concat[1].trim().replace(/^\(?/, "").replace(/\)$/, ""),
+      options: parseLooseJson(concat[3], () => {}),
+    };
+  }
+
+  const embedded = source.match(/(['"]),(\{\s*"headers?"\s*:\s*\{[\s\S]*?\}\s*\})\1/);
+  if (embedded) {
+    const options = parseLooseJson(embedded[2], () => {});
+    const cleaned = source
+      .replace(/\s*\+\s*(['"]),\{\s*"headers?"\s*:\s*\{[\s\S]*?\}\s*\}\1/gi, "")
+      .replace(/(['"]),\{\s*"headers?"\s*:\s*\{[\s\S]*?\}\s*\}\1/gi, "\"\"")
+      .trim();
+    return { url: cleaned || source, options };
+  }
+
+  return { url: source, options: {} };
 }
 
 /**
- * JSON API tocUrl like getBookMenu?bookId={{$.id}}&pageNum=1 → chapterList requestInfo.
+ * Cover/detail URL rules that only read `result.field` (optionally after the
+ * Legado header-suffix strip) become plain JSON field paths for 香色.
+ */
+function portableResultFieldRule(rule, responseType) {
+  if (responseType !== "json") return "";
+  const source = String(rule || "").trim()
+    .replace(/^@js:\s*/i, "")
+    .replace(/^return\s+/i, "")
+    .replace(/;?\s*$/, "")
+    .replace(/^\(+/, "")
+    .replace(/\)+$/, "")
+    .trim();
+  const field = source.match(/^result\.([A-Za-z_$][\w$]*)$/)?.[1];
+  return field || "";
+}
+
+/**
+ * Absolute JSON API tocUrl templates (…?bookId={{$.id}}&pageNum=1) → chapterList requestInfo.
  * Xiangse §七 uses detail URL as result; these menus need the book id + page instead.
  */
 function upstreamPageSizeFromTocUrl(tocUrl) {
@@ -540,8 +628,8 @@ function buildJsonApiTocNextPageUrl(tocUrl) {
 }
 
 /**
- * Turn getListenPath-style chapter URL templates into a bridge urlTemplate field.
- * entityId is taken from the toc page URL (bookId=); section/id from each row.
+ * Turn absolute HTTP chapter URL templates into a bridge urlTemplate field.
+ * Query values may come from the toc page URL (e.g. bookId=) or each row.
  */
 function compileHttpChapterUrlField(chapterUrl) {
   const { url: raw } = splitLegadoUrlOptions(chapterUrl);
@@ -571,6 +659,7 @@ function compileHttpChapterUrlField(chapterUrl) {
 function mergeLegadoUrlOptionHeaders(headers, ...rules) {
   const merged = { ...headers };
   for (const rule of rules) {
+    if (rule === undefined || rule === null || rule === "") continue;
     const { options } = splitLegadoUrlOptions(rule);
     const extra = parseHeaders(options.headers || options.header || {}, () => {});
     Object.assign(merged, extra);
@@ -844,6 +933,34 @@ function portableCoverRule(rule) {
   return "";
 }
 
+/**
+ * Drop Legado image-request header suffixes from cover rules and prefer a plain
+ * JSON field when the remainder is only `result.cover_pic`.
+ */
+function convertCoverRule(rule, responseType, warningFor) {
+  const original = String(rule ?? "").trim();
+  if (!original) return "";
+  const constantCover = portableCoverRule(original);
+  if (constantCover) return constantCover;
+
+  const { url: stripped, options } = splitLegadoUrlOptions(original);
+  const hadHeaderSuffix = Boolean(options.headers || options.header);
+  const working = hadHeaderSuffix ? stripped : original;
+  if (hadHeaderSuffix) {
+    warningFor("coverUrl", original)(
+      "封面规则中的阅读 headers 附加段已并入源 httpHeaders，并去掉 URL 尾缀以免香色把配置当成地址的一部分",
+    );
+  }
+
+  const field = portableResultFieldRule(working, responseType);
+  if (field) return field;
+
+  return compatibleTextRule(
+    working,
+    convertRule(working, { responseType, warn: warningFor("coverUrl", original) }),
+  );
+}
+
 function mapBookRules(rules, responseType, warningFor, { initPath = "", listContext = false } = {}) {
   const mapping = {
     bookList: "list",
@@ -861,11 +978,9 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
   for (const [from, to] of Object.entries(mapping)) {
     if (rules[from] !== undefined && rules[from] !== "") {
       if (from === "coverUrl") {
-        const constantCover = portableCoverRule(rules[from]);
-        if (constantCover) {
-          result[to] = constantCover;
-          continue;
-        }
+        const convertedCover = convertCoverRule(rules[from], responseType, warningFor);
+        if (convertedCover) result[to] = convertedCover;
+        continue;
       }
       if (from === "kind") {
         const convertedKind = portableKindRule(rules[from], responseType, warningFor, initPath);
@@ -1037,6 +1152,40 @@ function extractExploreEntriesFromJs(script) {
   return entries;
 }
 
+function materializeCatalogExploreEntries(source, imageProxyBase, warningFor) {
+  const plan = normalizeCatalogPlan(source?.read2xsgg?.catalogPlan);
+  if (!plan) return null;
+  const raw = Array.isArray(source.exploreUrl) ? source.exploreUrl : [];
+  const entityEntries = raw.filter((item) => item?.title && (item.entityId != null && String(item.entityId).trim() !== ""));
+  if (!entityEntries.length) return null;
+  if (!imageProxyBase) {
+    warningFor("exploreUrl", source.exploreUrl)(
+      "源含声明式 catalogPlan，但当前转换没有公开代理地址；分类分页无法物化为通用 catalog 适配器，请用在线转换或传入 imageProxyBase",
+    );
+    return null;
+  }
+  let encoded;
+  try {
+    encoded = encodeCatalogPlan(plan);
+  } catch (error) {
+    warningFor("read2xsgg.catalogPlan", plan)(`分类目录计划无效：${error.message}`);
+    return null;
+  }
+  const base = String(imageProxyBase).replace(/\/$/, "");
+  warningFor("exploreUrl", source.exploreUrl)(
+    `已将 ${entityEntries.length} 个声明式分类绑定到通用 catalog 适配器（idList 计划）`,
+  );
+  return entityEntries.map((entry) => {
+    const pageSize = Math.min(50, Math.max(1, Number(entry.pageSize) || plan.pageSize || 20));
+    return {
+      title: String(entry.title).trim(),
+      group: entry.group ? String(entry.group).trim() : "",
+      pageSize,
+      url: `${base}/adapter/catalog?plan=${encoded}&entityId=${encodeURIComponent(String(entry.entityId).trim())}&page=__READ2XSGG_PAGE__&pageSize=${pageSize}`,
+    };
+  });
+}
+
 function parseExploreEntries(exploreUrl, warningFor) {
   if (!exploreUrl || exploreUrl === "-") return [];
   const validEntries = (entries) => entries
@@ -1133,11 +1282,12 @@ function compactBookWorld(entries, { host, rules, responseType, warningFor }) {
 }
 
 function buildBookWorld(source, context) {
-  const { host, headers, warnings, sourceName } = context;
+  const { host, headers, warnings, sourceName, imageProxyBase = "" } = context;
   const exploreRules = getRules(source, "ruleExplore", "exploreRule");
   const searchRules = getRules(source, "ruleSearch", "searchRule");
   const warningFor = createWarningCollector(warnings, sourceName, "bookWorld");
-  let entries = parseExploreEntries(source.exploreUrl, warningFor);
+  let entries = materializeCatalogExploreEntries(source, imageProxyBase, warningFor)
+    || parseExploreEntries(source.exploreUrl, warningFor);
   const exploreUrlMissing = source.exploreUrl === undefined
     || source.exploreUrl === null
     || source.exploreUrl === "-"
@@ -1246,10 +1396,14 @@ function convertOne(source, warnings, options = {}) {
   if (/(?:jmcomic|18comic|comic18j)/i.test(adaptedFrom)) {
     warningForSource("siteAdapter", adaptedFrom)("已提取禁漫动态发现分类，并显式补齐分类列表规则");
   }
+  const searchRules = getRules(source, "ruleSearch", "searchRule");
+  const detailRules = getRules(source, "ruleBookInfo", "bookInfoRule");
+  const tocRules = getRules(source, "ruleToc", "tocRule");
+  const exploreRulesEarly = getRules(source, "ruleExplore", "exploreRule");
   const headers = portableHeaders(mergeLegadoUrlOptionHeaders({
     ...parseHeaders(source.header, warningForSource("header", source.header)),
     ...(source.httpUserAgent ? { "User-Agent": String(source.httpUserAgent) } : {}),
-  }, getRules(source, "ruleToc", "tocRule").chapterUrl, source.searchUrl), host, warningForSource);
+  }, tocRules.chapterUrl, source.searchUrl, searchRules.coverUrl, detailRules.coverUrl, exploreRulesEarly.coverUrl), host, warningForSource);
   if (!host) warningForSource("bookSourceUrl", source.bookSourceUrl)("缺少有效的 bookSourceUrl，生成源可能无法发起请求");
   const resolvedType = sourceType(source);
   if ((source.bookSourceType === 3 || source.bookSourceType === "3") && resolvedType === "text") {
@@ -1263,19 +1417,21 @@ function convertOne(source, warnings, options = {}) {
       "阅读源含登录/分流 UI（loginUrl/loginUi），香色无等价流程；Get('url') 已尽量回退为 config.host，镜像与登录态需手工处理",
     );
   }
-
-  const searchRules = getRules(source, "ruleSearch", "searchRule");
-  const detailRules = getRules(source, "ruleBookInfo", "bookInfoRule");
-  const tocRules = getRules(source, "ruleToc", "tocRule");
   const contentRules = getRules(source, "ruleContent", "contentRule");
   const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode);
   const comicExtractionPlan = compileComicExtractionPlan(contentRules.content, headers);
+  const explicitMediaResolution = contentRules.mediaResolution
+    || source.read2xsgg?.mediaResolution
+    || null;
   const mediaExtractionPlan = (resolvedType === "audio" || resolvedType === "video")
     ? compileMediaExtractionPlan(
       `${contentRules.content || ""}\n${tocRules.chapterUrl || ""}`,
       resolvedType,
       headers,
-      { sourceRegex: contentRules.sourceRegex || "" },
+      {
+        sourceRegex: contentRules.sourceRegex || "",
+        resolution: explicitMediaResolution,
+      },
     )
     : null;
   const isJmComic = resolvedType === "comic" && (
@@ -1299,7 +1455,7 @@ function convertOne(source, warnings, options = {}) {
       "阅读 imageStyle 在香色无直接字段，已忽略",
     );
   }
-  const context = { host, headers, warnings, sourceName };
+  const context = { host, headers, warnings, sourceName, imageProxyBase: options.imageProxyBase || "" };
 
   const detailResponseType = inferResponseType(detailRules);
   const detailWarningFor = createWarningCollector(warnings, sourceName, "bookDetail");
@@ -1499,7 +1655,9 @@ function convertOne(source, warnings, options = {}) {
   const mediaRuleNeedsServer = contentResponseType === "json"
     || hasSourceRegex
     || /(?:\bjava\.|\bPackages\b|\bandroid\.|\bsource\.|\bbook\.|\bjavaScript\.)/i
-      .test(String(contentRules.content || ""));
+      .test(String(contentRules.content || ""))
+    || mediaPlanHasResolution(mediaExtractionPlan)
+    || (mediaExtractionPlan?.properties || []).some((name) => /(?:path|url|uri|play|track|src|stream)/i.test(name));
   const hasMediaChapterUrl = Boolean(tocRules.chapterUrl && String(tocRules.chapterUrl).trim() !== "-");
   if ((resolvedType === "audio" || resolvedType === "video") && !contentRules.content && hasMediaChapterUrl) {
     converted.chapterContent.content = directMediaContent(options.imageProxyBase);
@@ -1513,28 +1671,26 @@ function convertOne(source, warnings, options = {}) {
     ].join("\n");
     tocWarningFor("chapterUrl", tocRules.chapterUrl)("单章节图片源没有 chapterUrl，已使用当前详情页作为章节地址");
   }
-  if ((resolvedType === "audio" || resolvedType === "video") && isLrtsSource(source)
-    && /getListenPath/i.test(String(tocRules.chapterUrl || ""))) {
-    converted.chapterContent = {
-      ...commonAction("chapterContent", host, "json"),
-      requestInfo: "%@result",
-      content: lrtsListenPathContent(),
-    };
-    contentWarningFor("content", contentRules.content)(
-      "懒人听书 getListenPath 接口已改为直接解析 JSON path 播放地址",
-    );
-  } else if ((resolvedType === "audio" || resolvedType === "video") && options.imageProxyBase && mediaRuleNeedsServer) {
+  if ((resolvedType === "audio" || resolvedType === "video") && options.imageProxyBase && mediaRuleNeedsServer) {
     converted.chapterContent = proxiedMediaChapterContent(
       host,
       options.imageProxyBase,
       resolvedType,
       mediaExtractionPlan,
     );
-    contentWarningFor("content", contentRules.content)(
-      hasSourceRegex
-        ? "阅读 sourceRegex 扩展名已编入媒体提取计划，正文改由通用媒体适配器解析播放地址（直连 CDN + 源站 httpHeaders）"
-        : "正文为 JSON 媒体接口或依赖阅读 Android API，已改由通用媒体提取器解析播放地址",
-    );
+    if (mediaPlanHasResolution(mediaExtractionPlan)) {
+      contentWarningFor("content", contentRules.content)(
+        "已将正文多步媒体流程编译为声明式媒体解析计划（页面取值 → 二次请求 → 选择 URL）",
+      );
+    } else if (mediaRuleNeedsPortabilityWarning(contentRules, tocRules, mediaExtractionPlan)) {
+      contentWarningFor("content", contentRules.content)(MEDIA_PORTABILITY_WARNING);
+    } else {
+      contentWarningFor("content", contentRules.content)(
+        hasSourceRegex
+          ? "阅读 sourceRegex 扩展名已编入媒体提取计划，正文改由通用媒体适配器解析播放地址（直连 CDN + 源站 httpHeaders）"
+          : "正文为 JSON 媒体接口或依赖阅读 Android API，已改由通用媒体提取器解析播放地址",
+      );
+    }
   } else if ((resolvedType === "audio" || resolvedType === "video") && hasSourceRegex) {
     // Offline / no proxy: enable 香色 webView so the chapter page can load like
     // Legado's interceptor path; play URL still comes from content / wrapMediaContent.
@@ -1547,9 +1703,13 @@ function convertOne(source, warnings, options = {}) {
       "}",
       "return {url: u, webView: true};",
     ].join("\n");
-    contentWarningFor("sourceRegex", contentRules.sourceRegex)(
-      "阅读 sourceRegex 已改由香色 webView 加载正文页；无转换站代理时无法服务端拦截网络流",
-    );
+    if (mediaRuleNeedsPortabilityWarning(contentRules, tocRules, mediaExtractionPlan)) {
+      contentWarningFor("sourceRegex", contentRules.sourceRegex)(MEDIA_PORTABILITY_WARNING);
+    } else {
+      contentWarningFor("sourceRegex", contentRules.sourceRegex)(
+        "阅读 sourceRegex 已改由香色 webView 加载正文页；无转换站代理时无法服务端拦截网络流",
+      );
+    }
   }
 
   // apply replaceRegex / replaceRegex array onto content field. 2.56.1 的
@@ -1558,24 +1718,27 @@ function convertOne(source, warnings, options = {}) {
   if (converted.chapterContent.content && replaceRegex) {
     const patterns = Array.isArray(replaceRegex) ? replaceRegex : [replaceRegex];
     const body = patterns
-      .map((pattern) => `result = String(result).replace(new RegExp(${JSON.stringify(String(pattern))}, "g"), "");`)
+      .map((pattern) => compileReplaceRegexStatement(String(pattern), contentWarningFor("replaceRegex", pattern)))
+      .filter(Boolean)
       .join("\n");
-    const current = String(converted.chapterContent.content);
-    const marker = current.match(/\|\|\s*@js:/i);
-    if (marker) {
-      const selector = current.slice(0, marker.index).trim();
-      const previous = current.slice(marker.index + marker[0].length).trim();
-      converted.chapterContent.content = [
-        `${selector}||@js:`,
-        "var __read2xsggPrevious = (function (result) {",
-        previous,
-        "})(result);",
-        'if (typeof __read2xsggPrevious !== "undefined") result = __read2xsggPrevious;',
-        body,
-        "return result;",
-      ].join("\n");
-    } else {
-      converted.chapterContent.content += `||@js:\n${body}\nreturn result;`;
+    if (body) {
+      const current = String(converted.chapterContent.content);
+      const marker = current.match(/\|\|\s*@js:/i);
+      if (marker) {
+        const selector = current.slice(0, marker.index).trim();
+        const previous = current.slice(marker.index + marker[0].length).trim();
+        converted.chapterContent.content = [
+          `${selector}||@js:`,
+          "var __read2xsggPrevious = (function (result) {",
+          previous,
+          "})(result);",
+          'if (typeof __read2xsggPrevious !== "undefined") result = __read2xsggPrevious;',
+          body,
+          "return result;",
+        ].join("\n");
+      } else {
+        converted.chapterContent.content += `||@js:\n${body}\nreturn result;`;
+      }
     }
   }
 

@@ -393,6 +393,157 @@ test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", as
   assert.deepEqual(await video.json(), { url: direct });
 });
 
+test("通用 catalog 适配端点按声明式 idList 计划分页", async (context) => {
+  const calls = [];
+  const upstream = createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    calls.push(`${request.method} ${url.pathname}${url.search}`);
+    if (url.pathname === "/list" && url.searchParams.get("entityId") === "11") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        bookIds: Array.from({ length: 25 }, (_, i) => i + 1),
+        books: [{ id: 1, name: "第一本", author: "A" }],
+      }));
+      return;
+    }
+    if (url.pathname === "/list" && url.searchParams.has("bookIds")) {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        books: [{ id: 21, name: "第二本", author: "B" }],
+      }));
+      return;
+    }
+    response.writeHead(404);
+    response.end("missing");
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const plan = Buffer.from(JSON.stringify({
+    version: 1,
+    kind: "idList",
+    origin: upstreamBase,
+    pageSize: 20,
+    headers: { "X-Demo": "catalog" },
+    first: {
+      url: "{{origin}}/list?entityId={{entityId}}&dsize={{pageSize}}",
+      idsProperty: "bookIds",
+      itemsProperty: "books",
+    },
+    next: {
+      url: "{{origin}}/list?bookIds={{idsJson}}",
+      itemsProperty: "books",
+    },
+    item: {
+      id: "id",
+      name: "name",
+      detailUrl: "{{origin}}/book/{{id}}",
+      author: "author",
+    },
+  })).toString("base64url");
+
+  const page1 = await fetch(`${appBase}/adapter/catalog?plan=${plan}&entityId=11&page=1&pageSize=20`);
+  assert.equal(page1.status, 200);
+  const first = await page1.json();
+  assert.equal(first.data[0].name, "第一本");
+  assert.equal(first.data[0].url, `${upstreamBase}/book/1`);
+  assert.equal(first.hasMore, true);
+
+  const page2 = await fetch(`${appBase}/adapter/catalog?plan=${plan}&entityId=11&page=2&pageSize=20`);
+  assert.equal(page2.status, 200);
+  const second = await page2.json();
+  assert.equal(second.data[0].name, "第二本");
+  assert.ok(calls.some((entry) => /bookIds=/.test(entry)));
+
+  const missing = await fetch(`${appBase}/adapter/catalog?plan=${plan}&page=1`);
+  assert.equal(missing.status, 400);
+});
+
+test("媒体适配按声明式两步计划二次请求，空计划不猜测网关", async (context) => {
+  const playUrl = "https://cdn.example/a/42/play.mp3";
+  let playBody = "";
+  let playHeaders = {};
+  const upstream = createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    if (url.pathname === "/item/42-7") {
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      response.end(`<!DOCTYPE html><html><head>
+<meta name="_token" content="token-abc"/>
+<link rel="alternate" href="https://m.example.com/item/42-7">
+</head><body><a href="/item/42-8">下一集</a></body></html>`);
+      return;
+    }
+    if (url.pathname === "/api/play" && request.method === "POST") {
+      playHeaders = { ...request.headers };
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(chunk));
+      request.on("end", () => {
+        playBody = Buffer.concat(chunks).toString("utf8");
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ playUrl, url: "https://cdn.example/fallback.mp3" }));
+      });
+      return;
+    }
+    response.writeHead(404);
+    response.end("missing");
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const resolutionPlan = Buffer.from(JSON.stringify({
+    version: 1,
+    kind: "audio",
+    properties: [],
+    attributes: ["href"],
+    urlHints: [],
+    resolution: {
+      extract: [
+        { name: "result", source: "meta", key: "_token" },
+        { name: "g1", source: "url", pattern: ".+/item/(\\d+)-(\\d+)", group: 1 },
+        { name: "g2", source: "url", pattern: ".+/item/(\\d+)-(\\d+)", group: 2 },
+      ],
+      request: {
+        url: "{{origin}}/api/play",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "X-Token": "{{result}}",
+          Referer: "{{chapterUrl}}",
+        },
+        body: "id={{g1}}&page={{g2}}",
+      },
+      response: { properties: ["playUrl", "url"] },
+    },
+  })).toString("base64url");
+  const resolved = await fetch(
+    `${appBase}/adapter/media?kind=audio&plan=${resolutionPlan}&url=${encodeURIComponent(`${upstreamBase}/item/42-7`)}`,
+  );
+  assert.equal(resolved.status, 200);
+  assert.deepEqual(await resolved.json(), { url: playUrl });
+  assert.equal(playHeaders["x-token"], "token-abc");
+  assert.match(playBody, /id=42/);
+  assert.match(playBody, /page=7/);
+
+  // Published-style empty plan: only navigation links → no invented gateway call.
+  const emptyPlan = Buffer.from(JSON.stringify({
+    version: 1, kind: "audio", properties: [], attributes: ["href"], urlHints: [],
+  })).toString("base64url");
+  const empty = await fetch(
+    `${appBase}/adapter/media?kind=audio&plan=${emptyPlan}&url=${encodeURIComponent(`${upstreamBase}/item/42-7`)}`,
+  );
+  assert.equal(empty.status, 422);
+});
+
 test("媒体代理转发音频字节流并带 Referer", async (context) => {
   const payload = Buffer.from("ID3fake-audio-bytes");
   let seenReferer = "";

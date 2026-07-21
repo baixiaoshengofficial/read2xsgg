@@ -1,0 +1,77 @@
+{
+  "bookSourceComment": "[read2xsgg] 原正文仅 WebView+sourceRegex，无多步播放协议；本 fixture 提供声明式 mediaResolution（章节 meta → POST {{origin}}/nlinka → url/ourl）。已发布 XBS 05004abd7dbd27c1 需用本源重新转换。",
+  "bookSourceGroup": "快速书源,有声书源",
+  "bookSourceName": "恋听🎧💜",
+  "bookSourceType": 1,
+  "bookSourceUrl": "https://ting55.com/",
+  "bookUrlPattern": "https://ting55.com/book/\\d+",
+  "customButton": false,
+  "customOrder": 905,
+  "enabled": true,
+  "enabledCookieJar": false,
+  "enabledExplore": true,
+  "eventListener": false,
+  "exploreUrl": "推荐::/tuijian<,/page/{{page}}>\n玄幻::/category/1<,/page/{{page}}>\n武侠::/category/2<,/page/{{page}}>\n都市::/category/3<,/page/{{page}}>\n言情::/category/4<,/page/{{page}}>\n穿越::/category/5<,/page/{{page}}>\n科幻::/category/6<,/page/{{page}}>\n推理::/category/7<,/page/{{page}}>\n恐怖::/category/8<,/page/{{page}}>\n惊悚::/category/9<,/page/{{page}}>\n历史::/category/10<,/page/{{page}}>\n经典::/category/11<,/page/{{page}}>\n相声::/category/12<,/page/{{page}}>\n评书::/category/14<,/page/{{page}}>\n讲坛::/category/13<,/page/{{page}}>",
+  "lastUpdateTime": 1741627207537,
+  "respondTime": 1839,
+  "ruleBookInfo": {
+    "author": "class.binfo@tag.p.2@text##播音：",
+    "coverUrl": "class.bimg@img@src",
+    "init": "",
+    "intro": "class.intro@text",
+    "kind": "class.binfo@tag.p.0@text&&\nclass.binfo@tag.p.1@text&&\nclass.binfo@tag.p.4@text##类别：|时间：",
+    "lastChapter": "class.binfo@tag.p.3@text##状态：",
+    "name": "class.binfo@h1@text##有声小说|\\（.*"
+  },
+  "ruleContent": {
+    "content": "[name=\"_c\"]@content@js:\nvar body=baseUrl.replace(/.+\\/book\\/(\\d+)-(\\d+)/,\"bookId=$1&isPay=0&page=$2\");\nvar url=\"/nlinka,\";\nvar headers={\n  \"Content-Type\":\"application/x-www-form-urlencoded\",\n  Referer:baseUrl,\n  xt:result,\n  l:\"1\"\n};\nvar options={\n  method:\"post\",\n  headers:JSON.stringify(headers),\n  body:body\n};\nJSON.parse(java.ajax(url+JSON.stringify(options))).url\n",
+    "mediaResolution": {
+      "extract": [
+        { "name": "xt", "source": "meta", "key": "_c" },
+        { "name": "l", "source": "meta", "key": "_l", "default": "1" },
+        { "name": "bookId", "source": "meta", "key": "_b" },
+        { "name": "page", "source": "meta", "key": "_cp" },
+        { "name": "isPay", "source": "meta", "key": "_p", "default": "0" }
+      ],
+      "request": {
+        "url": "{{origin}}/nlinka",
+        "method": "POST",
+        "headers": {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Referer": "{{chapterUrl}}",
+          "xt": "{{xt}}",
+          "l": "{{l}}"
+        },
+        "body": "bookId={{bookId}}&isPay={{isPay}}&page={{page}}"
+      },
+      "response": { "properties": ["url", "ourl"] }
+    }
+  },
+  "ruleExplore": {
+    "author": "class.info@tag.p.1@text##作者：",
+    "bookList": "class.category-list@ul@li",
+    "bookUrl": "class.info@h4@a@href",
+    "coverUrl": "img@src",
+    "kind": "class.info@tag.p.0@text&&\nclass.info@tag.p.2@text&&\nclass.info@tag.p.3@text##时间：|状态：|类别：",
+    "name": "class.info@h4@a@text##（.*"
+  },
+  "ruleSearch": {
+    "author": "class.info@tag.p.1@text##播音：",
+    "bookList": "class.category-list@ul@li",
+    "bookUrl": "class.info@h4@a@href",
+    "coverUrl": "img@src",
+    "kind": "class.info@tag.p.0@text&&\nclass.info@tag.p.2@text&&\nclass.info@tag.p.3@text##时间：|状态：",
+    "lastChapter": "",
+    "name": "class.info@h4@a@text##（.*"
+  },
+  "ruleToc": {
+    "chapterList": "class.plist@li",
+    "chapterName": "tag.a@text",
+    "chapterUrl": "tag.a@href"
+  },
+  "searchUrl": "https://ting55.com/search/{{key}}/page/{{page}}",
+  "weight": 0,
+  "read2xsgg": {
+    "notes": "Published library XBS 05004abd7dbd27c1 used empty media plan (href only). Reconvert from this fixture to embed MediaResolutionPlan."
+  }
+}

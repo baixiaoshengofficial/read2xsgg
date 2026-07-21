@@ -95,9 +95,13 @@ test("CSS、阅读链式选择器和分页选择器转换为 XPath", () => {
     "//*[contains(concat(' ', normalize-space(@class), ' '), ' txt-list ')]/li[position() >= 2]",
   );
   assert.equal(convertRule("tbody>tr!0"), "//tbody/tr[position() > 1]");
-  assert.equal(convertRule(".l li[0:-1]"), "//*[contains(concat(' ', normalize-space(@class), ' '), ' l ')]//li[position() >= 1 and position() <= last() - 1]");
+  assert.equal(
+    convertRule(".l li[0:-1]"),
+    "(.//*[contains(concat(' ', normalize-space(@class), ' '), ' l ')]//li)[position() >= 1 and position() <= last() - 1]",
+  );
   assert.equal(convertRule('##<a\\s*href="([^\"]+)"##$1###'), "//a/@href");
   assert.equal(convertRule("a.1@href"), "(.//a)[2]/@href");
+  assert.equal(convertRule("a[1]@href"), "(.//a)[2]/@href");
   assert.equal(convertRule("tag.a.0:1:2@text"), "(.//a)[position() = 1 or position() = 2 or position() = 3]/text()");
 });
 
@@ -1523,12 +1527,64 @@ test("在线质量门槛保留 sourceRegex 有声源并走媒体适配", () => {
   assert.ok(warnings.some((warning) => /sourceRegex/.test(warning.message)));
 });
 
+test("可识别多步媒体规则编入 resolution；WebView 拦截源给出重新转换警告", () => {
+  const twoStep = {
+    bookSourceName: "两步有声",
+    bookSourceUrl: "https://media.example/",
+    bookSourceType: 1,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: {
+      content: `[name="_token"]@content@js:
+var body=baseUrl.replace(/.+\\\\/item\\\\/(\\\\d+)-(\\\\d+)/,"id=$1&page=$2");
+var url="/api/play,";
+var headers={ "X-Token":result, Referer:baseUrl };
+var options={ method:"post", headers:JSON.stringify(headers), body:body };
+JSON.parse(java.ajax(url+JSON.stringify(options))).playUrl`,
+    },
+  };
+  const convertedTwoStep = convertLegado(twoStep, { imageProxyBase: "https://convert.example" });
+  const twoStepSource = convertedTwoStep.sources["两步有声"];
+  assert.ok(twoStepSource);
+  assert.match(twoStepSource.chapterContent.requestInfo, /\/adapter\/media\?kind=audio&plan=/);
+  const planMatch = String(twoStepSource.chapterContent.requestInfo).match(/plan=([A-Za-z0-9_-]+)/);
+  assert.ok(planMatch);
+  const planJson = JSON.parse(Buffer.from(planMatch[1], "base64url").toString("utf8"));
+  assert.equal(planJson.resolution?.request?.url, "{{origin}}/api/play");
+  assert.ok(convertedTwoStep.warnings.some((warning) => /多步媒体流程/.test(warning.message)));
+
+  const webViewOnly = {
+    bookSourceName: "拦截有声不可移植",
+    bookSourceUrl: "https://audio.example/",
+    bookSourceType: 1,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: {
+      chapterList: ".chapter a",
+      chapterName: "text",
+      chapterUrl: "tag.a@href@js:result+',{webView:true}'",
+    },
+    ruleContent: { content: "<js>result</js>", sourceRegex: ".*\\.(mp3|m4a).*" },
+  };
+  const convertedWebView = convertLegado(webViewOnly, { imageProxyBase: "https://convert.example" });
+  assert.ok(convertedWebView.sources["拦截有声不可移植"]);
+  assert.ok(convertedWebView.warnings.some((warning) => /重新转换/.test(warning.message)));
+  const emptyPlanMatch = String(convertedWebView.sources["拦截有声不可移植"].chapterContent.requestInfo)
+    .match(/plan=([A-Za-z0-9_-]+)/);
+  assert.ok(emptyPlanMatch);
+  const emptyPlan = JSON.parse(Buffer.from(emptyPlanMatch[1], "base64url").toString("utf8"));
+  assert.equal(emptyPlan.resolution, undefined);
+});
+
 test("CSS 负索引 [-n] 转为 last()-based position，不再生成非法 @-n", () => {
   assert.equal(
     convertRule(".panel[-2]@.grid@.item"),
-    "//*[contains(concat(' ', normalize-space(@class), ' '), ' panel ')][position() = last() - 1]//*[contains(concat(' ', normalize-space(@class), ' '), ' grid ')]//*[contains(concat(' ', normalize-space(@class), ' '), ' item ')]",
+    "(.//*[contains(concat(' ', normalize-space(@class), ' '), ' panel ')])[last() - 1]//*[contains(concat(' ', normalize-space(@class), ' '), ' grid ')]//*[contains(concat(' ', normalize-space(@class), ' '), ' item ')]",
   );
-  assert.equal(convertRule("li[0]"), "//li[position() = 1]");
+  assert.equal(convertRule("li[0]"), "(.//li)[1]");
 });
 
 test("JSON API 字段与 {$.id} URL 模板不再被误判成 HTML XPath", () => {
@@ -1678,4 +1734,117 @@ test("静态 @js 封面与发现页封面在搜索入口分类中保留", () => 
   const exploreWorld = Object.values(exploreSources["发现封面源"].bookWorld)[0];
   const explorePlan = decodeBridgePlan(String(exploreWorld.requestInfo).match(/plan=([^&]+)/)[1]);
   assert.match(explorePlan.fields.cover.selector, /img\/@src/);
+});
+
+test("纯文本请求头与截断引号 JSON 请求头可解析", () => {
+  const plain = {
+    bookSourceName: "纯文本UA",
+    bookSourceUrl: "https://novel.example/",
+    searchUrl: "/search?q={{key}}",
+    header: "User-Agent: Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36\nReferer: https://novel.example/",
+    ruleSearch: { bookList: ".book", name: "a@text", bookUrl: "a@href" },
+    ruleToc: { chapterList: ".chapter a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: "#content@html" },
+  };
+  const truncated = {
+    bookSourceName: "截断引号头",
+    bookSourceUrl: "https://comic.example/",
+    bookSourceType: 0,
+    searchUrl: "/search?key={{key}}",
+    header: '{  "User-Agent": "ComicUA/1.0", "Referer": "https://comic.example/}',
+    ruleSearch: {
+      bookList: "$.info[*]",
+      name: "$.name",
+      bookUrl: "$.id",
+      coverUrl: "@js:result.cover_pic + ',{\"headers\":{\"Referer\":\"https://comic.example/\"}}'",
+    },
+    ruleToc: { chapterList: "$.data[*]", chapterName: "$.title", chapterUrl: "$.url" },
+    ruleContent: { content: "$.content" },
+  };
+
+  const plainConverted = convertLegado(plain).sources["纯文本UA"];
+  assert.equal(plainConverted.httpHeaders["User-Agent"], "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36");
+  assert.equal(plainConverted.httpHeaders.Referer, "https://novel.example/");
+
+  const { sources, warnings } = convertLegado(truncated);
+  const converted = sources["截断引号头"];
+  assert.equal(converted.httpHeaders["User-Agent"], "ComicUA/1.0");
+  assert.equal(converted.httpHeaders.Referer, "https://comic.example/");
+  assert.equal(converted.searchBook.cover, "cover_pic");
+  assert.doesNotMatch(String(converted.searchBook.cover), /headers/);
+  assert.ok(warnings.some((warning) => /封面规则中的阅读 headers 附加段/.test(warning.message)));
+  assert.ok(!warnings.some((warning) => /请求配置不是有效 JSON/.test(warning.message)));
+});
+
+test("根级 JSONPath 递归下降 $..field 按字段名转换且不误报", () => {
+  assert.equal(convertRule("@json:$..data[*]", { responseType: "json" }), "data");
+  assert.equal(convertRule("$..content", { responseType: "json" }), "content");
+  const warns = [];
+  convertRule("@json:$..data[*]", { responseType: "json", warn: (message) => warns.push(message) });
+  assert.equal(warns.length, 0);
+  convertRule("$.payload..items[*]", { responseType: "json", warn: (message) => warns.push(message) });
+  assert.ok(warns.some((message) => /递归下降/.test(message)));
+});
+
+test("公开合集常见语法：相对 XPath、~= 交替、##$## 追加、@js 请求头与 replaceRegex", () => {
+  assert.equal(convertRule(".//span[@class='title']/text()"), ".//span[@class='title']/text()");
+  assert.equal(convertRule(".//a/@href"), ".//a/@href");
+  assert.equal(convertRule("text()"), "text()");
+  assert.equal(convertRule("NA"), "");
+  assert.equal(
+    convertRule("[property~=category|status|update_time]@content"),
+    "//*[(contains(@property, 'category') or contains(@property, 'status') or contains(@property, 'update_time'))]/@content",
+  );
+  assert.match(convertRule("{{baseUrl}}##$##?page=1"), /\?page=1/);
+  assert.doesNotMatch(convertRule("{{baseUrl}}##$##?page=1"), /##\$##/);
+  assert.match(convertRule("href##$##?page=1"), /\+ "\?page=1"/);
+  assert.equal(
+    convertRule('img@src##(.*)##$1,{"headers":{"Referer":"$1"}}###'),
+    '//img/@src||@js:\nreturn String(result).replace(new RegExp("(.*)", "g"), "$1");',
+  );
+
+  const source = {
+    bookSourceName: "合集语法样本",
+    bookSourceUrl: "https://www.gutenberg.org/",
+    searchUrl: "https://www.gutenberg.org/ebooks/search/?query={{key}}",
+    header: `@js:\nJSON.stringify({\n  'User-Agent': "Mozilla/5.0",\n  'Referer': "https://www.gutenberg.org/"\n})`,
+    ruleSearch: {
+      bookList: "//li[@class='booklink']",
+      name: ".//span[@class='title']/text()",
+      bookUrl: ".//a/@href",
+      kind: "[property~=category|status|update_time]@content",
+    },
+    ruleBookInfo: {
+      init: '@put:{n:"[property$=book_name]@content",a:"[property$=author]@content"}',
+      name: "@get:{n}",
+      author: "@get:{a}",
+    },
+    ruleToc: {
+      chapterList: ".directoryArea p a",
+      chapterName: "text()",
+      chapterUrl: "{{baseUrl}}##$##?page=1",
+      nextTocUrl: "option@value",
+    },
+    ruleContent: {
+      content: "#chaptercontent@html",
+      replaceRegex: "##\\s*({{ book.durChapterTitle }}|作者：.*)\\s*",
+    },
+  };
+  const { sources, warnings } = convertLegado(source);
+  const converted = sources["合集语法样本"];
+  assert.equal(converted.httpHeaders["User-Agent"], "Mozilla/5.0");
+  assert.equal(converted.httpHeaders.Referer, "https://www.gutenberg.org/");
+  assert.equal(converted.searchBook.list, "//li[@class='booklink']");
+  assert.match(converted.searchBook.bookName, /\.\/\/span\[@class='title'\]/);
+  assert.equal(converted.searchBook.detailUrl, ".//a/@href");
+  assert.match(converted.searchBook.cat, /contains\(@property, 'category'\) or contains\(@property, 'status'\)/);
+  assert.match(converted.bookDetail.bookName, /book_name/);
+  assert.match(converted.chapterList.title, /text\(\)/);
+  assert.match(converted.chapterList.url, /\?page=1/);
+  assert.doesNotMatch(converted.chapterList.url, /##\$##/);
+  assert.equal(converted.chapterList.nextPageUrl, "//option/@value");
+  assert.match(converted.chapterContent.content, /queryInfo\.chapterTitle/);
+  assert.doesNotMatch(converted.chapterContent.content, /\{\{\s*book\.durChapterTitle/);
+  assert.doesNotMatch(converted.chapterContent.content, /new RegExp\("##/);
+  assert.ok(!warnings.some((warning) => /请求配置不是有效 JSON/.test(warning.message)));
 });

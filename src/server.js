@@ -13,11 +13,16 @@ import { convertOnlineSource } from "./convertOnline.js";
 import { createLibraryStore } from "./libraryStore.js";
 import { createJobWorker } from "./jobWorker.js";
 import { analyzeSite } from "./siteAnalyze/index.js";
-import { isLrtsSource, enrichLrtsSource, fetchLrtsResourceBooks } from "./lrtsAdapter.js";
+import { createDownloader, redirectLimitForMethod } from "./httpTransport.js";
 import { decodeTextBuffer } from "./charset.js";
 import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
 import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
-import { decodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
+import {
+  decodeMediaExtractionPlan,
+  normalizeMediaExtractionPlan,
+  resolveChapterMediaUrls,
+} from "./mediaPlan.js";
+import { decodeCatalogPlan, executeCatalogPlan } from "./catalogPlan.js";
 import { encodeXbs } from "./xbs.js";
 import { parseHeaders } from "./requests.js";
 import { resolveChapterListUrls } from "./verifySource.js";
@@ -165,13 +170,24 @@ async function resolveTarget(url, config) {
   return addresses[0];
 }
 
-function requestBuffer(url, resolved, config, { maxBytes = config.maxSourceBytes, accept, headers = {}, label = "下载资源" } = {}) {
+function requestBuffer(url, resolved, config, {
+  maxBytes = config.maxSourceBytes,
+  accept,
+  headers = {},
+  label = "下载资源",
+  method = "GET",
+  body = null,
+} = {}) {
   const requester = url.protocol === "https:" ? httpsRequest : httpRequest;
+  const payload = body == null ? null : Buffer.isBuffer(body) ? body : Buffer.from(String(body), "utf8");
+  const requestMethod = String(method || "GET").toUpperCase();
   return new Promise((resolve, reject) => {
     const request = requester(url, {
+      method: requestMethod,
       headers: {
         Accept: accept || "application/json,text/plain;q=0.9,*/*;q=0.1",
         "User-Agent": "read2xsgg/0.2",
+        ...(payload ? { "Content-Length": String(payload.length) } : {}),
         ...headers,
       },
       lookup: (_hostname, options, callback) => {
@@ -183,6 +199,11 @@ function requestBuffer(url, resolved, config, { maxBytes = config.maxSourceBytes
       const status = response.statusCode ?? 0;
       if (status >= 300 && status < 400 && response.headers.location) {
         response.resume();
+        // Do not replay POST bodies across redirects.
+        if (requestMethod !== "GET" && requestMethod !== "HEAD") {
+          reject(new HttpError(502, `${label}失败：上游对 ${requestMethod} 返回重定向 HTTP ${status}`));
+          return;
+        }
         resolve({ redirect: new URL(response.headers.location, url) });
         return;
       }
@@ -228,20 +249,34 @@ function requestBuffer(url, resolved, config, { maxBytes = config.maxSourceBytes
     });
     request.setTimeout(config.fetchTimeoutMs, () => request.destroy(new HttpError(504, `${label}超时（${config.fetchTimeoutMs}ms）`)));
     request.on("error", (error) => reject(error instanceof HttpError ? error : new HttpError(502, `${label}失败：${error.message}`)));
-    request.end();
+    if (payload) request.end(payload);
+    else request.end();
   });
 }
 
-export async function downloadSource(sourceUrl, config = serverConfig(), headers = {}) {
+/**
+ * SSRF-safe page/API fetch used by conversion and adapters.
+ * Prefer createSourceDownloader(config) at call sites that need the adapter
+ * transport contract (headers / method / body).
+ */
+export async function downloadSource(sourceUrl, config = serverConfig(), headers = {}, options = {}) {
   let current;
   try {
     current = new URL(sourceUrl);
   } catch {
     throw new HttpError(400, "阅读源地址不是有效 URL");
   }
-  for (let redirects = 0; redirects <= config.maxRedirects; redirects += 1) {
+  const method = String(options?.method || "GET").toUpperCase();
+  const body = options?.body ?? null;
+  const maxRedirects = redirectLimitForMethod(method, config.maxRedirects);
+  for (let redirects = 0; redirects <= maxRedirects; redirects += 1) {
     const resolved = await resolveTarget(current, config);
-    const result = await requestBuffer(current, resolved, config, { label: "下载阅读源", headers });
+    const result = await requestBuffer(current, resolved, config, {
+      label: "下载阅读源",
+      headers,
+      method,
+      body: redirects === 0 ? body : null,
+    });
     if (result.buffer) {
       Object.defineProperty(result.buffer, "httpHeaders", {
         value: result.headers || {},
@@ -250,10 +285,15 @@ export async function downloadSource(sourceUrl, config = serverConfig(), headers
       });
       return result.buffer;
     }
-    if (redirects === config.maxRedirects) throw new HttpError(502, `阅读源重定向次数超过 ${config.maxRedirects}`);
+    if (redirects === maxRedirects) throw new HttpError(502, `阅读源重定向次数超过 ${maxRedirects}`);
     current = result.redirect;
   }
   throw new HttpError(502, "下载阅读源失败");
+}
+
+/** Bound adapter transport: download(url, headersOrInit?, options?). */
+export function createSourceDownloader(config = serverConfig()) {
+  return createDownloader(downloadSource, config);
 }
 
 /** Decode a downloaded page with plan/source charset hint (fixes GBK mojibake). */
@@ -582,10 +622,15 @@ async function sourceContentReachable(source, chapterUrl, config) {
   if (mediaPlan !== null) {
     const kind = source?.sourceType === "video" ? "video" : "audio";
     const plan = decodeMediaExtractionPlan(mediaPlan, kind);
-    const direct = pageMediaUrls("", chapterUrl, plan);
-    if (direct.length) return true;
-    const page = await downloadSource(chapterUrl, config, plan.headers);
-    return pageMediaUrls(page.toString("utf8"), chapterUrl, plan).length > 0;
+    const download = createSourceDownloader(config);
+    const urls = await resolveChapterMediaUrls(
+      async () => (await download(chapterUrl, plan.headers || {})).toString("utf8"),
+      chapterUrl,
+      plan,
+      download,
+      pageMediaUrls,
+    );
+    return urls.length > 0;
   }
 
   // Native JM and other fully portable XSGG actions do not expose a safe
@@ -1005,8 +1050,7 @@ export async function adaptOnlineSources(input, config) {
   const sources = legacySourceList(input);
   const hasMwwz = sources.some(isMwwzSource);
   const jmSources = sources.filter(isJmSource);
-  const hasLrts = sources.some(isLrtsSource);
-  if (!hasMwwz && !jmSources.length && !hasLrts) return input;
+  if (!hasMwwz && !jmSources.length) return input;
   const mwwzMirror = hasMwwz ? await resolveMwwzMirror(config) : "";
   const jmMirror = jmSources.length ? await resolveJmMirror(config, jmSources) : "";
 
@@ -1044,13 +1088,6 @@ export async function adaptOnlineSources(input, config) {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
         Referer: `${jmMirror}/`,
       });
-    }
-    if (isLrtsSource(source) && typeof config.download === "function" && config.imageProxyBase) {
-      const enriched = await enrichLrtsSource(source, {
-        download: config.download,
-        imageProxyBase: config.imageProxyBase,
-      });
-      Object.assign(source, enriched);
     }
   }
   return cloned;
@@ -1192,7 +1229,7 @@ function mediaProxyRequestFromRequest(request) {
 function adapterRequestFromRequest(request) {
   const parsed = new URL(request.url || "/", "http://read2xsgg.local");
   const type = parsed.pathname === "/adapter/jm/chapters" ? "jm-chapters"
-    : parsed.pathname === "/adapter/lrts-books" ? "lrts-books"
+    : parsed.pathname === "/adapter/catalog" ? "catalog"
     : parsed.pathname === "/adapter/images" || parsed.pathname === "/adapter/jm/images" ? "page-images"
       : parsed.pathname === "/adapter/media" ? "page-media"
         : parsed.pathname === "/adapter/toc" ? "toc-redirect"
@@ -1204,11 +1241,13 @@ function adapterRequestFromRequest(request) {
   if (!type) return null;
   let extractionPlan;
   let bridgePlan;
+  let catalogPlan;
   try {
     extractionPlan = type === "page-media"
       ? decodeMediaExtractionPlan(parsed.searchParams.get("plan") || "", parsed.searchParams.get("kind") || "audio")
       : type === "page-images" ? decodeComicExtractionPlan(parsed.searchParams.get("plan") || "") : null;
     if (type.startsWith("bridge-")) bridgePlan = decodeBridgePlan(parsed.searchParams.get("plan") || "");
+    if (type === "catalog") catalogPlan = decodeCatalogPlan(parsed.searchParams.get("plan") || "");
   } catch (error) {
     throw new HttpError(400, error.message);
   }
@@ -1227,6 +1266,7 @@ function adapterRequestFromRequest(request) {
     selector: parsed.searchParams.get("selector") || "",
     extractionPlan,
     bridgePlan,
+    catalogPlan,
     page: parsed.searchParams.get("page") || "1",
     pageSize: parsed.searchParams.get("pageSize") || "",
     slice: parsed.searchParams.get("slice") === "1",
@@ -2031,8 +2071,12 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
   }
   for (const match of text.replace(/\\\//g, "/").matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
     // sourceRegex-derived extension hints (e.g. ".mp3") promote matching URLs
-    // even when they sit outside semantic JSON keys.
-    add("media", match[0], urlHints.length > 0 && matchesUrlHint(match[0]));
+    // even when they sit outside semantic JSON keys. Skip bare page links: the
+    // synthetic key "media" is semantic and must not make every href playable.
+    const candidate = match[0];
+    const hintMatch = urlHints.length > 0 && matchesUrlHint(candidate);
+    if (!mediaExtensionPattern(kind).test(candidate) && !hintMatch) continue;
+    add("media", candidate, hintMatch);
   }
 
   return [...candidates.entries()]
@@ -2222,17 +2266,19 @@ export function createAppServer(options = {}) {
 
       const adapterTarget = adapterRequestFromRequest(request);
       if (adapterTarget) {
-        if (adapterTarget.type === "lrts-books") {
+        if (adapterTarget.type === "catalog") {
+          if (!adapterTarget.catalogPlan) throw new HttpError(400, "缺少分类目录计划");
           if (!adapterTarget.entityId) throw new HttpError(400, "缺少 entityId");
           if (active >= config.maxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
           active += 1;
           try {
-            const output = await fetchLrtsResourceBooks(
-              adapterTarget.entityId,
-              adapterTarget.page,
-              adapterTarget.pageSize || 20,
-              (url, headers = {}) => downloadSource(url, config, headers),
-            );
+            const download = createSourceDownloader(config);
+            const output = await executeCatalogPlan(adapterTarget.catalogPlan, {
+              entityId: adapterTarget.entityId,
+              pageIndex: adapterTarget.page,
+              pageSize: adapterTarget.pageSize || adapterTarget.catalogPlan.pageSize || 20,
+              download,
+            });
             sendJson(response, 200, output, commonHeaders);
           } finally {
             active -= 1;
@@ -2332,18 +2378,27 @@ export function createAppServer(options = {}) {
         let values;
         try {
           if (adapterTarget.type === "page-media") {
-            values = pageMediaUrls("", sourceUrl, adapterTarget.extractionPlan);
-          }
-          if (!values?.length && adapterTarget.type === "page-images") {
+            const download = createSourceDownloader(config);
+            const headers = adapterTarget.extractionPlan?.headers || {};
+            values = await resolveChapterMediaUrls(
+              async () => (await download(sourceUrl, headers)).toString("utf8"),
+              sourceUrl,
+              adapterTarget.extractionPlan,
+              download,
+              pageMediaUrls,
+            );
+          } else if (adapterTarget.type === "page-images") {
             values = await downloadComicImageSequence(sourceUrl, config, adapterTarget.extractionPlan);
-          }
-          if (!values?.length) {
+            if (!values?.length) {
+              const detailPage = await downloadSource(sourceUrl, config, adapterTarget.extractionPlan?.headers);
+              values = pageImageUrls(detailPage.toString("utf8"), sourceUrl, adapterTarget.extractionPlan);
+            }
+          } else {
             const detailPage = await downloadSource(sourceUrl, config, adapterTarget.extractionPlan?.headers);
+            const html = detailPage.toString("utf8");
             values = adapterTarget.type === "jm-chapters"
-              ? jmChapterEntries(detailPage.toString("utf8"), sourceUrl)
-              : adapterTarget.type === "page-media"
-                ? pageMediaUrls(detailPage.toString("utf8"), sourceUrl, adapterTarget.extractionPlan)
-                : pageImageUrls(detailPage.toString("utf8"), sourceUrl, adapterTarget.extractionPlan);
+              ? jmChapterEntries(html, sourceUrl)
+              : pageImageUrls(html, sourceUrl, adapterTarget.extractionPlan);
           }
         } finally {
           active -= 1;

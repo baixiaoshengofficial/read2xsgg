@@ -67,8 +67,15 @@ function splitCss(selector) {
 }
 
 function jsoupRegexToContains(attribute, value) {
-  // Jsoup `[attr~=regex]` uses regex matching. Approximate with literal contains().
-  const literals = String(value)
+  const raw = String(value);
+  // Common Legado form `[property~=category|status|update_time]`: Jsoup treats
+  // `~=` as regex, so `|` is alternation (OR), not an AND of contains().
+  if (/^(?:[a-zA-Z0-9/_-]+\|){1,}[a-zA-Z0-9/_-]+$/.test(raw)) {
+    const parts = raw.split("|").filter(Boolean);
+    return [`(${parts.map((part) => `contains(@${attribute}, ${quoteXPath(part)})`).join(" or ")})`];
+  }
+  // Approximate other regexes with literal contains() fragments.
+  const literals = raw
     .replace(/\\[dDwWsS]/g, " ")
     .replace(/\\([.^$*+?()[\]{}|\\])/g, "$1")
     .split(/[^a-zA-Z0-9/_-]+/)
@@ -77,10 +84,16 @@ function jsoupRegexToContains(attribute, value) {
   return literals.map((part) => `contains(@${attribute}, ${quoteXPath(part)})`);
 }
 
+function wrapResultSetPredicate(path, predicate) {
+  if (!predicate) return path;
+  const relative = path.startsWith("//") ? `.${path}` : path.startsWith("/") ? `.${path}` : `.//${path}`;
+  return `(${relative})[${predicate}]`;
+}
+
 function cssAtomToXPath(atom) {
   let source = atom;
   let excludedFirst = false;
-  let slicePredicate = "";
+  let resultSetPredicate = "";
   if (/!0$/.test(source)) {
     source = source.slice(0, -2);
     excludedFirst = true;
@@ -101,18 +114,18 @@ function cssAtomToXPath(atom) {
     if (end !== null) clauses.push(end >= 0
       ? `position() <= ${end}`
       : `position() <= last() - ${Math.abs(end)}`);
-    slicePredicate = clauses.join(" and ");
+    resultSetPredicate = clauses.join(" and ");
   }
 
-  // Legado also uses a single index like `.panel[-2]` / `li[0]` for the Nth
-  // match (negative from the end). That must not become a bogus `@-2` attribute.
+  // Legado also uses a single index like `.panel[-2]` / `li[0]` / `a[1]` for the
+  // Nth match in the result set (same idea as `tag.a.1`), not "Nth sibling a".
   const indexOnly = source.match(/\[\s*(-?\d+)\s*\]$/);
-  if (!slicePredicate && indexOnly) {
+  if (!resultSetPredicate && indexOnly) {
     source = source.slice(0, indexOnly.index);
     const index = Number(indexOnly[1]);
-    slicePredicate = index >= 0
-      ? `position() = ${index + 1}`
-      : `position() = last() - ${Math.abs(index) - 1}`;
+    resultSetPredicate = index >= 0
+      ? String(index + 1)
+      : `last() - ${Math.abs(index) - 1}`;
   }
 
   const tagMatch = source.match(/^[a-zA-Z][\w-]*|^\*/);
@@ -148,12 +161,18 @@ function cssAtomToXPath(atom) {
   const nth = source.match(/:nth-(?:child|of-type)\(\s*(?:n\s*\+\s*)?(\d+)\s*\)/);
   if (nth) predicates.push(source.includes("n+") ? `position() >= ${nth[1]}` : `position() = ${nth[1]}`);
   const eq = source.match(/:eq\(\s*(-?\d+)\s*\)/);
-  if (eq) predicates.push(Number(eq[1]) >= 0 ? `position() = ${Number(eq[1]) + 1}` : `position() = last() - ${Math.abs(Number(eq[1])) - 1}`);
+  if (eq) {
+    // :eq(n) is also result-set indexing in Jsoup.
+    const index = Number(eq[1]);
+    resultSetPredicate = index >= 0
+      ? String(index + 1)
+      : `last() - ${Math.abs(index) - 1}`;
+  }
   const lt = source.match(/:lt\(\s*(\d+)\s*\)/);
   if (lt) predicates.push(`position() <= ${lt[1]}`);
   if (excludedFirst) predicates.push("position() > 1");
-  if (slicePredicate) predicates.push(slicePredicate);
-  return `${tag}${predicates.map((predicate) => `[${predicate}]`).join("")}`;
+  const core = `${tag}${predicates.map((predicate) => `[${predicate}]`).join("")}`;
+  return { core, resultSetPredicate };
 }
 
 function regexOnlyAttributeRule(rule, warn) {
@@ -178,7 +197,9 @@ export function cssToXPath(selector) {
     } else if (part === " ") {
       axis = "//";
     } else {
-      xpath += `${axis}${cssAtomToXPath(part)}`;
+      const { core, resultSetPredicate } = cssAtomToXPath(part);
+      xpath += `${axis}${core}`;
+      if (resultSetPredicate) xpath = wrapResultSetPredicate(xpath, resultSetPredicate);
       axis = "//";
     }
   }
@@ -249,10 +270,22 @@ function legacySegmentToXPath(segment, first) {
   return withResultIndex(cssPath, indexPredicate, first);
 }
 
+function looksLikeNativeXPath(source) {
+  const value = String(source || "").trim();
+  // Relative/absolute XPath used directly in public collections
+  // (Gutenberg/Standard Ebooks/DuckDuckGo-style rules).
+  if (/^(?:\.\.?\/|\/\/|\()/.test(value)) return true;
+  if (/^text\(\)$/i.test(value)) return true;
+  return false;
+}
+
 function legadoHtmlToXPath(selector) {
   let source = selector.trim();
   if (/^@?(?:XPath|xpath):/.test(source)) return source.replace(/^@?(?:XPath|xpath):/, "");
-  if (source.startsWith("//") || source.startsWith("(") || source.startsWith("/html") || source.startsWith("/text()") || source.startsWith("/@")) {
+  if (looksLikeNativeXPath(source)
+    || source.startsWith("/html")
+    || source.startsWith("/text()")
+    || source.startsWith("/@")) {
     return source;
   }
   if (/^@css:/i.test(source)) {
@@ -301,7 +334,14 @@ function jsonPathToXsgg(path, warn) {
     source = source.slice(0, jsMatch.index);
   }
   if (source.includes("..")) {
-    warn("JSONPath 的递归下降操作符 '..' 在香色中没有完全等价语法，已按普通路径转换");
+    // `$..data[*]` / `$..content` from public comic/novel APIs almost always
+    // mean the root field of that name. Only warn when recursion sits under a
+    // prefix or descends through multiple segments, where the approximation is
+    // more lossy.
+    const onlyRootField = /^\$\.\.[A-Za-z_$][\w$]*(?:\[\*?\])?$/.test(source.trim());
+    if (!onlyRootField) {
+      warn("JSONPath 的递归下降操作符 '..' 在香色中没有完全等价语法，已按普通路径转换");
+    }
     source = source.replace(/\.\./g, ".");
   }
   if (/\[\?\(|\[\(/.test(source)) {
@@ -322,21 +362,51 @@ function jsonPathToXsgg(path, warn) {
     : jsSuffix;
 }
 
+function stripLegadoRegexOptions(replacement, warn) {
+  let value = String(replacement ?? "");
+  // Trailing ### (or extra #) is Legado's end-of-replace marker, not part of $n.
+  value = value.replace(/#+$/, "");
+  const optionMatch = value.match(/^([\s\S]*?),(\{[\s\S]*\})\s*$/);
+  if (optionMatch) {
+    try {
+      const options = JSON.parse(optionMatch[2]);
+      if (options && typeof options === "object" && !Array.isArray(options)) {
+        warn("正则替换后的 headers/webView 等附加配置无法映射到香色字段，已忽略配置并保留替换文本");
+        return optionMatch[1];
+      }
+    } catch {
+      // Keep the original replacement when the trailing object is not JSON.
+    }
+  }
+  return value;
+}
+
 function appendRegexReplacement(converted, suffix, warn) {
   const [pattern = "", replacement = ""] = suffix.split("##");
   if (!pattern) return converted;
 
-  // Legado chapter option idiom: href##$##,{"webView":true} → append option at end of URL.
-  // 香色不支持该 URL 尾部配置，这里丢掉配置并告警，只保留链接本身。
-  if (pattern === "$" && /webView/i.test(replacement)) {
-    warn("章节链接中的 webView 附加配置无法自动映射到香色 URL 字段，已只保留链接；如需 webView 请在正文 requestInfo 中配置");
-    return converted;
+  const safeReplacement = stripLegadoRegexOptions(replacement, warn);
+
+  // Legado URL append idiom: href##$##?page=1 or {{baseUrl}}##$##?page=1
+  // Pattern `$` means "end of string" / append, not a regexp substitution.
+  if (pattern === "$") {
+    if (/webView/i.test(replacement)) {
+      warn("章节链接中的 webView 附加配置无法自动映射到香色 URL 字段，已只保留链接；如需 webView 请在正文 requestInfo 中配置");
+      return converted;
+    }
+    if (!safeReplacement) return converted;
+    return `${converted}||@js:\nreturn String(result || "") + ${JSON.stringify(safeReplacement)};`;
   }
 
-  let safeReplacement = replacement;
   if (/\{\{\s*(?:Get|get)\s*\(/i.test(safeReplacement)) {
     warn("替换结果含 Get(...) 登录变量，已去掉该片段；镜像/分流参数请在香色中手工配置");
-    safeReplacement = safeReplacement.replace(/\{\{\s*(?:Get|get)\(\s*['"][^'"]+['"]\s*\)\s*\}\}/gi, "");
+    const cleaned = safeReplacement.replace(/\{\{\s*(?:Get|get)\(\s*['"][^'"]+['"]\s*\)\s*\}\}/gi, "");
+    try {
+      new RegExp(pattern);
+    } catch {
+      warn("清理正则无法解析，已原样写入转换结果");
+    }
+    return `${converted}||@js:\nreturn String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(cleaned)});`;
   }
 
   try {
@@ -412,6 +482,7 @@ function looksLikeHtmlRule(value) {
   if (!trimmed) return false;
   if (/^(?:@js:|<js>)/i.test(trimmed)) return false;
   if (/^\s*(?:@?json:|\$[.[])/i.test(trimmed)) return false;
+  if (looksLikeNativeXPath(trimmed)) return true;
   // A composed absolute URL is an output value, not an HTML selector. Treating
   // `https://.../{{$.id}}` as XPath solely because it contains `//` makes a
   // JSON detail response enter the DOM parser.
@@ -488,6 +559,9 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   let trimmed = rule.trim();
   if (!trimmed) return "";
 
+  // Placeholder list/detail rules seen in public stubs (`NA`, `-`).
+  if (/^(?:NA|N\/A|null|none|-)$/i.test(trimmed)) return "";
+
   const attributeFallback = regexOnlyAttributeRule(trimmed, warn);
   if (attributeFallback) return attributeFallback;
 
@@ -512,6 +586,25 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
       ? "阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查"
       : "已将阅读 JavaScript 中的分页、关键词或结果字段模板转换为香色运行时表达式");
     return rewritten;
+  }
+
+  // URL / field append before mustache rewrite so `{{baseUrl}}##$##?page=1`
+  // becomes baseUrl + "?page=1" instead of a literal "##$##" suffix.
+  const appendMatch = trimmed.match(/^([\s\S]*?)##\$##([\s\S]*)$/);
+  if (appendMatch && appendMatch[1].trim()) {
+    const head = convertRule(appendMatch[1].trim(), { responseType, warn });
+    const suffix = stripLegadoRegexOptions(appendMatch[2], warn);
+    if (!suffix) return head;
+    if (/^@js:/i.test(head)) {
+      const body = head.replace(/^@js:\s*/i, "").trim().replace(/;\s*$/, "");
+      if (/^return\b/i.test(body)) {
+        const expression = body.replace(/^return\s+/i, "").replace(/;\s*$/, "");
+        return `@js:\nreturn String(${expression}) + ${JSON.stringify(suffix)};`;
+      }
+      return `@js:\n${body};\nreturn String(result || "") + ${JSON.stringify(suffix)};`;
+    }
+    if (head) return `${head}||@js:\nreturn String(result || "") + ${JSON.stringify(suffix)};`;
+    return `@js:\nreturn ${JSON.stringify(suffix)};`;
   }
 
   // Absolute or relative JSON URL / field templates:

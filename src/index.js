@@ -13,7 +13,25 @@ export { convertRequest } from "./requests.js";
 export { decodeXbs, encodeXbs } from "./xbs.js";
 export { decodeImage, decoderForLegadoImageRule, imageMimeType, supportedImageDecoders } from "./imageDecoder.js";
 export { compileComicExtractionPlan, decodeComicExtractionPlan, encodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
-export { compileMediaExtractionPlan, decodeMediaExtractionPlan, encodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
+export {
+  compileMediaExtractionPlan,
+  compileMediaResolutionFromRule,
+  decodeMediaExtractionPlan,
+  encodeMediaExtractionPlan,
+  executeMediaResolution,
+  mediaPlanHasResolution,
+  mediaRuleNeedsPortabilityWarning,
+  MEDIA_PORTABILITY_WARNING,
+  normalizeMediaExtractionPlan,
+  resolveChapterMediaUrls,
+} from "./mediaPlan.js";
+export {
+  clearCatalogPlanCache,
+  decodeCatalogPlan,
+  encodeCatalogPlan,
+  executeCatalogPlan,
+  normalizeCatalogPlan,
+} from "./catalogPlan.js";
 export { bridgeTocUrl, chapterSortKey, compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, compileTextBridgePlan, decodeBridgePlan, encodeBridgePlan, executeBridgePlan, htmlToPlainText, orderChaptersAscending, DEFAULT_BRIDGE_LIMITS } from "./bridgePlan.js";
 export { hasUnsupportedLegadoRuntime, legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
 export {

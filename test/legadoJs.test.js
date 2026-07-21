@@ -30,6 +30,32 @@ test("分页三元表达式、关键词编码和源站模板可移植", () => {
   assert.equal(hasUnsupportedLegadoRuntime(converted.requestInfo), false);
 });
 
+test("关键词截断模板 key.length/substring 可移植到香色运行时", () => {
+  const converted = convertRequest("/index.php/search?key={{key.length>3?key.substring(0,3):key}}");
+  assert.match(converted.requestInfo, /params\.keyWord\.length\s*>\s*3/);
+  assert.match(converted.requestInfo, /params\.keyWord\.substring\(0,\s*3\)/);
+  assert.doesNotMatch(converted.requestInfo, /\{\{/);
+  assert.equal(hasUnsupportedLegadoRuntime(converted.requestInfo), false);
+});
+
+test("java.put 身份包装的 page/key 模板可降级为香色运行时参数", () => {
+  const pageOnly = convertRequest("/list?page={{java.put(\"page\",page)}}");
+  assert.match(pageOnly.requestInfo, /params\.pageIndex/);
+  assert.doesNotMatch(pageOnly.requestInfo, /java\.put|\{\{/);
+
+  const keyAndPage = convertRequest(
+    "/search?searchkey={{java.put('key',key)}}&page={{java.put('page',page)}}",
+  );
+  assert.match(keyAndPage.requestInfo, /params\.keyWord/);
+  assert.match(keyAndPage.requestInfo, /params\.pageIndex/);
+  assert.doesNotMatch(keyAndPage.requestInfo, /java\.put|\{\{/);
+
+  const trailingRef = convertRequest("/q?k={{java.put(\"key\",key);key}}&page={{java.put(\"page\",page);page}}");
+  assert.match(trailingRef.requestInfo, /params\.keyWord/);
+  assert.match(trailingRef.requestInfo, /params\.pageIndex/);
+  assert.doesNotMatch(trailingRef.requestInfo, /java\.put|\{\{/);
+});
+
 test("书名运行时模板不会被误转成 HTML 或 JSON 选择器", () => {
   assert.equal(
     convertRule("{{book.name}}"),

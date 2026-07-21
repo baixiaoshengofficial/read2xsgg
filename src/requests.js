@@ -5,21 +5,73 @@ function warnAndReturn(warn, message, fallback) {
   return fallback;
 }
 
+/**
+ * Legado sources often store headers as plain `Name: value` lines instead of JSON.
+ * Accept only when every non-empty line matches that shape.
+ */
+function parsePlainHeaderBlock(value) {
+  const lines = String(value || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return null;
+  const result = {};
+  for (const line of lines) {
+    const match = line.match(/^([A-Za-z][\w-]*)\s*:\s*(.*)$/);
+    if (!match) return null;
+    const name = match[1];
+    const headerValue = match[2].trim();
+    if (!headerValue) continue;
+    result[name] = headerValue;
+  }
+  return Object.keys(result).length ? result : null;
+}
+
+/**
+ * Public collections sometimes drop the closing quote on the last JSON string
+ * (`"Referer": "https://example.com/}`). Insert it before the final brace/bracket
+ * when the quote count is odd so UA/Referer survive conversion.
+ */
+function repairTruncatedJsonStrings(value) {
+  let source = String(value || "");
+  let quotes = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    if (source[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (source[index] === '"') quotes += 1;
+  }
+  if (quotes % 2 === 0) return source;
+  const trimmed = source.replace(/\s+$/g, "");
+  if (/[}\]]$/.test(trimmed)) {
+    return `${trimmed.slice(0, -1)}"${trimmed.slice(-1)}${source.slice(trimmed.length)}`;
+  }
+  return `${source}"`;
+}
+
 export function parseLooseJson(value, warn = () => {}) {
   if (!value) return {};
   if (typeof value === "object") return value;
+  const text = String(value).trim();
+  if (!text.startsWith("{") && !text.startsWith("[")) {
+    const plain = parsePlainHeaderBlock(text);
+    if (plain) return plain;
+  }
   try {
-    return JSON.parse(value);
+    return JSON.parse(text);
   } catch {
     try {
-      const normalized = value
-        // A number of public Legado collections contain literal NUL/newline
-        // characters inside JSON-like strings. They are invalid JSON but are
-        // only formatting noise for request/category metadata.
-        .replace(/[\u0000-\u001F]/g, " ")
-        .replace(/([{,]\s*)([A-Za-z_$][\w$-]*)(\s*:)/g, '$1"$2"$3')
-        .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, content) => JSON.stringify(content.replace(/\\'/g, "'")))
-        .replace(/,\s*([}\]])/g, "$1");
+      const normalized = repairTruncatedJsonStrings(
+        text
+          // A number of public Legado collections contain literal NUL/newline
+          // characters inside JSON-like strings. They are invalid JSON but are
+          // only formatting noise for request/category metadata.
+          .replace(/[\u0000-\u001F]/g, " ")
+          .replace(/([{,]\s*)([A-Za-z_$][\w$-]*)(\s*:)/g, '$1"$2"$3')
+          .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, content) => JSON.stringify(content.replace(/\\'/g, "'")))
+          .replace(/,\s*([}\]])/g, "$1"),
+      );
       return JSON.parse(normalized);
     } catch {
       return warnAndReturn(warn, "请求配置不是有效 JSON，已忽略其中的 method/body/header 配置", {});
@@ -246,6 +298,17 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
 }
 
 export function parseHeaders(header, warn = () => {}) {
-  const result = parseLooseJson(header, warn);
+  let text = header;
+  if (typeof text === "string") {
+    const trimmed = text.trim();
+    // Public sources often wrap static headers as:
+    //   @js: JSON.stringify({ "User-Agent": "...", Referer: "..." })
+    // Extract the object literal so UA/Referer survive conversion.
+    const jsObject = trimmed.match(
+      /^(?:@js:|<js>)\s*(?:return\s+)?JSON\.stringify\s*\(\s*(\{[\s\S]*\})\s*\)\s*;?\s*(?:<\/js>)?\s*$/i,
+    );
+    if (jsObject) text = jsObject[1];
+  }
+  const result = parseLooseJson(text, warn);
   return result && typeof result === "object" && !Array.isArray(result) ? result : {};
 }

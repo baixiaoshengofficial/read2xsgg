@@ -12,8 +12,6 @@
  * 3) list 同时兼容 section-list 与 mulu_list
  */
 
-import { isLrtsSource, lrtsDefaultHeaders } from "./lrtsAdapter.js";
-
 function hostnameOf(source) {
   const host = String(source?.bookSourceUrl ?? source?.url ?? "");
   try {
@@ -29,7 +27,6 @@ export function adaptLegadoSource(source) {
   if (isMwwzSource(source)) return adaptMwwz(source);
   if (isJmSource(source)) return adaptJm(source);
   if (isSuduguFamily(source)) return adaptSuduguFamily(source);
-  if (isLrtsSource(source)) return adaptLrts(source);
   return source;
 }
 
@@ -48,17 +45,6 @@ function adaptSuduguFamily(source) {
     ...source,
     searchUrl: `${searchUrl}${joiner}page={{page}}`,
   };
-}
-
-function adaptLrts(source) {
-  let header = source.header;
-  try {
-    const parsed = typeof header === "string" ? JSON.parse(header) : (header || {});
-    header = JSON.stringify({ ...lrtsDefaultHeaders(), ...parsed });
-  } catch {
-    header = JSON.stringify(lrtsDefaultHeaders());
-  }
-  return { ...source, header };
 }
 
 /** 《香色闺阁书源规则》§七：result = 书籍详情页 URL */

@@ -1,0 +1,139 @@
+{
+  "bookSourceGroup": "有声书源",
+  "bookSourceName": "懒人听书（优+++）",
+  "bookSourceType": 1,
+  "bookSourceUrl": "https://m.lrts.me/",
+  "customButton": false,
+  "customOrder": 325,
+  "enabled": true,
+  "enabledCookieJar": false,
+  "enabledExplore": true,
+  "eventListener": false,
+  "exploreUrl": [
+    {
+      "title": "玄幻奇幻",
+      "group": "有声小说",
+      "entityId": "11",
+      "pageSize": 20
+    },
+    {
+      "title": "武侠仙侠",
+      "group": "有声小说",
+      "entityId": "12",
+      "pageSize": 20
+    },
+    {
+      "title": "都市言情",
+      "group": "有声小说",
+      "entityId": "13",
+      "pageSize": 20
+    },
+    {
+      "title": "科幻灵异",
+      "group": "有声小说",
+      "entityId": "14",
+      "pageSize": 20
+    },
+    {
+      "title": "历史军事",
+      "group": "有声小说",
+      "entityId": "15",
+      "pageSize": 20
+    },
+    {
+      "title": "游戏竞技",
+      "group": "有声小说",
+      "entityId": "16",
+      "pageSize": 20
+    },
+    {
+      "title": "悬疑推理",
+      "group": "有声小说",
+      "entityId": "17",
+      "pageSize": 20
+    }
+  ],
+  "header": "{\n\t\t\"Accept-Language\": \"zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6\",\n\t\t\"Accept\": \"*/*\",\n\t\t\"Connection\": \"keep-alive\",\n\t\t\"User-Agent\": \"Mozilla/5.0 (Linux; Android 9; MIX 2S Build/PKQ1.180729.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/72.0.3626.121 Mobile Safari/537.36\",\n\t\t\"Referer\": \"https://m.lrts.me/\",\n\t\t\"X-Requested-With\": \"kaixin.diantai\"\n}",
+  "lastUpdateTime": 1765999798187,
+  "loginUrl": "http://www.lrts.me/",
+  "respondTime": 5017,
+  "ruleBookInfo": {
+    "author": "{{$.author}} 演播：{{$.announcer}}",
+    "coverUrl": "$.cover",
+    "init": "$.data.bookDetail",
+    "intro": "🔔 更新： {{$.update}}\n📯 演播：{{$.announcer}}\n🏷 标签：{{$.labels[*].name##\\n##,}}\n📂 内容简介：{{$.desc}}##(^|[。！？]+[”」）】]?)##$1<br>",
+    "kind": "{{$.type}}\n{{$.tags[*].name##支持听读劵}}\n{{$.lastUpdateTime}}\n@js:\nif(!/VIP/.test(result)&&/精品/.test(result)) \nresult = \"💰\" + result;\nelse result = result;",
+    "name": "$.name@put:{n: $.sections, entityType: $..entityType}",
+    "tocUrl": "https://m.lrts.me/ajax/getBookMenu?bookId={{$.id}}&pageNum=1&pageSize=50&sortType=0"
+  },
+  "ruleContent": {
+    "content": "@js:\n$ = JSON.parse(src);\nif($.data==null){\njava.longToast($.msg+\"\\n付费章节，请去官网付费订阅！\");\nyp_url = \"\";\n}else{\nyp_url = $.data.path;\n}\nyp_url;"
+  },
+  "ruleExplore": {
+    "bookList": "$.data",
+    "name": "$.name",
+    "bookUrl": "https://m.lrts.me/ajax/getBookDetail?bookId={{$.id}}",
+    "author": "{{$.author}}  演播：{{$.announcer}}",
+    "coverUrl": "$.cover",
+    "intro": "$.desc",
+    "kind": "{{$.tags[*].name}}\n{{$.score}}分",
+    "lastChapter": "$.sections"
+  },
+  "ruleSearch": {
+    "author": "{{$.author}}  演播：{{$.announcer}}",
+    "bookList": "<js>\nif(/getResourceList/.test(baseUrl)&&/pageNum=1/.test(baseUrl)){\n  bookIds = JSON.parse(result).bookIds;\n  source.put('bookIds', bookIds);\n  //cache.putFile('bookIds', bookIds, 3.6E6);\n  result = result;\n}\nelse{result = result;}\n</js>\n$..list[*]||$.books[*]",
+    "bookUrl": "https://m.lrts.me/ajax/getBookDetail?bookId={{$.id}}",
+    "checkKeyWord": "御兽之王 | 24新晋白金作家轻泉流响 | 起点霸榜 | 快节奏爽文",
+    "coverUrl": "$.cover",
+    "intro": "$.desc",
+    "kind": "{{$.tags[*].name##支持听读劵|高清}}\n{{$.score}}分\n{{$.lastUpdateTime}}\n@js:\nif(!/VIP/.test(result)&&/会员/.test(result)) \nresult = \"💰\" + result;\nelse result = result;",
+    "lastChapter": "$.sections",
+    "name": "$.name"
+  },
+  "ruleToc": {
+    "chapterList": "$.list[*]",
+    "chapterName": "$.name",
+    "chapterUrl": "https://m.lrts.me/ajax/getListenPath?entityId={{baseUrl.match(/bookId=(\\d+)/)[1]}}&entityType={{java.get(\"entityType\")}}&opType=1&sections=[{{$.section}}]&type=0&section={{$.section}}&id={{$.id}},{\"headers\":{\"cookie\": \"token=d0b4b76419aa2214f5d83e5db0a48deb629b6ab9c06bf66262458e0f0c22ce9a05479e7f1a1e2f8be9686f62a3def922b6b93cc67b00e0cf075b9b282231ed0ca2067c81ff60a19a3b8ca82fda10fd22c9f36c8c1a83971abaec49a2151801e6; token.sig=Mdac4MFXCTiXnfVjWCgrh525NjE\"}}",
+    "isVip": "$.payType",
+    "nextTocUrl": "@js:\nn = java.getString('$.sections')|java.get('n');\np = Math.ceil(n/50);\njava.log(\"章节数：\" + n)\nlist = [];\nfor(var i = 2; i <= p; i++){\nhref = baseUrl.replace(/pageNum=(\\d+)/,\"pageNum=\"+i);\nlist.push(href);\n}\nlist",
+    "updateTime": "{{java.timeFormatUTC(java.getString('$.lastModify'),'yyyy-MM-dd',8)}}"
+  },
+  "searchUrl": "https://m.lrts.me/ajax/searchBook?keyWord={{key}}&pageSize=15&pageNum={{page}}",
+  "weight": 0,
+  "bookSourceComment": "[read2xsgg] exploreUrl 为声明式迁移分类；分页由 read2xsgg.catalogPlan 描述，勿依赖源站专用适配器。",
+  "read2xsgg": {
+    "catalogPlan": {
+      "version": 1,
+      "kind": "idList",
+      "origin": "https://m.lrts.me",
+      "pageSize": 20,
+      "headers": {
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+        "Accept": "*/*",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 9; MIX 2S Build/PKQ1.180729.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/72.0.3626.121 Mobile Safari/537.36",
+        "Referer": "https://m.lrts.me/",
+        "X-Requested-With": "kaixin.diantai"
+      },
+      "first": {
+        "url": "{{origin}}/ajax/getResourceList?dsize={{pageSize}}&entityId={{entityId}}&entityType=1&pageNum=1&showFilters=1",
+        "idsProperty": "bookIds",
+        "itemsProperty": "books"
+      },
+      "next": {
+        "url": "{{origin}}/ajax/getResourceList?dsize={{pageSize}}&entityId=0&entityType=0&pageNum=0&showFilters=0&bookIds={{idsJson}}",
+        "itemsProperty": "books"
+      },
+      "item": {
+        "id": "id",
+        "name": "name",
+        "author": "author",
+        "desc": "desc",
+        "cover": "cover",
+        "kind": "tags",
+        "lastChapterTitle": "sections",
+        "detailUrl": "{{origin}}/ajax/getBookDetail?bookId={{id}}"
+      }
+    },
+    "notes": "原 exploreUrl 依赖 java.ajax/getCategory + bookIds 切片；已改为声明式 catalogPlan。分类表为迁移快照，新分类需更新本 fixture 或提供含 read2xsgg.catalogPlan 的源后重新转换。"
+  }
+}

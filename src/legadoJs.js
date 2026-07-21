@@ -4,10 +4,44 @@ function propertyExpression(root, path) {
   return `${root}.${value}`;
 }
 
+const PORTABLE_STRING_METHODS = "length|substring|substr|slice|indexOf|charAt|charCodeAt|trim|toLowerCase|toUpperCase|startsWith|endsWith|includes|replace|concat|padStart|padEnd";
+
+function rewriteKeyPageIdentifiers(expression) {
+  return String(expression || "")
+    .replace(/\bkey\b/gi, "params.keyWord")
+    .replace(/\bpage\b/gi, "params.pageIndex");
+}
+
+/**
+ * Comic/search sources often truncate keywords in URL templates, e.g.
+ * `{{key.length>3?key.substring(0,3):key}}`. Rewrite only expressions that stay
+ * within key/page plus a whitelist of String methods and operators.
+ */
+function portableKeyPageExpression(expression) {
+  const source = String(expression || "").trim();
+  if (!/\b(?:key|page)\b/i.test(source)) return "";
+  if (/\b(?:java|Packages|android|cookie|source|book|result|baseUrl|src)\b/i.test(source)) return "";
+  const withoutStrings = source.replace(/(['"])(?:\\.|(?!\1)[\s\S])*?\1/g, '""');
+  const remainder = withoutStrings
+    .replace(/\b(?:key|page)\b/gi, "")
+    .replace(new RegExp(`\\b(?:${PORTABLE_STRING_METHODS}|encodeURIComponent|encodeURI)\\b`, "g"), "")
+    .replace(/[\d\s()?:<>!=+*/%.,'[\]_&|+-]/g, "");
+  if (remainder) return "";
+  return `(${rewriteKeyPageIdentifiers(source)})`;
+}
+
 export function legadoTemplateExpression(value) {
   const expression = String(value || "").trim();
   if (/^key$/i.test(expression)) return "params.keyWord";
   if (/^page$/i.test(expression)) return "params.pageIndex";
+  // java.put(name, value) returns value; public URL templates commonly wrap
+  // page/key this way for side storage that 香色 cannot keep. Keep the URL value.
+  if (/^java\.put\(\s*['"]page['"]\s*,\s*page\s*\)(?:\s*;\s*page)?$/i.test(expression)) {
+    return "params.pageIndex";
+  }
+  if (/^java\.put\(\s*['"]key['"]\s*,\s*key\s*\)(?:\s*;\s*key)?$/i.test(expression)) {
+    return "params.keyWord";
+  }
   if (/^(?:java\.)?encodeURI(?:Component)?\(\s*key\s*\)$/i.test(expression)) return "encodeURIComponent(params.keyWord)";
   if (/^source\.bookSourceUrl$/i.test(expression)) return "config.host";
   if (/^[\d\s()+*/%.-]*\bpage\b[\d\s()+*/%.-]*$/i.test(expression)) {
@@ -18,6 +52,8 @@ export function legadoTemplateExpression(value) {
   if (/\bpage\b/i.test(withoutStrings) && /^[\d\s?:()+*/%<>=!&|.'"_-]*$/.test(pageRemainder)) {
     return `(${expression.replace(/\bpage\b/gi, "params.pageIndex")})`;
   }
+  const keyPage = portableKeyPageExpression(expression);
+  if (keyPage) return keyPage;
   const resultFallback = expression.split(/\s*\|\|\s*/).map((part) => (
     part.match(/^\$\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*)$/)?.[1] || ""
   ));
@@ -30,6 +66,9 @@ export function legadoTemplateExpression(value) {
   if (bookPath) {
     if (/^name$/i.test(bookPath)) return '(params.queryInfo.bookName || params.queryInfo.name || "正文")';
     if (/^author$/i.test(bookPath)) return '(params.queryInfo.author || "")';
+    if (/^durChapterTitle$/i.test(bookPath)) {
+      return '(params.queryInfo.chapterTitle || params.queryInfo.chapterName || params.queryInfo.title || "")';
+    }
     return propertyExpression("params.queryInfo", bookPath);
   }
   if (/^baseUrl$/i.test(expression)) return '(params.responseUrl || config.host || "")';
