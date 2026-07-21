@@ -119,15 +119,14 @@ function wrapComicImageContent(contentRule) {
 
 /**
  * 有声/视频正文：香色期望 content 最终给出可播媒体 JSON。
- * 有 imageProxyBase 时把播放地址改走 /media 转发（防盗链、Referer），与漫画 /image 同思路。
+ * 直接返回播放地址并带上源站 httpHeaders（Referer/Cookie）。不要默认走 /media：
+ * 代理会把 Referer 改成 CDN 自身域名，反而触发防盗链导致「能列目录却听不了」。
  */
 function wrapMediaContent(contentRule, imageProxyBase = "") {
   if (!contentRule) return contentRule;
   if (/JSON\.stringify\s*\(\s*\{[\s\S]*\burl\b/i.test(contentRule)) return contentRule;
   if (/forbidCache/i.test(contentRule) && /\burl\s*:/i.test(contentRule)) return contentRule;
-  const mediaEndpoint = imageProxyBase
-    ? `${String(imageProxyBase).replace(/\/$/, "")}/media?url=`
-    : "";
+  void imageProxyBase;
   const wrapJs = [
     "@js:",
     "var url = String(result || \"\").trim();",
@@ -137,12 +136,10 @@ function wrapMediaContent(contentRule, imageProxyBase = "") {
     "  || url.match(/https?:\\/\\/[^\\s\"'<>]+/i)",
     "  || (url.charAt(0) === \"/\" ? [null, url] : null);",
     "if (m) url = m[1] || m[0];",
-    mediaEndpoint
-      ? `var endpoint = ${JSON.stringify(mediaEndpoint)}; if (url) url = endpoint + encodeURIComponent(url);`
-      : "url = encodeURI(url);",
+    "url = encodeURI(url);",
     "return JSON.stringify({",
     "  url: url,",
-    mediaEndpoint ? "  httpHeaders: {}," : "  httpHeaders: config.httpHeaders,",
+    "  httpHeaders: config.httpHeaders,",
     "  forbidCache: true",
     "});",
   ].join("\n");
@@ -152,9 +149,7 @@ function wrapMediaContent(contentRule, imageProxyBase = "") {
 
 /** Audio/video sources often put the playable URL directly in chapterUrl. */
 function directMediaContent(imageProxyBase = "") {
-  const mediaEndpoint = imageProxyBase
-    ? `${String(imageProxyBase).replace(/\/$/, "")}/media?url=`
-    : "";
+  void imageProxyBase;
   return [
     "@js:",
     'var q = (typeof params !== "undefined" && params.queryInfo) || {};',
@@ -162,12 +157,10 @@ function directMediaContent(imageProxyBase = "") {
     'if (!url && typeof result === "string" && /^(?:https?:)?\\/\\//i.test(result.trim())) url = result.trim();',
     'if (url.indexOf("//") === 0) url = "https:" + url;',
     'else if (url && !/^https?:\\/\\//i.test(url)) url = config.host + (url.charAt(0) === "/" ? url : "/" + url);',
-    mediaEndpoint
-      ? `var endpoint = ${JSON.stringify(mediaEndpoint)}; if (url) url = endpoint + encodeURIComponent(url);`
-      : "url = encodeURI(url);",
+    "url = encodeURI(url);",
     "return JSON.stringify({",
     "  url: url,",
-    mediaEndpoint ? "  httpHeaders: {}," : "  httpHeaders: config.httpHeaders,",
+    "  httpHeaders: config.httpHeaders,",
     "  forbidCache: true",
     "});",
   ].join("\n");
@@ -235,7 +228,7 @@ function actionPageSize(action, fallback = 20) {
 
 function requestHasUpstreamPaging(requestInfo, action = null) {
   const source = String(requestInfo || "");
-  if (/%@pageIndex\b|params\.pageIndex\b/.test(source)) return true;
+  if (/%@pageIndex\b|params\.pageIndex\b|__PAGE__/.test(source)) return true;
   if (action?.nextPageUrl) return true;
   return false;
 }
@@ -380,8 +373,17 @@ function bridgeDetailAction(action, bridgeBase, headers) {
 
 function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {} } = {}) {
   if (!action?.list || !action?.title || !action?.url) return action;
+  // Only HTML link selectors belong in plan.tocSelector. JSON/API tocUrl is
+  // already compiled into requestInfo (absolute getBookMenu-style URLs).
+  const htmlTocSelector = String(tocSelector || "").trim();
+  const useHtmlToc = Boolean(
+    htmlTocSelector
+    && !/^@js:/i.test(htmlTocSelector)
+    && !/^https?:\/\//i.test(htmlTocSelector)
+    && !/\{\{|result\./i.test(htmlTocSelector),
+  );
   const plan = compileChapterBridgePlan(action, {
-    tocSelector,
+    tocSelector: useHtmlToc ? htmlTocSelector : "",
     headers: { ...headers, ...(action.httpHeaders || {}) },
     reverse: Boolean(action.reverseChapters || action.reverse),
   });
@@ -389,7 +391,7 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
   const endpoint = bridgeEndpoint(bridgeBase, "chapters", plan);
   const pageSize = actionPageSize(action, 100);
   const serverPaging = !requestHasUpstreamPaging(action.requestInfo || "%@result", action);
-  const requestInfo = tocSelector
+  const requestInfo = useHtmlToc
     ? runtimeAdapterRequestInfo(adapterEndpointWithPaging(endpoint, { pageSize, serverPaging }))
     : bridgeRequestInfo(action.requestInfo || "%@result", endpoint, { pageSize, serverPaging });
   if (!requestInfo) return action;
@@ -428,6 +430,108 @@ function tocLinkHint(rule) {
   return source.match(/(?:text\(\)|text\.)\s*(?:=|,)?\s*["']([^"']{1,32})["']/i)?.[1]
     || source.match(/["']([^"']*(?:章节|目录|chapter|catalog)[^"']*)["']/i)?.[1]
     || "";
+}
+
+/**
+ * Strip trailing Legado request options (`,{headers:{...}}`) and return them.
+ */
+function splitLegadoUrlOptions(rule) {
+  const source = String(rule || "").trim();
+  const match = source.match(/^(.*?)(,\s*\{[\s\S]*\})\s*$/);
+  if (!match) return { url: source, options: {} };
+  return { url: match[1].trim(), options: parseLooseJson(match[2].replace(/^,\s*/, ""), () => {}) };
+}
+
+/**
+ * JSON API tocUrl like getBookMenu?bookId={{$.id}}&pageNum=1 → chapterList requestInfo.
+ * Xiangse §七 uses detail URL as result; these menus need the book id + page instead.
+ */
+function upstreamPageSizeFromTocUrl(tocUrl) {
+  const { url: raw } = splitLegadoUrlOptions(tocUrl);
+  const match = String(raw || "").match(/[?&]pageSize=(\d{1,4})\b/i);
+  const size = match ? Number(match[1]) : 0;
+  return Number.isInteger(size) && size > 0 ? Math.min(200, size) : 0;
+}
+
+function buildJsonApiTocRequestInfo(tocUrl) {
+  const { url: raw } = splitLegadoUrlOptions(tocUrl);
+  if (!/^https?:\/\//i.test(raw)) return "";
+  if (!/\{\{\s*\$\.[A-Za-z_$][\w$]*\s*\}\}|\{(?:\$\.)?[A-Za-z_$][\w$]*\}/.test(raw)) return "";
+
+  let template = raw
+    .replace(/\{\{\s*page\s*\}\}/gi, "__PAGE__")
+    .replace(/([?&](?:pageNum|pageIndex|page)=)(?:1|\{\{\s*page\s*\}\})/gi, "$1__PAGE__");
+
+  const idFields = [];
+  template = template.replace(/\{\{\s*\$\.([A-Za-z_$][\w$]*)\s*\}\}/g, (_, field) => {
+    if (!idFields.includes(field)) idFields.push(field);
+    return "__ID__";
+  });
+  template = template.replace(/\{(?:\$\.)?([A-Za-z_$][\w$]*)\}/g, (_, field) => {
+    if (!idFields.includes(field)) idFields.push(field);
+    return "__ID__";
+  });
+  if (!template.includes("__ID__")) return "";
+
+  return [
+    "@js:",
+    "var q = (typeof params !== \"undefined\" && params.queryInfo) || {};",
+    "var u = String(q.detailUrl || q.url || q.chapterUrl || \"\");",
+    "if (!u && typeof result === \"string\") u = result;",
+    "if (!u && result && typeof result === \"object\") u = String(result.detailUrl || result.url || \"\");",
+    "var id = String(q.bookId || q.id || \"\").trim();",
+    "if (!id) {",
+    "  var m = u.match(/[?&](?:bookId|albumId|id)=(\\d+)/i)",
+    "    || u.match(/\\/(?:book|album|comic)\\/(\\d+)/i)",
+    "    || u.match(/\\/(\\d+)(?:\\/?(?:\\?|$))/);",
+    "  if (m) id = m[1];",
+    "}",
+    "if (!id) return \"\";",
+    "var page = String((params && params.pageIndex) || 1);",
+    `var url = ${JSON.stringify(template)};`,
+    "url = url.split(\"__ID__\").join(encodeURIComponent(id));",
+    "if (url.indexOf(\"__PAGE__\") >= 0) url = url.split(\"__PAGE__\").join(encodeURIComponent(page));",
+    "return url;",
+  ].join("\n");
+}
+
+/**
+ * Turn getListenPath-style chapter URL templates into a bridge urlTemplate field.
+ * entityId is taken from the toc page URL (bookId=); section/id from each row.
+ */
+function compileHttpChapterUrlField(chapterUrl) {
+  const { url: raw } = splitLegadoUrlOptions(chapterUrl);
+  if (!/^https?:\/\//i.test(raw)) return null;
+  if (!/\{\{\s*\$\./.test(raw) && !/baseUrl\.match/.test(raw)) return null;
+
+  let template = raw;
+  // baseUrl.match(/bookId=(\d+)/)[1] → {{base:bookId}}
+  template = template.replace(
+    /\{\{\s*baseUrl\.match\(\/((?:\\.|[^/])+)\/\)\[1\]\s*\}\}/gi,
+    () => "{{base:bookId}}",
+  );
+  template = template.replace(/\{\{\s*java\.get\(\s*["']entityType["']\s*\)\s*\}\}/gi, "1");
+  template = template.replace(/\{\{\s*\$\.([A-Za-z_$][\w$]*)\s*\}\}/g, "{{$1}}");
+  if (!/\{\{[A-Za-z_]/.test(template)) return null;
+
+  const primary = (template.match(/\{\{(id)\}\}/i) || template.match(/\{\{(section|url|path)\}\}/i))?.[1] || "id";
+  return {
+    selector: primary,
+    replacements: [],
+    hostPrefix: false,
+    matchTemplate: null,
+    urlTemplate: template.slice(0, 2_048),
+  };
+}
+
+function mergeLegadoUrlOptionHeaders(headers, ...rules) {
+  const merged = { ...headers };
+  for (const rule of rules) {
+    const { options } = splitLegadoUrlOptions(rule);
+    const extra = parseHeaders(options.headers || options.header || {}, () => {});
+    Object.assign(merged, extra);
+  }
+  return merged;
 }
 
 // 香色对 XPath 选中的元素会读取完整 textContent；阅读的 @text 也包含
@@ -492,12 +596,12 @@ function proxiedHtmlComicChapterContent(host, imageProxyBase, decoder = "auto", 
   };
 }
 
-/** Generic server-side audio/video URL extraction + /media proxy (like /image). */
+/** Generic server-side audio/video URL extraction. Play URL is returned with
+ * source httpHeaders so the client can satisfy Referer/Cookie anti-leech. */
 function proxiedMediaChapterContent(host, imageProxyBase, kind, extractionPlan) {
   const base = String(imageProxyBase).replace(/\/$/, "");
   const encodedPlan = encodeMediaExtractionPlan(extractionPlan);
   const endpoint = `${base}/adapter/media?kind=${kind}&plan=${encodedPlan}&url=`;
-  const mediaEndpoint = `${base}/media?url=`;
   return {
     ...commonAction("chapterContent", host, "json"),
     requestInfo: runtimeAdapterRequestInfo(endpoint),
@@ -505,11 +609,9 @@ function proxiedMediaChapterContent(host, imageProxyBase, kind, extractionPlan) 
       "@js:",
       'var payload = (typeof result === "string") ? JSON.parse(result) : result;',
       'var url = String((payload && payload.url) || "").trim();',
-      `var endpoint = ${JSON.stringify(mediaEndpoint)};`,
-      "if (url) url = endpoint + encodeURIComponent(url);",
       "return JSON.stringify({",
-      "  url: url,",
-      "  httpHeaders: {},",
+      "  url: encodeURI(url),",
+      "  httpHeaders: config.httpHeaders,",
       "  forbidCache: true",
       "});",
     ].join("\n"),
@@ -1090,10 +1192,10 @@ function convertOne(source, warnings, options = {}) {
   if (/(?:jmcomic|18comic|comic18j)/i.test(adaptedFrom)) {
     warningForSource("siteAdapter", adaptedFrom)("已提取禁漫动态发现分类，并显式补齐分类列表规则");
   }
-  const headers = portableHeaders({
+  const headers = portableHeaders(mergeLegadoUrlOptionHeaders({
     ...parseHeaders(source.header, warningForSource("header", source.header)),
     ...(source.httpUserAgent ? { "User-Agent": String(source.httpUserAgent) } : {}),
-  }, host, warningForSource);
+  }, getRules(source, "ruleToc", "tocRule").chapterUrl, source.searchUrl), host, warningForSource);
   if (!host) warningForSource("bookSourceUrl", source.bookSourceUrl)("缺少有效的 bookSourceUrl，生成源可能无法发起请求");
   const resolvedType = sourceType(source);
   if ((source.bookSourceType === 3 || source.bookSourceType === "3") && resolvedType === "text") {
@@ -1173,6 +1275,7 @@ function convertOne(source, warnings, options = {}) {
   // 官方 bookDetail 无 tocUrl；若阅读源带 tocUrl，仅作额外提取字段，不能代替 §七 的 result 语义。
   const requestInfoOverride = chapterListRequestInfoOverride(source);
   let chapterListRequestInfo = requestInfoOverride || "%@result";
+  let jsonApiToc = false;
   if (detailRules.tocUrl) {
     if (isDetailUrlAlias(detailRules.tocUrl)) {
       // tocUrl = baseUrl 表示目录就在详情页，不要转成 //baseUrl 这种假 XPath
@@ -1181,39 +1284,49 @@ function convertOne(source, warnings, options = {}) {
       );
       chapterListRequestInfo = requestInfoOverride || "%@result";
     } else {
-      bookDetail.tocUrl = convertRule(detailRules.tocUrl, {
-        responseType: detailResponseType,
-        warn: detailWarningFor("tocUrl", detailRules.tocUrl),
-      });
-      if (!requestInfoOverride) {
-        const nameTemplate = String(detailRules.name || "").trim().match(/^\{\{\s*([\s\S]*?)\s*\}\}$/)?.[0];
-        const tocTemplate = String(detailRules.tocUrl || "");
-        if (nameTemplate && tocTemplate.includes(nameTemplate)) {
-          const request = tocTemplate.split(nameTemplate).join("{{book.name}}");
-          chapterListRequestInfo = convertRequest(request, {
-            headers,
-            warn: tocWarningFor("request", request),
-            fallback: "%@result",
-          }).requestInfo;
-          detailWarningFor("tocUrl", detailRules.tocUrl)("目录 URL 与详情书名使用同一字段，已改为从香色 queryInfo.bookName 构造目录请求");
-        } else {
-          // 非官方字段兜底：部分客户端若把 tocUrl 写入 queryInfo 则可直连目录
-          chapterListRequestInfo = [
-            "@js:",
-            "var q = params.queryInfo || {};",
-            'var u = (typeof result === "string") ? result : "";',
-            'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
-            "u = String(q.tocUrl || q.detailUrl || u || q.url || \"\");",
-            "return u;",
-          ].join("\n");
+      const absoluteTocRequest = buildJsonApiTocRequestInfo(detailRules.tocUrl);
+      if (absoluteTocRequest && !requestInfoOverride) {
+        chapterListRequestInfo = absoluteTocRequest;
+        jsonApiToc = true;
+        detailWarningFor("tocUrl", detailRules.tocUrl)(
+          "阅读 JSON API tocUrl 已编译为目录请求（从详情 URL / bookId 取 id，并用 pageIndex 翻页）",
+        );
+      } else {
+        bookDetail.tocUrl = convertRule(detailRules.tocUrl, {
+          responseType: detailResponseType,
+          warn: detailWarningFor("tocUrl", detailRules.tocUrl),
+        });
+        if (!requestInfoOverride) {
+          const nameTemplate = String(detailRules.name || "").trim().match(/^\{\{\s*([\s\S]*?)\s*\}\}$/)?.[0];
+          const tocTemplate = String(detailRules.tocUrl || "");
+          if (nameTemplate && tocTemplate.includes(nameTemplate)) {
+            const request = tocTemplate.split(nameTemplate).join("{{book.name}}");
+            chapterListRequestInfo = convertRequest(request, {
+              headers,
+              warn: tocWarningFor("request", request),
+              fallback: "%@result",
+            }).requestInfo;
+            detailWarningFor("tocUrl", detailRules.tocUrl)("目录 URL 与详情书名使用同一字段，已改为从香色 queryInfo.bookName 构造目录请求");
+          } else {
+            // 非官方字段兜底：部分客户端若把 tocUrl 写入 queryInfo 则可直连目录
+            chapterListRequestInfo = [
+              "@js:",
+              "var q = params.queryInfo || {};",
+              'var u = (typeof result === "string") ? result : "";',
+              'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
+              "u = String(q.tocUrl || q.detailUrl || u || q.url || \"\");",
+              "return u;",
+            ].join("\n");
+          }
         }
+        detailWarningFor("tocUrl", detailRules.tocUrl)(
+          "阅读源含 tocUrl：已写入 bookDetail.tocUrl；章节请求仍以书源规则§七的 result（详情 URL）为准，请实测目录页",
+        );
       }
-      detailWarningFor("tocUrl", detailRules.tocUrl)(
-        "阅读源含 tocUrl：已写入 bookDetail.tocUrl；章节请求仍以书源规则§七的 result（详情 URL）为准，请实测目录页",
-      );
     }
   }
   if (detailRules.tocUrl && detailResponseType === "html" && options.imageProxyBase
+    && !jsonApiToc
     && !/^(?:@js:|<js>|https?:\/\/|\{\{)/i.test(String(detailRules.tocUrl).trim())) {
     const base = String(options.imageProxyBase).replace(/\/$/, "");
     const hint = tocLinkHint(detailRules.tocUrl);
@@ -1274,7 +1387,30 @@ function convertOne(source, warnings, options = {}) {
     chapterList: {
       ...commonAction("chapterList", host, tocResponseType),
       requestInfo: chapterListRequestInfo,
-      ...mapTocRules(tocRules, tocResponseType, tocWarningFor),
+      ...(() => {
+        const mapped = mapTocRules(tocRules, tocResponseType, tocWarningFor);
+        const httpChapterUrl = options.imageProxyBase
+          ? compileHttpChapterUrlField(tocRules.chapterUrl)
+          : null;
+        if (httpChapterUrl) {
+          mapped.url = httpChapterUrl;
+          tocWarningFor("chapterUrl", tocRules.chapterUrl)(
+            "章节播放地址模板已编译为桥接 urlTemplate（bookId 取自目录页 URL）",
+          );
+        }
+        if (jsonApiToc) {
+          // 香色：本页条数 < pageSize ⇒ 没有下一页。必须与上游 pageSize 对齐，
+          // 否则 getBookMenu?pageSize=50 却声明 100，会在第一页后停止翻页。
+          const upstreamSize = upstreamPageSizeFromTocUrl(detailRules.tocUrl) || 50;
+          delete mapped.nextPageUrl;
+          mapped.moreKeys = {
+            ...(mapped.moreKeys || {}),
+            pageSize: upstreamSize,
+            maxPage: 500,
+          };
+        }
+        return mapped;
+      })(),
     },
     chapterContent: {
       ...commonAction("chapterContent", host, contentResponseType),
@@ -1332,7 +1468,7 @@ function convertOne(source, warnings, options = {}) {
     );
     contentWarningFor("content", contentRules.content)(
       hasSourceRegex
-        ? "阅读 sourceRegex 扩展名已编入媒体提取计划，正文改由通用媒体适配器解析并由 /media 转发"
+        ? "阅读 sourceRegex 扩展名已编入媒体提取计划，正文改由通用媒体适配器解析播放地址（直连 CDN + 源站 httpHeaders）"
         : "正文为 JSON 媒体接口或依赖阅读 Android API，已改由通用媒体提取器解析播放地址",
     );
   } else if ((resolvedType === "audio" || resolvedType === "video") && hasSourceRegex) {
@@ -1400,7 +1536,7 @@ function convertOne(source, warnings, options = {}) {
     converted.searchBook = bridgeBookAction(converted.searchBook, options.imageProxyBase, headers);
     converted.bookDetail = bridgeDetailAction(converted.bookDetail, options.imageProxyBase, headers);
     converted.chapterList = bridgeChapterAction(converted.chapterList, options.imageProxyBase, {
-      tocSelector: bookDetail.tocUrl || "",
+      tocSelector: jsonApiToc ? "" : (bookDetail.tocUrl || ""),
       headers,
     });
     if (resolvedType === "text") {

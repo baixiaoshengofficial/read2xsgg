@@ -3,11 +3,12 @@ import { verifyConvertedSource } from "./verifySource.js";
 
 /**
  * After Legado conversion + origin preflight: verify each source; on failure
- * try site-analyze fallback. If analyze also fails, keep the original converted
- * source (soft keep) so sync /source and jobs do not drop usable conversions.
+ * try site-analyze (generic heuristic) to REPLACE the broken conversion.
  *
- * When `budgetMs` elapses, remaining sources are kept unverified so large
- * aggregate converts still finish within proxy/client timeouts.
+ * If the site host is known (reachable after preflight) and both verify and
+ * analyze fail, SKIP the source — do not soft-keep broken rules into XBS.
+ * Budget timeout is the only case that keeps unverified conversions.
+ *
  * Pass `budgetMs: 0` for unbounded full verify (async library jobs).
  */
 function emitProgress(onProgress, payload) {
@@ -108,16 +109,9 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
     });
   };
 
-  const softKeep = (name, source, reason) => {
-    kept[name] = source;
-    unverifiedCount += 1;
-    warnings.push({
-      source: name,
-      section: "source",
-      field: "verify",
-      message: `抽测/识站未通过（${reason}），已保留阅读转换结果供客户端试用`,
-      rule: String(source?.sourceUrl || source?.host || ""),
-    });
+  /** Site reachable but rules unusable: drop instead of shipping broken XBS. */
+  const hardSkip = (name, reason) => {
+    skipped.push({ source: name, reason });
     processed += 1;
   };
 
@@ -164,28 +158,37 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
         failedVerifyCount += 1;
         const reason = verified.reason || "rules-stale: empty-list";
         if (!analyzeFallback) {
-          softKeep(name, source, reason);
+          hardSkip(name, `${reason}；未启用识站回退，已跳过不可用转换`);
           continue;
         }
         const host = sourceHostKey(source);
         if (!host) {
-          softKeep(name, source, reason);
+          hardSkip(name, `${reason}；缺少 sourceUrl/host，无法识站修复`);
           continue;
         }
         report({ step: "analyze" });
         const preferKind = String(source?.sourceType || "").trim();
         const analyzed = await analyzeFor(host, preferKind, name);
         if (!analyzed.ok) {
-          softKeep(name, source, analyzed.reason || "analyze-failed: 识站失败");
+          hardSkip(
+            name,
+            `${analyzed.reason || "analyze-failed: 识站失败"}（阅读规则抽测：${reason}）`,
+          );
           continue;
         }
         const generated = analyzed.sources || {};
-        const matchName = Object.keys(generated).find((key) => generated[key]?.sourceType === preferKind);
+        // Repair must keep the same media kind; do not replace 听书 with a novel source.
+        const matchName = preferKind
+          ? Object.keys(generated).find((key) => generated[key]?.sourceType === preferKind)
+          : "";
         const picked = (matchName && generated[matchName])
-          || analyzed.source
-          || Object.values(generated)[0];
+          || (!preferKind ? (analyzed.source || Object.values(generated)[0]) : null);
         if (!picked) {
-          softKeep(name, source, analyzed.reason || "analyze-failed: 识站失败");
+          const kinds = Object.values(generated).map((item) => item?.sourceType).filter(Boolean).join("/");
+          hardSkip(
+            name,
+            `analyze-failed: 识站未生成可用的${preferKind || "匹配"}源${kinds ? `（仅有 ${kinds}）` : ""}（阅读规则抽测：${reason}）`,
+          );
           continue;
         }
         picked.sourceName = name;
@@ -196,7 +199,7 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
           source: name,
           section: "source",
           field: "verify",
-          message: `阅读规则抽测失败（${reason}），已回退自动识站`,
+          message: `阅读规则抽测失败（${reason}），已用自动识站修复为可用香色源`,
           rule: host,
         });
         processed += 1;

@@ -426,12 +426,13 @@ test("verify budget 到期后保留未抽测源", async () => {
     budgetMs: 40,
   });
   assert.ok(gated.unverifiedCount >= 1, `expected unverified, got ${gated.unverifiedCount}`);
-  assert.equal(Object.keys(gated.sources).length, 6);
-  assert.equal(gated.skipped.length, 0);
+  // Budget leftovers are kept; verify failures with analyzeFallback=false are skipped.
   assert.equal(Object.keys(gated.sources).length, gated.unverifiedCount);
+  assert.equal(Object.keys(gated.sources).length + gated.skipped.length, 6);
+  assert.ok(gated.skipped.length >= 1 || gated.unverifiedCount === 6);
 });
 
-test("识站失败时 soft keep 保留阅读转换结果", async () => {
+test("识站失败时跳过坏源，不再 soft keep", async () => {
   const broken = {
     sourceName: "懒人听书",
     sourceUrl: "https://audio.example",
@@ -476,12 +477,52 @@ test("识站失败时 soft keep 保留阅读转换结果", async () => {
     { 懒人听书: broken },
     { download, enabled: true, analyzeFallback: true, timeoutMs: 1_000, analyzeTimeoutMs: 1_000 },
   );
-  assert.ok(gated.sources["懒人听书"]);
-  assert.equal(gated.sources["懒人听书"].chapterContent.content, "audio@src");
+  assert.equal(gated.sources["懒人听书"], undefined);
+  assert.equal(Object.keys(gated.sources).length, 0);
   assert.equal(gated.fallbackCount, 0);
-  assert.equal(gated.unverifiedCount, 1);
-  assert.equal(gated.skipped.length, 0);
-  assert.ok(gated.warnings.some((item) => /保留阅读转换结果/.test(item.message)));
+  assert.equal(gated.unverifiedCount, 0);
+  assert.equal(gated.skipped.length, 1);
+  assert.match(gated.skipped[0].reason, /analyze-failed|rules-stale/);
+});
+
+test("抽测失败且关闭识站回退时跳过", async () => {
+  const broken = {
+    sourceName: "过时源",
+    sourceUrl: "https://novel.example",
+    host: "https://novel.example",
+    sourceType: "text",
+    bookWorld: {
+      分类: {
+        actionID: "bookWorld",
+        host: "https://novel.example",
+        responseFormatType: "html",
+        requestInfo: "https://novel.example/list",
+        list: "//.nope",
+        bookName: ".",
+        detailUrl: "./@href",
+      },
+    },
+    chapterList: {
+      actionID: "chapterList",
+      host: "https://novel.example",
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      list: "//a",
+      title: ".",
+      url: "./@href",
+    },
+  };
+  const gated = await applyVerifyAndAnalyzeFallback(
+    { 过时源: broken },
+    {
+      download: async () => Buffer.from("<html><body><p>empty</p></body></html>"),
+      enabled: true,
+      analyzeFallback: false,
+    },
+  );
+  assert.equal(Object.keys(gated.sources).length, 0);
+  assert.equal(gated.skipped.length, 1);
+  assert.match(gated.skipped[0].reason, /未启用识站回退/);
 });
 test("抽测进度回调包含当前站点名", async () => {
   const plan = {

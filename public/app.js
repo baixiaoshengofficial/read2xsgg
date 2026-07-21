@@ -125,7 +125,7 @@ function phaseLabel(job) {
     return current ? `${base} · ${current}` : base;
   }
   if (phase === "verify") {
-    const step = job.progress?.step === "analyze" ? "识站回退" : "抽测";
+    const step = job.progress?.step === "analyze" ? "识站修复" : "抽测";
     if (job.progress?.total) {
       const unverified = job.progress.unverified ? ` · 未抽测保留 ${job.progress.unverified}` : "";
       const base = `${step} ${job.progress.done || 0}/${job.progress.total} · 保留 ${job.progress.kept || 0} · 跳过 ${job.progress.skipped || 0}${unverified}`;
@@ -133,7 +133,7 @@ function phaseLabel(job) {
     }
     return current ? `${step}中… · ${current}` : `${step}中…`;
   }
-  if (phase === "analyze") return current ? `识站分析… · ${current}` : "识站分析…";
+  if (phase === "analyze") return current ? `识站修复… · ${current}` : "识站修复…";
   if (phase === "save") return "写入制品…";
   if (job.status === "running") return "处理中…";
   return "等待中";

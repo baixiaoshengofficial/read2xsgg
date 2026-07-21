@@ -130,7 +130,7 @@ async function writeOutputs(options, sources, { warnings = [], skipped = [], fal
     }, null, 2)}\n`, "utf8");
     process.stderr.write(`✓ 已生成兼容性报告：${reportPath}\n`);
   }
-  if (fallbackCount) process.stderr.write(`ℹ 其中 ${fallbackCount} 个由自动识站回退生成\n`);
+  if (fallbackCount) process.stderr.write(`ℹ 其中 ${fallbackCount} 个由自动识站修复生成\n`);
   if (skipped.length) process.stderr.write(`⚠ 跳过 ${skipped.length} 个源\n`);
   if (warnings.length) {
     process.stderr.write(`⚠ 转换完成，但有 ${warnings.length} 项需要人工复核${options.report ? "（详见报告）" : "（使用 --report 导出详情）"}\n`);

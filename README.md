@@ -228,13 +228,13 @@ node ./bin/server.js
 
 音频和视频源与文本书源一样走完整核心链路（搜索 → 详情 → 目录 → 正文），不会因为类型是有声/视频就被质量门槛整类丢掉。转换器从 `ruleContent` 中编译安全的字段和 HTML 属性提示；若带有阅读 `sourceRegex`，会把其中的媒体扩展名（如 `.mp3`、`.m3u8`）编入提取计划的 `urlHints`。在线服务再从 JSON、HTML、脚本片段、`audio` / `video` / `source` / `iframe` 标签中寻找媒体地址，并优先命中这些扩展名提示，同时支持 HLS（`.m3u8`）和 DASH 分片。
 
-播放地址会像漫画走 `/image` 一样，经 `{转换站}/media?url=` 转发（自动带同源 Referer，并做与在线转换相同的内网地址拦截），以应对防盗链。香色客户端本身支持 `webView` 请求；离线转换且没有代理地址时，带 `sourceRegex` 的源会改写正文请求为 `webView:true`，由客户端加载章节页。
+播放地址经通用媒体适配器解析后，直接交给香色播放，并带上源站 `httpHeaders`（Referer / Cookie）。默认不再把音频塞进 `/media` 代理：代理会把 Referer 改成 CDN 域名，容易触发防盗链。`/media?url=` 仍保留给需要服务端转发的特殊场景。
 
 若章节 URL 本身就是媒体地址则直接播放；若接口同时返回多个清晰度，会优先选择较高质量版本。转换器不会执行阅读源携带的远程 JavaScript、`eval` 或 Android 原生 API。
 
 ### 大型混合源验证
 
-在线转换管线现在是：**探活 → 按阅读规则转换 → 抽测列表/目录 → 失败则自动识站回退 → 仍失败则保留阅读转换结果（并告警）**。
+在线转换管线现在是：**探活 → 按阅读规则转换 → 抽测列表/目录 → 失败则自动识站修复 → 仍失败则跳过（不把坏源写入 XBS）**。站点可达时，抽测/识站失败视为转换器问题：必须用识站通用解析修成可用香色源，否则丢弃。
 
 ```mermaid
 flowchart LR
@@ -243,19 +243,18 @@ flowchart LR
   probe --> convert[规则转换]
   convert --> verify[抽测列表和目录]
   verify -->|通过| xbs[写入 XBS]
-  verify -->|失败| analyze[自动识站]
+  verify -->|失败| analyze[自动识站修复]
   analyze -->|成功| xbs
-  analyze -->|失败| soft[保留转换结果]
-  soft --> xbs
+  analyze -->|失败| skip2[跳过坏源]
   siteUrl[网站 URL] --> analyzeDirect["/url/ 直接识站"]
   analyzeDirect --> xbs
 ```
 
-Compose **默认同步路径**开启 origin 探活、抽测与识站回退；抽测/识站仍失败时**保留**阅读转换结果（soft keep），避免同步 `/source` 因 empty-toc 直接 422：
+Compose **默认同步路径**开启 origin 探活、抽测与识站修复；仅当抽测墙钟预算用尽时，未抽测的源才会暂时保留：
 
 - `PREFLIGHT_SOURCES=true`
 - `VERIFY_CONVERTED_SOURCES=true`
-- `ANALYZE_FALLBACK=true`（同步 `/source` 与 WebUI 任务都会识站回退）
+- `ANALYZE_FALLBACK=true`（同步 `/source` 与 WebUI 任务都会识站修复）
 - `VERIFY_BUDGET_MS=20000` / `VERIFY_MAX_SOURCES=50`（仅同步 `/source`；超限跳过抽测直接保留）
 - `JOB_VERIFY_BUDGET_MS=0`（WebUI 异步任务抽测墙钟预算；`0` 为完整抽测不限时）
 - `PREFLIGHT_CONCURRENCY=8`（探活与抽测共用并发；同源识站结果会复用）
@@ -314,8 +313,8 @@ Compose 支持通过环境变量调整：
 | `PREFLIGHT_DEEP_SOURCES` | `false` | 实测分类列表、第一本书、章节和正文；仅在 `PREFLIGHT_SOURCES=true` 时生效。聚合源成本高，默认关闭 |
 | `PREFLIGHT_TIMEOUT_MS` | `3000` | 单个上游站点预检/抽测超时时间 |
 | `PREFLIGHT_CONCURRENCY` | `8` | 上游站点并发预检/抽测数量；不建议在小内存容器中调高 |
-| `VERIFY_CONVERTED_SOURCES` | `true` | 转换后抽测分类列表与目录是否非空；失败进入识站回退，再失败则 soft keep |
-| `ANALYZE_FALLBACK` | `true` | 抽测失败时用启发式识站生成源；仍失败则保留阅读转换结果 |
+| `VERIFY_CONVERTED_SOURCES` | `true` | 转换后抽测分类列表与目录是否非空；失败进入识站修复，再失败则跳过 |
+| `ANALYZE_FALLBACK` | `true` | 抽测失败时用启发式识站生成可用香色源；仍失败则跳过坏源 |
 | `ANALYZE_TIMEOUT_MS` | `8000` | 自动识站单次页面下载超时 |
 | `MAX_COMIC_PAGES` | `50` | 单章 JSON 漫画接口最多聚合的分页数（含第一页） |
 | `MAX_COMIC_IMAGES` | `2000` | 单章最多返回的图片数 |

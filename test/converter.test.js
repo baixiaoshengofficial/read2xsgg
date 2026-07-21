@@ -1209,6 +1209,54 @@ test("有声和视频正文为空时自动使用章节媒体 URL", () => {
   }
 });
 
+test("JSON API tocUrl 编译为 getBookMenu 式目录请求与播放 urlTemplate", () => {
+  const source = {
+    bookSourceName: "听书目录",
+    bookSourceUrl: "https://audio.example/",
+    bookSourceType: 1,
+    searchUrl: "/ajax/search?keyWord={{key}}&pageNum={{page}}",
+    ruleSearch: { bookList: "$.list[*]", name: "$.name", bookUrl: "$.id" },
+    ruleBookInfo: {
+      name: "$.name",
+      tocUrl: "https://audio.example/ajax/getBookMenu?bookId={{$.id}}&pageNum=1&pageSize=50&sortType=0",
+    },
+    ruleToc: {
+      chapterList: "$.list[*]",
+      chapterName: "$.name",
+      chapterUrl: "https://audio.example/ajax/getListenPath?entityId={{baseUrl.match(/bookId=(\\d+)/)[1]}}&section={{$.section}}&id={{$.id}},{\"headers\":{\"cookie\":\"token=abc\"}}",
+    },
+    ruleContent: { content: "@js:return JSON.parse(src).data.path;" },
+  };
+  const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const converted = sources["听书目录"];
+  assert.match(converted.chapterList.requestInfo, /getBookMenu/);
+  assert.match(converted.chapterList.requestInfo, /adapter\/chapters\?plan=/);
+  assert.equal(converted.chapterList.moreKeys.pageSize, 50);
+  assert.equal(converted.chapterList.moreKeys.maxPage, 500);
+  assert.equal(converted.httpHeaders.cookie || converted.httpHeaders.Cookie, "token=abc");
+  assert.ok(warnings.some((warning) => /JSON API tocUrl/.test(warning.message)));
+  assert.match(converted.chapterContent.content, /config\.httpHeaders/);
+  assert.doesNotMatch(converted.chapterContent.content, /\/media\?url=/);
+  const plan = decodeBridgePlan(converted.chapterList.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)[1]);
+  assert.match(plan.fields.url.urlTemplate, /getListenPath/);
+  assert.deepEqual(
+    executeBridgePlan(
+      JSON.stringify({ list: [{ name: "第1集", id: 9, section: 1 }] }),
+      "https://audio.example/ajax/getBookMenu?bookId=42&pageNum=1&pageSize=50&sortType=0",
+      plan,
+    ),
+    {
+      data: [{
+        title: "第1集",
+        url: "https://audio.example/ajax/getListenPath?entityId=42&section=1&id=9",
+      }],
+      hasMore: false,
+      offset: 0,
+      pageSize: 100,
+    },
+  );
+});
+
 test("依赖 Android API 的媒体正文通过在线通用提取器转换", () => {
   const source = {
     bookSourceName: "媒体提取器",
@@ -1329,7 +1377,8 @@ test("在线质量门槛保留 sourceRegex 有声源并走媒体适配", () => {
   assert.ok(converted);
   assert.equal(converted.sourceType, "audio");
   assert.match(converted.chapterContent.requestInfo, /\/adapter\/media\?kind=audio/);
-  assert.match(converted.chapterContent.content, /\/media\?url=/);
+  assert.match(converted.chapterContent.content, /config\.httpHeaders/);
+  assert.doesNotMatch(converted.chapterContent.content, /\/media\?url=/);
   assert.ok(warnings.some((warning) => /sourceRegex/.test(warning.message)));
 });
 

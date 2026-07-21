@@ -76,7 +76,8 @@ function normalizeField(rule) {
         matchTemplate: null,
       };
     }
-    const selector = selectorOnly(rule.selector);
+    const urlTemplate = String(rule.urlTemplate || "").trim().slice(0, 2_048);
+    const selector = selectorOnly(rule.selector) || (urlTemplate ? "id" : "");
     if (!selector) return null;
     const replacements = Array.isArray(rule.replacements) ? rule.replacements.map((item) => {
       const pattern = safeRegexPattern(item?.pattern);
@@ -92,7 +93,13 @@ function normalizeField(rule) {
         hostPrefix: Boolean(rule.matchTemplate?.hostPrefix),
       };
     }
-    return { selector, replacements, hostPrefix: Boolean(rule.hostPrefix), matchTemplate };
+    return {
+      selector,
+      replacements,
+      hostPrefix: Boolean(rule.hostPrefix),
+      matchTemplate,
+      ...(urlTemplate && /^https?:\/\//i.test(urlTemplate) ? { urlTemplate } : {}),
+    };
   }
   const source = String(rule || "").trim();
   if (/^https?:\/\//i.test(source) && !/[|@]|##/.test(source.split(/\s/, 1)[0])) {
@@ -318,6 +325,9 @@ export function compileDetailBridgePlan(action, headers = {}) {
 }
 
 export function compileChapterBridgePlan(action, { tocSelector = "", headers = {}, reverse = false } = {}) {
+  const urlRule = action?.url && typeof action.url === "object" && action.url.urlTemplate
+    ? action.url
+    : inferredScriptField(action.url, [/url/i, /id/i, /href/i]);
   return normalizePlan({
     kind: "chapters",
     host: action.host,
@@ -328,7 +338,7 @@ export function compileChapterBridgePlan(action, { tocSelector = "", headers = {
     reverse: Boolean(reverse || action.reverseChapters || action.reverse),
     fields: {
       title: inferredScriptField(action.title, [/title/i, /name/i, /chapter/i]),
-      url: inferredScriptField(action.url, [/url/i, /id/i, /href/i]),
+      url: urlRule,
       updateTime: action.updateTime,
     },
     headers,
@@ -504,6 +514,29 @@ function transformed(plan, rule, input, options = {}) {
   return value;
 }
 
+function expandUrlTemplate(template, item, baseUrl) {
+  let bookId = "";
+  try {
+    const page = new URL(baseUrl);
+    bookId = page.searchParams.get("bookId")
+      || page.searchParams.get("albumId")
+      || page.searchParams.get("id")
+      || (page.pathname.match(/\/(?:book|album|comic)\/(\d+)/i)?.[1] || "")
+      || (page.pathname.match(/\/(\d+)(?:\/|$)/)?.[1] || "");
+  } catch {
+    bookId = String(baseUrl || "").match(/[?&](?:bookId|albumId|id)=(\d+)/i)?.[1] || "";
+  }
+  const values = {
+    bookId,
+    ...(item && typeof item === "object" && !Array.isArray(item) ? item : {}),
+  };
+  return String(template || "").replace(/\{\{(base:)?([A-Za-z_$][\w$]*)\}\}/g, (_, base, name) => {
+    if (base || name === "bookId") return encodeURIComponent(String(values.bookId || bookId || ""));
+    const value = values[name];
+    return encodeURIComponent(value == null ? "" : String(value));
+  });
+}
+
 function absolute(value, baseUrl) {
   const source = String(value || "").trim();
   if (!source) return "";
@@ -653,7 +686,12 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     for (const item of items) {
       const row = {};
       for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item);
-      row.url = absolute(row.url, baseUrl);
+      const urlField = normalizeField(plan.fields.url);
+      if (urlField?.urlTemplate) {
+        row.url = expandUrlTemplate(urlField.urlTemplate, item, baseUrl);
+      } else {
+        row.url = absolute(row.url, baseUrl);
+      }
       if (!row.title || !row.url) continue;
       rows.push(row);
     }

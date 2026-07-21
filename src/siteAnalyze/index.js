@@ -57,9 +57,12 @@ export async function analyzeSite(siteUrl, {
   }
 
   let kindInfos = detectKinds(homeHtml, origin.toString()).filter((item) => item.kind !== "unknown");
+  // Prefer the converted source's type first, but keep other detected kinds as
+  // secondary repair candidates when preferred discovery fails.
   if (preferKind) {
     const preferred = kindInfos.filter((item) => item.kind === preferKind);
-    if (preferred.length) kindInfos = preferred;
+    const others = kindInfos.filter((item) => item.kind !== preferKind);
+    if (preferred.length) kindInfos = [...preferred, ...others];
   }
   if (!kindInfos.length) {
     return { ok: false, reason: "analyze-failed: 未能识别站点类型", kind: "unknown" };

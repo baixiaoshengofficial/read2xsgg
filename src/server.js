@@ -74,7 +74,7 @@ export function serverConfig(environment = process.env) {
     // Verify/preflight share this pool; 8 keeps large jobs moving without
     // starving small containers as badly as 16+.
     preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 8),
-    // 转换后抽测列表+目录。失败时识站回退；仍失败则保留阅读转换结果（soft keep）。
+    // 转换后抽测列表+目录。失败时识站修复；站点可达且仍失败则跳过（不 soft-keep 坏源）。
     verifyConvertedSources: boolean(environment.VERIFY_CONVERTED_SOURCES, true),
     analyzeFallback: boolean(environment.ANALYZE_FALLBACK, true),
     analyzeTimeoutMs: integer(environment.ANALYZE_TIMEOUT_MS, 8_000),
