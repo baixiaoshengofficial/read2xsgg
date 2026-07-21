@@ -46,6 +46,14 @@ services:
       - /tmp:size=16m,noexec,nosuid,nodev
     cap_drop:
       - ALL
+    # Needed only by the root entrypoint to repair ownership of ./data, before
+    # it drops privileges and starts the Node process as the `node` user.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
     healthcheck:

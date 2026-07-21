@@ -83,6 +83,8 @@ APP_PORT=8080 docker compose up -d
 IMAGE_TAG=0.2.0 docker compose up -d
 ```
 
+Compose 将项目中的 `./data` 绑定到容器 `/data`。镜像启动时会自动修复该目录的属主，再以非 root 的 `node` 用户运行服务；首次启动无需手工 `chown`。
+
 ## 本地发布到 Docker Hub
 
 不再通过 GitHub Actions 推镜像（无需配置 `DOCKERHUB_TOKEN` secret）。本机登录 Docker Hub 后执行：
