@@ -145,7 +145,7 @@ docker compose up -d
 - `POST /api/jobs/:id/retry`
 - `DELETE /api/jobs/:id`
 
-制品落在 `DATA_DIR`（Compose 默认 volume `read2xsgg-data` → `/data`）。未设置 `ADMIN_TOKEN` 时管理接口返回 503。
+制品落在 `DATA_DIR`（Compose 默认把项目目录的 `./data` 挂载到容器 `/data`）。未设置 `ADMIN_TOKEN` 时管理接口返回 503。
 
 同步路径仍然可用；大聚合建议优先走 WebUI。
 
