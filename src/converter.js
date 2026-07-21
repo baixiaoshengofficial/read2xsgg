@@ -423,6 +423,7 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
     title: "title",
     url: "url",
     updateTime: "updateTime",
+    ...(action.nextPageUrl ? { nextPageUrl: action.nextPageUrl } : {}),
     moreKeys: {
       ...(action.moreKeys || {}),
       pageSize,
@@ -499,6 +500,7 @@ function buildJsonApiTocRequestInfo(tocUrl) {
     "var u = String(q.detailUrl || q.url || q.chapterUrl || \"\");",
     "if (!u && typeof result === \"string\") u = result;",
     "if (!u && result && typeof result === \"object\") u = String(result.detailUrl || result.url || \"\");",
+    "if (/(?:getBookMenu|getAlbumMenu|chapterList|toc)\\?/i.test(u) && /[?&](?:pageNum|pageIndex|page)=\\d+/i.test(u)) return u;",
     "var id = String(q.bookId || q.id || \"\").trim();",
     "if (!id) {",
     "  var m = u.match(/[?&](?:bookId|albumId|id)=(\\d+)/i)",
@@ -512,6 +514,28 @@ function buildJsonApiTocRequestInfo(tocUrl) {
     "url = url.split(\"__ID__\").join(encodeURIComponent(id));",
     "if (url.indexOf(\"__PAGE__\") >= 0) url = url.split(\"__PAGE__\").join(encodeURIComponent(page));",
     "return url;",
+  ].join("\n");
+}
+
+function buildJsonApiTocNextPageUrl(tocUrl) {
+  const { url: raw } = splitLegadoUrlOptions(tocUrl);
+  if (!/^https?:\/\//i.test(raw)) return "";
+  if (!/\{\{\s*\$\.[A-Za-z_$][\w$]*\s*\}\}|\{(?:\$\.)?[A-Za-z_$][\w$]*\}/.test(raw)) return "";
+  const requestInfo = buildJsonApiTocRequestInfo(tocUrl);
+  if (!requestInfo) return "";
+  return [
+    "@js:",
+    "var q = (typeof params !== \"undefined\" && params.queryInfo) || {};",
+    "var current = String((typeof result === \"string\" && result) || params.responseUrl || q.url || q.chapterUrl || q.detailUrl || \"\");",
+    "if (/(?:getBookMenu|getAlbumMenu|chapterList|toc)\\?/i.test(current)) {",
+    "  if (/[?&](pageNum|pageIndex|page)=\\d+/i.test(current)) {",
+    "    return current.replace(/([?&](?:pageNum|pageIndex|page)=)(\\d+)/i, function (_, prefix, value) {",
+    "      return prefix + String((Number(value) || 1) + 1);",
+    "    });",
+    "  }",
+    "  return current;",
+    "}",
+    requestInfo.replace(/^@js:\s*/i, ""),
   ].join("\n");
 }
 
@@ -1432,7 +1456,7 @@ function convertOne(source, warnings, options = {}) {
           // 香色：本页条数 < pageSize ⇒ 没有下一页。必须与上游 pageSize 对齐，
           // 否则 getBookMenu?pageSize=50 却声明 100，会在第一页后停止翻页。
           const upstreamSize = upstreamPageSizeFromTocUrl(detailRules.tocUrl) || 50;
-          delete mapped.nextPageUrl;
+          mapped.nextPageUrl = buildJsonApiTocNextPageUrl(detailRules.tocUrl);
           mapped.moreKeys = {
             ...(mapped.moreKeys || {}),
             pageSize: upstreamSize,

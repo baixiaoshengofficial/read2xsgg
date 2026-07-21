@@ -1260,6 +1260,7 @@ test("JSON API tocUrl 编译为 getBookMenu 式目录请求与播放 urlTemplate
   const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example" });
   const converted = sources["听书目录"];
   assert.match(converted.chapterList.requestInfo, /getBookMenu/);
+  assert.match(converted.chapterList.nextPageUrl, /pageNum|pageIndex|page/);
   assert.match(converted.chapterList.requestInfo, /adapter\/chapters\?plan=/);
   assert.equal(converted.chapterList.moreKeys.pageSize, 50);
   assert.equal(converted.chapterList.moreKeys.maxPage, 500);
