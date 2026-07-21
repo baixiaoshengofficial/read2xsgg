@@ -697,9 +697,12 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     }
     const ordered = orderChaptersAscending(rows, { reverseHint: Boolean(plan.reverse) });
     const page = ordered.slice(start, start + pageSize);
+    // Full page ⇒ assume more (upstream JSON menus like getBookMenu page by
+    // pageNum). Previously hasMore stayed false when items.length < scanCap,
+    // so Xiangse stopped after the first 50 chapters.
     return {
       data: page,
-      hasMore: ordered.length > start + page.length || (page.length >= pageSize && items.length >= scanCap),
+      hasMore: ordered.length > start + page.length || page.length >= pageSize,
       offset: start,
       pageSize,
     };
@@ -726,7 +729,8 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     hasMore = true;
     break;
   }
-  if (!hasMore && page.length >= pageSize && items.length >= scanCap) {
+  // Same full-page rule for upstream-paged book lists (search/category APIs).
+  if (!hasMore && page.length >= pageSize) {
     hasMore = true;
   }
   return {

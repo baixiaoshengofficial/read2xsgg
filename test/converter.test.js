@@ -481,6 +481,36 @@ test("桥接按 offset/limit 分页，而不是丢弃后续条目", () => {
   assert.equal(chapters.hasMore, true);
 });
 
+test("章节桥接满页时 hasMore 为 true，避免上游分页目录停在第一页", () => {
+  const plan = compileChapterBridgePlan({
+    host: "https://audio.example",
+    responseFormatType: "json",
+    list: "list",
+    title: "name",
+    url: {
+      selector: "id",
+      urlTemplate: "https://audio.example/play?id={{id}}",
+    },
+  });
+  const list = Array.from({ length: 50 }, (_, i) => ({ name: `第${i + 1}集`, id: i + 1 }));
+  const page = executeBridgePlan(
+    JSON.stringify({ list, sections: 966 }),
+    "https://audio.example/ajax/getBookMenu?bookId=42&pageNum=1&pageSize=50",
+    plan,
+    { limit: 50 },
+  );
+  assert.equal(page.data.length, 50);
+  assert.equal(page.hasMore, true);
+  const short = executeBridgePlan(
+    JSON.stringify({ list: list.slice(0, 16), sections: 966 }),
+    "https://audio.example/ajax/getBookMenu?bookId=42&pageNum=20&pageSize=50",
+    plan,
+    { limit: 50 },
+  );
+  assert.equal(short.data.length, 16);
+  assert.equal(short.hasMore, false);
+});
+
 test("章节桥接会把倒序目录排成从小到大", () => {
   const chapterPlan = compileChapterBridgePlan({
     host: "https://example.com",
