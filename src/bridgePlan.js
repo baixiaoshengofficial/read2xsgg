@@ -516,6 +516,8 @@ function transformed(plan, rule, input, options = {}) {
 
 function expandUrlTemplate(template, item, baseUrl) {
   let bookId = "";
+  let comicId = "";
+  let entityId = "";
   try {
     const page = new URL(baseUrl);
     bookId = page.searchParams.get("bookId")
@@ -523,16 +525,27 @@ function expandUrlTemplate(template, item, baseUrl) {
       || page.searchParams.get("id")
       || (page.pathname.match(/\/(?:book|album|comic)\/(\d+)/i)?.[1] || "")
       || (page.pathname.match(/\/(\d+)(?:\/|$)/)?.[1] || "");
+    comicId = page.searchParams.get("comic_id") || page.searchParams.get("comicId") || "";
+    entityId = page.searchParams.get("entityId") || page.searchParams.get("entity_id") || "";
   } catch {
     bookId = String(baseUrl || "").match(/[?&](?:bookId|albumId|id)=(\d+)/i)?.[1] || "";
+    comicId = String(baseUrl || "").match(/[?&](?:comic_id|comicId)=(\d+)/i)?.[1] || "";
+    entityId = String(baseUrl || "").match(/[?&](?:entityId|entity_id)=(\d+)/i)?.[1] || "";
   }
-  const values = {
+  const pageIds = {
     bookId,
+    comic_id: comicId || bookId,
+    comicId: comicId || bookId,
+    entityId: entityId || bookId,
+    entity_id: entityId || bookId,
+  };
+  const values = {
+    ...pageIds,
     ...(item && typeof item === "object" && !Array.isArray(item) ? item : {}),
   };
   return String(template || "").replace(/\{\{(base:)?([A-Za-z_$][\w$]*)\}\}/g, (_, base, name) => {
     if (base || name === "bookId") return encodeURIComponent(String(values.bookId || bookId || ""));
-    const value = values[name];
+    const value = values[name] ?? pageIds[name];
     return encodeURIComponent(value == null ? "" : String(value));
   });
 }

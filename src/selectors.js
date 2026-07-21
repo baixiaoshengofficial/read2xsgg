@@ -13,7 +13,9 @@ const RELATIVE_PROPERTIES = new Set([...TEXT_PROPERTIES, ...ATTR_PROPERTIES]);
 function propertyToXPath(name, { bare = false } = {}) {
   if (name === "html") return "";
   if (TEXT_PROPERTIES.has(name)) return "/text()";
-  if (ATTR_PROPERTIES.has(name) || name.startsWith("data-")) {
+  // 自定义属性（init-data）含连字符；排除 class.xxx / tag.xxx 这类分段选择器。
+  const customAttr = /^[A-Za-z_][\w-]*$/.test(name) && name.includes("-");
+  if (ATTR_PROPERTIES.has(name) || name.startsWith("data-") || customAttr) {
     // 单独 href：//@href 可命中节点自身；接在 a@href 后用 /@href。
     return bare ? `//@${name}` : `/@${name}`;
   }
@@ -256,7 +258,7 @@ function legadoHtmlToXPath(selector) {
   if (/^@css:/i.test(source)) {
     const css = source.replace(/^@css:/i, "");
     const property = css.match(/@([A-Za-z_$][\w$-]*)$/)?.[1] || "";
-    if (property && (RELATIVE_PROPERTIES.has(property) || property.startsWith("data-"))) {
+    if (property && (RELATIVE_PROPERTIES.has(property) || property.startsWith("data-") || (/^[A-Za-z_][\w-]*$/.test(property) && property.includes("-")))) {
       const path = cssToXPath(css.slice(0, -(property.length + 1)));
       return `${path}${propertyToXPath(property)}`;
     }
@@ -274,7 +276,7 @@ function legadoHtmlToXPath(selector) {
     // 不能用 //*[contains]/@href：祖先节点先命中且无 href 时，香色取首节点会得到空。
     if (segments[0]?.startsWith("text.") && segments.length >= 2) {
       const prop = segments[1].replace(/^@/, "");
-      if (ATTR_PROPERTIES.has(prop) || prop.startsWith("data-")) {
+      if (ATTR_PROPERTIES.has(prop) || prop.startsWith("data-") || (/^[A-Za-z_][\w-]*$/.test(prop) && prop.includes("-"))) {
         const label = quoteXPath(segments[0].slice(5));
         const head = `//a[contains(normalize-space(.), ${label})]`;
         const rest = segments.slice(1).map((segment) => legacySegmentToXPath(segment, false)).join("");

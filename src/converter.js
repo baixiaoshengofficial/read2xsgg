@@ -910,11 +910,11 @@ function mapTocRules(rules, responseType, warningFor) {
   };
   const result = {};
   // Legado: chapterList 首字符 `-` 表示目录倒序。必须先剥掉再转换选择器，
-  // 否则 `-//li` 会被误解析成残缺 XPath。
+  // 否则 `-//li` / `-$.data` 会被误解析成残缺 XPath 或 `-$/data`。
   let chapterListRule = rules.chapterList;
   let reverseChapters = false;
   if (typeof chapterListRule === "string") {
-    const stripped = chapterListRule.match(/^\s*-(?=[@.#/:*\[a-zA-Z])([\s\S]*)$/);
+    const stripped = chapterListRule.match(/^\s*-(?=[@.#/:*\[$a-zA-Z])([\s\S]*)$/);
     if (stripped) {
       reverseChapters = true;
       chapterListRule = stripped[1].trim();
@@ -1690,7 +1690,15 @@ export function portableConvertedSource(source) {
   const detail = completePortableAction(source?.bookDetail, ["requestInfo"]);
   const toc = completePortableAction(source?.chapterList, ["requestInfo", "list", "title", "url"]);
   const content = completePortableAction(source?.chapterContent, ["requestInfo", "content"]);
-  return { portable: Boolean(source?.sourceUrl && world && search && detail && toc && content), world, search, detail, toc, content };
+  // 发现分类可选：无 bookWorld 但搜索可用时仍可导入。
+  return {
+    portable: Boolean(source?.sourceUrl && search && detail && toc && content),
+    world,
+    search,
+    detail,
+    toc,
+    content,
+  };
 }
 
 /**
