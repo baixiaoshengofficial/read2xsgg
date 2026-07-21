@@ -19,6 +19,7 @@ import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comic
 import { decodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
 import { encodeXbs } from "./xbs.js";
 import { parseHeaders } from "./requests.js";
+import { resolveChapterListUrls } from "./verifySource.js";
 import {
   bridgeTocUrl,
   compileBookBridgePlan,
@@ -612,7 +613,7 @@ async function sourceBridgeChainReachable(source, config) {
       const books = await executeDeclarativeUrl(bookBridge.plan, targetUrl, deepConfig, { limit: 3 });
       for (const book of (books.data || []).slice(0, 3)) {
         if (!book?.url) continue;
-        for (const chapterPageUrl of chapterPageCandidates(book.url)) {
+        for (const chapterPageUrl of resolveChapterListUrls(chapterBridge.requestInfo, book.url)) {
           try {
             const chapters = await executeDeclarativeUrl(chapterBridge.plan, chapterPageUrl, deepConfig, { chapters: true, limit: 2 });
             for (const chapter of (chapters.data || []).slice(0, 2)) {

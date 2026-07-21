@@ -34,6 +34,12 @@ export { convertOnlineSource } from "./convertOnline.js";
 export { createLibraryStore } from "./libraryStore.js";
 export { createJobWorker } from "./jobWorker.js";
 export { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
-export { resolveBookTargetUrl, verifyConvertedSource, verifyConvertedSources } from "./verifySource.js";
+export {
+  resolveBookTargetUrl,
+  resolveChapterListUrls,
+  extractBookIdFromUrl,
+  verifyConvertedSource,
+  verifyConvertedSources,
+} from "./verifySource.js";
 export { downloadAsFetch, ruleUsesForbiddenSinglePipeJs, validateXiangseSource } from "./xiangseValidate.js";
 export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadMedia, downloadSource, filterReachableSources, HttpError, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaUrls, pageText, pageTocUrl, serverConfig, sourceUrlCandidates, startServer } from "./server.js";

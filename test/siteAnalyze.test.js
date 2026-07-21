@@ -13,7 +13,11 @@ import {
   downloadAsFetch,
 } from "../src/index.js";
 import { applyVerifyAndAnalyzeFallback } from "../src/pipeline.js";
-import { verifyConvertedSource } from "../src/verifySource.js";
+import {
+  verifyConvertedSource,
+  resolveChapterListUrls,
+  extractBookIdFromUrl,
+} from "../src/verifySource.js";
 import { skippedBuckets } from "../src/converter.js";
 import { encodeBridgePlan } from "../src/bridgePlan.js";
 
@@ -278,6 +282,206 @@ test("analyzeSite 图片堆但无列表结构时跳过漫画", async () => {
   });
   assert.equal(result.ok, false);
   assert.match(result.reason, /analyze-failed/);
+});
+
+test("resolveChapterListUrls 从 JSON API toc @js 解析 getBookMenu", () => {
+  assert.equal(extractBookIdFromUrl("https://m.lrts.me/ajax/getBookDetail?bookId=79665832"), "79665832");
+  const requestInfo = [
+    "@js:",
+    "var url = \"https://m.lrts.me/ajax/getBookMenu?bookId=__ID__&pageNum=__PAGE__&pageSize=50&sortType=0\";",
+    "url = url.split(\"__ID__\").join(encodeURIComponent(id));",
+    "return (\"https://convert.example/adapter/chapters?plan=abc&pageSize=50&url=\") + encodeURIComponent(u);",
+  ].join("\n");
+  const urls = resolveChapterListUrls(
+    requestInfo,
+    "https://m.lrts.me/ajax/getBookDetail?bookId=79665832",
+  );
+  assert.equal(
+    urls[0],
+    "https://m.lrts.me/ajax/getBookMenu?bookId=79665832&pageNum=1&pageSize=50&sortType=0",
+  );
+  assert.ok(urls.includes("https://m.lrts.me/ajax/getBookDetail?bookId=79665832"));
+});
+
+test("verifyConvertedSource 对 JSON API 目录用 getBookMenu 而不是详情页", async () => {
+  const chapterPlan = {
+    version: 1,
+    kind: "chapters",
+    host: "https://audio.example",
+    responseType: "json",
+    list: "list",
+    tocSelector: "",
+    reverse: false,
+    fields: {
+      title: { selector: "name", replacements: [], hostPrefix: false, matchTemplate: null },
+      url: {
+        selector: "id",
+        replacements: [],
+        hostPrefix: false,
+        matchTemplate: null,
+        urlTemplate: "https://audio.example/ajax/getListenPath?entityId={{base:bookId}}&id={{id}}&section={{section}}",
+      },
+    },
+    headers: {},
+  };
+  const bookPlan = {
+    version: 1,
+    kind: "books",
+    host: "https://audio.example",
+    responseType: "json",
+    list: "list",
+    fields: {
+      name: { selector: "name", replacements: [], hostPrefix: false, matchTemplate: null },
+      url: { selector: "url", replacements: [], hostPrefix: false, matchTemplate: null },
+    },
+    headers: {},
+  };
+  const chapterEncoded = encodeBridgePlan(chapterPlan);
+  const bookEncoded = encodeBridgePlan(bookPlan);
+  const source = {
+    sourceName: "听书",
+    host: "https://audio.example",
+    sourceType: "audio",
+    bookWorld: {
+      搜索: {
+        actionID: "bookWorld",
+        host: "https://audio.example",
+        responseFormatType: "json",
+        requestInfo: `https://convert.example/adapter/books?plan=${bookEncoded}&url=/search`,
+        list: "$.data",
+        bookName: "name",
+        detailUrl: "url",
+      },
+    },
+    chapterList: {
+      actionID: "chapterList",
+      host: "https://audio.example",
+      responseFormatType: "json",
+      requestInfo: [
+        "@js:",
+        'var url = "https://audio.example/ajax/getBookMenu?bookId=__ID__&pageNum=__PAGE__&pageSize=50";',
+        `return ("https://convert.example/adapter/chapters?plan=${chapterEncoded}&pageSize=50&url=") + encodeURIComponent(url);`,
+      ].join("\n"),
+      list: "$.data",
+      title: "title",
+      url: "url",
+    },
+  };
+  const fetched = [];
+  const download = async (url) => {
+    fetched.push(url);
+    if (String(url).includes("/search")) {
+      return Buffer.from(JSON.stringify({
+        list: [{ name: "有声书", url: "https://audio.example/ajax/getBookDetail?bookId=42" }],
+      }));
+    }
+    if (String(url).includes("getBookMenu")) {
+      return Buffer.from(JSON.stringify({
+        list: [{ name: "第1集", id: 9, section: 1 }],
+      }));
+    }
+    if (String(url).includes("getBookDetail")) {
+      return Buffer.from(JSON.stringify({ data: { bookDetail: { id: 42 } } }));
+    }
+    return Buffer.from("{}");
+  };
+  const result = await verifyConvertedSource(source, { download, timeoutMs: 2_000 });
+  assert.equal(result.ok, true);
+  assert.match(result.chapterUrl, /getListenPath.*entityId=42/);
+  assert.ok(fetched.some((url) => /getBookMenu/.test(url)));
+  assert.equal(result.page1Count, 1);
+});
+
+test("verifyConvertedSource 满页目录会抽测第 2 页翻页", async () => {
+  const chapterPlan = {
+    version: 1,
+    kind: "chapters",
+    host: "https://audio.example",
+    responseType: "json",
+    list: "list",
+    tocSelector: "",
+    reverse: false,
+    fields: {
+      title: { selector: "name", replacements: [], hostPrefix: false, matchTemplate: null },
+      url: {
+        selector: "id",
+        replacements: [],
+        hostPrefix: false,
+        matchTemplate: null,
+        urlTemplate: "https://audio.example/play?id={{id}}",
+      },
+    },
+    headers: {},
+  };
+  const bookPlan = {
+    version: 1,
+    kind: "books",
+    host: "https://audio.example",
+    responseType: "json",
+    list: "list",
+    fields: {
+      name: { selector: "name", replacements: [], hostPrefix: false, matchTemplate: null },
+      url: { selector: "url", replacements: [], hostPrefix: false, matchTemplate: null },
+    },
+    headers: {},
+  };
+  const chapterEncoded = encodeBridgePlan(chapterPlan);
+  const bookEncoded = encodeBridgePlan(bookPlan);
+  const source = {
+    sourceName: "听书分页",
+    host: "https://audio.example",
+    sourceType: "audio",
+    bookWorld: {
+      搜索: {
+        actionID: "bookWorld",
+        host: "https://audio.example",
+        responseFormatType: "json",
+        requestInfo: `https://convert.example/adapter/books?plan=${bookEncoded}&url=/search`,
+        list: "$.data",
+        bookName: "name",
+        detailUrl: "url",
+      },
+    },
+    chapterList: {
+      actionID: "chapterList",
+      host: "https://audio.example",
+      responseFormatType: "json",
+      requestInfo: [
+        "@js:",
+        'var url = "https://audio.example/ajax/getBookMenu?bookId=__ID__&pageNum=__PAGE__&pageSize=2";',
+        `return ("https://convert.example/adapter/chapters?plan=${chapterEncoded}&pageSize=2&url=") + encodeURIComponent(url);`,
+      ].join("\n"),
+      list: "$.data",
+      title: "title",
+      url: "url",
+      moreKeys: { pageSize: 2, maxPage: 500 },
+    },
+  };
+  const download = async (url) => {
+    if (String(url).includes("/search")) {
+      return Buffer.from(JSON.stringify({
+        list: [{ name: "有声书", url: "https://audio.example/ajax/getBookDetail?bookId=42" }],
+      }));
+    }
+    if (String(url).includes("pageNum=1")) {
+      return Buffer.from(JSON.stringify({
+        sections: 4,
+        list: [{ name: "第1集", id: 1 }, { name: "第2集", id: 2 }],
+      }));
+    }
+    if (String(url).includes("pageNum=2")) {
+      return Buffer.from(JSON.stringify({
+        sections: 4,
+        list: [{ name: "第3集", id: 3 }, { name: "第4集", id: 4 }],
+      }));
+    }
+    return Buffer.from("{}");
+  };
+  const result = await verifyConvertedSource(source, { download, timeoutMs: 2_000 });
+  assert.equal(result.ok, true);
+  assert.equal(result.page1Count, 2);
+  assert.equal(result.page2Count, 2);
+  assert.equal(result.upstreamSections, 4);
 });
 
 test("verifyConvertedSource 在空列表时返回 rules-stale", async () => {

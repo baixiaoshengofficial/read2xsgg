@@ -133,6 +133,106 @@ export function chapterPageCandidates(value) {
   return candidates;
 }
 
+export function extractBookIdFromUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const page = new URL(raw);
+    return page.searchParams.get("bookId")
+      || page.searchParams.get("albumId")
+      || page.searchParams.get("id")
+      || (page.pathname.match(/\/(?:book|album|comic)\/(\d+)/i)?.[1] || "")
+      || (page.pathname.match(/\/(\d+)(?:\/|$)/)?.[1] || "")
+      || "";
+  } catch {
+    return raw.match(/[?&](?:bookId|albumId|id)=(\d+)/i)?.[1] || "";
+  }
+}
+
+/**
+ * Resolve upstream TOC URLs for chapterList.requestInfo.
+ * JSON API toc (e.g. getBookMenu?bookId=) is compiled to @js that builds the
+ * menu URL from the detail page; verify must fetch that menu, not the detail JSON.
+ */
+export function resolveChapterListUrls(requestInfo, bookUrl, { pageIndex = 1 } = {}) {
+  const source = String(requestInfo || "");
+  const candidates = [];
+  const seen = new Set();
+  const push = (url) => {
+    const value = String(url || "").trim();
+    if (!value || !/^https?:\/\//i.test(value) || seen.has(value)) return;
+    seen.add(value);
+    candidates.push(value);
+  };
+
+  const bookId = extractBookIdFromUrl(bookUrl);
+  const page = String(pageIndex || 1);
+  const templateMatch = source.match(/var\s+url\s*=\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*;/);
+  if (templateMatch && bookId && /__ID__/.test(templateMatch[1])) {
+    try {
+      const literal = templateMatch[1].startsWith("'")
+        ? templateMatch[1].slice(1, -1).replace(/\\'/g, "'")
+        : JSON.parse(templateMatch[1]);
+      push(
+        String(literal)
+          .split("__ID__").join(encodeURIComponent(bookId))
+          .split("__PAGE__").join(encodeURIComponent(page)),
+      );
+    } catch {
+      // Fall through to detail-page candidates.
+    }
+  }
+
+  // Plain absolute menu URL embedded in requestInfo (rare offline shape).
+  const absoluteMenu = source.match(/https?:\/\/[^\s"'\\]+(?:getBookMenu|getAlbumMenu|chapterList|toc)[^\s"'\\]*/i);
+  if (absoluteMenu && bookId && !/__ID__|%@|\{\{/.test(absoluteMenu[0])) {
+    push(absoluteMenu[0].replace(/([?&](?:bookId|albumId|id)=)[^&]*/i, `$1${encodeURIComponent(bookId)}`)
+      .replace(/([?&](?:pageNum|pageIndex|page)=)[^&]*/i, `$1${encodeURIComponent(page)}`));
+  }
+
+  for (const candidate of chapterPageCandidates(bookUrl)) push(candidate);
+  return candidates;
+}
+
+function upstreamSectionsFromMenuBody(text) {
+  try {
+    const json = JSON.parse(String(text || ""));
+    const value = Number(json.sections ?? json.data?.sections ?? json.total ?? json.data?.total);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function fetchChapterPage(plan, targetUrl, download, { limit = 50 } = {}) {
+  const page = await download(targetUrl, plan.headers || {});
+  const text = page.toString("utf8");
+  if (plan.tocSelector) {
+    const tocUrl = bridgeTocUrl(text, targetUrl, plan);
+    if (tocUrl) {
+      try {
+        const tocPage = await download(tocUrl, plan.headers || {});
+        const output = executeBridgePlan(tocPage.toString("utf8"), tocUrl, plan, { limit });
+        if (Array.isArray(output.data) && output.data.length) {
+          return {
+            output,
+            upstreamSections: upstreamSectionsFromMenuBody(text),
+            pageCount: output.data.length,
+          };
+        }
+      } catch {
+        // Fall through to direct page parsing.
+      }
+    }
+  }
+  const output = executeBridgePlan(text, targetUrl, plan, { limit });
+  return {
+    output,
+    upstreamSections: upstreamSectionsFromMenuBody(text),
+    pageCount: Array.isArray(output.data) ? output.data.length : 0,
+  };
+}
+
 async function executeDeclarativeUrl(plan, targetUrl, download, { chapters = false, limit = 3 } = {}) {
   const page = await download(targetUrl, plan.headers || {});
   const text = page.toString("utf8");
@@ -153,7 +253,8 @@ async function executeDeclarativeUrl(plan, targetUrl, download, { chapters = fal
 
 /**
  * Light verification: at least one book from category/search, then at least one chapter.
- * Does not require chapter content (keeps aggregate conversion affordable).
+ * When the first TOC page is full (pageSize), also spot-check page 2 so paged
+ * JSON menus like getBookMenu are not mistaken for single-chapter books.
  */
 export async function verifyConvertedSource(source, {
   download,
@@ -192,29 +293,67 @@ export async function verifyConvertedSource(source, {
       if (!chapterBridge) {
         return { ok: false, reason: "rules-stale: empty-toc", detail: "章节动作无法抽测", bookUrl: book.url };
       }
-      for (const chapterPageUrl of chapterPageCandidates(book.url)) {
+      const pageSize = Number(source?.chapterList?.moreKeys?.pageSize) > 0
+        ? Number(source.chapterList.moreKeys.pageSize)
+        : 50;
+      const chapterLimit = Math.min(200, Math.max(pageSize, 2));
+      let firstChapter = null;
+      let page1Count = 0;
+      let page2Count = 0;
+      let upstreamSections = 0;
+      for (const chapterPageUrl of resolveChapterListUrls(chapterBridge.requestInfo, book.url, { pageIndex: 1 })) {
         try {
-          const chapters = await executeDeclarativeUrl(
+          const page1 = await fetchChapterPage(
             chapterBridge.plan,
             chapterPageUrl,
             timedDownload,
-            { chapters: true, limit: 2 },
+            { limit: chapterLimit },
           );
-          const chapter = (chapters.data || []).find((item) => item?.url && item?.title);
-          if (chapter) {
-            return {
-              ok: true,
-              bookUrl: book.url,
-              chapterUrl: chapter.url,
-              bookName: book.name,
-              chapterTitle: chapter.title,
-            };
-          }
+          page1Count = page1.pageCount;
+          upstreamSections = page1.upstreamSections;
+          firstChapter = (page1.output.data || []).find((item) => item?.url && item?.title);
+          if (firstChapter) break;
         } catch {
           // Try next candidate.
         }
       }
-      return { ok: false, reason: "rules-stale: empty-toc", detail: "目录解析为空", bookUrl: book.url };
+      if (!firstChapter) {
+        return { ok: false, reason: "rules-stale: empty-toc", detail: "目录解析为空", bookUrl: book.url };
+      }
+      if (page1Count >= pageSize) {
+        for (const chapterPageUrl of resolveChapterListUrls(chapterBridge.requestInfo, book.url, { pageIndex: 2 })) {
+          try {
+            const page2 = await fetchChapterPage(
+              chapterBridge.plan,
+              chapterPageUrl,
+              timedDownload,
+              { limit: chapterLimit },
+            );
+            page2Count = page2.pageCount;
+            if (page2Count > 0) break;
+          } catch {
+            // Try next candidate.
+          }
+        }
+        if (!page2Count) {
+          return {
+            ok: false,
+            reason: "rules-stale: empty-toc",
+            detail: `目录第 1 页 ${page1Count} 章但第 2 页为空，翻页可能失效`,
+            bookUrl: book.url,
+          };
+        }
+      }
+      return {
+        ok: true,
+        bookUrl: book.url,
+        chapterUrl: firstChapter.url,
+        bookName: book.name,
+        chapterTitle: firstChapter.title,
+        page1Count,
+        page2Count,
+        upstreamSections,
+      };
     } catch (error) {
       lastDetail = error.message || String(error);
     }
