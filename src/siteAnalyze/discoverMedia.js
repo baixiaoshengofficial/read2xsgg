@@ -63,7 +63,10 @@ export async function discoverMedia(originUrl, kind, { download, homeHtml = "" }
     mediaLinks.length ? mediaLinks : anchors.filter((a) => a.text.length >= 2 && a.text.length <= 60),
     homeUrl,
   ).slice(0, 30);
-  if (cluster.length < 3) return null;
+  // Audio/video home pages are often SPA shells with few static anchors.
+  // Prefer a short cluster over giving up when the page already looks media-like.
+  const minCluster = mediaLinks.length >= 1 || mediaKeyword(kind).test(html) ? 1 : 2;
+  if (cluster.length < minCluster) return null;
 
   const listLinks = cluster.map((item) => item.el);
   const listSelector = listSelectorFromLinks(listLinks, document);

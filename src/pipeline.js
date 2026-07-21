@@ -3,7 +3,8 @@ import { verifyConvertedSource } from "./verifySource.js";
 
 /**
  * After Legado conversion + origin preflight: verify each source; on failure
- * try site-analyze fallback; otherwise skip as rules-stale / analyze-failed.
+ * try site-analyze fallback. If analyze also fails, keep the original converted
+ * source (soft keep) so sync /source and jobs do not drop usable conversions.
  *
  * When `budgetMs` elapses, remaining sources are kept unverified so large
  * aggregate converts still finish within proxy/client timeouts.
@@ -29,6 +30,16 @@ function sourceDisplayName(name, source) {
     }
   }
   return label || host || "未命名书源";
+}
+
+function sourceHostKey(source) {
+  const raw = String(source?.sourceUrl || source?.host || source?.bookSourceUrl || "").trim();
+  if (!raw) return "";
+  try {
+    return new URL(raw.split("#", 1)[0]).origin;
+  } catch {
+    return raw;
+  }
 }
 
 export async function applyVerifyAndAnalyzeFallback(sources, {
@@ -77,6 +88,8 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
   const deadline = budgetMs > 0 ? Date.now() + budgetMs : 0;
   /** @type {Set<string>} */
   const active = new Set();
+  /** Share analyze work across sources on the same origin + kind. */
+  const analyzeByHost = new Map();
 
   const report = (extra = {}) => {
     const activeList = [...active];
@@ -93,6 +106,35 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
       active: activeList,
       ...extra,
     });
+  };
+
+  const softKeep = (name, source, reason) => {
+    kept[name] = source;
+    unverifiedCount += 1;
+    warnings.push({
+      source: name,
+      section: "source",
+      field: "verify",
+      message: `抽测/识站未通过（${reason}），已保留阅读转换结果供客户端试用`,
+      rule: String(source?.sourceUrl || source?.host || ""),
+    });
+    processed += 1;
+  };
+
+  const analyzeFor = (host, preferKind, name) => {
+    const key = `${host}|${preferKind || "*"}`;
+    if (!analyzeByHost.has(key)) {
+      analyzeByHost.set(key, analyzeSite(host, {
+        download,
+        sourceName: name,
+        timeoutMs: analyzeTimeoutMs,
+        preferKind: ["text", "comic", "audio", "video"].includes(preferKind) ? preferKind : "",
+      }).catch((error) => ({
+        ok: false,
+        reason: `analyze-failed: ${error.message || error}`,
+      })));
+    }
+    return analyzeByHost.get(key);
   };
 
   const workers = Array.from({ length: Math.min(concurrency, input.length) }, async () => {
@@ -120,42 +162,30 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
           continue;
         }
         failedVerifyCount += 1;
+        const reason = verified.reason || "rules-stale: empty-list";
         if (!analyzeFallback) {
-          skipped.push({ source: name, reason: verified.reason || "rules-stale: empty-list" });
-          processed += 1;
+          softKeep(name, source, reason);
           continue;
         }
-        const host = String(source?.sourceUrl || source?.host || source?.bookSourceUrl || "").trim();
+        const host = sourceHostKey(source);
         if (!host) {
-          skipped.push({ source: name, reason: verified.reason || "rules-stale: empty-list" });
-          processed += 1;
+          softKeep(name, source, reason);
           continue;
         }
         report({ step: "analyze" });
         const preferKind = String(source?.sourceType || "").trim();
-        const analyzed = await analyzeSite(host, {
-          download,
-          sourceName: name,
-          timeoutMs: analyzeTimeoutMs,
-          preferKind: ["text", "comic", "audio", "video"].includes(preferKind) ? preferKind : "",
-        });
+        const analyzed = await analyzeFor(host, preferKind, name);
         if (!analyzed.ok) {
-          skipped.push({
-            source: name,
-            reason: analyzed.reason || "analyze-failed: 识站失败",
-          });
-          processed += 1;
+          softKeep(name, source, analyzed.reason || "analyze-failed: 识站失败");
           continue;
         }
-        // Prefer a generated source matching the original type; keep display name.
         const generated = analyzed.sources || {};
         const matchName = Object.keys(generated).find((key) => generated[key]?.sourceType === preferKind);
         const picked = (matchName && generated[matchName])
           || analyzed.source
           || Object.values(generated)[0];
         if (!picked) {
-          skipped.push({ source: name, reason: analyzed.reason || "analyze-failed: 识站失败" });
-          processed += 1;
+          softKeep(name, source, analyzed.reason || "analyze-failed: 识站失败");
           continue;
         }
         picked.sourceName = name;
@@ -166,7 +196,7 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
           source: name,
           section: "source",
           field: "verify",
-          message: `阅读规则抽测失败（${verified.reason}），已回退自动识站`,
+          message: `阅读规则抽测失败（${reason}），已回退自动识站`,
           rule: host,
         });
         processed += 1;

@@ -426,10 +426,63 @@ test("verify budget 到期后保留未抽测源", async () => {
     budgetMs: 40,
   });
   assert.ok(gated.unverifiedCount >= 1, `expected unverified, got ${gated.unverifiedCount}`);
-  assert.equal(Object.keys(gated.sources).length + gated.skipped.length, 6);
+  assert.equal(Object.keys(gated.sources).length, 6);
+  assert.equal(gated.skipped.length, 0);
   assert.equal(Object.keys(gated.sources).length, gated.unverifiedCount);
 });
 
+test("识站失败时 soft keep 保留阅读转换结果", async () => {
+  const broken = {
+    sourceName: "懒人听书",
+    sourceUrl: "https://audio.example",
+    host: "https://audio.example",
+    sourceType: "audio",
+    bookWorld: {
+      分类: {
+        actionID: "bookWorld",
+        host: "https://audio.example",
+        responseFormatType: "html",
+        requestInfo: "https://audio.example/list",
+        list: "//li",
+        bookName: ".//a",
+        detailUrl: ".//a/@href",
+      },
+    },
+    chapterList: {
+      actionID: "chapterList",
+      host: "https://audio.example",
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      list: "//a",
+      title: ".",
+      url: "./@href",
+    },
+    chapterContent: {
+      actionID: "chapterContent",
+      host: "https://audio.example",
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      content: "audio@src",
+    },
+  };
+  const download = async (url) => {
+    if (String(url).includes("/list")) {
+      return Buffer.from('<html><body><ul><li><a href="/book/1">有声书</a></li></ul></body></html>');
+    }
+    // Detail / home: look like audio but no static catalog for 识站 to rebuild.
+    return Buffer.from('<html><body><title>听书</title><p>有声</p></body></html>');
+  };
+  const gated = await applyVerifyAndAnalyzeFallback(
+    { 懒人听书: broken },
+    { download, enabled: true, analyzeFallback: true, timeoutMs: 1_000, analyzeTimeoutMs: 1_000 },
+  );
+  assert.ok(gated.sources["懒人听书"]);
+  assert.equal(gated.sources["懒人听书"].chapterContent.content, "audio@src");
+  assert.equal(gated.fallbackCount, 0);
+  assert.equal(gated.unverifiedCount, 1);
+  assert.equal(gated.skipped.length, 0);
+  assert.ok(gated.warnings.some((item) => /保留阅读转换结果/.test(item.message)));
+});
 test("抽测进度回调包含当前站点名", async () => {
   const plan = {
     version: 1,

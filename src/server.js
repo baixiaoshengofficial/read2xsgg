@@ -71,10 +71,12 @@ export function serverConfig(environment = process.env) {
     preflightSources: boolean(environment.PREFLIGHT_SOURCES, true),
     preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES, false),
     preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 3_000),
-    preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 4),
-    // 转换后抽测列表+目录。大聚合源默认不做识站回退（太慢会拖垮 /source 订阅）。
+    // Verify/preflight share this pool; 8 keeps large jobs moving without
+    // starving small containers as badly as 16+.
+    preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 8),
+    // 转换后抽测列表+目录。失败时识站回退；仍失败则保留阅读转换结果（soft keep）。
     verifyConvertedSources: boolean(environment.VERIFY_CONVERTED_SOURCES, true),
-    analyzeFallback: boolean(environment.ANALYZE_FALLBACK, false),
+    analyzeFallback: boolean(environment.ANALYZE_FALLBACK, true),
     analyzeTimeoutMs: integer(environment.ANALYZE_TIMEOUT_MS, 8_000),
     // Wall-clock budget for verify phase; remainder kept unverified.
     verifyBudgetMs: integer(environment.VERIFY_BUDGET_MS, 20_000),
@@ -2163,9 +2165,13 @@ export function createAppServer(options = {}) {
           if (!job) throw new HttpError(404, "任务不存在");
           const next = await store.updateJob(jobRoute.id, {
             status: "queued",
+            phase: "queued",
             error: "",
             finishedAt: null,
             startedAt: null,
+            count: null,
+            fallbackCount: 0,
+            skippedBuckets: {},
             progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, failed: 0 },
           });
           worker.cancel?.(jobRoute.id);

@@ -234,7 +234,7 @@ node ./bin/server.js
 
 ### 大型混合源验证
 
-在线转换管线现在是：**探活 → 按阅读规则转换 → 抽测列表/目录 → 失败则自动识站回退 → 仍失败则跳过**。
+在线转换管线现在是：**探活 → 按阅读规则转换 → 抽测列表/目录 → 失败则自动识站回退 → 仍失败则保留阅读转换结果（并告警）**。
 
 ```mermaid
 flowchart LR
@@ -245,18 +245,20 @@ flowchart LR
   verify -->|通过| xbs[写入 XBS]
   verify -->|失败| analyze[自动识站]
   analyze -->|成功| xbs
-  analyze -->|失败| skip2[rules-stale]
+  analyze -->|失败| soft[保留转换结果]
+  soft --> xbs
   siteUrl[网站 URL] --> analyzeDirect["/url/ 直接识站"]
   analyzeDirect --> xbs
 ```
 
-Compose **默认同步路径**开启 origin 探活与抽测（大源有预算/上限）；WebUI 异步任务始终完整抽测并默认识站回退：
+Compose **默认同步路径**开启 origin 探活、抽测与识站回退；抽测/识站仍失败时**保留**阅读转换结果（soft keep），避免同步 `/source` 因 empty-toc 直接 422：
 
 - `PREFLIGHT_SOURCES=true`
 - `VERIFY_CONVERTED_SOURCES=true`
-- `ANALYZE_FALLBACK=false`（同步路径默认关；异步任务仍会识站回退）
-- `VERIFY_BUDGET_MS=20000` / `VERIFY_MAX_SOURCES=50`（仅同步 `/source`）
+- `ANALYZE_FALLBACK=true`（同步 `/source` 与 WebUI 任务都会识站回退）
+- `VERIFY_BUDGET_MS=20000` / `VERIFY_MAX_SOURCES=50`（仅同步 `/source`；超限跳过抽测直接保留）
 - `JOB_VERIFY_BUDGET_MS=0`（WebUI 异步任务抽测墙钟预算；`0` 为完整抽测不限时）
+- `PREFLIGHT_CONCURRENCY=8`（探活与抽测共用并发；同源识站结果会复用）
 - `ADMIN_TOKEN`（写在 `.env`，WebUI / `/api/jobs` 必需）
 - `DATA_DIR=/data`
 - `PREFLIGHT_DEEP_SOURCES=false`（全链路深检仍为 opt-in）
@@ -311,9 +313,9 @@ Compose 支持通过环境变量调整：
 | `PREFLIGHT_SOURCES` | `true` | 转换前探测上游站点是否可达（origin）；设为 `false` 可跳过探活以加快转换，但会死站也会进入 XBS |
 | `PREFLIGHT_DEEP_SOURCES` | `false` | 实测分类列表、第一本书、章节和正文；仅在 `PREFLIGHT_SOURCES=true` 时生效。聚合源成本高，默认关闭 |
 | `PREFLIGHT_TIMEOUT_MS` | `3000` | 单个上游站点预检/抽测超时时间 |
-| `PREFLIGHT_CONCURRENCY` | `4` | 上游站点并发预检/抽测数量；不建议在小内存容器中调高 |
-| `VERIFY_CONVERTED_SOURCES` | `true` | 转换后抽测分类列表与目录是否非空；失败才进入识站回退或跳过 |
-| `ANALYZE_FALLBACK` | `true` | 抽测失败时用启发式识站生成小说源；设为 `false` 则直接跳过 |
+| `PREFLIGHT_CONCURRENCY` | `8` | 上游站点并发预检/抽测数量；不建议在小内存容器中调高 |
+| `VERIFY_CONVERTED_SOURCES` | `true` | 转换后抽测分类列表与目录是否非空；失败进入识站回退，再失败则 soft keep |
+| `ANALYZE_FALLBACK` | `true` | 抽测失败时用启发式识站生成源；仍失败则保留阅读转换结果 |
 | `ANALYZE_TIMEOUT_MS` | `8000` | 自动识站单次页面下载超时 |
 | `MAX_COMIC_PAGES` | `50` | 单章 JSON 漫画接口最多聚合的分页数（含第一页） |
 | `MAX_COMIC_IMAGES` | `2000` | 单章最多返回的图片数 |

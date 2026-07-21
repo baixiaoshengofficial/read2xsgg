@@ -162,7 +162,9 @@ function renderJobs(jobs) {
       : "";
     const actions = [
       job.status === "done" ? `<button type="button" data-copy="${job.id}">复制订阅 URL</button>` : "",
-      job.status === "failed" ? `<button type="button" data-retry="${job.id}">重试</button>` : "",
+      (job.status === "done" || job.status === "failed")
+        ? `<button type="button" data-retry="${job.id}">重新转换</button>`
+        : "",
       `<button type="button" class="danger" data-del="${job.id}">删除</button>`,
     ].filter(Boolean).join("");
     return `

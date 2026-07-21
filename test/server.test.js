@@ -766,14 +766,15 @@ test("DNS 透明代理默认开启，origin 探活默认开启，深度预检默
   assert.equal(serverConfig({}).preflightSources, true);
   assert.equal(serverConfig({}).preflightDeep, false);
   assert.equal(serverConfig({}).preflightTimeoutMs, 3000);
-  assert.equal(serverConfig({}).preflightConcurrency, 4);
+  assert.equal(serverConfig({}).preflightConcurrency, 8);
   assert.equal(serverConfig({}).verifyConvertedSources, true);
-  assert.equal(serverConfig({}).analyzeFallback, false);
+  assert.equal(serverConfig({}).analyzeFallback, true);
   assert.equal(serverConfig({}).verifyBudgetMs, 20_000);
   assert.equal(serverConfig({}).verifyMaxSources, 50);
   assert.equal(serverConfig({ ALLOW_DNS_PROXY_NETWORKS: "false" }).allowDnsProxyNetworks, false);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "false" }).preflightSources, false);
   assert.equal(serverConfig({ VERIFY_CONVERTED_SOURCES: "false" }).verifyConvertedSources, false);
+  assert.equal(serverConfig({ ANALYZE_FALLBACK: "false" }).analyzeFallback, false);
   assert.equal(serverConfig({ ANALYZE_FALLBACK: "true" }).analyzeFallback, true);
   assert.equal(serverConfig({ VERIFY_BUDGET_MS: "5000" }).verifyBudgetMs, 5000);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "true", PREFLIGHT_DEEP_SOURCES: "true" }).preflightSources, true);

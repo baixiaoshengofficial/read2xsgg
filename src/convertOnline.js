@@ -126,9 +126,11 @@ export async function convertOnlineSource(sourceUrl, config, imageProxyBase = ""
     timeoutMs: config.preflightTimeoutMs,
     analyzeTimeoutMs: config.analyzeTimeoutMs,
     enabled: verifyEnabled,
-    analyzeFallback: fullVerify
-      ? (options.analyzeFallback !== undefined ? Boolean(options.analyzeFallback) : true)
-      : config.analyzeFallback,
+    // Sync /source and jobs both try 识站回退; soft-keep still retains the
+    // Legado conversion when analyze cannot rebuild the site.
+    analyzeFallback: options.analyzeFallback !== undefined
+      ? Boolean(options.analyzeFallback)
+      : (fullVerify ? true : config.analyzeFallback),
     budgetMs,
     onProgress: (progress) => emit({ ...progress, phase: progress.phase || "verify" }),
   });
