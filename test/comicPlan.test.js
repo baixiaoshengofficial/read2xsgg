@@ -129,3 +129,51 @@ test("数字文件名正文序列会纠正封面复用造成的乱序", () => {
     "https://cdn.example/pages/004.jpg",
   ]);
 });
+
+test("已按阅读顺序排列的图片不会被文件名误重排", () => {
+  const html = `
+    <img src="https://cdn.example/ch/id99_page_01.jpg">
+    <img src="https://cdn.example/ch/id99_page_02.jpg">
+    <img src="https://cdn.example/ch/id99_page_10.jpg">
+  `;
+  assert.deepEqual(pageImageUrls(html, "https://comic.example/chapter/1"), [
+    "https://cdn.example/ch/id99_page_01.jpg",
+    "https://cdn.example/ch/id99_page_02.jpg",
+    "https://cdn.example/ch/id99_page_10.jpg",
+  ]);
+});
+
+test("JSON 图片数组按 page/index 字段排序，而不是对象出现顺序", () => {
+  const payload = JSON.stringify({
+    data: {
+      images: [
+        { index: 3, url: "/comic/003.webp" },
+        { index: 1, url: "/comic/001.webp" },
+        { index: 2, url: "/comic/002.webp" },
+      ],
+    },
+  });
+  assert.deepEqual(pageImageUrls(payload, "https://api.example/chapter/1"), [
+    "https://api.example/comic/001.webp",
+    "https://api.example/comic/002.webp",
+    "https://api.example/comic/003.webp",
+  ]);
+});
+
+test("封面 url 不会插入到 images 数组正文序列前面", () => {
+  const payload = JSON.stringify({
+    cover: { url: "https://cdn.example/cover.jpg" },
+    data: {
+      images: [
+        { url: "https://cdn.example/pages/001.jpg" },
+        { url: "https://cdn.example/pages/002.jpg" },
+        { url: "https://cdn.example/pages/003.jpg" },
+      ],
+    },
+  });
+  assert.deepEqual(pageImageUrls(payload, "https://api.example/chapter/1"), [
+    "https://cdn.example/pages/001.jpg",
+    "https://cdn.example/pages/002.jpg",
+    "https://cdn.example/pages/003.jpg",
+  ]);
+});

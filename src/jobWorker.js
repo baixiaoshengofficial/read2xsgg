@@ -120,7 +120,8 @@ export function createJobWorker({ store, config, concurrency = 1, downloadSource
       const onProgress = async (progress) => {
         if (isCancelled(jobId)) return;
         try {
-          await store.updateJob(jobId, { progress, phase: "verify" });
+          const phase = progress?.phase || "verify";
+          await store.updateJob(jobId, { progress, phase });
         } catch {
           // Ignore progress write races.
         }
@@ -191,11 +192,11 @@ export function createJobWorker({ store, config, concurrency = 1, downloadSource
         error: "",
         finishedAt: new Date().toISOString(),
         progress: {
-          done: result.count,
+          done: result.count + (result.skipped?.length || 0),
           total: result.count + (result.skipped?.length || 0),
           kept: result.count,
           skipped: result.skipped?.length || 0,
-          unverified: 0,
+          unverified: result.unverifiedCount || 0,
           fallback: result.fallbackCount || 0,
           failed: 0,
         },

@@ -135,9 +135,12 @@ test("serverConfig 暴露 dataDir / adminToken / jobConcurrency", () => {
   assert.equal(serverConfig({}).dataDir, "./data");
   assert.equal(serverConfig({}).adminToken, "");
   assert.equal(serverConfig({}).jobConcurrency, 1);
+  assert.equal(serverConfig({}).jobVerifyBudgetMs, 0);
   assert.equal(serverConfig({ ADMIN_TOKEN: "x", DATA_DIR: "/data", JOB_CONCURRENCY: "2" }).adminToken, "x");
   assert.equal(serverConfig({ ADMIN_TOKEN: "x", DATA_DIR: "/data", JOB_CONCURRENCY: "2" }).dataDir, "/data");
   assert.equal(serverConfig({ ADMIN_TOKEN: "x", DATA_DIR: "/data", JOB_CONCURRENCY: "2" }).jobConcurrency, 2);
+  assert.equal(serverConfig({ JOB_VERIFY_BUDGET_MS: "120000" }).jobVerifyBudgetMs, 120_000);
+  assert.equal(serverConfig({ JOB_VERIFY_BUDGET_MS: "0" }).jobVerifyBudgetMs, 0);
 });
 
 test("删除运行中任务会释放队列槽位并启动下一个", async () => {

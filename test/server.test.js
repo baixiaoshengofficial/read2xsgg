@@ -393,6 +393,29 @@ test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", as
   assert.deepEqual(await video.json(), { url: direct });
 });
 
+test("媒体代理转发音频字节流并带 Referer", async (context) => {
+  const payload = Buffer.from("ID3fake-audio-bytes");
+  let seenReferer = "";
+  const upstream = createServer((request, response) => {
+    seenReferer = String(request.headers.referer || "");
+    response.writeHead(200, { "Content-Type": "audio/mpeg" });
+    response.end(payload);
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const response = await fetch(`${appBase}/media?url=${encodeURIComponent(`${upstreamBase}/chapter.mp3`)}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "audio/mpeg");
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), payload);
+  assert.match(seenReferer, new RegExp(`^${upstreamBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`));
+});
+
 test("通用漫画适配端点聚合 JSON API 的全部分页", async (context) => {
   const requestedPages = [];
   const requestedReferers = [];
@@ -763,7 +786,7 @@ test("skippedBuckets 按原因分桶", () => {
     { source: "b", reason: "未知 imageDecode，漫画图片将花屏" },
     { source: "c", reason: "依赖登录/分流变量 Get(...)，香色无法复现阅读登录 UI" },
     { source: "d", reason: "香色核心链路不可执行：world, content" },
-    { source: "e", reason: "正文依赖阅读 WebView 网络拦截（sourceRegex），香色无 sourceRegex，HTTP 转换器无法可靠取得媒体流" },
+    { source: "e", reason: "有声/视频缺少可播放正文，且章节链接不是可识别的媒体直链" },
   ]), {
     "dead-origin": 1,
     imageDecode: 1,

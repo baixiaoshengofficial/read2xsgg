@@ -26,7 +26,25 @@ export function adaptLegadoSource(source) {
   if (hostnameOf(source) === "alicesw.com") return adaptAlicesw(source);
   if (isMwwzSource(source)) return adaptMwwz(source);
   if (isJmSource(source)) return adaptJm(source);
+  if (isSuduguFamily(source)) return adaptSuduguFamily(source);
   return source;
+}
+
+/** 速读谷同站模板：搜索缺 page 参数时无法翻页（每页约 10 条）。 */
+function isSuduguFamily(source) {
+  return /^(?:sudugu\.(?:org|com)|deqixs\.com|bvquge\.com|tunshixingkong2\.com|3yexs\.com)$/i
+    .test(hostnameOf(source));
+}
+
+function adaptSuduguFamily(source) {
+  const searchUrl = String(source.searchUrl || "").trim();
+  if (!searchUrl || /\{\{\s*page\s*\}\}|%@pageIndex/i.test(searchUrl)) return source;
+  if (!/(?:sor\.aspx|[?&]key=)/i.test(searchUrl)) return source;
+  const joiner = searchUrl.includes("?") ? "&" : "?";
+  return {
+    ...source,
+    searchUrl: `${searchUrl}${joiner}page={{page}}`,
+  };
 }
 
 /** 《香色闺阁书源规则》§七：result = 书籍详情页 URL */

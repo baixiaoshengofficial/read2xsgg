@@ -170,6 +170,8 @@ function normalizePlan(value) {
     charset: /^(?:gbk|utf-8)$/i.test(String(value.charset || "").trim())
       ? String(value.charset).trim().toLowerCase()
       : "",
+    // Legado chapterList leading "-" / reverseChapters → reverse before ascending sort.
+    reverse: Boolean(value.reverse),
     fields,
     headers,
   };
@@ -315,7 +317,7 @@ export function compileDetailBridgePlan(action, headers = {}) {
   });
 }
 
-export function compileChapterBridgePlan(action, { tocSelector = "", headers = {} } = {}) {
+export function compileChapterBridgePlan(action, { tocSelector = "", headers = {}, reverse = false } = {}) {
   return normalizePlan({
     kind: "chapters",
     host: action.host,
@@ -323,6 +325,7 @@ export function compileChapterBridgePlan(action, { tocSelector = "", headers = {
     charset: planCharset(action),
     list: action.list,
     tocSelector,
+    reverse: Boolean(reverse || action.reverseChapters || action.reverse),
     fields: {
       title: inferredScriptField(action.title, [/title/i, /name/i, /chapter/i]),
       url: inferredScriptField(action.url, [/url/i, /id/i, /href/i]),
@@ -542,6 +545,67 @@ function resolveBridgeScanCap(kind, needValid, overrides = {}) {
   return Math.min(hard, Math.max(needValid + 16, scaled));
 }
 
+/** Extract a reading-order chapter number from title or URL when possible. */
+export function chapterSortKey(row) {
+  const title = String(row?.title || "");
+  const url = String(row?.url || "");
+  const patterns = [
+    /第\s*([0-9]+)\s*[章节回集话卷篇]/,
+    /(?:chapter|chap|ep|episode|ch)\s*[.\-_#]?\s*([0-9]+)/i,
+    /(?:^|[^\d])([0-9]{1,6})\s*(?:话|章|回|集)(?:$|[^\d])/,
+    /^\s*([0-9]{1,6})(?:\s*[.、:：)\]]|\s+)/,
+  ];
+  for (const pattern of patterns) {
+    const match = title.match(pattern);
+    if (match) return Number(match[1]);
+  }
+  const urlPatterns = [
+    /\/(?:chapter|chapters|read|episode|ep|ch)\/([0-9]+)/i,
+    /[_\-]([0-9]{1,6})(?:\.[A-Za-z0-9]+)?(?:[?#]|$)/,
+    /\/([0-9]{1,6})\.html?(?:[?#]|$)/i,
+  ];
+  for (const pattern of urlPatterns) {
+    const match = url.match(pattern);
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+
+/**
+ * Xiangse swipe-to-next expects ascending chapter order (1 → 2 → 3).
+ * Sort by detected numbers when reliable; otherwise honour Legado reverse
+ * (`-chapterList`) or auto-detect a descending DOM list.
+ */
+export function orderChaptersAscending(rows, { reverseHint = false } = {}) {
+  if (!Array.isArray(rows) || rows.length < 2) return rows || [];
+  const keyed = rows.map((row, index) => ({
+    row,
+    index,
+    number: chapterSortKey(row),
+  }));
+  const numbered = keyed.filter((item) => Number.isFinite(item.number));
+  if (numbered.length >= Math.ceil(rows.length * 0.5)) {
+    return keyed
+      .slice()
+      .sort((left, right) => (
+        (left.number ?? Number.MAX_SAFE_INTEGER) - (right.number ?? Number.MAX_SAFE_INTEGER)
+        || left.index - right.index
+      ))
+      .map((item) => item.row);
+  }
+  if (reverseHint) return rows.slice().reverse();
+  if (numbered.length >= 4) {
+    let decreases = 0;
+    let increases = 0;
+    for (let index = 1; index < numbered.length; index += 1) {
+      if (numbered[index].number < numbered[index - 1].number) decreases += 1;
+      else if (numbered[index].number > numbered[index - 1].number) increases += 1;
+    }
+    if (decreases > increases) return rows.slice().reverse();
+  }
+  return rows;
+}
+
 export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, limits } = {}) {
   const plan = normalizePlan(rawPlan);
   let input = body;
@@ -567,7 +631,11 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
   }
   const pageSize = resolvePageSize(plan.kind, limit, limits);
   const start = Math.max(0, Math.floor(Number(offset)) || 0);
-  const needValid = start + Math.max(pageSize, 0) + 1; // +1 to detect hasMore
+  // Chapters must be collected then sorted ascending before offset/limit so
+  // swipe-to-next reads 第1章 → 第2章 instead of newest-first site order.
+  const needValid = plan.kind === "chapters"
+    ? undefined
+    : start + Math.max(pageSize, 0) + 1;
   const scanCap = resolveBridgeScanCap(plan.kind, needValid, limits);
   const items = plan.responseType === "json"
     ? (() => {
@@ -576,23 +644,38 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
       return Number.isFinite(scanCap) ? list.slice(0, scanCap) : list;
     })()
     : htmlSelect(plan.list, input, { list: true, maxNodes: scanCap });
-  const page = [];
   if (pageSize === 0) {
-    return { data: page, hasMore: false, offset: start, pageSize };
+    return { data: [], hasMore: false, offset: start, pageSize };
   }
+
+  if (plan.kind === "chapters") {
+    const rows = [];
+    for (const item of items) {
+      const row = {};
+      for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item);
+      row.url = absolute(row.url, baseUrl);
+      if (!row.title || !row.url) continue;
+      rows.push(row);
+    }
+    const ordered = orderChaptersAscending(rows, { reverseHint: Boolean(plan.reverse) });
+    const page = ordered.slice(start, start + pageSize);
+    return {
+      data: page,
+      hasMore: ordered.length > start + page.length || (page.length >= pageSize && items.length >= scanCap),
+      offset: start,
+      pageSize,
+    };
+  }
+
+  const page = [];
   let seenValid = 0;
   let hasMore = false;
   for (const item of items) {
     const row = {};
     for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item);
-    if (plan.kind === "books") {
-      row.url = absolute(row.url, baseUrl);
-      if (row.cover) row.cover = absolute(row.cover, baseUrl);
-      if (!row.name || !row.url) continue;
-    } else {
-      row.url = absolute(row.url, baseUrl);
-      if (!row.title || !row.url) continue;
-    }
+    row.url = absolute(row.url, baseUrl);
+    if (row.cover) row.cover = absolute(row.cover, baseUrl);
+    if (!row.name || !row.url) continue;
     if (seenValid < start) {
       seenValid += 1;
       continue;
@@ -606,7 +689,6 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     break;
   }
   if (!hasMore && page.length >= pageSize && items.length >= scanCap) {
-    // Hit scan ceiling with a full page — later pages may still exist.
     hasMore = true;
   }
   return {

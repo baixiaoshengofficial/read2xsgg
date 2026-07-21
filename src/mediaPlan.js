@@ -34,11 +34,12 @@ function safeHeaders(value) {
 }
 
 /**
- * Compile safe, declarative hints from a Legado audio/video content rule. The
- * original JavaScript and regular expressions are deliberately not included,
- * so a remote source cannot inject executable code into the converter server.
+ * Compile safe, declarative hints from a Legado audio/video content rule.
+ * Executable JavaScript is never copied into the plan. sourceRegex is reduced
+ * to literal URL substring hints (e.g. ".mp3") so the server can prefer the
+ * same media the reading WebView interceptor would have captured.
  */
-export function compileMediaExtractionPlan(rule, kind = "audio", headers = {}) {
+export function compileMediaExtractionPlan(rule, kind = "audio", headers = {}, { sourceRegex = "" } = {}) {
   const source = String(rule || "");
   const properties = [];
   const attributes = [];
@@ -57,26 +58,42 @@ export function compileMediaExtractionPlan(rule, kind = "audio", headers = {}) {
     if (MEDIA_ATTRIBUTE.test(match[1])) attributes.push(match[1]);
   }
 
+  const urlHints = [];
+  for (const match of String(sourceRegex || "").matchAll(/\.(?:mp3|m4a|aac|flac|ogg|opus|wav|mp4|m4v|webm|mkv|m3u8|ts)(?:\b|(?=[^a-z0-9]))/gi)) {
+    const hint = match[0].toLowerCase();
+    if (!urlHints.includes(hint)) urlHints.push(hint);
+    if (urlHints.length >= MAX_HINTS) break;
+  }
+
   const normalizedHeaders = safeHeaders(headers);
   return {
     version: 1,
     kind: mediaKind(kind),
     properties: uniqueNames(properties, MEDIA_PROPERTY),
     attributes: uniqueNames(attributes, MEDIA_ATTRIBUTE),
+    urlHints: urlHints.slice(0, MAX_HINTS),
     ...(Object.keys(normalizedHeaders).length ? { headers: normalizedHeaders } : {}),
   };
 }
 
 export function normalizeMediaExtractionPlan(value, kind = "audio") {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return { version: 1, kind: mediaKind(kind), properties: [], attributes: [] };
+    return { version: 1, kind: mediaKind(kind), properties: [], attributes: [], urlHints: [] };
   }
   const headers = safeHeaders(value.headers);
+  const urlHints = [];
+  for (const hint of Array.isArray(value.urlHints) ? value.urlHints : []) {
+    const text = String(hint || "").trim().toLowerCase();
+    if (!/^\.[a-z0-9]{2,8}$/.test(text) || urlHints.includes(text)) continue;
+    urlHints.push(text);
+    if (urlHints.length >= MAX_HINTS) break;
+  }
   return {
     version: 1,
     kind: mediaKind(value.kind || kind),
     properties: uniqueNames(Array.isArray(value.properties) ? value.properties : [], MEDIA_PROPERTY),
     attributes: uniqueNames(Array.isArray(value.attributes) ? value.attributes : [], MEDIA_ATTRIBUTE),
+    urlHints,
     ...(Object.keys(headers).length ? { headers } : {}),
   };
 }

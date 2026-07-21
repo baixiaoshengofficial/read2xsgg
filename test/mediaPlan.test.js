@@ -53,3 +53,12 @@ test("音频支持 HLS/DASH 并优先较高质量字段", () => {
     "https://cdn.example/audio.m3u8?quality=64",
   ]);
 });
+
+test("sourceRegex 扩展名提示进入提取计划并优先匹配", () => {
+  const plan = compileMediaExtractionPlan("audio@src", "audio", {}, { sourceRegex: ".*\\.mp3.*" });
+  assert.deepEqual(plan.urlHints, [".mp3"]);
+  const html = `
+    <script>var a="https://cdn.example/preview.m4a"; var b="https://cdn.example/play.mp3?token=1";</script>
+  `;
+  assert.equal(pageMediaUrls(html, "https://audio.example/chapter", plan)[0], "https://cdn.example/play.mp3?token=1");
+});

@@ -1,9 +1,13 @@
 const TOKEN_KEY = "read2xsgg.adminToken";
 
 const els = {
+  login: document.getElementById("login"),
+  app: document.getElementById("app"),
+  heroTitle: document.getElementById("hero-title"),
+  heroLede: document.getElementById("hero-lede"),
   token: document.getElementById("token"),
-  authForm: document.getElementById("auth-form"),
-  authStatus: document.getElementById("auth-status"),
+  loginForm: document.getElementById("login-form"),
+  loginStatus: document.getElementById("login-status"),
   createForm: document.getElementById("create-form"),
   createStatus: document.getElementById("create-status"),
   url: document.getElementById("url"),
@@ -11,6 +15,7 @@ const els = {
   mode: document.getElementById("mode"),
   jobs: document.getElementById("jobs"),
   refresh: document.getElementById("refresh"),
+  logout: document.getElementById("logout"),
 };
 
 function getToken() {
@@ -18,7 +23,8 @@ function getToken() {
 }
 
 function setToken(value) {
-  sessionStorage.setItem(TOKEN_KEY, value);
+  if (value) sessionStorage.setItem(TOKEN_KEY, value);
+  else sessionStorage.removeItem(TOKEN_KEY);
 }
 
 function showStatus(el, message, ok = true) {
@@ -30,7 +36,9 @@ function showStatus(el, message, ok = true) {
 
 function authHeaders() {
   const token = getToken();
-  return token ? { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } : { "Content-Type": "application/json" };
+  return token
+    ? { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
+    : { "Content-Type": "application/json" };
 }
 
 async function api(path, options = {}) {
@@ -52,6 +60,28 @@ async function api(path, options = {}) {
     throw error;
   }
   return data;
+}
+
+function showLogin(message = "", ok = false) {
+  els.login.hidden = false;
+  els.app.hidden = true;
+  els.heroTitle.textContent = "登录";
+  els.heroLede.innerHTML = "请输入部署时在 <code>.env</code> 中配置的 <code>ADMIN_TOKEN</code> 后进入。";
+  els.token.value = "";
+  els.token.focus();
+  if (message) showStatus(els.loginStatus, message, ok);
+  else {
+    els.loginStatus.hidden = true;
+    els.loginStatus.textContent = "";
+  }
+}
+
+function showApp() {
+  els.login.hidden = true;
+  els.app.hidden = false;
+  els.heroTitle.textContent = "源管理";
+  els.heroLede.textContent = "异步完整抽测转换，完成后生成可订阅的稳定 XBS 地址。同步直转路径仍然可用。";
+  els.loginStatus.hidden = true;
 }
 
 function subscribeUrl(job) {
@@ -76,21 +106,43 @@ function statusLabel(status) {
 
 function phaseLabel(job) {
   const phase = job.phase || "";
+  const current = currentSitesLabel(job);
   if (job.status === "queued") return "等待调度";
-  if (job.status === "done") return job.count != null ? `保留 ${job.count} 源` : "完成";
+  if (job.status === "done") {
+    const unverified = job.progress?.unverified ? ` · 未抽测保留 ${job.progress.unverified}` : "";
+    return job.count != null ? `保留 ${job.count} 源${unverified}` : "完成";
+  }
   if (job.status === "failed") return job.error || "失败";
   if (phase === "download") return "下载阅读源…";
-  if (phase === "convert") return "转换规则…";
-  if (phase === "verify") {
-    if (job.progress?.total) {
-      return `抽测 ${job.progress.done || 0}/${job.progress.total} · 保留 ${job.progress.kept || 0} · 跳过 ${job.progress.skipped || 0}`;
-    }
-    return "抽测中…";
+  if (phase === "convert") {
+    if (job.progress?.total) return `转换规则 ${job.progress.done || 0}/${job.progress.total}`;
+    return "转换规则…";
   }
-  if (phase === "analyze") return "识站分析…";
+  if (phase === "preflight") {
+    const base = job.progress?.total
+      ? `探活 ${job.progress.done || 0}/${job.progress.total}`
+      : "探活上游站点…";
+    return current ? `${base} · ${current}` : base;
+  }
+  if (phase === "verify") {
+    const step = job.progress?.step === "analyze" ? "识站回退" : "抽测";
+    if (job.progress?.total) {
+      const unverified = job.progress.unverified ? ` · 未抽测保留 ${job.progress.unverified}` : "";
+      const base = `${step} ${job.progress.done || 0}/${job.progress.total} · 保留 ${job.progress.kept || 0} · 跳过 ${job.progress.skipped || 0}${unverified}`;
+      return current ? `${base}\n当前：${current}` : base;
+    }
+    return current ? `${step}中… · ${current}` : `${step}中…`;
+  }
+  if (phase === "analyze") return current ? `识站分析… · ${current}` : "识站分析…";
   if (phase === "save") return "写入制品…";
   if (job.status === "running") return "处理中…";
   return "等待中";
+}
+
+function currentSitesLabel(job) {
+  const active = Array.isArray(job.progress?.active) ? job.progress.active.filter(Boolean) : [];
+  if (active.length) return active.join(" · ");
+  return String(job.progress?.current || "").trim();
 }
 
 function renderJobs(jobs) {
@@ -117,7 +169,7 @@ function renderJobs(jobs) {
       <article class="job" data-id="${job.id}">
         <p class="job-title"><span class="badge ${job.status}">${statusLabel(job.status)}</span>${escapeHtml(job.title || job.id)}</p>
         <p class="meta">${escapeHtml(job.sourceUrl || "")}</p>
-        <p class="meta">${escapeHtml(progressText)}</p>
+        <p class="meta progress-text">${escapeHtml(progressText).replaceAll("\n", "<br>")}</p>
         <div class="progress" aria-hidden="true"><span style="width:${pct}%"></span></div>
         ${sub}
         ${err}
@@ -146,20 +198,47 @@ let pollTimer = 0;
 function schedulePoll() {
   clearTimeout(pollTimer);
   pollTimer = setTimeout(() => {
-    refreshJobs().catch(() => {});
+    refreshJobs().catch((error) => {
+      if (error.status === 401 || error.status === 503) logout(error.message);
+    });
   }, 2000);
 }
 
-els.token.value = getToken();
+async function enterApp(token) {
+  setToken(token);
+  await refreshJobs();
+  showApp();
+}
 
-els.authForm.addEventListener("submit", async (event) => {
+function logout(message = "") {
+  clearTimeout(pollTimer);
+  setToken("");
+  if (message) showLogin(message, false);
+  else showLogin("已退出登录", true);
+}
+
+els.loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  setToken(els.token.value.trim());
+  const token = els.token.value.trim();
+  if (!token) {
+    showStatus(els.loginStatus, "请输入管理口令", false);
+    return;
+  }
+  const button = els.loginForm.querySelector("button[type=submit]");
+  button.disabled = true;
   try {
-    await refreshJobs();
-    showStatus(els.authStatus, "口令已保存，任务列表可访问", true);
+    await enterApp(token);
   } catch (error) {
-    showStatus(els.authStatus, error.message || "鉴权失败", false);
+    setToken("");
+    if (error.status === 503) {
+      showStatus(els.loginStatus, "服务器未配置 ADMIN_TOKEN，请先在 .env 中设置", false);
+    } else if (error.status === 401) {
+      showStatus(els.loginStatus, "口令不正确", false);
+    } else {
+      showStatus(els.loginStatus, error.message || "登录失败", false);
+    }
+  } finally {
+    button.disabled = false;
   }
 });
 
@@ -181,6 +260,10 @@ els.createForm.addEventListener("submit", async (event) => {
     els.name.value = "";
     await refreshJobs();
   } catch (error) {
+    if (error.status === 401 || error.status === 503) {
+      logout(error.message);
+      return;
+    }
     showStatus(els.createStatus, error.message || "创建失败", false);
   } finally {
     button.disabled = false;
@@ -188,8 +271,13 @@ els.createForm.addEventListener("submit", async (event) => {
 });
 
 els.refresh.addEventListener("click", () => {
-  refreshJobs().catch((error) => showStatus(els.authStatus, error.message, false));
+  refreshJobs().catch((error) => {
+    if (error.status === 401 || error.status === 503) logout(error.message);
+    else showStatus(els.createStatus, error.message, false);
+  });
 });
+
+els.logout.addEventListener("click", () => logout());
 
 els.jobs.addEventListener("click", async (event) => {
   const target = event.target;
@@ -199,7 +287,7 @@ els.jobs.addEventListener("click", async (event) => {
   const delId = target.getAttribute("data-del");
   try {
     if (copyId) {
-      const job = (await api(`/api/jobs/${copyId}`));
+      const job = await api(`/api/jobs/${copyId}`);
       await navigator.clipboard.writeText(subscribeUrl(job));
       showStatus(els.createStatus, "订阅 URL 已复制", true);
     }
@@ -213,13 +301,23 @@ els.jobs.addEventListener("click", async (event) => {
       await refreshJobs();
     }
   } catch (error) {
-    showStatus(els.createStatus, error.message || "操作失败", false);
+    if (error.status === 401 || error.status === 503) logout(error.message);
+    else showStatus(els.createStatus, error.message || "操作失败", false);
   }
 });
 
-if (getToken()) {
-  refreshJobs().catch((error) => showStatus(els.authStatus, error.message, false));
-} else {
-  renderJobs([]);
-  showStatus(els.authStatus, "请先填写 ADMIN_TOKEN", false);
-}
+(async function boot() {
+  const saved = getToken();
+  if (!saved) {
+    showLogin();
+    return;
+  }
+  try {
+    await enterApp(saved);
+  } catch (error) {
+    setToken("");
+    if (error.status === 503) showLogin("服务器未配置 ADMIN_TOKEN，请先在 .env 中设置");
+    else if (error.status === 401) showLogin("登录已失效，请重新输入口令");
+    else showLogin(error.message || "无法进入源管理");
+  }
+})();

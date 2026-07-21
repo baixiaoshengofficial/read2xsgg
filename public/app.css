@@ -73,6 +73,19 @@ body {
   color: var(--muted);
 }
 
+.login-panel {
+  max-width: 28rem;
+}
+
+.login-panel button[type="submit"] {
+  width: 100%;
+}
+
+#app[hidden],
+#login[hidden] {
+  display: none !important;
+}
+
 .hint {
   margin: -0.25rem 0 0.9rem;
   color: var(--muted);
@@ -180,6 +193,10 @@ button:disabled {
   font-size: 0.85rem;
   line-height: 1.45;
   word-break: break-all;
+}
+
+.progress-text {
+  white-space: normal;
 }
 
 .badge {

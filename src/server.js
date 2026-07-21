@@ -27,6 +27,7 @@ import {
   compileTextBridgePlan,
   decodeBridgePlan,
   executeBridgePlan,
+  orderChaptersAscending,
 } from "./bridgePlan.js";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -58,6 +59,7 @@ export function serverConfig(environment = process.env) {
     fetchTimeoutMs: integer(environment.FETCH_TIMEOUT_MS, 15_000),
     maxSourceBytes: integer(environment.MAX_SOURCE_BYTES, 32 * 1024 * 1024),
     maxImageBytes: integer(environment.MAX_IMAGE_BYTES, 25 * 1024 * 1024),
+    maxMediaBytes: integer(environment.MAX_MEDIA_BYTES, 80 * 1024 * 1024),
     maxRedirects: integer(environment.MAX_REDIRECTS, 5, 0),
     maxConcurrent: integer(environment.MAX_CONCURRENT, 8),
     cacheTtlMs: integer(environment.CACHE_TTL_SECONDS, 300, 0) * 1000,
@@ -78,6 +80,8 @@ export function serverConfig(environment = process.env) {
     verifyBudgetMs: integer(environment.VERIFY_BUDGET_MS, 20_000),
     // Skip verify entirely above this count (aggregate shuyuans).
     verifyMaxSources: integer(environment.VERIFY_MAX_SOURCES, 50),
+    // Async WebUI jobs: 0 = unbounded full verify (default). Set >0 to cap wall time.
+    jobVerifyBudgetMs: integer(environment.JOB_VERIFY_BUDGET_MS, 0, 0),
     maxComicPages: integer(environment.MAX_COMIC_PAGES, 50),
     maxComicImages: integer(environment.MAX_COMIC_IMAGES, 2_000),
     comicPageConcurrency: integer(environment.COMIC_PAGE_CONCURRENCY, 4),
@@ -627,41 +631,100 @@ async function sourceBridgeChainReachable(source, config) {
   return false;
 }
 
-export async function filterReachableSources(input, config) {
+export async function filterReachableSources(input, config, { onProgress = null } = {}) {
   const sources = legacySourceList(input);
-  if (!config.preflightSources || !sources.length) return { input, skipped: [] };
+  const sourceLabel = (source) => {
+    const name = String(source?.bookSourceName || source?.sourceName || source?.name || "").trim();
+    const host = String(source?.bookSourceUrl || source?.sourceUrl || source?.url || "").trim();
+    if (name && host) {
+      try {
+        return `${name} (${new URL(host.split("#", 1)[0]).hostname})`;
+      } catch {
+        return `${name} (${host})`;
+      }
+    }
+    return name || host || "未命名书源";
+  };
+  if (!config.preflightSources || !sources.length) {
+    if (typeof onProgress === "function") {
+      try {
+        onProgress({
+          phase: "preflight",
+          done: sources.length,
+          total: sources.length,
+          kept: sources.length,
+          skipped: 0,
+          unverified: 0,
+          current: "",
+          active: [],
+        });
+      } catch { /* ignore */ }
+    }
+    return { input, skipped: [] };
+  }
   const results = new Array(sources.length);
   const originTasks = new Map();
   const deepTasks = new Map();
   let cursor = 0;
+  let processed = 0;
+  /** @type {Set<string>} */
+  const active = new Set();
+  const report = () => {
+    if (typeof onProgress !== "function") return;
+    try {
+      const activeList = [...active];
+      onProgress({
+        phase: "preflight",
+        done: processed,
+        total: sources.length,
+        kept: results.filter((value) => value === true).length,
+        skipped: results.filter((value) => value === false).length,
+        unverified: 0,
+        current: activeList[0] || "",
+        active: activeList,
+      });
+    } catch {
+      // Progress callbacks must not break conversion.
+    }
+  };
   const workers = Array.from({ length: Math.min(config.preflightConcurrency, sources.length) }, async () => {
     while (cursor < sources.length) {
       const index = cursor;
       cursor += 1;
       const source = sources[index];
+      const label = sourceLabel(source);
       let key = String(source?.bookSourceUrl || source?.sourceUrl || source?.url || "");
       try {
         key = new URL(key.split("#", 1)[0]).origin;
       } catch {
         // Invalid URLs intentionally remain unique and fail the probe.
       }
-      if (!originTasks.has(key)) originTasks.set(key, sourceOriginReachable(source, config));
-      const originReachable = await originTasks.get(key);
-      if (!originReachable) {
-        results[index] = false;
-        continue;
+      active.add(label);
+      report();
+      try {
+        if (!originTasks.has(key)) originTasks.set(key, sourceOriginReachable(source, config));
+        const originReachable = await originTasks.get(key);
+        if (!originReachable) {
+          results[index] = false;
+          processed += 1;
+          continue;
+        }
+        // Aggregates often contain renamed copies of exactly the same source.
+        // Share their expensive list→chapter→content probe while keeping the
+        // original entries and names intact in the converted output.
+        const chainKey = JSON.stringify([
+          Object.entries(source?.bookWorld || {})[0] || null,
+          source?.chapterList || null,
+          source?.chapterContent || null,
+          source?.httpHeaders || null,
+        ]);
+        if (!deepTasks.has(chainKey)) deepTasks.set(chainKey, sourceBridgeChainReachable(source, config));
+        results[index] = await deepTasks.get(chainKey);
+        processed += 1;
+      } finally {
+        active.delete(label);
+        report();
       }
-      // Aggregates often contain renamed copies of exactly the same source.
-      // Share their expensive list→chapter→content probe while keeping the
-      // original entries and names intact in the converted output.
-      const chainKey = JSON.stringify([
-        Object.entries(source?.bookWorld || {})[0] || null,
-        source?.chapterList || null,
-        source?.chapterContent || null,
-        source?.httpHeaders || null,
-      ]);
-      if (!deepTasks.has(chainKey)) deepTasks.set(chainKey, sourceBridgeChainReachable(source, config));
-      results[index] = await deepTasks.get(chainKey);
     }
   });
   await Promise.all(workers);
@@ -731,6 +794,56 @@ export async function downloadImage(imageUrl, decoder = "auto", config = serverC
     }
   }
   throw new HttpError(502, "下载图片失败");
+}
+
+function mediaMimeType(url, contentType = "") {
+  const declared = String(contentType || "").split(";")[0].trim().toLowerCase();
+  if (declared && declared !== "application/octet-stream" && !declared.startsWith("text/")) return declared;
+  const pathName = (() => {
+    try { return new URL(url).pathname; } catch { return String(url || ""); }
+  })();
+  if (/\.m3u8(?:$|\?)/i.test(pathName)) return "application/vnd.apple.mpegurl";
+  if (/\.mp3(?:$|\?)/i.test(pathName)) return "audio/mpeg";
+  if (/\.m4a(?:$|\?)/i.test(pathName)) return "audio/mp4";
+  if (/\.aac(?:$|\?)/i.test(pathName)) return "audio/aac";
+  if (/\.ogg(?:$|\?)/i.test(pathName)) return "audio/ogg";
+  if (/\.wav(?:$|\?)/i.test(pathName)) return "audio/wav";
+  if (/\.flac(?:$|\?)/i.test(pathName)) return "audio/flac";
+  if (/\.mp4(?:$|\?)/i.test(pathName)) return "video/mp4";
+  if (/\.webm(?:$|\?)/i.test(pathName)) return "video/webm";
+  if (/\.mkv(?:$|\?)/i.test(pathName)) return "video/x-matroska";
+  return declared || "application/octet-stream";
+}
+
+/** Fetch a remote audio/video URL the same way /image fetches comics (Referer + SSRF guards). */
+export async function downloadMedia(mediaUrl, config = serverConfig()) {
+  let current;
+  try {
+    current = new URL(normalizeRemoteUrl(mediaUrl));
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(400, "媒体 URL 不是有效 URL");
+  }
+  for (let redirects = 0; redirects <= config.maxRedirects; redirects += 1) {
+    const resolved = await resolveTarget(current, config);
+    const result = await requestBuffer(current, resolved, config, {
+      maxBytes: config.maxMediaBytes,
+      label: "下载媒体",
+      accept: "audio/*,video/*,application/vnd.apple.mpegurl,application/x-mpegURL,*/*;q=0.8",
+      headers: { Referer: `${current.protocol}//${current.host}/` },
+    });
+    if (!result.buffer) {
+      if (redirects === config.maxRedirects) throw new HttpError(502, `媒体重定向次数超过 ${config.maxRedirects}`);
+      current = result.redirect;
+      continue;
+    }
+    return {
+      buffer: result.buffer,
+      mimeType: mediaMimeType(current.toString(), result.headers?.["content-type"]),
+      upstreamUrl: current.toString(),
+    };
+  }
+  throw new HttpError(502, "下载媒体失败");
 }
 
 function legacySourceList(input) {
@@ -1058,6 +1171,12 @@ function imageRequestFromRequest(request) {
   return { imageUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "", decoder };
 }
 
+function mediaProxyRequestFromRequest(request) {
+  const parsed = new URL(request.url || "/", "http://read2xsgg.local");
+  if (parsed.pathname !== "/media") return null;
+  return { mediaUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "" };
+}
+
 function adapterRequestFromRequest(request) {
   const parsed = new URL(request.url || "/", "http://read2xsgg.local");
   const type = parsed.pathname === "/adapter/jm/chapters" ? "jm-chapters"
@@ -1196,12 +1315,14 @@ function help(config) {
       convert: "/convert.xbs?url=https://www.example.com/legado.json",
       json: "/j/www.example.com/legado.json",
       image: "/image/mwwz-aes?url=https://cdn.example.com/encrypted-image",
+      media: "/media?url=https://cdn.example.com/chapter.mp3",
       health: "/healthz",
       jobs: "/api/jobs",
     },
     limits: {
       maxSourceBytes: config.maxSourceBytes,
       maxImageBytes: config.maxImageBytes,
+      maxMediaBytes: config.maxMediaBytes,
       maxBridgeBookPageSize: config.maxBridgeBookPageSize,
       maxBridgeChapterPageSize: config.maxBridgeChapterPageSize,
       maxBridgeHtmlBytes: config.maxBridgeHtmlBytes,
@@ -1335,13 +1456,13 @@ export function jmChapterEntries(detailPage, baseUrl) {
   for (const match of html.matchAll(/<ul\b([^>]*)>([\s\S]*?)<\/ul>/gi)) {
     const className = htmlAttribute(match[1], "class") || "";
     if (!/(?:^|\s)btn-toolbar(?:\s|$)/i.test(className)) continue;
-    const chapters = jmAnchorEntries(match[2], baseUrl);
+    const chapters = orderChaptersAscending(jmAnchorEntries(match[2], baseUrl));
     if (chapters.length) return chapters;
   }
   for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
     const className = htmlAttribute(match[1], "class") || "";
     if (!/(?:^|\s)reading(?:\s|$)/i.test(className)) continue;
-    const chapters = jmAnchorEntries(match[0], baseUrl);
+    const chapters = orderChaptersAscending(jmAnchorEntries(match[0], baseUrl));
     if (chapters.length) return chapters;
   }
   return [];
@@ -1393,11 +1514,82 @@ function hydrationDocuments(html) {
   return documents;
 }
 
+const IMAGE_SEQ_PARENT = /(?:images?|pages?|pics?|pictures?|photos?|slides?|gallery|list|items?|files?|data)$/i;
+const IMAGE_ORDER_KEYS = ["page", "pageIndex", "pageNo", "pageNum", "pageNumber", "index", "order", "seq", "sort", "no", "num", "number"];
+
+function imageObjectOrder(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  for (const name of IMAGE_ORDER_KEYS) {
+    if (!Object.hasOwn(value, name)) continue;
+    const number = Number(value[name]);
+    if (Number.isFinite(number)) return number;
+  }
+  for (const [key, raw] of Object.entries(value)) {
+    if (!/^(?:page|index|order|seq|sort|no|num|number)/i.test(key)) continue;
+    const number = Number(raw);
+    if (Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
+function pickObjectImageUrl(value, baseUrl, hints) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  const preferred = [...hints, "pageSrc", "imageUrl", "image_url", "img", "src", "url", "uri", "path", "file"];
+  for (const key of preferred) {
+    if (!Object.hasOwn(value, key)) continue;
+    const url = normalizedImageUrl(value[key], baseUrl);
+    if (url) return url;
+  }
+  for (const [key, raw] of Object.entries(value)) {
+    if (!/(?:url|uri|src|source|image|img|pic|picture|file|path)/i.test(key)) continue;
+    const url = normalizedImageUrl(raw, baseUrl);
+    if (url) return url;
+  }
+  return "";
+}
+
+/** Prefer the last digit run before the extension (page_10.jpg → 10, not a leading id). */
+function imageFilenameNumber(pathname) {
+  const file = String(pathname || "").split("/").pop() || "";
+  const match = file.match(/(\d+)(?=\.[A-Za-z0-9]+$)/) || file.match(/(\d+)(?=[?#]|$)/);
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * Only reorder when DOM/JSON appearance order is clearly out of sequence
+ * (e.g. cover reused as page 1). Already ascending sequences stay untouched.
+ */
+function maybeReorderByFilename(urls) {
+  if (!Array.isArray(urls) || urls.length < 2) return urls;
+  const numbered = urls.map((value, index) => {
+    try {
+      return { value, index, number: imageFilenameNumber(new URL(value).pathname) };
+    } catch {
+      return { value, index, number: null };
+    }
+  });
+  const withNums = numbered.filter((item) => Number.isFinite(item.number));
+  if (withNums.length / numbered.length < 0.8) return urls;
+  let decreases = 0;
+  for (let i = 1; i < withNums.length; i += 1) {
+    if (withNums[i].number < withNums[i - 1].number) decreases += 1;
+  }
+  if (!decreases) return urls;
+  return numbered
+    .slice()
+    .sort((left, right) => (
+      (left.number ?? Number.MAX_SAFE_INTEGER) - (right.number ?? Number.MAX_SAFE_INTEGER)
+      || left.index - right.index
+    ))
+    .map((item) => item.value);
+}
+
 function propertyImageUrls(document, baseUrl, extractionPlan) {
   const plan = normalizeComicExtractionPlan(extractionPlan);
   const hints = new Set(plan.properties.map((value) => value.toLowerCase()));
   const groups = new Map();
-  const add = (keyValue, value) => {
+  const sequences = [];
+  const add = (keyValue, value, { sequenceKey = "" } = {}) => {
     const key = String(keyValue || "").toLowerCase();
     const semantic = /(?:url|uri|src|source|image|img|pic|picture|file|path)/i.test(key);
     if (!hints.has(key) && !semantic) return;
@@ -1410,9 +1602,39 @@ function propertyImageUrls(document, baseUrl, extractionPlan) {
     // url/path/file keys are only image candidates when the original rule
     // named that key or the value itself looks like an image.
     if (!explicit && !imageSemantic && !imageExtension) return;
-    const group = groups.get(key) || [];
+    const bucket = sequenceKey ? `${sequenceKey}::${key}` : key;
+    const group = groups.get(bucket) || [];
     if (!group.includes(url)) group.push(url);
-    groups.set(key, group);
+    groups.set(bucket, group);
+  };
+
+  const recordObjectArray = (items, parentKey) => {
+    if (!Array.isArray(items) || items.length < 2) return false;
+    if (!items.every((item) => item && typeof item === "object" && !Array.isArray(item))) return false;
+    const ranked = items.map((item, index) => ({
+      item,
+      index,
+      order: imageObjectOrder(item),
+    }));
+    const orderedCount = ranked.filter((entry) => Number.isFinite(entry.order)).length;
+    if (orderedCount >= Math.ceil(ranked.length * 0.6)) {
+      ranked.sort((left, right) => (
+        (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER)
+        || left.index - right.index
+      ));
+    }
+    const urls = [];
+    for (const entry of ranked) {
+      const url = pickObjectImageUrl(entry.item, baseUrl, hints);
+      if (url && !urls.includes(url)) urls.push(url);
+    }
+    if (urls.length < 2) return false;
+    sequences.push({
+      key: String(parentKey || "images").toLowerCase(),
+      urls,
+      fromArray: true,
+    });
+    return true;
   };
 
   // The second form decodes JSON strings embedded inside HTML/JavaScript. Only
@@ -1426,16 +1648,32 @@ function propertyImageUrls(document, baseUrl, extractionPlan) {
       add(match[1], match[2]);
     }
   }
-  // Direct JSON APIs frequently use arrays of strings, which cannot be found
-  // by key:value text matching. Walk parsed data after the text pass so repeated
-  // textual properties retain their original order.
+  // Direct JSON APIs frequently use arrays of strings/objects. Prefer whole
+  // array sequences (optionally sorted by page/index) over flat key merges.
   try {
     const parsed = JSON.parse(String(document || ""));
     const walk = (value, parentKey = "") => {
       if (Array.isArray(value)) {
+        if (recordObjectArray(value, parentKey)) {
+          // Still walk nested structures, but the array itself is the reading order.
+          for (const item of value) {
+            if (item && typeof item === "object") walk(item, parentKey);
+          }
+          return;
+        }
+        const stringUrls = [];
         for (const item of value) {
-          if (typeof item === "string") add(parentKey, item);
-          else walk(item, parentKey);
+          if (typeof item === "string") {
+            const url = normalizedImageUrl(item, baseUrl);
+            if (url && !stringUrls.includes(url)) stringUrls.push(url);
+          } else if (item && typeof item === "object") {
+            walk(item, parentKey);
+          }
+        }
+        if (stringUrls.length > 1 && (hints.has(String(parentKey || "").toLowerCase()) || IMAGE_SEQ_PARENT.test(parentKey))) {
+          sequences.push({ key: String(parentKey || "images").toLowerCase(), urls: stringUrls, fromArray: true });
+        } else {
+          for (const url of stringUrls) add(parentKey, url, { sequenceKey: parentKey });
         }
         return;
       }
@@ -1449,18 +1687,24 @@ function propertyImageUrls(document, baseUrl, extractionPlan) {
   } catch {
     // HTML and hydration streams continue through the safe text extractor.
   }
+
   let best = [];
   let bestScore = -1;
-  for (const [key, urls] of groups) {
-    const explicit = hints.has(key);
-    const imageLike = /(?:image|img|pic|picture|src|source)/i.test(key);
-    const score = (explicit ? 1_000_000 : 0) + (imageLike ? 10_000 : 0) + urls.length;
+  const consider = (key, urls, { fromArray = false } = {}) => {
+    if (!urls?.length) return;
+    const explicit = [...hints].some((hint) => key === hint || key.endsWith(`::${hint}`));
+    const imageLike = /(?:image|img|pic|picture|src|source|page)/i.test(key);
+    const parentBoost = IMAGE_SEQ_PARENT.test(key.split("::")[0] || key) ? 50_000 : 0;
+    const arrayBoost = fromArray ? 200_000 : 0;
+    const score = (explicit ? 1_000_000 : 0) + arrayBoost + parentBoost + (imageLike ? 10_000 : 0) + urls.length;
     if (score > bestScore) {
       best = urls;
       bestScore = score;
     }
-  }
-  return best;
+  };
+  for (const sequence of sequences) consider(sequence.key, sequence.urls, { fromArray: true });
+  for (const [key, urls] of groups) consider(key, urls);
+  return maybeReorderByFilename(best);
 }
 
 export function pageImageUrls(page, baseUrl, extractionPlan = null) {
@@ -1536,17 +1780,7 @@ export function pageImageUrls(page, baseUrl, extractionPlan = null) {
   for (const group of groups.values()) {
     if (group.length > largest.length) largest = group;
   }
-  const numbered = largest.map((value, index) => {
-    const pathname = new URL(value).pathname;
-    const match = pathname.match(/(?:^|\/)(?:[^/]*?)(\d+)(?:\.[A-Za-z0-9]+)$/);
-    return { value, index, number: match ? Number(match[1]) : null };
-  });
-  if (numbered.length >= 2 && numbered.filter((item) => Number.isFinite(item.number)).length / numbered.length >= 0.8) {
-    return numbered
-      .sort((left, right) => (left.number ?? Number.MAX_SAFE_INTEGER) - (right.number ?? Number.MAX_SAFE_INTEGER) || left.index - right.index)
-      .map((item) => item.value);
-  }
-  return largest;
+  return maybeReorderByFilename(largest);
 }
 
 const PAGE_QUERY_KEYS = new Set([
@@ -1727,6 +1961,8 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
   if (direct) return [direct];
 
   const hints = new Set(plan.properties.map((value) => value.toLowerCase()));
+  const urlHints = (plan.urlHints || []).map((value) => String(value || "").toLowerCase()).filter(Boolean);
+  const matchesUrlHint = (url) => urlHints.some((hint) => String(url).toLowerCase().includes(hint));
   const candidates = new Map();
   let order = 0;
   const add = (keyValue, value, allowGeneric = false) => {
@@ -1739,7 +1975,8 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
     const kindName = kind === "video" ? /(?:video|stream|hls|m3u8)/i.test(key) : /(?:audio|sound|voice|track)/i.test(key);
     const quality = Number(key.match(/(?:^|_)(\d{2,4})$/)?.[1] || 0);
     const stream = STREAM_MEDIA_EXTENSION.test(url);
-    const score = (extension ? 1_000_000 : 0) + (hints.has(key) ? 100_000 : 0)
+    const hintMatch = matchesUrlHint(url);
+    const score = (extension ? 1_000_000 : 0) + (hintMatch ? 500_000 : 0) + (hints.has(key) ? 100_000 : 0)
       + (kindName ? 10_000 : 0) + (stream ? 1_000 : 0) + quality - order;
     candidates.set(url, score);
     order += 1;
@@ -1779,7 +2016,9 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
     }
   }
   for (const match of text.replace(/\\\//g, "/").matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
-    add("media", match[0], false);
+    // sourceRegex-derived extension hints (e.g. ".mp3") promote matching URLs
+    // even when they sit outside semantic JSON keys.
+    add("media", match[0], urlHints.length > 0 && matchesUrlHint(match[0]));
   }
 
   return [...candidates.entries()]
@@ -2095,6 +2334,27 @@ export function createAppServer(options = {}) {
         });
         if (request.method === "HEAD") response.end();
         else response.end(image.buffer);
+        return;
+      }
+      const mediaTarget = mediaProxyRequestFromRequest(request);
+      if (mediaTarget) {
+        if (!mediaTarget.mediaUrl) throw new HttpError(400, "缺少媒体 URL");
+        if (active >= config.maxConcurrent) throw new HttpError(429, "当前媒体处理任务过多，请稍后重试");
+        active += 1;
+        let media;
+        try {
+          media = await downloadMedia(mediaTarget.mediaUrl, config);
+        } finally {
+          active -= 1;
+        }
+        response.writeHead(200, {
+          ...commonHeaders,
+          "Content-Type": media.mimeType,
+          "Content-Length": media.buffer.length,
+          "Cache-Control": "public, max-age=3600",
+        });
+        if (request.method === "HEAD") response.end();
+        else response.end(media.buffer);
         return;
       }
       const target = requestTargetFromRequest(request);

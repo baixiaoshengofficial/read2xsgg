@@ -14,7 +14,7 @@ export { decodeXbs, encodeXbs } from "./xbs.js";
 export { decodeImage, decoderForLegadoImageRule, imageMimeType, supportedImageDecoders } from "./imageDecoder.js";
 export { compileComicExtractionPlan, decodeComicExtractionPlan, encodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
 export { compileMediaExtractionPlan, decodeMediaExtractionPlan, encodeMediaExtractionPlan, normalizeMediaExtractionPlan } from "./mediaPlan.js";
-export { bridgeTocUrl, compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, compileTextBridgePlan, decodeBridgePlan, encodeBridgePlan, executeBridgePlan, htmlToPlainText, DEFAULT_BRIDGE_LIMITS } from "./bridgePlan.js";
+export { bridgeTocUrl, chapterSortKey, compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, compileTextBridgePlan, decodeBridgePlan, encodeBridgePlan, executeBridgePlan, htmlToPlainText, orderChaptersAscending, DEFAULT_BRIDGE_LIMITS } from "./bridgePlan.js";
 export { hasUnsupportedLegadoRuntime, legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
 export {
   analyzeSite,
@@ -36,4 +36,4 @@ export { createJobWorker } from "./jobWorker.js";
 export { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
 export { resolveBookTargetUrl, verifyConvertedSource, verifyConvertedSources } from "./verifySource.js";
 export { downloadAsFetch, ruleUsesForbiddenSinglePipeJs, validateXiangseSource } from "./xiangseValidate.js";
-export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadSource, filterReachableSources, HttpError, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaUrls, pageText, pageTocUrl, serverConfig, sourceUrlCandidates, startServer } from "./server.js";
+export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadMedia, downloadSource, filterReachableSources, HttpError, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaUrls, pageText, pageTocUrl, serverConfig, sourceUrlCandidates, startServer } from "./server.js";

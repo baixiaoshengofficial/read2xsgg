@@ -481,6 +481,58 @@ test("桥接按 offset/limit 分页，而不是丢弃后续条目", () => {
   assert.equal(chapters.hasMore, true);
 });
 
+test("章节桥接会把倒序目录排成从小到大", () => {
+  const chapterPlan = compileChapterBridgePlan({
+    host: "https://example.com",
+    responseFormatType: "html",
+    list: "//a",
+    title: "/text()",
+    url: "/@href",
+  });
+  const reverseHtml = Array.from({ length: 12 }, (_, index) => {
+    const number = 12 - index;
+    return `<a href="/c/${number}">第 ${number} 章</a>`;
+  }).join("");
+  const page = executeBridgePlan(reverseHtml, "https://example.com", chapterPlan, { limit: 5, offset: 0 });
+  assert.deepEqual(page.data.map((item) => item.title), [
+    "第 1 章",
+    "第 2 章",
+    "第 3 章",
+    "第 4 章",
+    "第 5 章",
+  ]);
+  assert.equal(page.hasMore, true);
+  const page2 = executeBridgePlan(reverseHtml, "https://example.com", chapterPlan, { limit: 5, offset: 5 });
+  assert.equal(page2.data[0].title, "第 6 章");
+});
+
+test("阅读目录规则前导 - 会保留倒序语义且不破坏选择器", () => {
+  const source = {
+    bookSourceName: "倒序目录源",
+    bookSourceUrl: "https://novel.example.com",
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".book", name: "a@text", bookUrl: "a@href", checkKeyWord: "测" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: {
+      chapterList: "-//div[@id='list']//a",
+      chapterName: "text",
+      chapterUrl: "href",
+    },
+    ruleContent: { content: "#content@text" },
+  };
+  const { sources } = convertLegado(source, {
+    omitNonPortable: true,
+    imageProxyBase: "https://convert.example",
+  });
+  const toc = sources["倒序目录源"].chapterList;
+  assert.equal(toc.reverseChapters, undefined);
+  assert.match(toc.requestInfo, /adapter\/chapters\?plan=/);
+  const plan = decodeBridgePlan(String(toc.requestInfo).match(/plan=([^&]+)/)[1]);
+  assert.equal(plan.reverse, true);
+  assert.match(plan.list, /\/\/div\[@id='list'\]/);
+  assert.doesNotMatch(plan.list, /^-\/\//);
+});
+
 test("桥接 URL 在 plan 与 url 之间插入分页参数后仍可被抽测识别", () => {
   const source = {
     bookSourceName: "分页桥接识别",
@@ -826,6 +878,7 @@ test("大量普通 GET 分类压缩为一个香色原生筛选动作", () => {
   assert.match(world["分类"].requestInfo, /params\.filters\.category/);
   assert.match(world["分类"].requestInfo, /params\.pageIndex/);
   assert.doesNotMatch(world["分类"].moreKeys.requestFilters, /%@pageIndex/);
+  assert.equal(world["分类"].moreKeys.pageSize, 10);
   assert.ok(warnings.some((warning) => warning.message.includes("压缩为香色 requestFilters")));
 });
 
@@ -877,6 +930,41 @@ JSON.stringify([]);`;
   assert.ok(converted);
   assert.ok(Object.keys(converted.bookWorld).length >= 3);
   assert.ok(warnings.some((item) => item.message.includes("静态提取")));
+});
+
+test("速读谷式分类：pageSize 对齐站点页长且忽略装饰分组头", () => {
+  const source = {
+    bookSourceName: "速读谷分页",
+    bookSourceUrl: "https://www.sudugu.org",
+    searchUrl: "/i/sor.aspx?key={{key}}",
+    ruleSearch: {
+      bookList: ".item",
+      name: "a.1@text",
+      bookUrl: "a@href",
+      coverUrl: "img@src",
+    },
+    ruleBookInfo: { name: "h1@a@text" },
+    ruleToc: { chapterList: "#list@ul@li@a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: ".con@html" },
+    ruleExplore: [],
+    exploreUrl: `@js:
+var inputData = \`°・*.☆ 全部榜单 ☆.*・°
+最近更新::/zuixin/{{page}}.html
+热门小说::/paihang/{{page}}.html
+连载小说::/lianzai/{{page}}.html
+完结小说::/wanjie/{{page}}.html
+玄幻小说::/xuanhuan/{{page}}.html
+都市小说::/dushi/{{page}}.html
+历史小说::/lishi/{{page}}.html\`;
+JSON.stringify([]);`,
+  };
+  const { sources } = convertLegado(source);
+  const world = sources["速读谷分页"].bookWorld["分类"];
+  assert.equal(world.moreKeys.pageSize, 10);
+  assert.match(world.moreKeys.requestFilters, /^最近更新::\/zuixin\/__READ2XSGG_PAGE__\.html$/m);
+  assert.doesNotMatch(world.moreKeys.requestFilters, /全部榜单·/);
+  assert.match(sources["速读谷分页"].searchBook.requestInfo, /page=%@pageIndex/);
+  assert.equal(sources["速读谷分页"].searchBook.moreKeys.pageSize, 10);
 });
 
 test("正文清理规则与既有后处理合并为单个香色 JavaScript", () => {
@@ -1219,7 +1307,7 @@ test("在线质量门槛跳过未适配的登录分流 Get 源", () => {
   assert.equal(buckets.login, 1);
 });
 
-test("在线质量门槛跳过依赖 sourceRegex 的有声源", () => {
+test("在线质量门槛保留 sourceRegex 有声源并走媒体适配", () => {
   const source = {
     bookSourceName: "拦截有声",
     bookSourceUrl: "https://audio.example.com/",
@@ -1232,13 +1320,17 @@ test("在线质量门槛跳过依赖 sourceRegex 的有声源", () => {
     ruleToc: { chapterList: ".chapter a", chapterName: "text", chapterUrl: "href" },
     ruleContent: { content: "audio@src", sourceRegex: ".*\\.mp3.*" },
   };
-  const { sources, skipped, skippedBuckets: buckets } = convertLegado(source, {
+  const { sources, skipped, warnings } = convertLegado(source, {
     omitNonPortable: true,
     imageProxyBase: "https://convert.example",
   });
-  assert.equal(sources["拦截有声"], undefined);
-  assert.ok(skipped.some((item) => /sourceRegex/.test(item.reason)));
-  assert.equal(buckets.media, 1);
+  assert.equal(skipped.length, 0);
+  const converted = sources["拦截有声"];
+  assert.ok(converted);
+  assert.equal(converted.sourceType, "audio");
+  assert.match(converted.chapterContent.requestInfo, /\/adapter\/media\?kind=audio/);
+  assert.match(converted.chapterContent.content, /\/media\?url=/);
+  assert.ok(warnings.some((warning) => /sourceRegex/.test(warning.message)));
 });
 
 test("CSS 负索引 [-n] 转为 last()-based position，不再生成非法 @-n", () => {

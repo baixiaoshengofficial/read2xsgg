@@ -10,54 +10,62 @@
   <div class="shell">
     <header class="hero">
       <p class="brand">read2xsgg</p>
-      <h1>源管理</h1>
-      <p class="lede">异步完整抽测转换，完成后生成可订阅的稳定 XBS 地址。同步直转路径仍然可用。</p>
+      <h1 id="hero-title">源管理</h1>
+      <p id="hero-lede" class="lede">请输入部署时在 <code>.env</code> 中配置的 <code>ADMIN_TOKEN</code> 后进入。</p>
     </header>
 
-    <section id="auth" class="panel">
-      <h2>管理口令</h2>
-      <p class="hint">对应环境变量 <code>ADMIN_TOKEN</code>。仅管理接口需要，订阅 URL 可公开访问。</p>
-      <form id="auth-form" class="row">
-        <input id="token" type="password" autocomplete="current-password" placeholder="ADMIN_TOKEN" />
-        <button type="submit">保存</button>
-      </form>
-      <p id="auth-status" class="status" hidden></p>
-    </section>
-
-    <section id="create" class="panel">
-      <h2>新建转换任务</h2>
-      <form id="create-form" class="stack">
+    <section id="login" class="panel login-panel">
+      <h2>登录</h2>
+      <p class="hint">口令来自服务器 <code>.env</code> 的 <code>ADMIN_TOKEN</code>。未登录无法查看任务与转换功能；公开订阅地址 <code>/library/…xbs</code> 不受影响。</p>
+      <form id="login-form" class="stack">
         <label>
-          <span>源地址</span>
-          <input id="url" type="url" required placeholder="https://example.com/legado.json" />
+          <span>管理口令</span>
+          <input id="token" type="password" autocomplete="current-password" required placeholder="ADMIN_TOKEN" />
         </label>
-        <label>
-          <span>显示名称（可选）</span>
-          <input id="name" type="text" placeholder="我的书源合集" />
-        </label>
-        <label class="inline">
-          <span>类型</span>
-          <select id="mode">
-            <option value="source">阅读源 JSON</option>
-            <option value="site">网站识站</option>
-          </select>
-        </label>
-        <button type="submit">开始异步转换</button>
+        <button type="submit">进入源管理</button>
       </form>
-      <p id="create-status" class="status" hidden></p>
+      <p id="login-status" class="status" hidden></p>
     </section>
 
-    <section class="panel">
-      <div class="row between">
-        <h2>任务列表</h2>
-        <button type="button" id="refresh" class="ghost">刷新</button>
-      </div>
-      <div id="jobs" class="jobs"></div>
-    </section>
+    <div id="app" hidden>
+      <section id="create" class="panel">
+        <div class="row between">
+          <h2>新建转换任务</h2>
+          <button type="button" id="logout" class="ghost">退出登录</button>
+        </div>
+        <form id="create-form" class="stack">
+          <label>
+            <span>源地址</span>
+            <input id="url" type="url" required placeholder="https://example.com/legado.json" />
+          </label>
+          <label>
+            <span>显示名称（可选）</span>
+            <input id="name" type="text" placeholder="我的书源合集" />
+          </label>
+          <label class="inline">
+            <span>类型</span>
+            <select id="mode">
+              <option value="source">阅读源 JSON</option>
+              <option value="site">网站识站</option>
+            </select>
+          </label>
+          <button type="submit">开始异步转换</button>
+        </form>
+        <p id="create-status" class="status" hidden></p>
+      </section>
 
-    <footer class="foot">
-      <p>同步直转：<code>/source/…xbs</code> · 识站：<code>/url/…xbs</code> · 书库订阅：<code>/library/{id}.xbs</code></p>
-    </footer>
+      <section class="panel">
+        <div class="row between">
+          <h2>任务列表</h2>
+          <button type="button" id="refresh" class="ghost">刷新</button>
+        </div>
+        <div id="jobs" class="jobs"></div>
+      </section>
+
+      <footer class="foot">
+        <p>同步直转：<code>/source/…xbs</code> · 识站：<code>/url/…xbs</code> · 书库订阅：<code>/library/{id}.xbs</code></p>
+      </footer>
+    </div>
   </div>
   <script src="/ui/app.js" type="module"></script>
 </body>

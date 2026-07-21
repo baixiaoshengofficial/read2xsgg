@@ -429,3 +429,65 @@ test("verify budget 到期后保留未抽测源", async () => {
   assert.equal(Object.keys(gated.sources).length + gated.skipped.length, 6);
   assert.equal(Object.keys(gated.sources).length, gated.unverifiedCount);
 });
+
+test("抽测进度回调包含当前站点名", async () => {
+  const plan = {
+    version: 1,
+    kind: "books",
+    host: "https://novel.example",
+    responseType: "html",
+    list: "//li",
+    fields: {
+      name: { selector: ".//a", replacements: [], hostPrefix: false, matchTemplate: null },
+      url: { selector: ".//a/@href", replacements: [], hostPrefix: false, matchTemplate: null },
+    },
+    headers: {},
+  };
+  const encoded = encodeBridgePlan(plan);
+  const source = {
+    sourceName: "进度站",
+    sourceUrl: "https://novel.example",
+    sourceType: "text",
+    bookWorld: {
+      分类: {
+        actionID: "bookWorld",
+        host: "https://novel.example",
+        responseFormatType: "html",
+        requestInfo: `https://convert.example/adapter/books?plan=${encoded}&page=%@pageIndex&pageSize=20&slice=1&url=/list`,
+        list: "//li",
+        bookName: ".//a",
+        detailUrl: ".//a/@href",
+      },
+    },
+    chapterList: {
+      actionID: "chapterList",
+      host: "https://novel.example",
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      list: "//a",
+      title: ".",
+      url: "./@href",
+    },
+  };
+  const seen = [];
+  const download = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    return Buffer.from("<html><ul><li><a href='/a'>A</a></li></ul></html>");
+  };
+  await applyVerifyAndAnalyzeFallback(
+    { 进度站: source },
+    {
+      download,
+      concurrency: 1,
+      timeoutMs: 200,
+      enabled: true,
+      analyzeFallback: false,
+      onProgress: (progress) => {
+        if (progress.current || progress.active?.length) seen.push(progress);
+      },
+    },
+  );
+  assert.ok(seen.length >= 1);
+  assert.ok(seen.some((item) => String(item.current).includes("进度站")));
+  assert.ok(seen.some((item) => String(item.current).includes("novel.example")));
+});

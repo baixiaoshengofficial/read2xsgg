@@ -7,6 +7,7 @@ import { verifyConvertedSource } from "./verifySource.js";
  *
  * When `budgetMs` elapses, remaining sources are kept unverified so large
  * aggregate converts still finish within proxy/client timeouts.
+ * Pass `budgetMs: 0` for unbounded full verify (async library jobs).
  */
 function emitProgress(onProgress, payload) {
   if (typeof onProgress !== "function") return;
@@ -15,6 +16,19 @@ function emitProgress(onProgress, payload) {
   } catch {
     // Progress callbacks must not break conversion.
   }
+}
+
+function sourceDisplayName(name, source) {
+  const label = String(name || source?.sourceName || source?.bookSourceName || "").trim();
+  const host = String(source?.sourceUrl || source?.host || source?.bookSourceUrl || "").trim();
+  if (label && host) {
+    try {
+      return `${label} (${new URL(host).hostname})`;
+    } catch {
+      return `${label} (${host})`;
+    }
+  }
+  return label || host || "未命名书源";
 }
 
 export async function applyVerifyAndAnalyzeFallback(sources, {
@@ -39,11 +53,14 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
       unverifiedCount: 0,
     };
     emitProgress(onProgress, {
+      phase: "verify",
       done: input.length,
       total: input.length,
       kept: input.length,
       skipped: 0,
       unverified: 0,
+      current: "",
+      active: [],
     });
     return result;
   }
@@ -58,9 +75,13 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
   let processed = 0;
   const total = input.length;
   const deadline = budgetMs > 0 ? Date.now() + budgetMs : 0;
+  /** @type {Set<string>} */
+  const active = new Set();
 
-  const report = () => {
+  const report = (extra = {}) => {
+    const activeList = [...active];
     emitProgress(onProgress, {
+      phase: "verify",
       done: processed,
       total,
       kept: Object.keys(kept).length,
@@ -68,6 +89,9 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
       unverified: unverifiedCount,
       fallback: fallbackCount,
       failed: failedVerifyCount,
+      current: activeList[0] || "",
+      active: activeList,
+      ...extra,
     });
   };
 
@@ -76,6 +100,7 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
       const index = cursor;
       cursor += 1;
       const [name, source] = input[index];
+      const label = sourceDisplayName(name, source);
 
       if (deadline && Date.now() >= deadline) {
         kept[name] = source;
@@ -85,68 +110,70 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
         continue;
       }
 
-      const verified = await verifyConvertedSource(source, { download, timeoutMs });
-      if (verified.ok) {
-        kept[name] = source;
-        processed += 1;
-        report();
-        continue;
-      }
-      failedVerifyCount += 1;
-      if (!analyzeFallback) {
-        skipped.push({ source: name, reason: verified.reason || "rules-stale: empty-list" });
-        processed += 1;
-        report();
-        continue;
-      }
-      const host = String(source?.sourceUrl || source?.host || source?.bookSourceUrl || "").trim();
-      if (!host) {
-        skipped.push({ source: name, reason: verified.reason || "rules-stale: empty-list" });
-        processed += 1;
-        report();
-        continue;
-      }
-      const preferKind = String(source?.sourceType || "").trim();
-      const analyzed = await analyzeSite(host, {
-        download,
-        sourceName: name,
-        timeoutMs: analyzeTimeoutMs,
-        preferKind: ["text", "comic", "audio", "video"].includes(preferKind) ? preferKind : "",
-      });
-      if (!analyzed.ok) {
-        skipped.push({
+      active.add(label);
+      report({ step: "verify" });
+      try {
+        const verified = await verifyConvertedSource(source, { download, timeoutMs });
+        if (verified.ok) {
+          kept[name] = source;
+          processed += 1;
+          continue;
+        }
+        failedVerifyCount += 1;
+        if (!analyzeFallback) {
+          skipped.push({ source: name, reason: verified.reason || "rules-stale: empty-list" });
+          processed += 1;
+          continue;
+        }
+        const host = String(source?.sourceUrl || source?.host || source?.bookSourceUrl || "").trim();
+        if (!host) {
+          skipped.push({ source: name, reason: verified.reason || "rules-stale: empty-list" });
+          processed += 1;
+          continue;
+        }
+        report({ step: "analyze" });
+        const preferKind = String(source?.sourceType || "").trim();
+        const analyzed = await analyzeSite(host, {
+          download,
+          sourceName: name,
+          timeoutMs: analyzeTimeoutMs,
+          preferKind: ["text", "comic", "audio", "video"].includes(preferKind) ? preferKind : "",
+        });
+        if (!analyzed.ok) {
+          skipped.push({
+            source: name,
+            reason: analyzed.reason || "analyze-failed: 识站失败",
+          });
+          processed += 1;
+          continue;
+        }
+        // Prefer a generated source matching the original type; keep display name.
+        const generated = analyzed.sources || {};
+        const matchName = Object.keys(generated).find((key) => generated[key]?.sourceType === preferKind);
+        const picked = (matchName && generated[matchName])
+          || analyzed.source
+          || Object.values(generated)[0];
+        if (!picked) {
+          skipped.push({ source: name, reason: analyzed.reason || "analyze-failed: 识站失败" });
+          processed += 1;
+          continue;
+        }
+        picked.sourceName = name;
+        kept[name] = picked;
+        fallbackCount += 1;
+        if (analyzed.warning) warnings.push({ ...analyzed.warning, source: name });
+        warnings.push({
           source: name,
-          reason: analyzed.reason || "analyze-failed: 识站失败",
+          section: "source",
+          field: "verify",
+          message: `阅读规则抽测失败（${verified.reason}），已回退自动识站`,
+          rule: host,
         });
         processed += 1;
+      } finally {
+        active.delete(label);
         report();
-        continue;
       }
-      // Prefer a generated source matching the original type; keep display name.
-      const generated = analyzed.sources || {};
-      const matchName = Object.keys(generated).find((key) => generated[key]?.sourceType === preferKind);
-      const picked = (matchName && generated[matchName])
-        || analyzed.source
-        || Object.values(generated)[0];
-      if (!picked) {
-        skipped.push({ source: name, reason: analyzed.reason || "analyze-failed: 识站失败" });
-        processed += 1;
-        report();
-        continue;
-      }
-      picked.sourceName = name;
-      kept[name] = picked;
-      fallbackCount += 1;
-      if (analyzed.warning) warnings.push({ ...analyzed.warning, source: name });
-      warnings.push({
-        source: name,
-        section: "source",
-        field: "verify",
-        message: `阅读规则抽测失败（${verified.reason}），已回退自动识站`,
-        rule: host,
-      });
-      processed += 1;
-      report();
     }
   });
   await Promise.all(workers);

@@ -10,8 +10,8 @@ import { encodeXbs } from "./xbs.js";
  * @param {object} config
  * @param {string} [imageProxyBase]
  * @param {object} [options]
- * @param {boolean} [options.fullVerify] - When true, ignore verifyMaxSources / verifyBudgetMs
- *   so async library jobs can finish thorough verify+analyze.
+ * @param {boolean} [options.fullVerify] - When true, ignore sync verifyMaxSources skip
+ *   and run full verify+analyze. Optional JOB_VERIFY_BUDGET_MS (>0) caps wall time.
  * @param {(progress: object) => void} [options.onProgress]
  * @param {typeof downloadSource} [options.downloadSource]
  * @param {Function} [options.adaptOnlineSources]
@@ -30,6 +30,14 @@ export async function convertOnlineSource(sourceUrl, config, imageProxyBase = ""
 
   const fullVerify = Boolean(options.fullVerify);
   const onProgress = options.onProgress || null;
+  const emit = (payload) => {
+    if (typeof onProgress !== "function") return;
+    try {
+      onProgress(payload);
+    } catch {
+      // Progress callbacks must not break conversion.
+    }
+  };
 
   let parsed;
   let parseError;
@@ -59,13 +67,27 @@ export async function convertOnlineSource(sourceUrl, config, imageProxyBase = ""
   if (!parsed && downloadError) throw downloadError;
   if (!parsed) throw new HttpError(422, "在线阅读源不是有效 JSON");
   parsed = await adaptOnlineSources(parsed, config);
+
+  emit({ phase: "convert", done: 0, total: 0, kept: 0, skipped: 0, unverified: 0 });
   let converted;
   try {
     converted = convertLegado(parsed, { imageProxyBase, omitNonPortable: true });
   } catch (error) {
     throw new HttpError(422, `无法转换在线阅读源：${error.message}`);
   }
-  const preflight = await filterReachableSources(Object.values(converted.sources), config);
+  const convertedCount = Object.keys(converted.sources).length;
+  emit({
+    phase: "convert",
+    done: convertedCount,
+    total: convertedCount + (converted.skipped?.length || 0),
+    kept: convertedCount,
+    skipped: converted.skipped?.length || 0,
+    unverified: 0,
+  });
+
+  const preflight = await filterReachableSources(Object.values(converted.sources), config, {
+    onProgress: (progress) => emit({ ...progress, phase: progress.phase || "preflight" }),
+  });
   if (config.preflightSources) {
     const reachableSources = new Set(preflight.input);
     converted.sources = Object.fromEntries(Object.entries(converted.sources).filter(([, source]) => reachableSources.has(source)));
@@ -92,6 +114,12 @@ export async function convertOnlineSource(sourceUrl, config, imageProxyBase = ""
     : config.verifyConvertedSources
       && sourceCount > 0
       && sourceCount <= (config.verifyMaxSources || 50);
+  // Sync path: short VERIFY_BUDGET_MS.
+  // Job path: JOB_VERIFY_BUDGET_MS (0 = unbounded full verify).
+  const jobBudget = Number(config.jobVerifyBudgetMs);
+  const budgetMs = fullVerify
+    ? (Number.isFinite(jobBudget) && jobBudget > 0 ? jobBudget : 0)
+    : config.verifyBudgetMs;
   const gated = await applyVerifyAndAnalyzeFallback(converted.sources, {
     download,
     concurrency: config.preflightConcurrency,
@@ -101,8 +129,8 @@ export async function convertOnlineSource(sourceUrl, config, imageProxyBase = ""
     analyzeFallback: fullVerify
       ? (options.analyzeFallback !== undefined ? Boolean(options.analyzeFallback) : true)
       : config.analyzeFallback,
-    budgetMs: fullVerify ? 0 : config.verifyBudgetMs,
-    onProgress,
+    budgetMs,
+    onProgress: (progress) => emit({ ...progress, phase: progress.phase || "verify" }),
   });
   converted.sources = gated.sources;
   if (!verifyEnabled && !fullVerify && config.verifyConvertedSources && sourceCount > (config.verifyMaxSources || 50)) {
@@ -130,7 +158,9 @@ export async function convertOnlineSource(sourceUrl, config, imageProxyBase = ""
       source: "",
       section: "source",
       field: "verify",
-      message: `抽测超时预算已用尽，另有 ${gated.unverifiedCount} 个源未抽测仍保留`,
+      message: fullVerify
+        ? `异步任务抽测预算已用尽（${Math.round(budgetMs / 1000)}s），另有 ${gated.unverifiedCount} 个源未抽测仍保留`
+        : `抽测超时预算已用尽，另有 ${gated.unverifiedCount} 个源未抽测仍保留`,
       rule: "",
     });
   }
@@ -151,6 +181,7 @@ export async function convertOnlineSource(sourceUrl, config, imageProxyBase = ""
     ...converted,
     count,
     fallbackCount: gated.fallbackCount || 0,
+    unverifiedCount: gated.unverifiedCount || 0,
     skippedBuckets: buckets,
     json,
     xbs,

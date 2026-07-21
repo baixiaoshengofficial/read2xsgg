@@ -118,40 +118,43 @@ function wrapComicImageContent(contentRule) {
 }
 
 /**
- * 有声正文：香色 audio 期望 content 最终给出可播媒体。
- * 参考官方样例（海洋听书/老白故事）：返回 JSON 字符串 {url, httpHeaders, forbidCache}。
+ * 有声/视频正文：香色期望 content 最终给出可播媒体 JSON。
+ * 有 imageProxyBase 时把播放地址改走 /media 转发（防盗链、Referer），与漫画 /image 同思路。
  */
-function wrapMediaContent(contentRule) {
+function wrapMediaContent(contentRule, imageProxyBase = "") {
   if (!contentRule) return contentRule;
-  // 已显式构造播放 JSON 的 JS，不再二次包装
   if (/JSON\.stringify\s*\(\s*\{[\s\S]*\burl\b/i.test(contentRule)) return contentRule;
   if (/forbidCache/i.test(contentRule) && /\burl\s*:/i.test(contentRule)) return contentRule;
+  const mediaEndpoint = imageProxyBase
+    ? `${String(imageProxyBase).replace(/\/$/, "")}/media?url=`
+    : "";
   const wrapJs = [
     "@js:",
     "var url = String(result || \"\").trim();",
     "if (!url) return url;",
     "if (url.charAt(0) === \"{\") return url;",
-    // 正文里偶发 <audio src> / 纯链接混排，取第一个像媒体的 URL
-    "var m = url.match(/https?:\\/\\/[^\\s\"'<>]+\\.(?:mp3|m4a|aac|ogg|wav|flac)(?:\\?[^\\s\"'<>]*)?/i)",
+    "var m = url.match(/https?:\\/\\/[^\\s\"'<>]+\\.(?:mp3|m4a|aac|ogg|wav|flac|mp4|m3u8|m4v|webm)(?:\\?[^\\s\"'<>]*)?/i)",
     "  || url.match(/https?:\\/\\/[^\\s\"'<>]+/i)",
     "  || (url.charAt(0) === \"/\" ? [null, url] : null);",
     "if (m) url = m[1] || m[0];",
+    mediaEndpoint
+      ? `var endpoint = ${JSON.stringify(mediaEndpoint)}; if (url) url = endpoint + encodeURIComponent(url);`
+      : "url = encodeURI(url);",
     "return JSON.stringify({",
-    "  url: encodeURI(url),",
-    "  httpHeaders: config.httpHeaders,",
+    "  url: url,",
+    mediaEndpoint ? "  httpHeaders: {}," : "  httpHeaders: config.httpHeaders,",
     "  forbidCache: true",
     "});",
   ].join("\n");
-  if (/\|\|?\s*@js:/i.test(contentRule)) {
-    // 香色公开样例中没有串联多个 @js 后处理器；保留现有脚本，避免把
-    // 第二段 `||@js:` 当作第一段 JavaScript 的源码。
-    return contentRule;
-  }
+  if (/\|\|?\s*@js:/i.test(contentRule)) return contentRule;
   return `${contentRule}||${wrapJs}`;
 }
 
 /** Audio/video sources often put the playable URL directly in chapterUrl. */
-function directMediaContent() {
+function directMediaContent(imageProxyBase = "") {
+  const mediaEndpoint = imageProxyBase
+    ? `${String(imageProxyBase).replace(/\/$/, "")}/media?url=`
+    : "";
   return [
     "@js:",
     'var q = (typeof params !== "undefined" && params.queryInfo) || {};',
@@ -159,9 +162,12 @@ function directMediaContent() {
     'if (!url && typeof result === "string" && /^(?:https?:)?\\/\\//i.test(result.trim())) url = result.trim();',
     'if (url.indexOf("//") === 0) url = "https:" + url;',
     'else if (url && !/^https?:\\/\\//i.test(url)) url = config.host + (url.charAt(0) === "/" ? url : "/" + url);',
+    mediaEndpoint
+      ? `var endpoint = ${JSON.stringify(mediaEndpoint)}; if (url) url = endpoint + encodeURIComponent(url);`
+      : "url = encodeURI(url);",
     "return JSON.stringify({",
-    "  url: encodeURI(url),",
-    "  httpHeaders: config.httpHeaders,",
+    "  url: url,",
+    mediaEndpoint ? "  httpHeaders: {}," : "  httpHeaders: config.httpHeaders,",
     "  forbidCache: true",
     "});",
   ].join("\n");
@@ -377,6 +383,7 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
   const plan = compileChapterBridgePlan(action, {
     tocSelector,
     headers: { ...headers, ...(action.httpHeaders || {}) },
+    reverse: Boolean(action.reverseChapters || action.reverse),
   });
   if (!plan.list || !plan.fields.title || !plan.fields.url) return action;
   const endpoint = bridgeEndpoint(bridgeBase, "chapters", plan);
@@ -386,7 +393,8 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
     ? runtimeAdapterRequestInfo(adapterEndpointWithPaging(endpoint, { pageSize, serverPaging }))
     : bridgeRequestInfo(action.requestInfo || "%@result", endpoint, { pageSize, serverPaging });
   if (!requestInfo) return action;
-  return preserveEncode(action, {
+  const { reverseChapters: _reverseChapters, reverse: _reverse, ...rest } = action;
+  return preserveEncode(rest, {
     ...commonAction("chapterList", action.host, "json"),
     requestInfo,
     list: "$.data",
@@ -484,11 +492,12 @@ function proxiedHtmlComicChapterContent(host, imageProxyBase, decoder = "auto", 
   };
 }
 
-/** Generic server-side audio/video URL extraction for JSON and Android-only rules. */
+/** Generic server-side audio/video URL extraction + /media proxy (like /image). */
 function proxiedMediaChapterContent(host, imageProxyBase, kind, extractionPlan) {
   const base = String(imageProxyBase).replace(/\/$/, "");
   const encodedPlan = encodeMediaExtractionPlan(extractionPlan);
   const endpoint = `${base}/adapter/media?kind=${kind}&plan=${encodedPlan}&url=`;
+  const mediaEndpoint = `${base}/media?url=`;
   return {
     ...commonAction("chapterContent", host, "json"),
     requestInfo: runtimeAdapterRequestInfo(endpoint),
@@ -496,9 +505,11 @@ function proxiedMediaChapterContent(host, imageProxyBase, kind, extractionPlan) 
       "@js:",
       'var payload = (typeof result === "string") ? JSON.parse(result) : result;',
       'var url = String((payload && payload.url) || "").trim();',
+      `var endpoint = ${JSON.stringify(mediaEndpoint)};`,
+      "if (url) url = endpoint + encodeURIComponent(url);",
       "return JSON.stringify({",
-      "  url: encodeURI(url),",
-      "  httpHeaders: config.httpHeaders,",
+      "  url: url,",
+      "  httpHeaders: {},",
       "  forbidCache: true",
       "});",
     ].join("\n"),
@@ -752,11 +763,23 @@ function mapTocRules(rules, responseType, warningFor) {
     nextTocUrl: "nextPageUrl",
   };
   const result = {};
+  // Legado: chapterList 首字符 `-` 表示目录倒序。必须先剥掉再转换选择器，
+  // 否则 `-//li` 会被误解析成残缺 XPath。
+  let chapterListRule = rules.chapterList;
+  let reverseChapters = false;
+  if (typeof chapterListRule === "string") {
+    const stripped = chapterListRule.match(/^\s*-(?=[@.#/:*\[a-zA-Z])([\s\S]*)$/);
+    if (stripped) {
+      reverseChapters = true;
+      chapterListRule = stripped[1].trim();
+    }
+  }
   for (const [from, to] of Object.entries(mapping)) {
-    if (rules[from] !== undefined && rules[from] !== "") {
+    const raw = from === "chapterList" ? chapterListRule : rules[from];
+    if (raw !== undefined && raw !== "") {
       result[to] = compatibleTextRule(
-        rules[from],
-        convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) }),
+        raw,
+        convertRule(raw, { responseType, warn: warningFor(from, raw) }),
       );
     }
   }
@@ -766,6 +789,7 @@ function mapTocRules(rules, responseType, warningFor) {
   if (responseType === "html" && result.list && /(?:^|@)href(?:$|##)/i.test(String(rules.chapterUrl || ""))) {
     result.list = `(${result.list})[self::a[@href] or .//a[@href]]`;
   }
+  if (reverseChapters) result.reverseChapters = true;
   return result;
 }
 
@@ -777,8 +801,19 @@ function buildBookAction({ actionID, host, request, rules, headers, warnings, so
     ...convertRequest(request, { headers, warn: warningFor("request", request), fallback: actionID === "searchBook" ? "" : "%@result" }),
     ...mapBookRules(rules, responseType, warningFor, { listContext: true }),
   };
-  if (rules.bookList && !action.moreKeys) action.moreKeys = { pageSize: 20 };
+  if (rules.bookList && !action.moreKeys) {
+    action.moreKeys = { pageSize: listPageSizeForRequest(action.requestInfo || request, null) };
+  }
   return action;
+}
+
+/** Decorative explore headers like `°・*.☆ 全部榜单 ☆.*・°` are not real groups. */
+function isOrnamentalExploreHeader(value) {
+  const text = String(value || "").trim();
+  if (!text) return true;
+  if (/[☆★°・＊※◆◇■□▲△]/.test(text)) return true;
+  const stripped = text.replace(/[\s\-—－_=.*·]+/g, "");
+  return stripped.length > 0 && stripped.length < 2;
 }
 
 function extractTitleUrlLinesFromText(text) {
@@ -787,11 +822,14 @@ function extractTitleUrlLinesFromText(text) {
     const value = line.trim();
     const separator = value.indexOf("::");
     if (separator > 0 && !value.slice(separator + 2).trim()) {
-      group = value.slice(0, separator).replace(/[—－\-\s]/g, "") || group;
+      const header = value.slice(0, separator).replace(/[—－\-\s]/g, "");
+      if (header && !isOrnamentalExploreHeader(value.slice(0, separator))) group = header;
       return null;
     }
     if (separator <= 0) {
-      if (value) group = value.replace(/[—－\-\s]/g, "") || group;
+      if (value && !isOrnamentalExploreHeader(value)) {
+        group = value.replace(/[—－\-\s]/g, "") || group;
+      }
       return null;
     }
     const title = value.slice(0, separator).trim();
@@ -800,6 +838,20 @@ function extractTitleUrlLinesFromText(text) {
     if (!/^(?:\/|https?:\/\/)/i.test(url) && !/\{\{\s*page\s*\}\}|%@pageIndex/i.test(url)) return null;
     return { title, url, group };
   }).filter((item) => item?.title && item?.url);
+}
+
+/**
+ * 香色用 moreKeys.pageSize 判断「本页条数 < pageSize ⇒ 没有下一页」。
+ * 上游自带 page 占位时，默认 10（国内列表站常见页长），避免默认 20 导致只加载第一页。
+ */
+function listPageSizeForRequest(template, configured) {
+  const numeric = Number(configured);
+  if (Number.isInteger(numeric) && numeric > 0) return Math.min(200, numeric);
+  const source = String(template || "");
+  if (/__READ2XSGG_PAGE__|\{\{\s*page\s*\}\}|%@pageIndex|params\.pageIndex/i.test(source)) {
+    return 10;
+  }
+  return 20;
 }
 
 /**
@@ -895,8 +947,7 @@ function compactBookWorld(entries, { host, rules, responseType, warningFor }) {
     seenLabels.set(base, occurrence);
     return `${occurrence === 1 ? base : `${base} (${occurrence})`}::${index}`;
   });
-  const configuredPageSize = Number(entries[0]?.pageSize);
-  const pageSize = Number.isInteger(configuredPageSize) && configuredPageSize > 0 ? configuredPageSize : 20;
+  const pageSize = listPageSizeForRequest(templates[0], entries[0]?.pageSize);
   const requestFilters = labels.map((label, index) => (
     `${label.slice(0, label.lastIndexOf("::") + 2)}${templates[index]}`
   ));
@@ -1010,8 +1061,7 @@ function buildBookWorld(source, context) {
       title = `${baseTitle} (${duplicate})`;
       duplicate += 1;
     }
-    const configuredPageSize = Number(entry.pageSize);
-    const pageSize = Number.isInteger(configuredPageSize) && configuredPageSize > 0 ? configuredPageSize : 20;
+    const pageSize = listPageSizeForRequest(entry.url, entry.pageSize);
     result[title] = {
       ...commonAction("bookWorld", host, responseType),
       ...convertRequest(entry.url, { headers, warn: warningFor("exploreUrl", entry.url), fallback: "" }),
@@ -1065,7 +1115,12 @@ function convertOne(source, warnings, options = {}) {
   const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode);
   const comicExtractionPlan = compileComicExtractionPlan(contentRules.content, headers);
   const mediaExtractionPlan = (resolvedType === "audio" || resolvedType === "video")
-    ? compileMediaExtractionPlan(`${contentRules.content || ""}\n${tocRules.chapterUrl || ""}`, resolvedType, headers)
+    ? compileMediaExtractionPlan(
+      `${contentRules.content || ""}\n${tocRules.chapterUrl || ""}`,
+      resolvedType,
+      headers,
+      { sourceRegex: contentRules.sourceRegex || "" },
+    )
     : null;
   const isJmComic = resolvedType === "comic" && (
     ["jm-scramble", "id-md5-reverse-tiles"].includes(imageDecoder)
@@ -1191,7 +1246,7 @@ function convertOne(source, warnings, options = {}) {
     content = wrapComicImageContent(content);
   }
   if (content && (resolvedType === "audio" || resolvedType === "video")) {
-    content = wrapMediaContent(content);
+    content = wrapMediaContent(content, options.imageProxyBase);
   }
 
   const converted = {
@@ -1250,12 +1305,14 @@ function convertOne(source, warnings, options = {}) {
       comicExtractionPlan,
     );
   }
+  const hasSourceRegex = Boolean(String(contentRules.sourceRegex || "").trim());
   const mediaRuleNeedsServer = contentResponseType === "json"
+    || hasSourceRegex
     || /(?:\bjava\.|\bPackages\b|\bandroid\.|\bsource\.|\bbook\.|\bjavaScript\.)/i
       .test(String(contentRules.content || ""));
   const hasMediaChapterUrl = Boolean(tocRules.chapterUrl && String(tocRules.chapterUrl).trim() !== "-");
   if ((resolvedType === "audio" || resolvedType === "video") && !contentRules.content && hasMediaChapterUrl) {
-    converted.chapterContent.content = directMediaContent();
+    converted.chapterContent.content = directMediaContent(options.imageProxyBase);
     contentWarningFor("content", contentRules.content)("正文为空但章节规则提供媒体 URL，已自动将章节 URL 作为播放地址");
   }
   if (resolvedType === "comic" && converted.chapterList.list && !converted.chapterList.url) {
@@ -1266,15 +1323,33 @@ function convertOne(source, warnings, options = {}) {
     ].join("\n");
     tocWarningFor("chapterUrl", tocRules.chapterUrl)("单章节图片源没有 chapterUrl，已使用当前详情页作为章节地址");
   }
-  if ((resolvedType === "audio" || resolvedType === "video") && options.imageProxyBase
-    && hasMediaChapterUrl && mediaRuleNeedsServer) {
+  if ((resolvedType === "audio" || resolvedType === "video") && options.imageProxyBase && mediaRuleNeedsServer) {
     converted.chapterContent = proxiedMediaChapterContent(
       host,
       options.imageProxyBase,
       resolvedType,
       mediaExtractionPlan,
     );
-    contentWarningFor("content", contentRules.content)("正文为 JSON 媒体接口或依赖阅读 Android API，已改由通用媒体提取器解析播放地址");
+    contentWarningFor("content", contentRules.content)(
+      hasSourceRegex
+        ? "阅读 sourceRegex 扩展名已编入媒体提取计划，正文改由通用媒体适配器解析并由 /media 转发"
+        : "正文为 JSON 媒体接口或依赖阅读 Android API，已改由通用媒体提取器解析播放地址",
+    );
+  } else if ((resolvedType === "audio" || resolvedType === "video") && hasSourceRegex) {
+    // Offline / no proxy: enable 香色 webView so the chapter page can load like
+    // Legado's interceptor path; play URL still comes from content / wrapMediaContent.
+    converted.chapterContent.requestInfo = [
+      "@js:",
+      'var u = String(result || "");',
+      "if (!u && typeof params !== \"undefined\" && params.queryInfo) {",
+      '  var q = params.queryInfo;',
+      '  u = String(q.url || q.chapterUrl || q.detailUrl || "");',
+      "}",
+      "return {url: u, webView: true};",
+    ].join("\n");
+    contentWarningFor("sourceRegex", contentRules.sourceRegex)(
+      "阅读 sourceRegex 已改由香色 webView 加载正文页；无转换站代理时无法服务端拦截网络流",
+    );
   }
 
   // apply replaceRegex / replaceRegex array onto content field. 2.56.1 的
@@ -1331,6 +1406,10 @@ function convertOne(source, warnings, options = {}) {
     if (resolvedType === "text") {
       converted.chapterContent = bridgeTextAction(converted.chapterContent, options.imageProxyBase, headers);
     }
+  }
+  // reverseChapters is only meaningful inside the bridge plan; never ship it to Xiangse.
+  if (converted.chapterList && "reverseChapters" in converted.chapterList) {
+    delete converted.chapterList.reverseChapters;
   }
 
   if (!source.searchUrl) warningForSource("searchUrl", source.searchUrl)("缺少 searchUrl，转换后的源不能搜索");
@@ -1414,20 +1493,12 @@ export function portableConvertedSource(source) {
   return { portable: Boolean(source?.sourceUrl && world && search && detail && toc && content), world, search, detail, toc, content };
 }
 
-function nonPortableOnlineMediaReason(source, converted) {
-  if (!new Set(["audio", "video"]).has(converted?.sourceType)) return "";
-  const contentRules = getRules(source, "ruleContent", "contentRule");
-  if (contentRules.sourceRegex) {
-    return "正文依赖阅读 WebView 网络拦截（sourceRegex），香色无 sourceRegex，HTTP 转换器无法可靠取得媒体流";
-  }
-  const toc = converted?.chapterList || {};
-  const serverParsed = /\/adapter\/chapters\?/i.test(String(toc.requestInfo || ""));
-  if (!serverParsed && [toc.title, toc.url].some((rule) => /^@js:/i.test(String(rule || "").trim()))) {
-    return "章节标题或媒体 URL 仍依赖客户端 JavaScript，未能编译为服务器 JSON 规则";
-  }
-  if (!String(converted?.chapterContent?.content || "").trim()) {
-    return "有声/视频缺少可播放正文，且章节链接不是可识别的媒体直链";
-  }
+/**
+ * Audio/video use the same core-chain / portable checks as text. sourceRegex and
+ * Android JS rules are rewritten to the generic media adapter + /media proxy
+ * (or 香色 webView when offline), so they are no longer omitted here.
+ */
+function nonPortableOnlineMediaReason() {
   return "";
 }
 
