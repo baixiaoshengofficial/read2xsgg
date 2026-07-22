@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 function nowIso() {
@@ -32,6 +32,10 @@ async function writeJsonAtomic(filePath, value) {
     // Explicit mode so root-run ops CLIs do not leave 0600 files unreadable to the service user.
     await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o644 });
     await rename(tmp, filePath);
+    // `mode` is still filtered through the caller's umask. Force the final
+    // artifact readable after the atomic rename because host-side operations
+    // can run as root while the container serves files as an unprivileged user.
+    await chmod(filePath, 0o644);
   } catch (error) {
     await rm(tmp, { force: true }).catch(() => {});
     throw error;
@@ -195,8 +199,16 @@ export function createLibraryStore(dataDir) {
 
   async function saveArtifacts(id, { xbs, json } = {}) {
     await ensure();
-    if (xbs) await writeFile(artifactPath(id, "xbs"), xbs, { mode: 0o644 });
-    if (json) await writeFile(artifactPath(id, "json"), json, { mode: 0o644 });
+    if (xbs) {
+      const target = artifactPath(id, "xbs");
+      await writeFile(target, xbs, { mode: 0o644 });
+      await chmod(target, 0o644);
+    }
+    if (json) {
+      const target = artifactPath(id, "json");
+      await writeFile(target, json, { mode: 0o644 });
+      await chmod(target, 0o644);
+    }
   }
 
   async function readArtifact(id, ext) {

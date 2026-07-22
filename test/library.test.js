@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -30,7 +30,12 @@ test("libraryStore 持久化任务与制品", async () => {
     const xbs = encodeXbs(Buffer.from('{"a":1}\n'));
     const json = Buffer.from('{"a":1}\n');
     await store.saveArtifacts(job.id, { xbs, json });
+    await store.saveSourcePayload(job.id, { bookSourceName: "payload" });
     await store.updateJob(job.id, { status: "done", count: 1 });
+
+    const artifactDir = path.join(dir, "artifacts");
+    assert.equal((await stat(path.join(artifactDir, `${job.id}.xbs`))).mode & 0o777, 0o644);
+    assert.equal((await stat(path.join(artifactDir, `${job.id}.source.json`))).mode & 0o777, 0o644);
 
     const listed = await store.listJobs();
     assert.equal(listed[0].id, job.id);
@@ -347,6 +352,91 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
     assert.ok(planMatch);
     const plan = decodeMediaExtractionPlan(planMatch[1], "audio");
     assert.equal(mediaPlanHasResolution(plan), true);
+    assert.equal(plan.resolution.request.url, "{{origin}}/nlinka");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("convert/publish：opaque 正文仍捕获嵌套 ruleContent.mediaResolution", async () => {
+  const {
+    convertLegado,
+    publishLibraryArtifact,
+    mediaPlanHasResolution,
+    decodeMediaExtractionPlan,
+    decodeXbs,
+    declaredMediaResolution,
+  } = await import("../src/index.js");
+  const fixture = JSON.parse(
+    await readFile(path.resolve("sources/migrations/lian-ting.legado.json"), "utf8"),
+  );
+  // Opaque content cannot compile a resolution from JS; only the nested
+  // ruleContent.mediaResolution declaration may populate the generic plan.
+  const source = {
+    bookSourceName: "声明式有声",
+    bookSourceUrl: "https://audio.fixture.example/",
+    bookSourceType: 1,
+    searchUrl: "https://audio.fixture.example/search?q={{key}}",
+    ruleSearch: { bookList: "li", name: "a", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1" },
+    ruleToc: { chapterList: "li", chapterName: "a", chapterUrl: "a@href" },
+    ruleContent: {
+      content: "<js>result</js>",
+      sourceRegex: ".*\\.(mp3|m4a).*",
+      mediaResolution: fixture.ruleContent.mediaResolution,
+    },
+  };
+  assert.equal(declaredMediaResolution(source).request.url, "{{origin}}/nlinka");
+  assert.equal(source.read2xsgg?.mediaResolution, undefined);
+
+  const convertedOffline = convertLegado(source, {
+    imageProxyBase: "https://convert.example",
+    omitNonPortable: true,
+  });
+  const offline = convertedOffline.sources["声明式有声"];
+  assert.ok(offline);
+  const offlineMatch = String(offline.chapterContent.requestInfo).match(/plan=([A-Za-z0-9_-]+)/);
+  assert.ok(offlineMatch);
+  const offlinePlan = decodeMediaExtractionPlan(offlineMatch[1], "audio");
+  assert.equal(mediaPlanHasResolution(offlinePlan), true);
+  assert.equal(offlinePlan.resolution.request.url, "{{origin}}/nlinka");
+  assert.deepEqual(offlinePlan.resolution.response.properties, ["url", "ourl"]);
+
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-nested-mr-"));
+  try {
+    const store = createLibraryStore(dir);
+    const job = await store.createJob({
+      url: "https://example.com/legacy-remote.json",
+      name: "legacy-remote",
+      imageProxyBase: "https://convert.example",
+    });
+    await store.updateJob(job.id, { status: "done", count: 0 });
+    const published = await publishLibraryArtifact({
+      store,
+      jobId: job.id,
+      source,
+      config: serverConfig({
+        PREFLIGHT_SOURCES: "false",
+        VERIFY_CONVERTED_SOURCES: "false",
+        ANALYZE_FALLBACK: "false",
+      }),
+      imageProxyBase: "https://convert.example",
+      verify: false,
+    });
+    assert.equal(published.job.publishedFrom, "payload");
+    const payload = await store.readSourcePayload(job.id);
+    assert.equal(payload.ruleContent.mediaResolution.request.url, "{{origin}}/nlinka");
+    assert.equal(payload.read2xsgg?.mediaResolution, undefined);
+
+    const xbs = await store.readArtifact(job.id, "xbs");
+    const sources = JSON.parse(decodeXbs(xbs).toString("utf8"));
+    const converted = sources["声明式有声"];
+    assert.ok(converted);
+    const planMatch = String(converted.chapterContent.requestInfo).match(/plan=([A-Za-z0-9_-]+)/);
+    assert.ok(planMatch);
+    const plan = decodeMediaExtractionPlan(planMatch[1], "audio");
+    assert.equal(mediaPlanHasResolution(plan), true);
+    assert.equal(plan.resolution.request.url, "{{origin}}/nlinka");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
