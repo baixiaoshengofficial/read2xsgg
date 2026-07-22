@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   compileMediaExtractionPlan,
   compileMediaResolutionFromRule,
+  declaredMediaResolution,
   decodeMediaExtractionPlan,
   encodeMediaExtractionPlan,
   executeMediaResolution,
@@ -14,6 +15,42 @@ import {
   pageMediaUrls,
   resolveChapterMediaUrls,
 } from "../src/index.js";
+
+const SAMPLE_RESOLUTION = {
+  extract: [{ name: "token", source: "meta", key: "_t" }],
+  request: { url: "{{origin}}/play", method: "POST", body: "t={{token}}" },
+  response: { properties: ["url"] },
+};
+
+test("declaredMediaResolution：从 ruleContent / nested read2xsgg / 源根提取声明", () => {
+  assert.equal(declaredMediaResolution(null), null);
+  assert.deepEqual(
+    declaredMediaResolution({ ruleContent: { mediaResolution: SAMPLE_RESOLUTION } }),
+    SAMPLE_RESOLUTION,
+  );
+  assert.deepEqual(
+    declaredMediaResolution({
+      contentRule: { read2xsgg: { mediaResolution: SAMPLE_RESOLUTION } },
+    }),
+    SAMPLE_RESOLUTION,
+  );
+  assert.deepEqual(
+    declaredMediaResolution({ read2xsgg: { mediaResolution: SAMPLE_RESOLUTION } }),
+    SAMPLE_RESOLUTION,
+  );
+  assert.deepEqual(
+    declaredMediaResolution({ mediaResolution: SAMPLE_RESOLUTION }),
+    SAMPLE_RESOLUTION,
+  );
+  // Prefer rule-object declaration over a conflicting source-root bag.
+  assert.equal(
+    declaredMediaResolution({
+      ruleContent: { mediaResolution: SAMPLE_RESOLUTION },
+      read2xsgg: { mediaResolution: { ...SAMPLE_RESOLUTION, request: { url: "{{origin}}/other" } } },
+    }).request.url,
+    "{{origin}}/play",
+  );
+});
 
 test("媒体提取计划只保留安全字段和属性提示", () => {
   const plan = compileMediaExtractionPlan(`

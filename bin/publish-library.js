@@ -16,7 +16,7 @@ function usage() {
 
 选项:
   --id <jobId>                 已有库任务 ID（订阅路径保持 /library/{id}.xbs）
-  --source <file>              声明式 Legado JSON（可含 read2xsgg.mediaResolution）
+  --source <file>              声明式 Legado JSON（可含 ruleContent.mediaResolution 或 read2xsgg.mediaResolution）
   --data-dir <dir>             DATA_DIR（默认环境变量或 ./data）
   --image-proxy-base <url>     写入适配器链接的公开基址（默认沿用任务记录）
   --verify                     发布时顺带抽测（默认只转换，便于离线确定性发布）

@@ -6,6 +6,7 @@ import { decoderForLegadoImageRule } from "./imageDecoder.js";
 import { compileComicExtractionPlan, encodeComicExtractionPlan } from "./comicPlan.js";
 import {
   compileMediaExtractionPlan,
+  declaredMediaResolution,
   encodeMediaExtractionPlan,
   mediaPlanHasResolution,
   mediaRuleNeedsPortabilityWarning,
@@ -1424,9 +1425,9 @@ function convertOne(source, warnings, options = {}) {
   const contentRules = getRules(source, "ruleContent", "contentRule");
   const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode);
   const comicExtractionPlan = compileComicExtractionPlan(contentRules.content, headers);
-  const explicitMediaResolution = contentRules.mediaResolution
-    || source.read2xsgg?.mediaResolution
-    || null;
+  // Generic: lift declared metadata from rule objects (esp. ruleContent) or
+  // source-root read2xsgg — never keyed by source name/domain.
+  const explicitMediaResolution = declaredMediaResolution(source);
   const mediaExtractionPlan = (resolvedType === "audio" || resolvedType === "video")
     ? compileMediaExtractionPlan(
       `${contentRules.content || ""}\n${tocRules.chapterUrl || ""}`,

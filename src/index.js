@@ -16,6 +16,7 @@ export { compileComicExtractionPlan, decodeComicExtractionPlan, encodeComicExtra
 export {
   compileMediaExtractionPlan,
   compileMediaResolutionFromRule,
+  declaredMediaResolution,
   decodeMediaExtractionPlan,
   encodeMediaExtractionPlan,
   executeMediaResolution,

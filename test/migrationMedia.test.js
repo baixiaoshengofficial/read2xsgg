@@ -7,7 +7,9 @@ import {
   clearCatalogPlanCache,
   compileMediaExtractionPlan,
   convertLegado,
+  declaredMediaResolution,
   decodeCatalogPlan,
+  decodeMediaExtractionPlan,
   encodeCatalogPlan,
   executeCatalogPlan,
   executeMediaResolution,
@@ -160,6 +162,11 @@ test("LRTS 迁移 fixture：分类菜单与播放 JSON 走通用计划，无域�
 });
 
 test("恋听迁移 fixture：显式 mediaResolution 可执行；legacy WebView XBS 给可移植诊断", async () => {
+  assert.equal(
+    declaredMediaResolution(lianTingFixture)?.request?.url,
+    "{{origin}}/nlinka",
+  );
+  assert.equal(lianTingFixture.read2xsgg?.mediaResolution, undefined);
   const { sources, warnings } = convertLegado(lianTingFixture, {
     imageProxyBase: "https://convert.example",
   });
@@ -168,7 +175,7 @@ test("恋听迁移 fixture：显式 mediaResolution 可执行；legacy WebView X
   assert.match(converted.chapterContent.requestInfo, /\/adapter\/media\?/);
   const planMatch = converted.chapterContent.requestInfo.match(/plan=([A-Za-z0-9_-]+)/);
   assert.ok(planMatch);
-  const plan = JSON.parse(Buffer.from(planMatch[1], "base64url").toString("utf8"));
+  const plan = decodeMediaExtractionPlan(planMatch[1], "audio");
   assert.ok(mediaPlanHasResolution(plan));
   assert.equal(plan.resolution.request.url, "{{origin}}/nlinka");
   assert.equal(plan.resolution.request.method, "POST");

@@ -293,6 +293,37 @@ export function compileMediaResolutionFromRule(rule) {
 }
 
 /**
+ * Read a declared MediaResolutionPlan fragment from a container object.
+ * Accepts either a direct `mediaResolution` field or a nested
+ * `read2xsgg.mediaResolution` bag (common on ruleContent objects).
+ */
+function mediaResolutionFrom(container) {
+  if (!container || typeof container !== "object" || Array.isArray(container)) return null;
+  const direct = container.mediaResolution;
+  if (direct && typeof direct === "object" && !Array.isArray(direct)) return direct;
+  const nested = container.read2xsgg?.mediaResolution;
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) return nested;
+  return null;
+}
+
+/**
+ * Resolve declared media-resolution metadata from a Legado source without
+ * site/domain conditionals. Prefers rule-object declarations
+ * (`ruleContent` / `contentRule`, including nested `read2xsgg`) over
+ * source-root `read2xsgg.mediaResolution` / `mediaResolution` so migration
+ * fixtures that nest under ruleContent are retained into the generic plan.
+ */
+export function declaredMediaResolution(source) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+  const contentRule = source.ruleContent ?? source.contentRule ?? null;
+  return (
+    mediaResolutionFrom(contentRule)
+    || mediaResolutionFrom(source.read2xsgg)
+    || mediaResolutionFrom(source)
+  );
+}
+
+/**
  * Compile safe, declarative hints from a Legado audio/video content rule.
  * When the rule contains a safely recognizable multi-step protected-media
  * workflow, attach a `resolution` block (MediaResolutionPlan). Executable
@@ -333,7 +364,7 @@ export function mediaPlanIsLegacyHrefOnly(plan) {
  */
 export function mediaRuleNeedsPortabilityWarning(contentRule = {}, tocRule = {}, plan = null) {
   if (mediaPlanHasResolution(plan)) return false;
-  if (contentRule?.mediaResolution || contentRule?.read2xsgg?.mediaResolution) return false;
+  if (mediaResolutionFrom(contentRule)) return false;
   const content = String(contentRule.content || "").trim();
   const sourceRegex = String(contentRule.sourceRegex || "").trim();
   const chapterUrl = String(tocRule.chapterUrl || "");
