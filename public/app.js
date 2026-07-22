@@ -16,6 +16,9 @@ const els = {
   jobs: document.getElementById("jobs"),
   refresh: document.getElementById("refresh"),
   logout: document.getElementById("logout"),
+  confirmDialog: document.getElementById("confirm-dialog"),
+  confirmMessage: document.getElementById("confirm-message"),
+  confirmOk: document.getElementById("confirm-ok"),
 };
 
 function getToken() {
@@ -166,7 +169,7 @@ function renderJobs(jobs) {
       ? `<div class="meta">订阅：<code>${subscribeUrl(job)}</code></div>`
       : "";
     const err = job.error && job.status === "failed"
-      ? `<div class="meta" style="color:var(--bad)">${escapeHtml(job.error)}</div>`
+      ? `<div class="meta meta-error">${escapeHtml(job.error)}</div>`
       : "";
     const actions = [
       job.status === "done" ? `<button type="button" data-copy="${job.id}">复制订阅 URL</button>` : "",
@@ -177,10 +180,10 @@ function renderJobs(jobs) {
     ].filter(Boolean).join("");
     return `
       <article class="job" data-id="${job.id}">
-        <p class="job-title"><span class="badge ${job.status}">${statusLabel(job.status)}</span>${escapeHtml(job.title || job.id)}</p>
+        <p class="job-title"><span class="badge ${job.status}">${statusLabel(job.status)}</span><span class="job-name">${escapeHtml(job.title || job.id)}</span></p>
         <p class="meta">${escapeHtml(job.sourceUrl || "")}</p>
         <p class="meta progress-text">${escapeHtml(progressText).replaceAll("\n", "<br>")}</p>
-        <div class="progress" aria-hidden="true"><span style="width:${pct}%"></span></div>
+        <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}" aria-label="转换进度"><span style="width:${pct}%"></span></div>
         ${sub}
         ${err}
         <div class="actions">${actions}</div>
@@ -195,6 +198,26 @@ function escapeHtml(value) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function confirmAction(message, { title = "确认操作", confirmLabel = "确认" } = {}) {
+  const dialog = els.confirmDialog;
+  if (!dialog || typeof dialog.showModal !== "function") {
+    return Promise.resolve(window.confirm(message));
+  }
+  els.confirmMessage.textContent = message;
+  const titleEl = dialog.querySelector("#confirm-title");
+  if (titleEl) titleEl.textContent = title;
+  if (els.confirmOk) els.confirmOk.textContent = confirmLabel;
+  dialog.returnValue = "cancel";
+  dialog.showModal();
+  return new Promise((resolve) => {
+    const onClose = () => {
+      dialog.removeEventListener("close", onClose);
+      resolve(dialog.returnValue === "ok");
+    };
+    dialog.addEventListener("close", onClose);
+  });
 }
 
 async function refreshJobs() {
@@ -306,7 +329,11 @@ els.jobs.addEventListener("click", async (event) => {
       await refreshJobs();
     }
     if (delId) {
-      if (!window.confirm("删除该任务及制品？")) return;
+      const ok = await confirmAction("删除该任务及制品？", {
+        title: "删除任务",
+        confirmLabel: "删除",
+      });
+      if (!ok) return;
       await api(`/api/jobs/${delId}`, { method: "DELETE" });
       await refreshJobs();
     }

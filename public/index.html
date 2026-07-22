@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>read2xsgg 源管理</title>
   <link rel="stylesheet" href="/ui/app.css" />
 </head>
@@ -20,7 +20,7 @@
       <form id="login-form" class="stack">
         <label>
           <span>管理口令</span>
-          <input id="token" type="password" autocomplete="current-password" required placeholder="ADMIN_TOKEN" />
+          <input id="token" type="password" autocomplete="current-password" required placeholder="ADMIN_TOKEN" enterkeyhint="go" />
         </label>
         <button type="submit">进入源管理</button>
       </form>
@@ -36,11 +36,11 @@
         <form id="create-form" class="stack">
           <label>
             <span>源地址</span>
-            <input id="url" type="url" required placeholder="https://example.com/legado.json" />
+            <input id="url" type="url" inputmode="url" autocomplete="url" required placeholder="https://example.com/legado.json" enterkeyhint="next" />
           </label>
           <label>
             <span>显示名称（可选）</span>
-            <input id="name" type="text" placeholder="我的书源合集" />
+            <input id="name" type="text" autocomplete="off" placeholder="我的书源合集" enterkeyhint="done" />
           </label>
           <label class="inline">
             <span>类型</span>
@@ -67,6 +67,18 @@
       </footer>
     </div>
   </div>
+
+  <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog" class="confirm-form">
+      <h2 id="confirm-title">确认操作</h2>
+      <p id="confirm-message" class="confirm-message"></p>
+      <div class="confirm-actions">
+        <button type="submit" value="cancel" class="ghost" autofocus>取消</button>
+        <button type="submit" value="ok" class="danger" id="confirm-ok">确认</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="/ui/app.js" type="module"></script>
 </body>
 </html>
