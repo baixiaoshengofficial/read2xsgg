@@ -1241,6 +1241,10 @@ function compactCategoryTemplate(value, host) {
  */
 function compactBookWorld(entries, { host, rules, responseType, warningFor }) {
   if (entries.length < 7) return null;
+  // A group is meaningful navigation metadata. Keep it as bookWorld entries
+  // instead of flattening it into one generic “分类” filter action.
+  if (entries.some((entry) => String(entry.group || "").trim())) return null;
+
   const templates = entries.map((entry) => compactCategoryTemplate(entry.url, host));
   if (templates.some((template) => !template)) return null;
 
