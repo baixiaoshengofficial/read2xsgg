@@ -496,11 +496,59 @@ function jsonProperty(payload, name) {
   return "";
 }
 
+function hasHeader(headers, name) {
+  const wanted = String(name || "").toLowerCase();
+  return Object.keys(headers || {}).some((key) => String(key).toLowerCase() === wanted);
+}
+
+function responseHeader(response, name) {
+  const wanted = String(name || "").toLowerCase();
+  const headers = response?.httpHeaders;
+  if (!headers || typeof headers !== "object") return undefined;
+  for (const [key, value] of Object.entries(headers)) {
+    if (String(key).toLowerCase() === wanted) return value;
+  }
+  return undefined;
+}
+
+function sameOrigin(left, right) {
+  try {
+    return new URL(left).origin === new URL(right).origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Keep only the name=value part of cookies issued by the chapter request.
+ * They are deliberately used for one same-origin follow-up only; this is not
+ * a shared cookie jar and must never leak a chapter session to another host.
+ */
+function chapterSessionCookies(response) {
+  const value = responseHeader(response, "set-cookie");
+  const entries = Array.isArray(value) ? value : value ? [value] : [];
+  const cookies = [];
+  let total = 0;
+  for (const entry of entries) {
+    const pair = String(entry || "").split(";", 1)[0].trim();
+    const equal = pair.indexOf("=");
+    const name = equal > 0 ? pair.slice(0, equal).trim() : "";
+    const cookieValue = equal > 0 ? pair.slice(equal + 1).trim() : "";
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/.test(name)) continue;
+    if (!cookieValue || /[\r\n;]/.test(cookieValue) || pair.length > 1_024) continue;
+    if (total + pair.length + (cookies.length ? 2 : 0) > 4_096) break;
+    cookies.push(pair);
+    total += pair.length + (cookies.length > 1 ? 2 : 0);
+    if (cookies.length >= 16) break;
+  }
+  return cookies.join("; ");
+}
+
 /**
  * Execute a declarative MediaResolutionPlan.resolution block.
  * Transport is injected (`download`); no source/domain branches live here.
  */
-export async function executeMediaResolution(html, chapterUrl, plan, download) {
+export async function executeMediaResolution(html, chapterUrl, plan, download, chapterResponse = null) {
   const resolution = normalizeResolution(plan?.resolution);
   if (!resolution || typeof download !== "function") return [];
   const vars = collectExtractVars(html, chapterUrl, resolution.extract);
@@ -514,6 +562,10 @@ export async function executeMediaResolution(html, chapterUrl, plan, download) {
     if (value) headers[name] = value;
   }
   if (!headers.Referer && vars.chapterUrl) headers.Referer = vars.chapterUrl;
+  const sessionCookies = chapterSessionCookies(chapterResponse);
+  if (sessionCookies && !hasHeader(headers, "cookie") && sameOrigin(url, chapterUrl)) {
+    headers.Cookie = sessionCookies;
+  }
   const body = resolution.request.body ? interpolate(resolution.request.body, vars) : null;
   try {
     const response = await download(url, {
@@ -555,18 +607,23 @@ export async function resolveChapterMediaUrls(
   const direct = extractPageMediaUrls("", chapterUrl, plan);
   if (direct.length) return direct;
 
-  let htmlPromise;
-  const loadHtml = async () => {
-    if (!htmlPromise) {
-      htmlPromise = Promise.resolve(
+  let pagePromise;
+  const loadPage = async () => {
+    if (!pagePromise) {
+      pagePromise = Promise.resolve(
         typeof htmlOrLoad === "function" ? htmlOrLoad() : htmlOrLoad,
-      ).then((value) => String(value ?? ""));
+      );
     }
-    return htmlPromise;
+    return pagePromise;
+  };
+  const loadHtml = async () => {
+    const page = await loadPage();
+    return responseText(page);
   };
 
   if (plan.resolution) {
-    const resolved = await executeMediaResolution(await loadHtml(), chapterUrl, plan, download);
+    const page = await loadPage();
+    const resolved = await executeMediaResolution(responseText(page), chapterUrl, plan, download, page);
     if (resolved.length) return resolved;
   }
 

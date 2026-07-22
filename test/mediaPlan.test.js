@@ -211,6 +211,42 @@ test("两步媒体计划执行器按声明取 meta、POST 并选择 JSON URL", a
   assert.match(String(calls[0].init.body), /page=7/);
 });
 
+test("两步媒体解析仅向同源请求继承章节响应的会话 Cookie", async () => {
+  const plan = compileMediaExtractionPlan(TWO_STEP_RULE, "audio");
+  const page = Buffer.from('<meta name="_token" content="session-token"/>');
+  Object.defineProperty(page, "httpHeaders", {
+    value: { "set-cookie": ["sid=chapter-session; Path=/; HttpOnly", "visit=1; Path=/"] },
+  });
+  const calls = [];
+  const urls = await resolveChapterMediaUrls(
+    page,
+    "https://media.example/item/42-7",
+    plan,
+    async (url, init = {}) => {
+      calls.push({ url, init });
+      return Buffer.from(JSON.stringify({ playUrl: "https://cdn.example/a/42.mp3" }));
+    },
+    pageMediaUrls,
+  );
+  assert.deepEqual(urls, ["https://cdn.example/a/42.mp3"]);
+  assert.equal(calls[0].init.headers.Cookie, "sid=chapter-session; visit=1");
+
+  const crossOriginPlan = {
+    ...plan,
+    resolution: { ...plan.resolution, request: { ...plan.resolution.request, url: "https://other.example/play" } },
+  };
+  await resolveChapterMediaUrls(
+    page,
+    "https://media.example/item/42-7",
+    crossOriginPlan,
+    async (_url, init = {}) => {
+      assert.equal(Object.keys(init.headers).some((name) => name.toLowerCase() === "cookie"), false);
+      return Buffer.from(JSON.stringify({ playUrl: "https://cdn.example/a/42.mp3" }));
+    },
+    pageMediaUrls,
+  );
+});
+
 test("无 resolution 时回退通用页面扫描；空计划不猜测受保护网关", async () => {
   const html = `
     <html><head><meta name="_token" content="x"/></head>
