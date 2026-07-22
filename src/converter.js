@@ -291,11 +291,16 @@ function finalizeAdapterUrlExpression(endpoint) {
   return `(${JSON.stringify(endpoint)}).replace(/%@pageIndex/g, String((params && params.pageIndex) || 1))`;
 }
 
-function runtimeAdapterRequestInfo(endpoint) {
+function runtimeAdapterRequestInfo(endpoint, { preferDetail = false } = {}) {
+  const seedExpr = preferDetail
+    ? 'var u = q.detailUrl || q.url || q.chapterUrl || "";'
+    : 'var u = q.chapterUrl || q.url || q.detailUrl || "";';
   return [
     "@js:",
     'var q = (params && params.queryInfo) || {};',
-    'var u = q.chapterUrl || q.url || q.detailUrl || "";',
+    // Chapter lists prefer detailUrl (catalogue seed). Chapter content prefers
+    // chapterUrl so leftover detail urls do not replace the chapter page.
+    seedExpr,
     'if (!u) u = (typeof result == "string") ? result : "";',
     'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
     'if (u == "%@result") u = "";',
@@ -306,20 +311,23 @@ function runtimeAdapterRequestInfo(endpoint) {
   ].join("\n");
 }
 
-function bridgeRequestInfo(requestInfo, endpoint, { pageSize = 20, serverPaging = false } = {}) {
+function bridgeRequestInfo(requestInfo, endpoint, { pageSize = 20, serverPaging = false, preferDetail = false } = {}) {
   const source = String(requestInfo || "").trim();
   if (!source) return "";
   const pagedEndpoint = adapterEndpointWithPaging(endpoint, { pageSize, serverPaging });
-  if (source === "%@result") return runtimeAdapterRequestInfo(pagedEndpoint);
+  if (source === "%@result") return runtimeAdapterRequestInfo(pagedEndpoint, { preferDetail });
   // POST / httpParams / webView cannot be safely re-fetched by the GET-only
   // adapter. Keep the native Xiangse request (caller skips bridging on "").
   if (/^@js:/i.test(source)) {
     const effectiveSource = source.replace(/\bPOST\s*:\s*false\b/g, "");
     if (/\b(?:POST|httpParams|requestBody|webView)\b/.test(effectiveSource)) return "";
+    const seedExpr = preferDetail
+      ? 'var seed = q.detailUrl || q.url || q.chapterUrl || result || "";'
+      : 'var seed = q.chapterUrl || q.url || q.detailUrl || result || "";';
     return [
       "@js:",
       'var q = (params && params.queryInfo) || {};',
-      'var seed = q.chapterUrl || q.url || q.detailUrl || result || "";',
+      seedExpr,
       "var u = (function (result) {",
       source.replace(/^@js:\s*/i, ""),
       "}).call(this, seed);",
@@ -457,10 +465,19 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
   const pageSize = actionPageSize(action, 100);
   const serverPaging = !requestHasUpstreamPaging(action.requestInfo || "%@result", action);
   const requestInfo = useHtmlToc
-    ? runtimeAdapterRequestInfo(adapterEndpointWithPaging(endpoint, { pageSize, serverPaging }))
-    : bridgeRequestInfo(action.requestInfo || "%@result", endpoint, { pageSize, serverPaging });
+    ? runtimeAdapterRequestInfo(adapterEndpointWithPaging(endpoint, { pageSize, serverPaging }), { preferDetail: true })
+    : bridgeRequestInfo(action.requestInfo || "%@result", endpoint, { pageSize, serverPaging, preferDetail: true });
   if (!requestInfo) return action;
+  // Bridged rows are `{ data: [...] }`. A raw upstream nextPageUrl (e.g.
+  // getBookMenu) still returns `{ list: [...] }` with data:null — Xiangse then
+  // reads list:"$.data" and the chapter catalogue goes empty after page 1.
+  const nextPageUrl = action.nextPageUrl
+    ? bridgeRequestInfo(action.nextPageUrl, endpoint, { pageSize, serverPaging: false, preferDetail: true })
+    : "";
   const { reverseChapters: _reverseChapters, reverse: _reverse, ...rest } = action;
+  const maxPage = Number(action.moreKeys?.maxPage) > 0
+    ? action.moreKeys.maxPage
+    : (serverPaging || nextPageUrl ? 500 : 0);
   return preserveEncode(rest, {
     ...commonAction("chapterList", action.host, "json"),
     requestInfo,
@@ -468,11 +485,11 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
     title: "title",
     url: "url",
     updateTime: "updateTime",
-    ...(action.nextPageUrl ? { nextPageUrl: action.nextPageUrl } : {}),
+    ...(nextPageUrl ? { nextPageUrl } : {}),
     moreKeys: {
       ...(action.moreKeys || {}),
       pageSize,
-      ...(serverPaging ? { maxPage: Number(action.moreKeys?.maxPage) > 0 ? action.moreKeys.maxPage : 300 } : {}),
+      ...(maxPage > 0 ? { maxPage } : {}),
     },
   });
 }
@@ -590,11 +607,14 @@ function buildJsonApiTocRequestInfo(tocUrl) {
     "if (!u && typeof result === \"string\") u = result;",
     "if (!u && result && typeof result === \"object\") u = String(result.detailUrl || result.url || \"\");",
     "if (/(?:getBookMenu|getAlbumMenu|chapterList|toc)\\?/i.test(u) && /[?&](?:pageNum|pageIndex|page)=\\d+/i.test(u)) return u;",
-    "var id = String(q.bookId || q.id || \"\").trim();",
+    "var id = String(q.bookId || q.albumId || q.entityId || q.id || \"\").trim();",
     "if (!id) {",
-    "  var m = u.match(/[?&](?:bookId|albumId|id)=(\\d+)/i)",
+    // Prefer book/album/entity ids. Bare `id=` on listen/play URLs is often a
+    // per-section key (e.g. bookId+section) and must not seed the menu request.
+    "  var m = u.match(/[?&](?:bookId|albumId|entityId)=(\\d+)/i)",
     "    || u.match(/\\/(?:book|album|comic)\\/(\\d+)/i)",
-    "    || u.match(/\\/(\\d+)(?:\\/?(?:\\?|$))/);",
+    "    || u.match(/[?&]id=(\\d{1,12})(?!\\d)/i)",
+    "    || u.match(/\\/(\\d{1,12})(?:\\/?(?:\\?|$))/);",
     "  if (m) id = m[1];",
     "}",
     "if (!id) return \"\";",

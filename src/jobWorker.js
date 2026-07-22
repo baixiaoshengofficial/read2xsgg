@@ -8,7 +8,14 @@ import { encodeXbs } from "./xbs.js";
  * Deleting a running job cancels it and frees the concurrency slot so the
  * next queued job can start immediately.
  */
-export function createJobWorker({ store, config, concurrency = 1, downloadSource } = {}) {
+export function createJobWorker({
+  store,
+  config,
+  concurrency = 1,
+  downloadSource,
+  convertParsed = convertParsedSource,
+  convertOnline = convertOnlineSource,
+} = {}) {
   if (!store) throw new Error("createJobWorker requires a library store");
   if (typeof downloadSource !== "function") throw new Error("createJobWorker requires downloadSource");
   const maxConcurrent = Math.max(1, Number(concurrency) || 1);
@@ -174,17 +181,19 @@ export function createJobWorker({ store, config, concurrency = 1, downloadSource
         };
         // Prefer an explicitly published payload when present so retries keep
         // declarative fields (e.g. mediaResolution) that remote legacy JSON lacks.
+        // Skip online mirror adaptation for payloads: the operator-supplied JSON is
+        // authoritative offline; adaptOnlineSources is for live remote downloads.
         const sourcePayload = typeof store.readSourcePayload === "function"
           ? await store.readSourcePayload(jobId)
           : null;
         result = sourcePayload
-          ? await convertParsedSource(
+          ? await convertParsed(
             sourcePayload,
             jobConfig,
             job.imageProxyBase || "",
-            progressOpts,
+            { ...progressOpts, adapt: false },
           )
-          : await convertOnlineSource(
+          : await convertOnline(
             job.sourceUrl,
             jobConfig,
             job.imageProxyBase || "",

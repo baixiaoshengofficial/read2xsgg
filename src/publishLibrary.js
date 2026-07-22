@@ -54,7 +54,9 @@ export async function publishLibraryArtifact({
   const result = await convertParsed(parsed, publishConfig, proxyBase, {
     fullVerify: Boolean(verify),
     analyzeFallback: Boolean(verify),
-    adapt: true,
+    // Default publish is offline/deterministic: do not mutate via adaptOnlineSources.
+    // Only when the caller opts into verify may adaptation run (e.g. mirror refresh).
+    adapt: Boolean(verify),
   });
 
   await store.saveSourcePayload(id, parsed);

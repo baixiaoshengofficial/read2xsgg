@@ -304,6 +304,7 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
   const fixture = JSON.parse(
     await readFile(path.resolve("sources/migrations/lian-ting.legado.json"), "utf8"),
   );
+  const previousUmask = process.umask(0o077);
   try {
     const store = createLibraryStore(dir);
     const job = await store.createJob({
@@ -323,6 +324,7 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
     await store.saveArtifacts(job.id, { xbs: encodeXbs(staleJson), json: staleJson });
     await store.updateJob(job.id, { status: "done", count: 1 });
 
+    let seenAdapt;
     const published = await publishLibraryArtifact({
       store,
       jobId: job.id,
@@ -334,7 +336,22 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
       }),
       imageProxyBase: "https://convert.example",
       verify: false,
+      convertParsed: async (parsed, config, proxy, options = {}) => {
+        seenAdapt = options.adapt;
+        const { convertParsedSource } = await import("../src/convertOnline.js");
+        return convertParsedSource(parsed, config, proxy, {
+          ...options,
+          adaptOnlineSources: async () => {
+            throw new Error("offline publish must not adapt");
+          },
+          filterReachableSources: async (sources) => ({ input: sources, skipped: [] }),
+          downloadSource: async () => {
+            throw new Error("offline publish must not download");
+          },
+        });
+      },
     });
+    assert.equal(seenAdapt, false);
     assert.equal(published.job.id, job.id);
     assert.equal(published.job.status, "done");
     assert.equal(published.job.publishedFrom, "payload");
@@ -343,6 +360,11 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
 
     const payload = await store.readSourcePayload(job.id);
     assert.equal(payload.ruleContent.mediaResolution.request.url, "{{origin}}/nlinka");
+    // Root-style umask 0077 must not leave payload/metadata 0600 for the service user.
+    assert.equal((await stat(path.join(dir, "artifacts", `${job.id}.source.json`))).mode & 0o777, 0o644);
+    assert.equal((await stat(path.join(dir, "artifacts", `${job.id}.xbs`))).mode & 0o777, 0o644);
+    assert.equal((await stat(path.join(dir, "jobs", `${job.id}.json`))).mode & 0o777, 0o644);
+    assert.equal((await stat(path.join(dir, "index.json"))).mode & 0o777, 0o644);
 
     const xbs = await store.readArtifact(job.id, "xbs");
     const sources = JSON.parse(decodeXbs(xbs).toString("utf8"));
@@ -353,6 +375,168 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
     const plan = decodeMediaExtractionPlan(planMatch[1], "audio");
     assert.equal(mediaPlanHasResolution(plan), true);
     assert.equal(plan.resolution.request.url, "{{origin}}/nlinka");
+  } finally {
+    process.umask(previousUmask);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("retry 优先使用已发布 source payload，不回落缺 mediaResolution 的远程源", async () => {
+  const {
+    createJobWorker,
+    publishLibraryArtifact,
+    mediaPlanHasResolution,
+    decodeMediaExtractionPlan,
+    decodeXbs,
+  } = await import("../src/index.js");
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-retry-payload-"));
+  const fixture = JSON.parse(
+    await readFile(path.resolve("sources/migrations/lian-ting.legado.json"), "utf8"),
+  );
+  fixture.bookSourceName = "payload-retry-audio";
+  fixture.bookSourceUrl = "https://audio.fixture.example/";
+  const store = createLibraryStore(dir);
+  const job = await store.createJob({
+    url: "https://example.com/legacy-remote-without-mediaResolution.json",
+    name: "legacy-remote",
+    imageProxyBase: "https://convert.example",
+  });
+  await store.updateJob(job.id, { status: "done", count: 0 });
+  await publishLibraryArtifact({
+    store,
+    jobId: job.id,
+    source: fixture,
+    config: serverConfig({
+      PREFLIGHT_SOURCES: "false",
+      VERIFY_CONVERTED_SOURCES: "false",
+      ANALYZE_FALLBACK: "false",
+    }),
+    imageProxyBase: "https://convert.example",
+    verify: false,
+  });
+
+  let remoteConverts = 0;
+  let payloadConverts = 0;
+  const worker = createJobWorker({
+    store,
+    config: serverConfig({
+      PREFLIGHT_SOURCES: "false",
+      VERIFY_CONVERTED_SOURCES: "false",
+      ANALYZE_FALLBACK: "false",
+    }),
+    concurrency: 1,
+    downloadSource: async () => {
+      throw new Error("retry must not download when a source payload is present");
+    },
+    convertOnline: async () => {
+      remoteConverts += 1;
+      throw new Error("retry must not convert the legacy remote URL");
+    },
+    convertParsed: async (parsed, _config, _proxy, options = {}) => {
+      payloadConverts += 1;
+      assert.equal(parsed.ruleContent.mediaResolution.request.url, "{{origin}}/nlinka");
+      // Payload retries must stay offline: never re-run adaptOnlineSources.
+      assert.equal(options.adapt, false);
+      const json = Buffer.from(`${JSON.stringify({
+        "payload-retry-audio": {
+          sourceName: "payload-retry-audio",
+          chapterContent: {
+            requestInfo: "https://convert.example/adapter/media?kind=audio&plan=eyJ2ZXJzaW9uIjoxLCJraW5kIjoiYXVkaW8iLCJwcm9wZXJ0aWVzIjpbInVybCJdLCJhdHRyaWJ1dGVzIjpbXSwidXJsSGludHMiOltdLCJyZXNvbHV0aW9uIjp7ImV4dHJhY3QiOlt7Im5hbWUiOiJ4dCIsInNvdXJjZSI6Im1ldGEiLCJrZXkiOiJfYyJ9XSwicmVxdWVzdCI6eyJ1cmwiOiJ7e29yaWdpbn19L25saW5rYSIsIm1ldGhvZCI6IlBPU1QifSwicmVzcG9uc2UiOnsicHJvcGVydGllcyI6WyJ1cmwiXX19fQ&url=",
+          },
+        },
+      }, null, 2)}\n`);
+      return {
+        sources: JSON.parse(json.toString("utf8")),
+        warnings: [],
+        skipped: [],
+        count: 1,
+        fallbackCount: 0,
+        unverifiedCount: 0,
+        skippedBuckets: {},
+        json,
+        xbs: encodeXbs(json),
+      };
+    },
+  });
+
+  try {
+    await store.updateJob(job.id, {
+      status: "queued",
+      phase: "queued",
+      error: "",
+      finishedAt: null,
+      startedAt: null,
+      count: null,
+      progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, failed: 0 },
+    });
+    worker.enqueue(job.id);
+    const deadline = Date.now() + 5_000;
+    let next;
+    while (Date.now() < deadline) {
+      next = await store.getJob(job.id);
+      if (next.status === "done" || next.status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    assert.equal(next.status, "done", next.error || next.status);
+    assert.equal(remoteConverts, 0);
+    assert.equal(payloadConverts, 1);
+    const xbs = await store.readArtifact(job.id, "xbs");
+    const sources = JSON.parse(decodeXbs(xbs).toString("utf8"));
+    const converted = sources["payload-retry-audio"];
+    assert.ok(converted);
+    const planMatch = String(converted.chapterContent.requestInfo).match(/plan=([A-Za-z0-9_-]+)/);
+    assert.ok(planMatch);
+    assert.equal(mediaPlanHasResolution(decodeMediaExtractionPlan(planMatch[1], "audio")), true);
+  } finally {
+    worker.cancel?.(job.id);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("publishLibraryArtifact：verify=true 才允许 adapt", async () => {
+  const { publishLibraryArtifact } = await import("../src/index.js");
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-publish-adapt-"));
+  const fixture = JSON.parse(
+    await readFile(path.resolve("sources/migrations/lian-ting.legado.json"), "utf8"),
+  );
+  fixture.bookSourceName = "verify-adapt-audio";
+  fixture.bookSourceUrl = "https://audio.fixture.example/";
+  try {
+    const store = createLibraryStore(dir);
+    const job = await store.createJob({
+      url: "https://example.com/legacy-remote.json",
+      name: "legacy-remote",
+      imageProxyBase: "https://convert.example",
+    });
+    let seenAdapt;
+    let adapted = false;
+    await publishLibraryArtifact({
+      store,
+      jobId: job.id,
+      source: fixture,
+      config: serverConfig({
+        PREFLIGHT_SOURCES: "false",
+        VERIFY_CONVERTED_SOURCES: "false",
+        ANALYZE_FALLBACK: "false",
+      }),
+      imageProxyBase: "https://convert.example",
+      verify: true,
+      convertParsed: async (parsed, config, proxy, options = {}) => {
+        seenAdapt = options.adapt;
+        const { convertParsedSource } = await import("../src/convertOnline.js");
+        return convertParsedSource(parsed, config, proxy, {
+          ...options,
+          adaptOnlineSources: async (input) => {
+            adapted = true;
+            return input;
+          },
+          filterReachableSources: async (sources) => ({ input: sources, skipped: [] }),
+          downloadSource: async () => Buffer.from("{}"),
+        });
+      },
+    });
+    assert.equal(seenAdapt, true);
+    assert.equal(adapted, true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

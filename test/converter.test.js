@@ -1375,7 +1375,10 @@ test("JSON API tocUrl 编译为 getBookMenu 式目录请求与播放 urlTemplate
   const converted = sources["听书目录"];
   assert.match(converted.chapterList.requestInfo, /getBookMenu/);
   assert.match(converted.chapterList.nextPageUrl, /pageNum|pageIndex|page/);
+  // Bridged nextPageUrl must stay on /adapter/chapters so list:"$.data" still matches.
+  assert.match(converted.chapterList.nextPageUrl, /adapter\/chapters\?plan=/);
   assert.match(converted.chapterList.requestInfo, /adapter\/chapters\?plan=/);
+  assert.equal(converted.chapterList.list, "$.data");
   assert.equal(converted.chapterList.moreKeys.pageSize, 50);
   assert.equal(converted.chapterList.moreKeys.maxPage, 500);
   assert.equal(converted.httpHeaders.cookie || converted.httpHeaders.Cookie, "token=abc");
@@ -1400,6 +1403,9 @@ test("JSON API tocUrl 编译为 getBookMenu 式目录请求与播放 urlTemplate
       pageSize: 100,
     },
   );
+  // Prefer entityId/bookId over bare section `id=` on listen URLs.
+  assert.match(converted.chapterList.requestInfo, /bookId\|albumId\|entityId/);
+  assert.match(converted.chapterList.requestInfo, /seed = q\.detailUrl \|\| q\.url \|\| q\.chapterUrl/);
 });
 
 test("依赖 Android API 的媒体正文通过在线通用提取器转换", () => {
