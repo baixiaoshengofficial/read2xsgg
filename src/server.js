@@ -1481,7 +1481,7 @@ function libraryIdFromPath(pathname) {
 }
 
 function jobIdFromPath(pathname) {
-  const match = String(pathname || "").match(/^\/api\/jobs\/([A-Za-z0-9_-]+)(?:\/(retry|publish))?$/);
+  const match = String(pathname || "").match(/^\/api\/jobs\/([A-Za-z0-9_-]+)(?:\/(retry|publish|rebase))?$/);
   if (!match) return null;
   return { id: match[1], action: match[2] || "" };
 }
@@ -2323,6 +2323,42 @@ export function createAppServer(options = {}) {
           }
           return;
         }
+        if (jobRoute.action === "rebase") {
+          if (method !== "POST") throw new HttpError(405, "rebase 仅支持 POST");
+          const job = await store.getJob(jobRoute.id);
+          if (!job) throw new HttpError(404, "任务不存在");
+          const raw = await readRequestBody(request);
+          let body = {};
+          try {
+            body = raw.length ? JSON.parse(raw.toString("utf8")) : {};
+          } catch {
+            throw new HttpError(400, "请求体必须是 JSON");
+          }
+          const oldOrigin = String(body.oldOrigin || body.from || "").trim();
+          const newOrigin = String(body.newOrigin || body.to || "").trim();
+          if (!oldOrigin) throw new HttpError(400, "缺少 oldOrigin");
+          if (!newOrigin) throw new HttpError(400, "缺少 newOrigin");
+          const { rebaseLibraryArtifact } = await import("./rebaseLibrary.js");
+          try {
+            const rebased = await rebaseLibraryArtifact({
+              store,
+              jobId: jobRoute.id,
+              oldOrigin,
+              newOrigin,
+              dryRun: Boolean(body.dryRun),
+            });
+            // Summary only — never echo artifact payloads.
+            sendJson(response, 200, {
+              ...rebased.summary,
+              status: rebased.job?.status || job.status,
+            }, commonHeaders);
+          } catch (error) {
+            if (error instanceof HttpError) throw error;
+            const status = Number(error?.status) || 422;
+            throw new HttpError(status, error?.message || String(error));
+          }
+          return;
+        }
         if (method === "GET" || method === "HEAD") {
           const job = await store.getJob(jobRoute.id);
           if (!job) throw new HttpError(404, "任务不存在");
@@ -2491,8 +2527,16 @@ export function createAppServer(options = {}) {
               : "页面没有解析到图片";
           throw new HttpError(422, message);
         }
-        const payload = adapterTarget.type === "jm-chapters" ? { chapters: values }
-          : adapterTarget.type === "page-media" ? { url: values[0] } : { urls: values };
+        let payload;
+        if (adapterTarget.type === "jm-chapters") payload = { chapters: values };
+        else if (adapterTarget.type === "page-media") {
+          // Xiangse player objects need httpHeaders for Referer/Cookie anti-leech.
+          // Echo the chapter page as Referer; content JS merges over source headers.
+          payload = { url: values[0] };
+          if (/^https?:\/\//i.test(String(sourceUrl || ""))) {
+            payload.httpHeaders = { Referer: String(sourceUrl) };
+          }
+        } else payload = { urls: values };
         sendJson(response, 200, payload, { ...commonHeaders, "Cache-Control": "public, max-age=300" });
         return;
       }

@@ -1529,8 +1529,81 @@ test("在线质量门槛保留 sourceRegex 有声源并走媒体适配", () => {
   assert.equal(converted.sourceType, "audio");
   assert.match(converted.chapterContent.requestInfo, /\/adapter\/media\?kind=audio/);
   assert.match(converted.chapterContent.content, /config\.httpHeaders/);
+  assert.match(converted.chapterContent.content, /payload\.httpHeaders/);
+  assert.match(converted.chapterContent.content, /baseHeaders/);
   assert.doesNotMatch(converted.chapterContent.content, /\/media\?url=/);
   assert.ok(warnings.some((warning) => /sourceRegex/.test(warning.message)));
+});
+
+test("有声媒体 requestInfo 优先 result，避免 queryInfo 残留详情页；player 合并 httpHeaders", () => {
+  const source = {
+    bookSourceName: "残留详情有声",
+    bookSourceUrl: "https://audio.example.com/",
+    bookSourceType: 1,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: {
+      content: `[name="_c"]@content@js:
+var body=baseUrl.replace(/.+\\\\/book\\\\/(\\\\d+)-(\\\\d+)/,"bookId=$1&page=$2");
+var url="/nlinka,";
+var options={ method:"post", headers:JSON.stringify({ xt:result, Referer:baseUrl }), body:body };
+JSON.parse(java.ajax(url+JSON.stringify(options))).url`,
+      mediaResolution: {
+        extract: [{ name: "xt", source: "meta", key: "_c" }],
+        request: {
+          url: "{{origin}}/nlinka",
+          method: "POST",
+          headers: { xt: "{{xt}}", Referer: "{{chapterUrl}}" },
+          body: "xt={{xt}}",
+        },
+        response: { properties: ["url"] },
+      },
+    },
+  };
+  const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const converted = sources["残留详情有声"];
+  assert.ok(converted);
+  const requestJs = String(converted.chapterContent.requestInfo).replace(/^@js:\s*/i, "");
+  const build = new Function("config", "params", "result", requestJs);
+  const detail = "https://audio.example.com/book/42";
+  const chapter = "https://audio.example.com/book/42-7";
+  const leftover = build(
+    { host: "https://audio.example.com", httpHeaders: null },
+    { queryInfo: { detailUrl: detail, url: detail }, pageIndex: 1 },
+    chapter,
+  );
+  assert.match(leftover, /url=https%3A%2F%2Faudio\.example\.com%2Fbook%2F42-7$/);
+  assert.doesNotMatch(leftover, /url=https%3A%2F%2Faudio\.example\.com%2Fbook%2F42$/);
+
+  const contentRule = String(converted.chapterContent.content);
+  const { script } = (() => {
+    const match = contentRule.match(/\|\|\s*@js:/i);
+    return {
+      script: match ? contentRule.slice(match.index + match[0].length) : contentRule.replace(/^@js:\s*/i, ""),
+    };
+  })();
+  const contentFn = new Function("config", "params", "result", script);
+  const player = JSON.parse(contentFn(
+    { host: "https://audio.example.com", httpHeaders: { "User-Agent": "UA" } },
+    { queryInfo: { detailUrl: detail, chapterUrl: chapter }, responseUrl: "https://convert.example/adapter/media" },
+    { url: "https://cdn.example/a.mp3", httpHeaders: { Referer: chapter } },
+  ));
+  assert.equal(player.url, "https://cdn.example/a.mp3");
+  assert.equal(player.forbidCache, true);
+  // Source headers must be preserved; adapter Referer overlays/merges on top.
+  assert.deepEqual(player.httpHeaders, { "User-Agent": "UA", Referer: chapter });
+  assert.notEqual(player.httpHeaders, null);
+
+  const playerFromUrl = JSON.parse(contentFn(
+    { host: "https://audio.example.com", httpHeaders: { cookie: "a=1" } },
+    { queryInfo: { detailUrl: detail, chapterUrl: chapter } },
+    "https://cdn.example/b.mp3",
+  ));
+  assert.equal(playerFromUrl.url, "https://cdn.example/b.mp3");
+  assert.equal(playerFromUrl.httpHeaders.cookie, "a=1");
+  assert.equal(playerFromUrl.httpHeaders.Referer, chapter);
 });
 
 test("可识别多步媒体规则编入 resolution；WebView 拦截源给出重新转换警告", () => {

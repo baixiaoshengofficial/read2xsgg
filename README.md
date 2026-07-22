@@ -146,13 +146,20 @@ docker compose up -d
 - `GET /api/jobs` / `GET /api/jobs/:id`
 - `POST /api/jobs/:id/retry`
 - `POST /api/jobs/:id/publish` — 用显式声明式阅读源 JSON 覆盖同一 `id` 的 `/library/{id}.xbs`（`{ "source": <legado>, "verify?" }`，或直接提交 Legado 对象）；会持久化 payload，后续 retry 不再回落到缺字段的远程源
+- `POST /api/jobs/:id/rebase` — 将制品内旧公开桥接 origin 替换为新 origin（`{ "oldOrigin"|"from", "newOrigin"|"to", "dryRun?" }`）；保留任务 id / 订阅路径 / source payload，只改属于旧 origin 的 URL；响应仅为摘要，不含制品正文
 - `DELETE /api/jobs/:id`
 
 离线/运维也可：
 
 ```sh
 npm run publish:library -- --id <jobId> --source path/to/legado.json --data-dir ./data
+
+# 先 dry-run 校验，再写入（origins 来自配置，无硬编码域名）
+npm run rebase:library -- --id <jobId> --from https://old-bridge.example --to https://new-bridge.example --dry-run
+npm run rebase:library -- --id <jobId> --from https://old-bridge.example --to https://new-bridge.example --data-dir ./data
 ```
+
+`rebase:library` / `POST .../rebase` 适用于公开转换站域名变更：在已有 JSON/XBS 上安全改写桥接基址，无需按源名或上游站点重转。`from === to` 或无匹配时为校验 no-op，不写盘。
 
 制品落在 `DATA_DIR`（Compose 默认把项目目录的 `./data` 挂载到容器 `/data`）。未设置 `ADMIN_TOKEN` 时管理接口返回 503。
 

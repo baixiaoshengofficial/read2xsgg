@@ -339,7 +339,9 @@ export async function runXbsPipeline(source, options = {}) {
     };
 
     const content = source.chapterContent || {};
-    const contentQuery = { ...queryInfo, chapterTitle, chapterUrl, url: chapterUrl };
+    // Match real Xiangse: keep book-level queryInfo.url/detailUrl, pass the
+    // chapter address primarily through `result` (+ optional chapterUrl).
+    const contentQuery = { ...queryInfo, chapterTitle, chapterUrl };
     const contentResponse = await requestAction(source, content, {
       result: chapterUrl,
       queryInfo: contentQuery,

@@ -7,7 +7,8 @@
     "read2xsgg": "./bin/read2xsgg.js",
     "read2xsgg-server": "./bin/server.js",
     "read2xsgg-validate": "./bin/validate-xbs.js",
-    "read2xsgg-publish-library": "./bin/publish-library.js"
+    "read2xsgg-publish-library": "./bin/publish-library.js",
+    "read2xsgg-rebase-library": "./bin/rebase-library.js"
   },
   "exports": "./src/index.js",
   "scripts": {
@@ -17,6 +18,7 @@
     "validate:xbs": "node ./bin/validate-xbs.js",
     "convert": "node ./bin/read2xsgg.js",
     "publish:library": "node ./bin/publish-library.js",
+    "rebase:library": "node ./bin/rebase-library.js",
     "start": "node ./bin/server.js",
     "docker:push": "./scripts/docker-push.sh"
   },

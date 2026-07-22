@@ -54,6 +54,12 @@ export {
 export { convertOnlineSource, convertParsedSource } from "./convertOnline.js";
 export { createLibraryStore } from "./libraryStore.js";
 export { publishLibraryArtifact } from "./publishLibrary.js";
+export {
+  normalizePublicOrigin,
+  rebaseArtifactPair,
+  rebaseLibraryArtifact,
+  rebaseOriginInText,
+} from "./rebaseLibrary.js";
 export { createJobWorker } from "./jobWorker.js";
 export { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
 export {

@@ -184,7 +184,7 @@ function wrapMediaContent(contentRule, imageProxyBase = "") {
     "url = encodeURI(url);",
     "return JSON.stringify({",
     "  url: url,",
-    "  httpHeaders: config.httpHeaders,",
+    "  httpHeaders: (config && config.httpHeaders) || {},",
     "  forbidCache: true",
     "});",
   ].join("\n");
@@ -198,14 +198,14 @@ function directMediaContent(imageProxyBase = "") {
   return [
     "@js:",
     'var q = (typeof params !== "undefined" && params.queryInfo) || {};',
-    'var url = String(q.url || q.detailUrl || q.chapterUrl || "").trim();',
+    'var url = String(q.chapterUrl || q.url || q.detailUrl || "").trim();',
     'if (!url && typeof result === "string" && /^(?:https?:)?\\/\\//i.test(result.trim())) url = result.trim();',
     'if (url.indexOf("//") === 0) url = "https:" + url;',
     'else if (url && !/^https?:\\/\\//i.test(url)) url = config.host + (url.charAt(0) === "/" ? url : "/" + url);',
     "url = encodeURI(url);",
     "return JSON.stringify({",
     "  url: url,",
-    "  httpHeaders: config.httpHeaders,",
+    "  httpHeaders: (config && config.httpHeaders) || {},",
     "  forbidCache: true",
     "});",
   ].join("\n");
@@ -252,11 +252,10 @@ function nativeJmRequestInfo() {
   return [
     "@js:",
     'var q = (params && params.queryInfo) || {};',
-    // chapterUrl/url changes with the active action; detailUrl remains the
-    // book page for the whole chain and must therefore be the last fallback.
-    'var u = q.chapterUrl || q.url || q.detailUrl || "";',
-    'if (!u) u = (typeof result == "string") ? result : "";',
-    'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
+    // Prefer chapter `result` over leftover queryInfo.url/detailUrl (Xiangse H5).
+    'var u = (typeof result == "string" && result && result != "%@result") ? result : "";',
+    'if (!u) u = q.chapterUrl || q.url || q.detailUrl || "";',
+    'if (!u && result && typeof result == "object") u = result.url || result.detailUrl || "";',
     'if (u == "%@result") u = "";',
     'u = String(u || "").trim();',
     'if (u.indexOf("//") == 0) u = "https:" + u;',
@@ -292,17 +291,27 @@ function finalizeAdapterUrlExpression(endpoint) {
 }
 
 function runtimeAdapterRequestInfo(endpoint, { preferDetail = false } = {}) {
-  const seedExpr = preferDetail
-    ? 'var u = q.detailUrl || q.url || q.chapterUrl || "";'
-    : 'var u = q.chapterUrl || q.url || q.detailUrl || "";';
+  // Chapter lists prefer detailUrl (catalogue seed).
+  // Chapter content / media must prefer `result` first: Xiangse H5 commonly keeps
+  // queryInfo.url as the book detail URL while passing the chapter URL as result
+  // (docs §3.2 / §4.6). Preferring q.url first makes the media adapter fetch the
+  // detail page and return 422 “页面没有解析到媒体地址”.
+  const seedBlock = preferDetail
+    ? [
+      'var u = q.detailUrl || q.url || q.chapterUrl || "";',
+      'if (!u) u = (typeof result == "string") ? result : "";',
+      'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
+    ]
+    : [
+      'var u = (typeof result == "string" && result && result != "%@result") ? result : "";',
+      'if (!u) u = q.chapterUrl || "";',
+      'if (!u) u = q.url || q.detailUrl || "";',
+      'if (!u && result && typeof result == "object") u = result.url || result.detailUrl || "";',
+    ];
   return [
     "@js:",
     'var q = (params && params.queryInfo) || {};',
-    // Chapter lists prefer detailUrl (catalogue seed). Chapter content prefers
-    // chapterUrl so leftover detail urls do not replace the chapter page.
-    seedExpr,
-    'if (!u) u = (typeof result == "string") ? result : "";',
-    'if (!u && result && typeof result == "object") u = result.detailUrl || result.url || "";',
+    ...seedBlock,
     'if (u == "%@result") u = "";',
     'u = String(u || "").trim();',
     'if (u.indexOf("//") == 0) u = "https:" + u;',
@@ -323,7 +332,7 @@ function bridgeRequestInfo(requestInfo, endpoint, { pageSize = 20, serverPaging 
     if (/\b(?:POST|httpParams|requestBody|webView)\b/.test(effectiveSource)) return "";
     const seedExpr = preferDetail
       ? 'var seed = q.detailUrl || q.url || q.chapterUrl || result || "";'
-      : 'var seed = q.chapterUrl || q.url || q.detailUrl || result || "";';
+      : 'var seed = (typeof result == "string" && result && result != "%@result") ? result : (q.chapterUrl || q.url || q.detailUrl || "");';
     return [
       "@js:",
       'var q = (params && params.queryInfo) || {};',
@@ -760,12 +769,32 @@ function proxiedMediaChapterContent(host, imageProxyBase, kind, extractionPlan) 
     ...commonAction("chapterContent", host, "json"),
     requestInfo: runtimeAdapterRequestInfo(endpoint),
     content: [
+      // Keep full JSON payload in `result` (do not preselect $.url) so adapter
+      // httpHeaders (chapter Referer) can merge with source Cookie/UA headers.
       "@js:",
-      'var payload = (typeof result === "string") ? JSON.parse(result) : result;',
-      'var url = String((payload && payload.url) || "").trim();',
+      "var payload = result;",
+      "if (typeof result === \"string\") {",
+      "  try { payload = JSON.parse(result); } catch (e) { payload = { url: result }; }",
+      "}",
+      "var url = String((payload && payload.url) || \"\").trim();",
+      "var headers = {};",
+      "var baseHeaders = (config && config.httpHeaders) || {};",
+      "for (var k in baseHeaders) {",
+      "  if (Object.prototype.hasOwnProperty.call(baseHeaders, k)) headers[k] = baseHeaders[k];",
+      "}",
+      "var extra = (payload && payload.httpHeaders) || {};",
+      "for (var k2 in extra) {",
+      "  if (Object.prototype.hasOwnProperty.call(extra, k2)) headers[k2] = extra[k2];",
+      "}",
+      "var q = (params && params.queryInfo) || {};",
+      "if (!headers.Referer && !headers.referer) {",
+      "  var ref = String(q.chapterUrl || \"\").trim();",
+      "  if (!ref || ref === String(q.detailUrl || \"\")) ref = \"\";",
+      "  if (/^https?:\\/\\//i.test(ref)) headers.Referer = ref;",
+      "}",
       "return JSON.stringify({",
       "  url: encodeURI(url),",
-      "  httpHeaders: config.httpHeaders,",
+      "  httpHeaders: headers,",
       "  forbidCache: true",
       "});",
     ].join("\n"),

@@ -118,13 +118,13 @@ export async function discoverMedia(originUrl, kind, { download, homeHtml = "" }
   const contentDirect = [
     "@js:",
     'var q = (typeof params !== "undefined" && params.queryInfo) || {};',
-    'var url = String(q.url || q.detailUrl || q.chapterUrl || "").trim();',
+    'var url = String(q.chapterUrl || q.url || q.detailUrl || "").trim();',
     'if (!url && typeof result === "string" && /^(?:https?:)?\\/\\//i.test(result.trim())) url = result.trim();',
     'if (url.indexOf("//") === 0) url = "https:" + url;',
     'else if (url && !/^https?:\\/\\//i.test(url)) url = config.host + (url.charAt(0) === "/" ? url : "/" + url);',
     "return JSON.stringify({",
     "  url: encodeURI(url),",
-    "  httpHeaders: config.httpHeaders,",
+    "  httpHeaders: (config && config.httpHeaders) || {},",
     "  forbidCache: true",
     "});",
   ].join("\n");
@@ -137,7 +137,7 @@ export async function discoverMedia(originUrl, kind, { download, homeHtml = "" }
     "if (!url) return \"\";",
     "return JSON.stringify({",
     "  url: encodeURI(url),",
-    "  httpHeaders: config.httpHeaders,",
+    "  httpHeaders: (config && config.httpHeaders) || {},",
     "  forbidCache: true",
     "});",
   ].join("\n");
