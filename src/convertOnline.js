@@ -4,29 +4,28 @@ import { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
 import { encodeXbs } from "./xbs.js";
 
 /**
- * Convert a remote Legado JSON source URL into Xiangse XBS.
+ * Convert an already-parsed Legado JSON payload into Xiangse XBS.
+ * Used by the remote URL path and by explicit artifact publication.
  *
- * @param {string} sourceUrl
+ * @param {object|object[]} parsed
  * @param {object} config
  * @param {string} [imageProxyBase]
  * @param {object} [options]
- * @param {boolean} [options.fullVerify] - When true, ignore sync verifyMaxSources skip
- *   and run full verify+analyze. Optional JOB_VERIFY_BUDGET_MS (>0) caps wall time.
+ * @param {boolean} [options.fullVerify]
  * @param {(progress: object) => void} [options.onProgress]
  * @param {typeof downloadSource} [options.downloadSource]
  * @param {Function} [options.adaptOnlineSources]
  * @param {Function} [options.filterReachableSources]
- * @param {Function} [options.sourceUrlCandidates]
  * @param {new (status: number, message: string) => Error} [options.HttpError]
+ * @param {boolean} [options.adapt] - When false, skip online mirror adaptation.
  */
-export async function convertOnlineSource(sourceUrl, config, imageProxyBase = "", options = {}) {
+export async function convertParsedSource(parsed, config, imageProxyBase = "", options = {}) {
   // Lazy import avoids a circular dependency with server.js.
   const server = await import("./server.js");
   const downloadSource = options.downloadSource || server.downloadSource;
   const adaptOnlineSources = options.adaptOnlineSources || server.adaptOnlineSources;
   const filterReachableSources = options.filterReachableSources || server.filterReachableSources;
   const HttpError = options.HttpError || server.HttpError;
-  const sourceUrlCandidates = options.sourceUrlCandidates || server.sourceUrlCandidates;
 
   const fullVerify = Boolean(options.fullVerify);
   const onProgress = options.onProgress || null;
@@ -39,47 +38,23 @@ export async function convertOnlineSource(sourceUrl, config, imageProxyBase = ""
     }
   };
 
-  let parsed;
-  let parseError;
-  let downloadError;
-  const candidates = sourceUrlCandidates(sourceUrl);
-  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
-    const candidate = candidates[candidateIndex];
-    let raw;
-    try {
-      raw = await downloadSource(candidate, config);
-    } catch (error) {
-      downloadError = error;
-      // shuyuans -> shuyuan is only a response-format fallback. A transient
-      // DNS/TLS/CDN failure must not silently turn an aggregate ID into an
-      // unrelated single source with the same numeric ID.
-      if (candidateIndex === 0) throw error;
-      continue;
-    }
-    try {
-      parsed = JSON.parse(raw.toString("utf8").replace(/^\uFEFF/, ""));
-      break;
-    } catch (error) {
-      parseError = error;
-    }
+  let input = parsed;
+  if (options.adapt !== false) {
+    input = await adaptOnlineSources(input, {
+      ...config,
+      imageProxyBase,
+      download: (url, headers = {}) => downloadSource(
+        url,
+        { ...config, fetchTimeoutMs: Math.max(config.preflightTimeoutMs, 1_000) },
+        headers,
+      ),
+    });
   }
-  if (!parsed && parseError) throw new HttpError(422, `在线阅读源不是有效 JSON：${parseError.message}`);
-  if (!parsed && downloadError) throw downloadError;
-  if (!parsed) throw new HttpError(422, "在线阅读源不是有效 JSON");
-  parsed = await adaptOnlineSources(parsed, {
-    ...config,
-    imageProxyBase,
-    download: (url, headers = {}) => downloadSource(
-      url,
-      { ...config, fetchTimeoutMs: Math.max(config.preflightTimeoutMs, 1_000) },
-      headers,
-    ),
-  });
 
   emit({ phase: "convert", done: 0, total: 0, kept: 0, skipped: 0, unverified: 0 });
   let converted;
   try {
-    converted = convertLegado(parsed, { imageProxyBase, omitNonPortable: true });
+    converted = convertLegado(input, { imageProxyBase, omitNonPortable: true });
   } catch (error) {
     throw new HttpError(422, `无法转换在线阅读源：${error.message}`);
   }
@@ -196,4 +171,57 @@ export async function convertOnlineSource(sourceUrl, config, imageProxyBase = ""
     xbs,
     etag: `"${createHash("sha256").update(xbs).digest("hex")}"`,
   };
+}
+
+/**
+ * Convert a remote Legado JSON source URL into Xiangse XBS.
+ *
+ * @param {string} sourceUrl
+ * @param {object} config
+ * @param {string} [imageProxyBase]
+ * @param {object} [options]
+ * @param {boolean} [options.fullVerify] - When true, ignore sync verifyMaxSources skip
+ *   and run full verify+analyze. Optional JOB_VERIFY_BUDGET_MS (>0) caps wall time.
+ * @param {(progress: object) => void} [options.onProgress]
+ * @param {typeof downloadSource} [options.downloadSource]
+ * @param {Function} [options.adaptOnlineSources]
+ * @param {Function} [options.filterReachableSources]
+ * @param {Function} [options.sourceUrlCandidates]
+ * @param {new (status: number, message: string) => Error} [options.HttpError]
+ */
+export async function convertOnlineSource(sourceUrl, config, imageProxyBase = "", options = {}) {
+  const server = await import("./server.js");
+  const downloadSource = options.downloadSource || server.downloadSource;
+  const HttpError = options.HttpError || server.HttpError;
+  const sourceUrlCandidates = options.sourceUrlCandidates || server.sourceUrlCandidates;
+
+  let parsed;
+  let parseError;
+  let downloadError;
+  const candidates = sourceUrlCandidates(sourceUrl);
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    const candidate = candidates[candidateIndex];
+    let raw;
+    try {
+      raw = await downloadSource(candidate, config);
+    } catch (error) {
+      downloadError = error;
+      // shuyuans -> shuyuan is only a response-format fallback. A transient
+      // DNS/TLS/CDN failure must not silently turn an aggregate ID into an
+      // unrelated single source with the same numeric ID.
+      if (candidateIndex === 0) throw error;
+      continue;
+    }
+    try {
+      parsed = JSON.parse(raw.toString("utf8").replace(/^\uFEFF/, ""));
+      break;
+    } catch (error) {
+      parseError = error;
+    }
+  }
+  if (!parsed && parseError) throw new HttpError(422, `在线阅读源不是有效 JSON：${parseError.message}`);
+  if (!parsed && downloadError) throw downloadError;
+  if (!parsed) throw new HttpError(422, "在线阅读源不是有效 JSON");
+
+  return convertParsedSource(parsed, config, imageProxyBase, options);
 }

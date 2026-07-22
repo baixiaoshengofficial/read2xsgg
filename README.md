@@ -145,7 +145,14 @@ docker compose up -d
 - `POST /api/jobs` — `{ "url", "mode": "source"|"site", "name?" }`
 - `GET /api/jobs` / `GET /api/jobs/:id`
 - `POST /api/jobs/:id/retry`
+- `POST /api/jobs/:id/publish` — 用显式声明式阅读源 JSON 覆盖同一 `id` 的 `/library/{id}.xbs`（`{ "source": <legado>, "verify?" }`，或直接提交 Legado 对象）；会持久化 payload，后续 retry 不再回落到缺字段的远程源
 - `DELETE /api/jobs/:id`
+
+离线/运维也可：
+
+```sh
+npm run publish:library -- --id <jobId> --source path/to/legado.json --data-dir ./data
+```
 
 制品落在 `DATA_DIR`（Compose 默认把项目目录的 `./data` 挂载到容器 `/data`）。未设置 `ADMIN_TOKEN` 时管理接口返回 503。
 

@@ -1,4 +1,4 @@
-import { convertOnlineSource } from "./convertOnline.js";
+import { convertOnlineSource, convertParsedSource } from "./convertOnline.js";
 import { analyzeSite } from "./siteAnalyze/index.js";
 import { encodeXbs } from "./xbs.js";
 
@@ -163,20 +163,33 @@ export function createJobWorker({ store, config, concurrency = 1, downloadSource
           ...config,
           verifyConvertedSources: true,
         };
-        result = await convertOnlineSource(
-          job.sourceUrl,
-          jobConfig,
-          job.imageProxyBase || "",
-          {
-            fullVerify: true,
-            analyzeFallback: true,
-            downloadSource,
-            onProgress: (progress) => {
-              if (isCancelled(jobId)) return;
-              return onProgress(progress);
-            },
+        const progressOpts = {
+          fullVerify: true,
+          analyzeFallback: true,
+          downloadSource,
+          onProgress: (progress) => {
+            if (isCancelled(jobId)) return;
+            return onProgress(progress);
           },
-        );
+        };
+        // Prefer an explicitly published payload when present so retries keep
+        // declarative fields (e.g. mediaResolution) that remote legacy JSON lacks.
+        const sourcePayload = typeof store.readSourcePayload === "function"
+          ? await store.readSourcePayload(jobId)
+          : null;
+        result = sourcePayload
+          ? await convertParsedSource(
+            sourcePayload,
+            jobConfig,
+            job.imageProxyBase || "",
+            progressOpts,
+          )
+          : await convertOnlineSource(
+            job.sourceUrl,
+            jobConfig,
+            job.imageProxyBase || "",
+            progressOpts,
+          );
       }
 
       if (isCancelled(jobId)) return;

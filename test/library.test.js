@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -291,4 +291,130 @@ test("进度回写不会覆盖 done 状态", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 mediaResolution", async () => {
+  const { publishLibraryArtifact, mediaPlanHasResolution, decodeMediaExtractionPlan, decodeXbs } = await import("../src/index.js");
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-publish-"));
+  const fixture = JSON.parse(
+    await readFile(path.resolve("sources/migrations/lian-ting.legado.json"), "utf8"),
+  );
+  try {
+    const store = createLibraryStore(dir);
+    const job = await store.createJob({
+      url: "https://example.com/legacy-remote.json",
+      name: "legacy-remote",
+      imageProxyBase: "https://convert.example",
+    });
+    // Seed a legacy href-only artifact to prove replacement.
+    const staleJson = Buffer.from(`${JSON.stringify({
+      stale: {
+        sourceName: "stale",
+        chapterContent: {
+          requestInfo: "https://convert.example/adapter/media?kind=audio&plan=e30&url=%40%40result",
+        },
+      },
+    }, null, 2)}\n`);
+    await store.saveArtifacts(job.id, { xbs: encodeXbs(staleJson), json: staleJson });
+    await store.updateJob(job.id, { status: "done", count: 1 });
+
+    const published = await publishLibraryArtifact({
+      store,
+      jobId: job.id,
+      source: fixture,
+      config: serverConfig({
+        PREFLIGHT_SOURCES: "false",
+        VERIFY_CONVERTED_SOURCES: "false",
+        ANALYZE_FALLBACK: "false",
+      }),
+      imageProxyBase: "https://convert.example",
+      verify: false,
+    });
+    assert.equal(published.job.id, job.id);
+    assert.equal(published.job.status, "done");
+    assert.equal(published.job.publishedFrom, "payload");
+    assert.equal(published.job.subscribePath, `/library/${job.id}.xbs`);
+    assert.ok(published.job.sourcePayloadHash);
+
+    const payload = await store.readSourcePayload(job.id);
+    assert.equal(payload.ruleContent.mediaResolution.request.url, "{{origin}}/nlinka");
+
+    const xbs = await store.readArtifact(job.id, "xbs");
+    const sources = JSON.parse(decodeXbs(xbs).toString("utf8"));
+    const converted = sources["恋听🎧💜"];
+    assert.ok(converted);
+    const planMatch = String(converted.chapterContent.requestInfo).match(/plan=([A-Za-z0-9_-]+)/);
+    assert.ok(planMatch);
+    const plan = decodeMediaExtractionPlan(planMatch[1], "audio");
+    assert.equal(mediaPlanHasResolution(plan), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("管理 API publish 用声明式 source 覆盖制品", async (context) => {
+  const { mediaPlanHasResolution, decodeMediaExtractionPlan, decodeXbs } = await import("../src/index.js");
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-publish-api-"));
+  const store = createLibraryStore(dir);
+  const fixture = JSON.parse(
+    await readFile(path.resolve("sources/migrations/lian-ting.legado.json"), "utf8"),
+  );
+  // Swap fixture identity so the test proves the path is payload-driven, not name/domain keyed.
+  fixture.bookSourceName = "迁移示例听书";
+  fixture.bookSourceUrl = "https://audio.fixture.example/";
+  const worker = { enqueue() {}, recover: async () => {}, cancel() {} };
+  const app = createAppServer({
+    config: {
+      ...serverConfig({
+        ADMIN_TOKEN: "secret-token",
+        DATA_DIR: dir,
+        PREFLIGHT_SOURCES: "false",
+        VERIFY_CONVERTED_SOURCES: "false",
+      }),
+      dataDir: dir,
+      adminToken: "secret-token",
+    },
+    store,
+    worker,
+    recoverJobs: false,
+  });
+  const base = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const created = await fetch(`${base}/api/jobs`, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer secret-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ url: "https://example.com/legacy.json", name: "legacy" }),
+  });
+  assert.equal(created.status, 202);
+  const job = await created.json();
+  await store.updateJob(job.id, { status: "done", count: 1 });
+
+  const published = await fetch(`${base}/api/jobs/${job.id}/publish`, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer secret-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ source: fixture }),
+  });
+  assert.equal(published.status, 200);
+  const next = await published.json();
+  assert.equal(next.id, job.id);
+  assert.equal(next.publishedFrom, "payload");
+
+  const ready = await fetch(`${base}/library/${job.id}.xbs`);
+  assert.equal(ready.status, 200);
+  const sources = JSON.parse(decodeXbs(Buffer.from(await ready.arrayBuffer())).toString("utf8"));
+  const converted = sources["迁移示例听书"];
+  assert.ok(converted);
+  const planMatch = String(converted.chapterContent.requestInfo).match(/plan=([A-Za-z0-9_-]+)/);
+  assert.ok(planMatch);
+  assert.equal(mediaPlanHasResolution(decodeMediaExtractionPlan(planMatch[1], "audio")), true);
 });

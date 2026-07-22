@@ -1481,7 +1481,7 @@ function libraryIdFromPath(pathname) {
 }
 
 function jobIdFromPath(pathname) {
-  const match = String(pathname || "").match(/^\/api\/jobs\/([A-Za-z0-9_-]+)(?:\/(retry))?$/);
+  const match = String(pathname || "").match(/^\/api\/jobs\/([A-Za-z0-9_-]+)(?:\/(retry|publish))?$/);
   if (!match) return null;
   return { id: match[1], action: match[2] || "" };
 }
@@ -2276,6 +2276,51 @@ export function createAppServer(options = {}) {
           worker.cancel?.(jobRoute.id);
           worker.enqueue(jobRoute.id);
           sendJson(response, 202, next, commonHeaders);
+          return;
+        }
+        if (jobRoute.action === "publish") {
+          if (method !== "POST") throw new HttpError(405, "发布仅支持 POST");
+          const job = await store.getJob(jobRoute.id);
+          if (!job) throw new HttpError(404, "任务不存在");
+          const raw = await readRequestBody(request);
+          let body = {};
+          try {
+            body = raw.length ? JSON.parse(raw.toString("utf8")) : {};
+          } catch {
+            throw new HttpError(400, "请求体必须是 JSON");
+          }
+          let source;
+          if (Object.prototype.hasOwnProperty.call(body, "source")) {
+            source = body.source;
+          } else if (
+            Array.isArray(body)
+            || body.bookSourceUrl
+            || body.ruleContent
+            || body.bookSourceName
+          ) {
+            source = body;
+          } else {
+            throw new HttpError(400, "缺少声明式阅读源（source）");
+          }
+          if (source == null || source === "") {
+            throw new HttpError(400, "缺少声明式阅读源（source）");
+          }
+          const { publishLibraryArtifact } = await import("./publishLibrary.js");
+          try {
+            const published = await publishLibraryArtifact({
+              store,
+              jobId: jobRoute.id,
+              source,
+              config,
+              imageProxyBase: String(body.imageProxyBase || job.imageProxyBase || publicBaseUrl(request) || ""),
+              verify: Boolean(body.verify),
+            });
+            sendJson(response, 200, published.job, commonHeaders);
+          } catch (error) {
+            if (error instanceof HttpError) throw error;
+            const status = Number(error?.status) || 422;
+            throw new HttpError(status, error?.message || String(error));
+          }
           return;
         }
         if (method === "GET" || method === "HEAD") {

@@ -6,7 +6,8 @@
   "bin": {
     "read2xsgg": "./bin/read2xsgg.js",
     "read2xsgg-server": "./bin/server.js",
-    "read2xsgg-validate": "./bin/validate-xbs.js"
+    "read2xsgg-validate": "./bin/validate-xbs.js",
+    "read2xsgg-publish-library": "./bin/publish-library.js"
   },
   "exports": "./src/index.js",
   "scripts": {
@@ -15,6 +16,7 @@
     "test:xbs-live": "RUN_XBS_LIVE=1 node --test test/live-xbs.test.js",
     "validate:xbs": "node ./bin/validate-xbs.js",
     "convert": "node ./bin/read2xsgg.js",
+    "publish:library": "node ./bin/publish-library.js",
     "start": "node ./bin/server.js",
     "docker:push": "./scripts/docker-push.sh"
   },

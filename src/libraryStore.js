@@ -29,7 +29,8 @@ async function writeJsonAtomic(filePath, value) {
   await mkdir(dir, { recursive: true });
   const tmp = `${filePath}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
   try {
-    await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    // Explicit mode so root-run ops CLIs do not leave 0600 files unreadable to the service user.
+    await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o644 });
     await rename(tmp, filePath);
   } catch (error) {
     await rm(tmp, { force: true }).catch(() => {});
@@ -194,8 +195,8 @@ export function createLibraryStore(dataDir) {
 
   async function saveArtifacts(id, { xbs, json } = {}) {
     await ensure();
-    if (xbs) await writeFile(artifactPath(id, "xbs"), xbs);
-    if (json) await writeFile(artifactPath(id, "json"), json);
+    if (xbs) await writeFile(artifactPath(id, "xbs"), xbs, { mode: 0o644 });
+    if (json) await writeFile(artifactPath(id, "json"), json, { mode: 0o644 });
   }
 
   async function readArtifact(id, ext) {
@@ -205,6 +206,20 @@ export function createLibraryStore(dataDir) {
       if (error?.code === "ENOENT") return null;
       throw error;
     }
+  }
+
+  /**
+   * Persist an explicitly supplied Legado JSON payload for a library job.
+   * Used when remote legacy sources lack declarative fields (e.g. mediaResolution)
+   * and an operator republishes from a migration fixture / admin body.
+   */
+  async function saveSourcePayload(id, source) {
+    await ensure();
+    await writeJsonAtomic(artifactPath(id, "source.json"), source);
+  }
+
+  async function readSourcePayload(id) {
+    return readJson(artifactPath(id, "source.json"), null);
   }
 
   /**
@@ -265,6 +280,7 @@ export function createLibraryStore(dataDir) {
     });
     await rm(artifactPath(id, "xbs"), { force: true });
     await rm(artifactPath(id, "json"), { force: true });
+    await rm(artifactPath(id, "source.json"), { force: true });
     await removeIndexEntry(id);
     return true;
   }
@@ -283,6 +299,8 @@ export function createLibraryStore(dataDir) {
     updateJob,
     saveArtifacts,
     readArtifact,
+    saveSourcePayload,
+    readSourcePayload,
     saveConversion,
     readConversion,
     deleteJob,

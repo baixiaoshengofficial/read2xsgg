@@ -50,8 +50,9 @@ export {
   kindLabel,
   withNovelHtmlStripped,
 } from "./siteAnalyze/index.js";
-export { convertOnlineSource } from "./convertOnline.js";
+export { convertOnlineSource, convertParsedSource } from "./convertOnline.js";
 export { createLibraryStore } from "./libraryStore.js";
+export { publishLibraryArtifact } from "./publishLibrary.js";
 export { createJobWorker } from "./jobWorker.js";
 export { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
 export {
