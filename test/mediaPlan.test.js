@@ -7,8 +7,10 @@ import {
   encodeMediaExtractionPlan,
   executeMediaResolution,
   mediaPlanHasResolution,
+  mediaPlanIsLegacyHrefOnly,
   mediaRuleNeedsPortabilityWarning,
   MEDIA_PORTABILITY_WARNING,
+  MEDIA_RECONVERSION_DIAGNOSTIC,
   pageMediaUrls,
   resolveChapterMediaUrls,
 } from "../src/index.js";
@@ -80,6 +82,33 @@ test("通用媒体扫描不把章节页普通链接当成播放地址", () => {
   `;
   const plan = { kind: "audio", properties: [], attributes: ["href"], urlHints: [] };
   assert.deepEqual(pageMediaUrls(html, "https://audio.example.com/book/14917-1", plan), []);
+});
+
+test("legacy href-only 计划不把章节 HTML / iframe 当成播放地址", () => {
+  const plan = { version: 1, kind: "audio", properties: [], attributes: ["href"], urlHints: [] };
+  assert.equal(mediaPlanIsLegacyHrefOnly(plan), true);
+  assert.equal(
+    mediaPlanIsLegacyHrefOnly({ kind: "audio", properties: ["path"], attributes: ["href"] }),
+    false,
+  );
+  assert.match(MEDIA_RECONVERSION_DIAGNOSTIC, /重新转换/);
+
+  const html = `
+    <link rel="alternate" href="https://m.example.com/book/14917-1">
+    <iframe src="https://audio.example.com/book/14917-1"></iframe>
+    <a href="https://audio.example.com/book/14917-2">下一集</a>
+    <meta name="_f" content="mp3"/>
+  `;
+  assert.deepEqual(pageMediaUrls(html, "https://audio.example.com/book/14917-1", plan), []);
+  // Real media still wins even under a legacy plan.
+  assert.deepEqual(
+    pageMediaUrls(
+      `${html}<script>var u="https://cdn.example/a.mp3"</script>`,
+      "https://audio.example.com/book/14917-1",
+      plan,
+    ),
+    ["https://cdn.example/a.mp3"],
+  );
 });
 
 const TWO_STEP_RULE = `

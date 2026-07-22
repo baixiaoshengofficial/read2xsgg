@@ -313,6 +313,19 @@ export function mediaPlanHasResolution(plan) {
 }
 
 /**
+ * Legacy published media plans that only retained `attributes:["href"]` from
+ * chapter-list link selectors. They lack properties, urlHints, and a
+ * declarative MediaResolutionPlan — not enough to recover protected playback.
+ */
+export function mediaPlanIsLegacyHrefOnly(plan) {
+  const normalized = normalizeMediaExtractionPlan(plan, plan?.kind);
+  if (mediaPlanHasResolution(normalized)) return false;
+  if (normalized.properties.length || normalized.urlHints.length) return false;
+  if (!normalized.attributes.length) return false;
+  return normalized.attributes.every((name) => name === "href");
+}
+
+/**
  * Sources that only rely on Legado WebView + sourceRegex (or trivial
  * `<js>result</js>`), or that contain a multi-step script we could not safely
  * compile, do not describe a portable MediaResolutionPlan. Portable selectors
@@ -339,6 +352,8 @@ export function mediaRuleNeedsPortabilityWarning(contentRule = {}, tocRule = {},
 
 export const MEDIA_PORTABILITY_WARNING = "正文依赖阅读 WebView/sourceRegex（或不可识别的 Android 脚本）拦截播放流，规则中没有可安全编译的多步媒体流程（页面取值 → 二次请求 → 解析 URL）；已保留通用 HTML/JSON/媒体回退，但受保护播放地址无法从当前规则还原。请用包含该流程的原始阅读源重新转换";
 
+/** Adapter/runtime diagnostic for legacy href-only plans that cannot play. */
+export const MEDIA_RECONVERSION_DIAGNOSTIC = "媒体提取计划仅有导航型 href、缺少声明式多步解析（resolution），无法把章节 HTML 当作播放地址；请用包含 mediaResolution/可编译多步流程的原始阅读源重新转换";
 export function normalizeMediaExtractionPlan(value, kind = "audio") {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return { version: 1, kind: mediaKind(kind), properties: [], attributes: [], urlHints: [] };

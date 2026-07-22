@@ -12,8 +12,10 @@ import {
   executeCatalogPlan,
   executeMediaResolution,
   mediaPlanHasResolution,
+  mediaPlanIsLegacyHrefOnly,
   mediaRuleNeedsPortabilityWarning,
   MEDIA_PORTABILITY_WARNING,
+  MEDIA_RECONVERSION_DIAGNOSTIC,
   pageMediaUrls,
   resolveChapterMediaUrls,
 } from "../src/index.js";
@@ -236,6 +238,24 @@ test("恋听迁移 fixture：显式 mediaResolution 可执行；legacy WebView X
   assert.ok(legacyPlanMatch);
   const emptyPlan = JSON.parse(Buffer.from(legacyPlanMatch[1], "base64url").toString("utf8"));
   assert.equal(emptyPlan.resolution, undefined);
+
+  // Published library artifact shape: href-only media plan (恋听 8ffae8f8…) needs
+  // reconversion; native JSON path extractors (懒人听书 85a2e59d…) stay compatible.
+  const publishedHrefOnly = { version: 1, kind: "audio", properties: [], attributes: ["href"], urlHints: [] };
+  assert.equal(mediaPlanIsLegacyHrefOnly(publishedHrefOnly), true);
+  assert.match(MEDIA_RECONVERSION_DIAGNOSTIC, /重新转换/);
+  assert.deepEqual(
+    pageMediaUrls(
+      `<link rel="alternate" href="https://m.example.com/book/1-1"><iframe src="https://audio.example.com/book/1-1"></iframe>`,
+      "https://audio.example.com/book/1-1",
+      publishedHrefOnly,
+    ),
+    [],
+  );
+  assert.equal(
+    mediaPlanIsLegacyHrefOnly({ version: 1, kind: "audio", properties: ["path"], attributes: [], urlHints: [] }),
+    false,
+  );
 });
 
 test("迁移播放解析：直链章节不触发下载；resolution 优先于页面扫描", async () => {

@@ -19,6 +19,8 @@ import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDe
 import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
 import {
   decodeMediaExtractionPlan,
+  mediaPlanIsLegacyHrefOnly,
+  MEDIA_RECONVERSION_DIAGNOSTIC,
   normalizeMediaExtractionPlan,
   resolveChapterMediaUrls,
 } from "./mediaPlan.js";
@@ -2003,6 +2005,18 @@ function normalizedMediaUrl(value, baseUrl, kind, { allowGeneric = false } = {})
   }
 }
 
+function sameChapterPageUrl(candidate, chapterUrl) {
+  try {
+    const left = new URL(candidate);
+    const right = new URL(chapterUrl);
+    const leftPath = left.pathname.replace(/\/+$/, "") || "/";
+    const rightPath = right.pathname.replace(/\/+$/, "") || "/";
+    return leftPath === rightPath && left.search === right.search;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Extract playable audio/video URLs from JSON, HTML and inline player scripts.
  * Rule-derived plans only prioritize field/attribute names; source JavaScript
@@ -2017,15 +2031,20 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
   const hints = new Set(plan.properties.map((value) => value.toLowerCase()));
   const urlHints = (plan.urlHints || []).map((value) => String(value || "").toLowerCase()).filter(Boolean);
   const matchesUrlHint = (url) => urlHints.some((hint) => String(url).toLowerCase().includes(hint));
+  const legacyHrefOnly = mediaPlanIsLegacyHrefOnly(plan);
   const candidates = new Map();
   let order = 0;
   const add = (keyValue, value, allowGeneric = false) => {
     const key = String(keyValue || "").toLowerCase();
     const semantic = /(?:url|uri|src|source|audio|sound|voice|track|play|video|media|stream|hls|m3u8|file|path)/i.test(key);
     if (!semantic && !hints.has(key) && !allowGeneric) return;
+    // Legacy href-only plans must never promote navigation hrefs into play URLs.
+    if (legacyHrefOnly && key === "href") return;
     const url = normalizedMediaUrl(value, baseUrl, kind, { allowGeneric: allowGeneric || hints.has(key) || semantic });
     if (!url || candidates.has(url)) return;
     const extension = mediaExtensionPattern(kind).test(url);
+    // Chapter HTML (and mobile alternate twins with the same path) are never media.
+    if (!extension && sameChapterPageUrl(url, baseUrl)) return;
     const kindName = kind === "video" ? /(?:video|stream|hls|m3u8)/i.test(key) : /(?:audio|sound|voice|track)/i.test(key);
     const quality = Number(key.match(/(?:^|_)(\d{2,4})$/)?.[1] || 0);
     const stream = STREAM_MEDIA_EXTENSION.test(url);
@@ -2062,11 +2081,26 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
     // Ordinary HTML/player pages continue through attribute and URL scanning.
   }
 
+  const planAttributes = new Set(plan.attributes.map((name) => String(name || "").toLowerCase()));
   const attributes = [...new Set([...plan.attributes, "src", "data-src", "data-url", "data-play-url", "href"])];
   for (const match of text.matchAll(/<(audio|video|source|iframe)\b([^>]*)>/gi)) {
+    const tagName = match[1].toLowerCase();
+    const mediaElement = tagName === "audio" || tagName === "video" || tagName === "source";
     for (const attribute of attributes) {
       const value = htmlAttribute(match[2], attribute);
-      if (value) add(attribute, value, true);
+      if (!value) continue;
+      if (!mediaElement) {
+        // iframe@src from the rule may be an embed player; default/href-only
+        // plans must not treat chapter HTML iframes as playable media.
+        if (planAttributes.has(String(attribute).toLowerCase())) {
+          add(attribute, value, true);
+        } else {
+          const strict = normalizedMediaUrl(value, baseUrl, kind, { allowGeneric: false });
+          if (strict) add(attribute, strict, false);
+        }
+        continue;
+      }
+      add(attribute, value, attribute !== "href");
     }
   }
   for (const match of text.replace(/\\\//g, "/").matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
@@ -2405,7 +2439,11 @@ export function createAppServer(options = {}) {
         }
         if (!values.length) {
           const message = adapterTarget.type === "jm-chapters" ? "详情页没有解析到章节"
-            : adapterTarget.type === "page-media" ? "页面没有解析到媒体地址" : "页面没有解析到图片";
+            : adapterTarget.type === "page-media"
+              ? (mediaPlanIsLegacyHrefOnly(adapterTarget.extractionPlan)
+                ? MEDIA_RECONVERSION_DIAGNOSTIC
+                : "页面没有解析到媒体地址")
+              : "页面没有解析到图片";
           throw new HttpError(422, message);
         }
         const payload = adapterTarget.type === "jm-chapters" ? { chapters: values }

@@ -20,8 +20,10 @@ export {
   encodeMediaExtractionPlan,
   executeMediaResolution,
   mediaPlanHasResolution,
+  mediaPlanIsLegacyHrefOnly,
   mediaRuleNeedsPortabilityWarning,
   MEDIA_PORTABILITY_WARNING,
+  MEDIA_RECONVERSION_DIAGNOSTIC,
   normalizeMediaExtractionPlan,
   resolveChapterMediaUrls,
 } from "./mediaPlan.js";
