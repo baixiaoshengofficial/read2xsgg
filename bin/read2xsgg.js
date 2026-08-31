@@ -8,6 +8,7 @@ import {
   convertLegado,
   downloadSource,
   encodeXbs,
+  filterValidXiangseSources,
   serverConfig,
 } from "../src/index.js";
 
@@ -175,6 +176,16 @@ async function main() {
   let { sources, warnings, skipped = [] } = convertLegado(parsed, {
     omitNonPortable: options.omitNonPortable,
   });
+  // With live verification enabled, structurally invalid conversions must
+  // reach the generic site-analysis fallback first. Filtering here would drop
+  // exactly the sources that need recognition and repair.
+  if (!options.verify) {
+    sources = filterValidXiangseSources(sources, {
+      warnings,
+      skipped,
+      stage: "post-convert",
+    }).sources;
+  }
   let fallbackCount = 0;
 
   if (options.verify) {
@@ -195,6 +206,11 @@ async function main() {
     sources = gated.sources;
     skipped = [...skipped, ...gated.skipped];
     warnings = [...warnings, ...gated.warnings];
+    sources = filterValidXiangseSources(sources, {
+      warnings,
+      skipped,
+      stage: "post-verify",
+    }).sources;
     fallbackCount = gated.fallbackCount;
   }
 

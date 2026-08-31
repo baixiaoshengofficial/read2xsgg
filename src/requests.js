@@ -1,5 +1,20 @@
 import { legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
 
+/** Refresh anonymous client IDs that are literal millisecond timestamps. */
+export function refreshEphemeralHeaders(headers, now = Date.now()) {
+  const output = { ...(headers || {}) };
+  for (const [name, value] of Object.entries(output)) {
+    if (!/(?:visitor|device|request|trace|session)[_-]?id/i.test(name)) continue;
+    const numeric = String(value || "").trim();
+    if (!/^1\d{12}$/.test(numeric)) continue;
+    const timestamp = Number(numeric);
+    if (timestamp < 1_400_000_000_000 || timestamp > 2_100_000_000_000) continue;
+    if (Math.abs(now - timestamp) < 86_400_000) continue;
+    output[name] = String(now);
+  }
+  return output;
+}
+
 function warnAndReturn(warn, message, fallback) {
   warn(message);
   return fallback;
@@ -93,8 +108,28 @@ function splitUrlAndOptions(request) {
 function stripLeadingLegadoSideEffectTemplates(request, warn) {
   let value = String(request ?? "").trim();
   let removed = false;
-  while (/^\{\{\s*(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie)\s*\([^{}]*\)\s*\}\}/i.test(value)) {
-    value = value.replace(/^\{\{\s*(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie)\s*\([^{}]*\)\s*\}\}\s*/i, "");
+  const jsSideEffect = /^@js:\s*(?:(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie|setCookie)\s*\([^;\n]*\)\s*;?\s*)+<\/js>\s*/i;
+  if (jsSideEffect.test(value)) {
+    value = value.replace(jsSideEffect, "");
+    removed = true;
+  }
+  const sideEffect = /^\{\{\s*([^{}]*)\s*\}\}\s*/i;
+  while (sideEffect.test(value)) {
+    const match = value.match(sideEffect);
+    const body = match?.[1] || "";
+    const onlyCookie = /^(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie|setCookie)\s*\([^{}]*\)\s*;?$/i.test(body);
+    const hostCookieSetup = /\bsource\.(?:getKey\s*\(\s*\)|key\b|bookSourceUrl\b)/i.test(body)
+      && /\b(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie|setCookie)\s*\(/i.test(body)
+      && !/\b(?:ajax|webView|org\.jsoup|JSON\.parse)\b/i.test(body)
+      && !String(body).replace(/\bsource\.(?:getKey\s*\(\s*\)|key\b|bookSourceUrl\b)/gi, "")
+        .replace(/\b(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie|setCookie)\s*\([^;]*\)\s*;?/gi, "")
+        .replace(/\bjava\.put\s*\(\s*['"][^'"]+['"]\s*,\s*[^;]+\)\s*;?/gi, "")
+        .replace(/\b(?:var|let|const)\s+[A-Za-z_$][\w$]*\s*=\s*;?/g, "")
+        .replace(/[A-Za-z_$][\w$]*\s*=\s*;?/g, "")
+        .replace(/[;\s]/g, "")
+        .trim();
+    if (!onlyCookie && !hostCookieSetup) break;
+    value = value.slice(match[0].length);
     removed = true;
   }
   if (removed) warn("阅读请求开头的 cookie 清理表达式在香色无等价 API，已忽略并保留后续 URL 请求");

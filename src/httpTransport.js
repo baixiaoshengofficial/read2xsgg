@@ -24,7 +24,7 @@ function looksLikeTransportInit(value) {
 
 /**
  * Normalize download() positional args into a single request descriptor.
- * @returns {{ headers: Record<string, string>, method: string, body: string|Buffer|null }}
+ * @returns {{ headers: Record<string, string>, method: string, body: string|Buffer|null, signal?: AbortSignal }}
  */
 export function normalizeDownloadArgs(headersOrInit = {}, maybeOptions = undefined) {
   if (maybeOptions !== undefined) {
@@ -34,6 +34,7 @@ export function normalizeDownloadArgs(headersOrInit = {}, maybeOptions = undefin
       headers: isPlainObject(options.headers) ? { ...headers, ...options.headers } : headers,
       method: String(options.method || "GET").toUpperCase(),
       body: options.body ?? null,
+      signal: options.signal,
     };
   }
 
@@ -43,6 +44,7 @@ export function normalizeDownloadArgs(headersOrInit = {}, maybeOptions = undefin
       headers,
       method: String(headersOrInit.method || "GET").toUpperCase(),
       body: headersOrInit.body ?? null,
+      signal: headersOrInit.signal,
     };
   }
 
@@ -50,6 +52,7 @@ export function normalizeDownloadArgs(headersOrInit = {}, maybeOptions = undefin
     headers: isPlainObject(headersOrInit) ? { ...headersOrInit } : {},
     method: "GET",
     body: null,
+    signal: undefined,
   };
 }
 
@@ -80,7 +83,7 @@ export function createDownloader(fetchBuffer, config) {
     throw new TypeError("createDownloader requires fetchBuffer(url, config, headers, options)");
   }
   return async function download(url, headersOrInit = {}, maybeOptions) {
-    const { headers, method, body } = normalizeDownloadArgs(headersOrInit, maybeOptions);
-    return fetchBuffer(String(url), config, headers, { method, body });
+    const { headers, method, body, signal } = normalizeDownloadArgs(headersOrInit, maybeOptions);
+    return fetchBuffer(String(url), config, headers, { method, body, signal });
   };
 }

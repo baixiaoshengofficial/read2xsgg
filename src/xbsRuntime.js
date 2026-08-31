@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { JSDOM } from "jsdom";
 import { decodeXbs } from "./xbs.js";
+import { encodeFormBody } from "./charset.js";
+import { orderChaptersAscending } from "./bridgePlan.js";
 
 function splitPostScript(rule) {
   const source = String(rule || "").trim();
@@ -24,9 +26,9 @@ function runJavaScript(script, config, params, result) {
   return new Function("config", "params", "result", String(script))(config, params, result);
 }
 
-function xpathValues(document, expression) {
+function xpathValues(document, expression, context = document) {
   const view = document.defaultView;
-  const result = document.evaluate(expression, document, null, view.XPathResult.ANY_TYPE, null);
+  const result = document.evaluate(expression, context, null, view.XPathResult.ANY_TYPE, null);
   if (result.resultType === view.XPathResult.STRING_TYPE) return [result.stringValue];
   if (result.resultType === view.XPathResult.NUMBER_TYPE) return [String(result.numberValue)];
   if (result.resultType === view.XPathResult.BOOLEAN_TYPE) return [String(result.booleanValue)];
@@ -37,9 +39,18 @@ function xpathValues(document, expression) {
 }
 
 function htmlDocument(value, wrapItem = false) {
-  if (!wrapItem) return new JSDOM(String(value || "")).window.document;
+  const sanitize = (html) => String(html || "")
+    .replace(/<script\b[^>]*>[\s\S]*?(?:<\/script>|$)/gi, "")
+    .replace(/<style\b[^>]*>[\s\S]*?(?:<\/style>|$)/gi, "");
+  if (!wrapItem) return new JSDOM(sanitize(value)).window.document;
   const html = value?.outerHTML || value?.textContent || String(value || "");
-  return new JSDOM(`<!doctype html><html><body>${html}</body></html>`).window.document;
+  return new JSDOM(`<!doctype html><html><body>${sanitize(html)}</body></html>`).window.document;
+}
+
+function xpathNeedsIsolatedItem(expression) {
+  const value = String(expression || "").trim();
+  return /(?:^|[\s(=,|])\/\//.test(value)
+    || /(?:^|[\s(=,|])\/html(?:\/|\b)/i.test(value);
 }
 
 function nodeValue(node, { content = false } = {}) {
@@ -51,18 +62,52 @@ function nodeValue(node, { content = false } = {}) {
   return String(node.textContent || "").trim();
 }
 
-function htmlSelect(rule, input, { list = false, content = false, config, params } = {}) {
+function htmlSelect(rule, input, {
+  list = false,
+  content = false,
+  config,
+  params,
+  document: preparedDocument,
+} = {}) {
   const { selector, script } = splitPostScript(rule);
+  if (!selector && script && !list) {
+    const result = typeof input === "string"
+      ? input
+      : nodeValue(input, { content });
+    return runJavaScript(script, config, params, result);
+  }
   let selected = [];
   if (selector) {
-    const document = input?.nodeType ? htmlDocument(input, true) : htmlDocument(input);
+    const itemInput = Boolean(input?.nodeType && input.nodeType !== 9);
+    const document = preparedDocument
+      || (itemInput ? (input.ownerDocument || input) : input?.nodeType === 9 ? input : htmlDocument(input));
     for (const alternative of selector.split(/\s*\|\|\s*/).filter(Boolean)) {
       try {
-        selected = xpathValues(document, alternative.trim());
+        let expression = alternative.trim();
+        let evaluationDocument = document;
+        let evaluationContext = itemInput ? input : document;
+        if (itemInput) {
+          if (expression.startsWith("//@")) expression = `descendant-or-self::*/${expression.slice(2)}`;
+          else if (expression.startsWith("//")) expression = `descendant-or-self::${expression.slice(2)}`;
+          else if (/^\/(?:@|text\(\)|node\(\))/.test(expression)) expression = `.${expression}`;
+          else if (expression.startsWith("(.//")) expression = `(descendant-or-self::${expression.slice(4)}`;
+          else if (xpathNeedsIsolatedItem(expression)) {
+            // Xiangse evaluates scalar rules against the serialized list item.
+            // Keep that behavior for absolute paths nested in functions such as
+            // normalize-space(//a), while common relative rules reuse the page DOM.
+            evaluationDocument = htmlDocument(input, true);
+            evaluationContext = evaluationDocument;
+          }
+        }
+        const candidate = xpathValues(evaluationDocument, expression, evaluationContext);
+        const usable = list
+          ? candidate.some((value) => value?.nodeType === 1)
+          : candidate.some((value) => nodeValue(value, { content }).trim());
+        selected = candidate;
+        if (usable) break;
       } catch {
         selected = [];
       }
-      if (selected.length) break;
     }
   }
   if (list) return selected.filter((value) => value?.nodeType === 1);
@@ -199,7 +244,11 @@ async function requestAction(source, action, context, fetchImpl) {
   const method = request.POST ? "POST" : "GET";
   const headers = { ...config.httpHeaders, ...(request.httpHeaders || {}) };
   let url = absoluteUrl(request.url, config.host || source.sourceUrl);
-  const init = { method, headers, redirect: "follow", signal: AbortSignal.timeout(context.timeoutMs || 20_000) };
+  const timeoutSignal = AbortSignal.timeout(context.timeoutMs || 20_000);
+  const signal = context.signal
+    ? AbortSignal.any([context.signal, timeoutSignal])
+    : timeoutSignal;
+  const init = { method, headers, redirect: "follow", signal };
   if (request.httpParams && method === "GET") {
     const parsed = new URL(url);
     for (const [key, value] of Object.entries(request.httpParams)) parsed.searchParams.set(key, String(value));
@@ -208,12 +257,10 @@ async function requestAction(source, action, context, fetchImpl) {
     const contentType = Object.entries(headers).find(([key]) => key.toLowerCase() === "content-type")?.[1] || "";
     if (/json/i.test(String(contentType))) init.body = JSON.stringify(request.httpParams);
     else {
-      init.body = new URLSearchParams(Object.entries(request.httpParams).map(([key, value]) => [key, String(value)])).toString();
+      init.body = encodeFormBody(request.httpParams, action);
       if (!contentType) headers["Content-Type"] = "application/x-www-form-urlencoded";
     }
   }
-  if (request.webView) throw new Error(`${action.actionID} 需要 WebView，当前 HTTP 验收器不能伪装为通过`);
-
   const response = await fetchImpl(url, init);
   const body = await response.text();
   if (!response.ok) throw new Error(`${action.actionID} 请求失败：HTTP ${response.status} ${response.url}`);
@@ -259,20 +306,136 @@ function contentSummary(sourceType, value) {
   return { count: text.length, firstUrl: "", value: parsed };
 }
 
+const MEDIA_EXTENSION = /\.(?:mp3|m4a|aac|ogg|oga|wav|flac|opus|mp4|m4v|webm|mkv|ts|m3u8|mpd)(?:[?#]|$)/i;
+const MEDIA_CONTENT_TYPE = /^(?:audio|video)\//i;
+const STREAM_CONTENT_TYPE = /^(?:application\/(?:vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)|audio\/mpegurl)/i;
+const NON_MEDIA_CONTENT_TYPE = /^(?:text\/(?:html|plain)|application\/(?:json|problem\+json|xml|xhtml\+xml))/i;
+
+export function isPlayableMediaResponse(response, requestedUrl = "") {
+  if (!response?.ok) return false;
+  const contentType = String(response.headers?.get?.("content-type") || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  if (NON_MEDIA_CONTENT_TYPE.test(contentType)) return false;
+  if (MEDIA_CONTENT_TYPE.test(contentType) || STREAM_CONTENT_TYPE.test(contentType)) return true;
+  const finalUrl = String(response.url || requestedUrl || "");
+  if (MEDIA_EXTENSION.test(finalUrl)) return !contentType || contentType === "application/octet-stream";
+  return false;
+}
+
+async function probeMedia(fetchImpl, url, headers, timeoutMs, signal) {
+  const request = async (method, extraHeaders = {}) => fetchImpl(url, {
+    method,
+    headers: { ...headers, ...extraHeaders },
+    redirect: "follow",
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+      : AbortSignal.timeout(timeoutMs),
+  });
+  let head;
+  try {
+    head = await request("HEAD");
+    if (isPlayableMediaResponse(head, url)) {
+      return {
+        response: head,
+        bytes: Number(head.headers?.get?.("content-length")) || 0,
+        method: "HEAD",
+      };
+    }
+  } catch {
+    // HEAD is optional and may have different routing/content from GET.
+  }
+
+  const response = await request("GET", { Range: "bytes=0-4095" });
+  if (!response.ok) throw new Error(`正文媒体请求失败：HTTP ${response.status}`);
+  if (!isPlayableMediaResponse(response, url)) {
+    const contentType = response.headers?.get?.("content-type") || "unknown";
+    throw new Error(`正文媒体返回非媒体类型：${contentType}`);
+  }
+  let bytes = 0;
+  if (response.body?.getReader) {
+    const reader = response.body.getReader();
+    const chunk = await reader.read();
+    bytes = chunk.value?.byteLength || 0;
+    await reader.cancel().catch(() => {});
+  } else {
+    bytes = Buffer.from(await response.arrayBuffer()).length;
+  }
+  if (!bytes) throw new Error("正文媒体响应为空");
+  return { response, bytes, method: "GET" };
+}
+
+/** Execute only chapterContent after list/catalogue verification found a real chapter. */
+export async function runXbsChapterContent(source, {
+  bookName = "",
+  detailUrl = "",
+  chapterTitle = "",
+  chapterUrl = "",
+} = {}, options = {}) {
+  const fetchImpl = options.fetchImpl || fetch;
+  const timeoutMs = options.timeoutMs || 20_000;
+  const report = { ok: false, itemCount: 0, firstUrl: "", error: "" };
+  try {
+    if (!chapterUrl) throw new Error("chapterContent 缺少章节 URL");
+    const content = source.chapterContent || {};
+    const queryInfo = {
+      bookName,
+      name: bookName,
+      detailUrl,
+      url: detailUrl,
+      chapterTitle,
+      chapterUrl,
+    };
+    const response = await requestAction(source, content, {
+      result: chapterUrl,
+      queryInfo,
+      responseUrl: detailUrl,
+      timeoutMs,
+      signal: options.signal,
+    }, fetchImpl);
+    const value = select(content, content.content, response.parsed, {
+      content: (source.sourceType || "text") === "text",
+      config: response.config,
+      params: { ...response.params, responseUrl: response.response.url },
+    });
+    const summary = contentSummary(source.sourceType || "text", value);
+    if (!summary.count) throw new Error("chapterContent.content 解析为空");
+    report.ok = true;
+    report.itemCount = summary.count;
+    report.firstUrl = summary.firstUrl;
+    report.requestUrl = response.response.url;
+    if (["audio", "video"].includes(source.sourceType)
+      && summary.value && typeof summary.value === "object" && !Array.isArray(summary.value)) {
+      report.httpHeaders = { ...(summary.value.httpHeaders || summary.value.headers || {}) };
+    }
+  } catch (error) {
+    report.error = String(error?.message || error);
+  }
+  return report;
+}
+
 export async function runXbsPipeline(source, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
   const timeoutMs = options.timeoutMs || 20_000;
   const report = { source: source.sourceName, sourceType: source.sourceType || "text", ok: false, steps: {} };
   try {
     const worldEntries = Object.entries(source.bookWorld || {});
-    const selectedWorld = worldEntries.find(([title]) => title === options.world) || worldEntries[0];
-    if (!selectedWorld) throw new Error("bookWorld 没有可执行分类");
+    const selectedWorld = (options.useSearch && source.searchBook ? ["搜索", source.searchBook] : null)
+      || worldEntries.find(([title]) => title === options.world)
+      || worldEntries[0]
+      || (source.searchBook ? ["搜索", source.searchBook] : null);
+    if (!selectedWorld) throw new Error("bookWorld/searchBook 没有可执行入口");
     const [worldTitle, world] = selectedWorld;
+    const usingSearch = world === source.searchBook;
+    const defaultKeyWord = ({ comic: "漫画", audio: "广播剧", video: "视频" })[source?.sourceType] || "小说";
     const selectedFilter = filtersForAction(world, options.filter);
     const worldResponse = await requestAction(source, world, {
       pageIndex: options.pageIndex || 1,
+      keyWord: usingSearch ? (options.keyWord || defaultKeyWord) : "",
       ...selectedFilter,
       timeoutMs,
+      signal: options.signal,
     }, fetchImpl);
     const books = select(world, world.list, worldResponse.parsed, {
       list: true,
@@ -302,11 +465,42 @@ export async function runXbsPipeline(source, options = {}) {
     };
 
     const detail = source.bookDetail || {};
-    const detailResponse = await requestAction(source, detail, { result: detailUrl, queryInfo, timeoutMs }, fetchImpl);
+    const detailResponse = await requestAction(source, detail, {
+      result: detailUrl,
+      queryInfo,
+      timeoutMs,
+      signal: options.signal,
+    }, fetchImpl);
+    const detailParams = {
+      ...detailResponse.params,
+      responseUrl: detailResponse.response.url,
+    };
+    const detailDocument = detail.responseFormatType === "html"
+      ? htmlDocument(detailResponse.parsed)
+      : null;
+    const detailValues = {};
+    for (const [name, ruleName] of [
+      ["name", "bookName"],
+      ["cover", "cover"],
+      ["author", "author"],
+      ["cat", "cat"],
+      ["lastChapterTitle", "lastChapterTitle"],
+    ]) {
+      if (!detail?.[ruleName]) continue;
+      const value = firstString(select(detail, detail[ruleName], detailResponse.parsed, {
+        config: detailResponse.config,
+        params: detailParams,
+        document: detailDocument,
+      }));
+      if (value) detailValues[name] = name === "cover"
+        ? absoluteUrl(value, detailResponse.response.url)
+        : value;
+    }
     report.steps.bookDetail = {
       requestUrl: detailResponse.response.url,
       status: detailResponse.response.status,
       bytes: Buffer.byteLength(detailResponse.body),
+      ...detailValues,
     };
 
     const toc = source.chapterList || {};
@@ -315,13 +509,19 @@ export async function runXbsPipeline(source, options = {}) {
       queryInfo,
       responseUrl: detailResponse.response.url,
       timeoutMs,
+      signal: options.signal,
     }, fetchImpl);
+    const tocDocument = toc.responseFormatType === "html"
+      ? htmlDocument(tocResponse.parsed)
+      : null;
     const chapters = select(toc, toc.list, tocResponse.parsed, {
       list: true,
       config: tocResponse.config,
       params: { ...tocResponse.params, responseUrl: tocResponse.response.url },
+      document: tocDocument,
     });
-    const firstChapter = chapters[0];
+    const chapterIndex = Number.isInteger(options.chapterIndex) ? options.chapterIndex : 0;
+    const firstChapter = chapters[chapterIndex];
     if (!firstChapter) throw new Error("chapterList.list 解析结果为 0");
     const tocParams = { ...tocResponse.params, responseUrl: tocResponse.response.url };
     const chapterTitle = firstString(select(toc, toc.title, firstChapter, { config: tocResponse.config, params: tocParams }));
@@ -329,6 +529,17 @@ export async function runXbsPipeline(source, options = {}) {
     const chapterUrl = absoluteUrl(rawChapterUrl, tocResponse.response.url);
     if (!chapterTitle) throw new Error("chapterList.title 解析为空");
     if (!chapterUrl) throw new Error("chapterList.url 解析为空");
+    if (!report.steps.bookDetail.lastChapterTitle) {
+      const chapterRows = chapters.map((item) => ({
+        title: firstString(select(toc, toc.title, item, { config: tocResponse.config, params: tocParams })),
+      })).filter((item) => item.title);
+      report.steps.bookDetail.lastChapterTitle = orderChaptersAscending(chapterRows, {
+        reverseHint: Boolean(toc.reverseChapters || toc.reverse),
+      }).at(-1)?.title || "";
+      if (report.steps.bookDetail.lastChapterTitle) {
+        report.steps.bookDetail.derivedFields = ["lastChapterTitle"];
+      }
+    }
     report.steps.chapterList = {
       requestUrl: tocResponse.response.url,
       status: tocResponse.response.status,
@@ -336,6 +547,7 @@ export async function runXbsPipeline(source, options = {}) {
       listCount: chapters.length,
       chapterTitle,
       chapterUrl,
+      candidateIndex: chapterIndex,
     };
 
     const content = source.chapterContent || {};
@@ -347,6 +559,7 @@ export async function runXbsPipeline(source, options = {}) {
       queryInfo: contentQuery,
       responseUrl: tocResponse.response.url,
       timeoutMs,
+      signal: options.signal,
     }, fetchImpl);
     const contentParams = { ...contentResponse.params, responseUrl: contentResponse.response.url };
     const contentValue = select(content, content.content, contentResponse.parsed, {
@@ -363,25 +576,69 @@ export async function runXbsPipeline(source, options = {}) {
       itemCount: summary.count,
       firstUrl: summary.firstUrl,
     };
-    if (summary.firstUrl && options.fetchMedia !== false) {
-      const media = await fetchImpl(summary.firstUrl, { redirect: "follow", signal: AbortSignal.timeout(timeoutMs) });
-      const mediaBody = Buffer.from(await media.arrayBuffer());
-      if (!media.ok || !mediaBody.length) throw new Error(`正文媒体请求失败：HTTP ${media.status}`);
+    if (summary.firstUrl
+      && ["audio", "video"].includes(source.sourceType)
+      && options.fetchMedia !== false) {
+      const mediaHeaders = summary.value && typeof summary.value === "object" && !Array.isArray(summary.value)
+        ? (summary.value.httpHeaders || summary.value.headers || {})
+        : {};
+      const probe = await probeMedia(fetchImpl, summary.firstUrl, mediaHeaders, timeoutMs, options.signal);
+      const media = probe.response;
       report.steps.media = {
         requestUrl: media.url,
         status: media.status,
         contentType: media.headers.get("content-type") || "",
-        bytes: mediaBody.length,
+        bytes: probe.bytes,
+        method: probe.method,
       };
     }
     report.ok = true;
   } catch (error) {
     report.error = error.message;
+    if (!options.world && !options.useSearch && !options._worldFallback) {
+      const maxWorldCandidates = Math.max(1, Math.min(12, options.maxWorldCandidates || 8));
+      const alternatives = Object.keys(source.bookWorld || {}).slice(1, maxWorldCandidates);
+      for (const world of alternatives) {
+        const candidate = await runXbsPipeline(source, {
+          ...options,
+          world,
+          _worldFallback: true,
+        });
+        if (candidate.ok) {
+          candidate.attemptedWorlds = alternatives.indexOf(world) + 2;
+          return candidate;
+        }
+      }
+      if (source.searchBook) {
+        const candidate = await runXbsPipeline(source, {
+          ...options,
+          useSearch: true,
+          _worldFallback: true,
+        });
+        if (candidate.ok) {
+          candidate.attemptedWorlds = alternatives.length + 1;
+          return candidate;
+        }
+      }
+    }
+    if (!Number.isInteger(options.chapterIndex)
+      && Number(report.steps?.chapterList?.listCount || 0) > 1) {
+      const maxCandidates = Math.max(1, Math.min(20,
+        options.maxChapterCandidates || options.maxCandidates || 5));
+      for (let index = 1; index < maxCandidates; index += 1) {
+        const candidate = await runXbsPipeline(source, { ...options, chapterIndex: index });
+        if (candidate.ok) {
+          candidate.attemptedChapterCandidates = index + 1;
+          return candidate;
+        }
+      }
+    }
     // A category may contain a newly-added/deleted book with no chapters while
     // the source itself is healthy. Validate several independent books before
     // declaring the whole XBS source broken.
-    if (!Number.isInteger(options.bookIndex)) {
-      const maxCandidates = Math.max(1, Math.min(10, options.maxCandidates || 5));
+    if (!Number.isInteger(options.bookIndex) && !Number.isInteger(options.chapterIndex)) {
+      const maxCandidates = Math.max(1, Math.min(50,
+        options.maxBookCandidates || options.maxCandidates || 5));
       for (let index = 1; index < maxCandidates; index += 1) {
         const candidate = await runXbsPipeline(source, { ...options, bookIndex: index });
         if (candidate.ok) {

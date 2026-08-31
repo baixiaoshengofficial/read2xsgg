@@ -3,7 +3,7 @@ import { analyzeSite } from "./siteAnalyze/index.js";
 import { encodeXbs } from "./xbs.js";
 
 /**
- * In-process queue that runs full verify conversions and persists results.
+ * In-process queue that converts, verifies, and persists source artifacts.
  *
  * Deleting a running job cancels it and frees the concurrency slot so the
  * next queued job can start immediately.
@@ -166,11 +166,9 @@ export function createJobWorker({
         await onProgress({ done: count, total: count, kept: count, skipped: 0, unverified: 0, fallback: count, failed: 0 });
       } else {
         await store.updateJob(jobId, { phase: "convert" });
-        const jobConfig = {
-          ...config,
-          verifyConvertedSources: true,
-        };
         const progressOpts = {
+          // Library jobs intentionally verify the full aggregate. The sync
+          // endpoint has a small bounded sample budget for interactive use.
           fullVerify: true,
           analyzeFallback: true,
           downloadSource,
@@ -181,21 +179,19 @@ export function createJobWorker({
         };
         // Prefer an explicitly published payload when present so retries keep
         // declarative fields (e.g. mediaResolution) that remote legacy JSON lacks.
-        // Skip online mirror adaptation for payloads: the operator-supplied JSON is
-        // authoritative offline; adaptOnlineSources is for live remote downloads.
         const sourcePayload = typeof store.readSourcePayload === "function"
           ? await store.readSourcePayload(jobId)
           : null;
         result = sourcePayload
           ? await convertParsed(
             sourcePayload,
-            jobConfig,
+            config,
             job.imageProxyBase || "",
-            { ...progressOpts, adapt: false },
+            progressOpts,
           )
           : await convertOnline(
             job.sourceUrl,
-            jobConfig,
+            config,
             job.imageProxyBase || "",
             progressOpts,
           );

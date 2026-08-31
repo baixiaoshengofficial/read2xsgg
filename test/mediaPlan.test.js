@@ -12,6 +12,7 @@ import {
   mediaRuleNeedsPortabilityWarning,
   MEDIA_PORTABILITY_WARNING,
   MEDIA_RECONVERSION_DIAGNOSTIC,
+  pageMediaPlaylist,
   pageMediaUrls,
   resolveChapterMediaUrls,
 } from "../src/index.js";
@@ -79,6 +80,38 @@ test("通用媒体提取支持 JSON、HTML 标签和脚本 URL", () => {
   ]);
 });
 
+test("通用媒体提取解析 data 属性中的分隔播放列表并压过普通接口", () => {
+  const html = [
+    '<script>var player={"url":"https://audio.example/admin-ajax.php"}</script>',
+    '<div data-address="https://cdn.example/one.mp3|https://cdn.example/two.mp3"></div>',
+  ].join("");
+  assert.deepEqual(
+    pageMediaUrls(html, "https://audio.example/work/1", { kind: "audio" }).slice(0, 2),
+    ["https://cdn.example/one.mp3", "https://cdn.example/two.mp3"],
+  );
+  assert.deepEqual(
+    pageMediaPlaylist(
+      '<div data-title="第一集|第二集" data-address="https://cdn.example/one.mp3|https://cdn.example/two.mp3"></div>',
+      "https://audio.example/work/1",
+      "audio",
+    ),
+    [
+      { title: "第一集", url: "https://cdn.example/one.mp3" },
+      { title: "第二集", url: "https://cdn.example/two.mp3" },
+    ],
+  );
+});
+
+test("媒体目录按缓存参数去重并用文件名替换 URL 标题", () => {
+  const html = [
+    '<audio><source src="https://cdn.example/story/episode-1.mp3?_=1"></audio>',
+    '<a href="https://cdn.example/story/episode-1.mp3">https://cdn.example/story/episode-1.mp3</a>',
+  ].join("");
+  assert.deepEqual(pageMediaPlaylist(html, "https://audio.example/work/1", "audio"), [
+    { title: "episode-1", url: "https://cdn.example/story/episode-1.mp3?_=1" },
+  ]);
+});
+
 test("媒体直链无需下载页面即可识别", () => {
   assert.deepEqual(pageMediaUrls("", "https://cdn.example/audio/file.mp3?token=x", { kind: "audio" }), [
     "https://cdn.example/audio/file.mp3?token=x",
@@ -86,6 +119,11 @@ test("媒体直链无需下载页面即可识别", () => {
   assert.deepEqual(pageMediaUrls("", "https://cdn.example/live/master.m3u8", { kind: "video" }), [
     "https://cdn.example/live/master.m3u8",
   ]);
+  assert.deepEqual(pageMediaUrls(
+    "",
+    "https://player.example/play?url=https%3A%2F%2Fcdn.example%2Flive%2Fmaster.m3u8",
+    { kind: "video" },
+  ), ["https://cdn.example/live/master.m3u8"]);
 });
 
 test("音频支持 HLS/DASH 并优先较高质量字段", () => {
@@ -271,6 +309,115 @@ test("无 resolution 时回退通用页面扫描；空计划不猜测受保护�
     pageMediaUrls,
   );
   assert.deepEqual(empty, []);
+});
+
+test("通用媒体回退安全解析同源外链脚本声明的 AJAX 播放接口", async () => {
+  const page = Buffer.from(`
+    <script>var trackId = "42";</script>
+    <script src="/assets/player.js"></script>
+    <div id="player"></div>
+  `);
+  Object.defineProperty(page, "httpHeaders", {
+    value: { "set-cookie": ["sid=chapter; Path=/; HttpOnly"] },
+  });
+  const calls = [];
+  const script = `
+    $.ajax({
+      type: "post",
+      url: "/api/play_" + trackId + ".json" + new Date().getTime(),
+      dataType: "json",
+      success: function (payload) {
+        var reg = new RegExp(".flv", "g");
+        payload.urlpath = payload.urlpath.replace(reg, ".mp3");
+      }
+    });
+  `;
+  const urls = await resolveChapterMediaUrls(
+    page,
+    "https://media.example/chapter/42",
+    { kind: "audio", properties: ["urlpath"], attributes: ["src"], urlHints: [] },
+    async (url, init = {}) => {
+      calls.push({ url, init });
+      if (url === "https://media.example/assets/player.js") return Buffer.from(script);
+      assert.match(url, /^https:\/\/media\.example\/api\/play_42\.json\d+$/);
+      return Buffer.from('{"urlpath":"https://cdn.example/audio/42.flv?token=x"}');
+    },
+    pageMediaUrls,
+  );
+  assert.deepEqual(urls, ["https://cdn.example/audio/42.mp3?token=x"]);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].init.method, "POST");
+  assert.equal(calls[1].init.headers.Cookie, "sid=chapter");
+  assert.equal(calls[1].init.headers["X-Requested-With"], "XMLHttpRequest");
+});
+
+test("通用媒体回退静态解包 P.A.C.K.E.R. 播放脚本", async () => {
+  const packed = `eval(function(p,a,c,k,e,r){e=function(c){return(c<a?'':e(parseInt(c/a)))+((c=c%a)>35?String.fromCharCode(c+29):c.toString(36))};if(!''.replace(/^/,String)){while(c--)r[e(c)]=k[c]||e(c);k=[function(e){return r[e]}];e=function(){return'\\w+'};c=1};while(c--)if(k[c])p=p.replace(new RegExp('\\b'+e(c)+'\\b','g'),k[c]);return p}('0.1({2:"/play",3:"post",4:function(a){a.5}})',6,6,'$|ajax|url|type|success|url'.split('|'),0,{}))`;
+  const urls = await resolveChapterMediaUrls(
+    '<script src="/player.js"></script>',
+    "https://packed.example/chapter/1",
+    { kind: "audio", properties: ["url"], attributes: [], urlHints: [] },
+    async (url, init = {}) => {
+      if (url.endsWith("/player.js")) return Buffer.from(packed);
+      assert.equal(url, "https://packed.example/play");
+      assert.equal(init.method, "POST");
+      return Buffer.from('{"url":"https://cdn.example/packed.mp3"}');
+    },
+    pageMediaUrls,
+  );
+  assert.deepEqual(urls, ["https://cdn.example/packed.mp3"]);
+});
+
+test("通用媒体回退从页面 meta 静态组装 AJAX 表单和请求头", async () => {
+  const page = `
+    <meta name="_b" content="14916">
+    <meta name="_p" content="11">
+    <meta name="_cp" content="3">
+    <meta name="_c" content="token-1">
+    <script src="/player.js"></script>
+  `;
+  const script = `
+    var id=$("meta[name='_b']").attr('content');
+    var ispay=$("meta[name='_p']").attr('content');
+    var currentPage=$("meta[name='_cp']").attr('content');
+    var h={}; h['xt']=$("meta[name='_c']").attr('content');
+    play(currentPage,1);
+    function play(e,c){$.ajax({url:"/glink",type:"POST",data:{'bookId':id,'isPay':ispay,'page':e},dataType:"json",headers:h,success:function(a){player.src=a.ourl}})}
+  `;
+  const urls = await resolveChapterMediaUrls(
+    page,
+    "https://meta.example/book/14916-3",
+    { kind: "audio", properties: ["ourl"], attributes: [], urlHints: [] },
+    async (url, init = {}) => {
+      if (url.endsWith("/player.js")) return Buffer.from(script);
+      assert.equal(url, "https://meta.example/glink");
+      assert.equal(init.method, "POST");
+      assert.equal(init.headers.xt, "token-1");
+      assert.equal(init.body, "bookId=14916&isPay=11&page=3");
+      return Buffer.from('{"ourl":"https://cdn.example/chapter.m4a"}');
+    },
+    pageMediaUrls,
+  );
+  assert.deepEqual(urls, ["https://cdn.example/chapter.m4a"]);
+});
+
+test("媒体脚本相对请求使用章节重定向后的最终 URL", async () => {
+  const page = Buffer.from('<script src="/player.js"></script>');
+  Object.defineProperty(page, "read2xsggResponseUrl", {
+    value: "https://m.redirected.example/chapter/1",
+  });
+  const urls = await resolveChapterMediaUrls(
+    page,
+    "https://redirected.example/chapter/1",
+    { kind: "audio", properties: ["url"], attributes: [], urlHints: [] },
+    async (url) => {
+      if (url.endsWith("/player.js")) return Buffer.from('$.ajax({url:"/play",success:function(a){player.src=a.url}})');
+      assert.equal(url, "https://m.redirected.example/play");
+      return Buffer.from('{"url":"https://cdn.example/final.mp3"}');
+    },
+    pageMediaUrls,
+  );
+  assert.deepEqual(urls, ["https://cdn.example/final.mp3"]);
 });
 
 test("直链章节不触发懒加载页面正文", async () => {

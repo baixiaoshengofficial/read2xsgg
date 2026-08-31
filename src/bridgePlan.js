@@ -4,7 +4,7 @@ import { isXiangseGbkEncode } from "./charset.js";
 const MAX_PLAN_BYTES = 24 * 1024;
 const FIELD_NAMES = new Set([
   "name", "url", "author", "desc", "cat", "lastChapterTitle", "cover", "status", "wordCount",
-  "title", "updateTime", "content",
+  "tocUrl", "title", "updateTime", "content",
 ]);
 
 function selectorOnly(rule) {
@@ -23,7 +23,47 @@ function safeRegexPattern(value) {
   return pattern;
 }
 
+function staticStringLiteral(token) {
+  const source = String(token || "");
+  if (source.length < 2 || !["\"", "'"].includes(source[0]) || source.at(-1) !== source[0]) {
+    throw new TypeError("不是静态字符串");
+  }
+  if (source[0] === "\"") return JSON.parse(source);
+  return source.slice(1, -1).replace(/\\(u[\da-fA-F]{4}|x[\da-fA-F]{2}|['"\\/bfnrt])/g, (_match, escape) => {
+    if (escape[0] === "u" || escape[0] === "x") {
+      return String.fromCodePoint(Number.parseInt(escape.slice(1), 16));
+    }
+    return ({ b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" })[escape] ?? escape;
+  });
+}
+
 function splitTemplateTransform(script) {
+  const literal = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
+  const direct = String(script || "").match(new RegExp(
+    `return\\s+\\(?\\s*(${literal})\\s*\\+\\s*(?:String\\(\\s*)?result\\.split\\(\\s*(${literal})\\s*\\)\\s*\\[\\s*(\\d{1,2})\\s*\\]\\s*\\)?\\s*\\+\\s*(${literal})\\s*\\)?\\s*;`,
+    "i",
+  ));
+  if (direct) {
+    try {
+      const delimiter = staticStringLiteral(direct[2]);
+      const index = Number(direct[3]);
+      if (delimiter.length !== 1 || !Number.isInteger(index) || index > 32) return null;
+      const escapedDelimiter = delimiter.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const classDelimiter = delimiter.replace(/[\\\]^-]/g, "\\$&");
+      const segments = Array.from({ length: index }, () => `[^${classDelimiter}]*${escapedDelimiter}`).join("");
+      const pattern = safeRegexPattern(`^${segments}([^${classDelimiter}]*)`);
+      if (!pattern) return null;
+      const prefix = staticStringLiteral(direct[1]);
+      return {
+        pattern,
+        prefix,
+        suffix: staticStringLiteral(direct[4]),
+        hostPrefix: Boolean(prefix && !/^https?:\/\//i.test(prefix)),
+      };
+    } catch {
+      return null;
+    }
+  }
   const split = String(script || "").match(
     /(?:\bvar\s+)?([A-Za-z_$][\w$]*)\s*=\s*result\.split\(\s*(["'])([\s\S]*?)\2\s*\)\s*\[\s*(\d{1,2})\s*\]/,
   );
@@ -67,10 +107,13 @@ function hostResultTransform(script) {
 
 function normalizeField(rule) {
   if (rule && typeof rule === "object" && !Array.isArray(rule)) {
-    if (rule.constant && /^https?:\/\//i.test(String(rule.constant))) {
+    if (rule.currentUrl) {
+      return { selector: ".", currentUrl: true, replacements: [], hostPrefix: false, matchTemplate: null };
+    }
+    if (Object.hasOwn(rule, "constant") && String(rule.constant || "").trim()) {
       return {
         selector: ".",
-        constant: String(rule.constant).slice(0, 2048),
+        constant: String(rule.constant).trim().slice(0, 2048),
         replacements: [],
         hostPrefix: false,
         matchTemplate: null,
@@ -98,6 +141,7 @@ function normalizeField(rule) {
       replacements,
       hostPrefix: Boolean(rule.hostPrefix),
       matchTemplate,
+      ...(String(rule.fallback || "").trim() ? { fallback: String(rule.fallback).trim().slice(0, 2048) } : {}),
       ...(urlTemplate && /^https?:\/\//i.test(urlTemplate) ? { urlTemplate } : {}),
     };
   }
@@ -123,9 +167,34 @@ function normalizeField(rule) {
       // Ignore non-generated postprocessors.
     }
   }
+  if (/rows\s*\[\s*rows\.length\s*-\s*1\s*\]/.test(script)
+    && /\.split\(\/\[\|/.test(script)) {
+    replacements.push({
+      pattern: "^[\\s\\S]*\\|([^|\\r\\n]+)\\|?\\s*$",
+      replacement: "$1",
+    });
+  }
   let matchTemplate = null;
+  const scalarTemplate = script.match(
+    /return\s+\(?\s*(?:((?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'))\s*\+\s*)?(?:String\(\s*)?result(?:\s*\|\|\s*""\s*)?\)?(?:\s*\+\s*((?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')))?\s*\)?\s*;/i,
+  );
+  if (scalarTemplate && (scalarTemplate[1] || scalarTemplate[2])) {
+    try {
+      const prefix = scalarTemplate[1] ? staticStringLiteral(scalarTemplate[1]) : "";
+      let suffix = scalarTemplate[2] ? staticStringLiteral(scalarTemplate[2]) : "";
+      if (/^\s*,\s*\{\s*webView\s*:/i.test(suffix)) suffix = "";
+      matchTemplate = {
+        pattern: "^([\\s\\S]+)$",
+        prefix,
+        suffix,
+        hostPrefix: Boolean(prefix && !/^https?:\/\//i.test(prefix)),
+      };
+    } catch {
+      matchTemplate = null;
+    }
+  }
   const template = script.match(/match\(\/((?:\\.|[^/])+)\/[gimuy]*\)[\s\S]*?return\s+m\s*\?\s*(config\.host\s*\+\s*)?("(?:\\.|[^"\\])*")\s*\+\s*m\[1\]\s*\+\s*("(?:\\.|[^"\\])*")/i);
-  if (template) {
+  if (!matchTemplate && template) {
     try {
       const pattern = safeRegexPattern(template[1]);
       if (pattern) matchTemplate = {
@@ -138,6 +207,13 @@ function normalizeField(rule) {
       // Keep the base selector when the generated template is malformed.
     }
   }
+  const directMatch = script.match(
+    /result\.match\(\s*\/((?:\\.|[^/])+)\/[gimuy]*\s*\)\s*\[\s*1\s*\]/i,
+  );
+  if (!matchTemplate && directMatch) {
+    const pattern = safeRegexPattern(directMatch[1]);
+    if (pattern) matchTemplate = { pattern, prefix: "", suffix: "", hostPrefix: false };
+  }
   if (!matchTemplate) matchTemplate = hostResultTransform(script);
   if (!matchTemplate) matchTemplate = splitTemplateTransform(script);
   return {
@@ -146,6 +222,15 @@ function normalizeField(rule) {
     hostPrefix: /return\s+config\.host\s*\+/i.test(script),
     matchTemplate,
   };
+}
+
+function normalizeLatestField(rule) {
+  const field = normalizeField(rule);
+  if (!field || field.constant || field.currentUrl) return null;
+  if (!field.replacements.length && !field.hostPrefix && !field.matchTemplate && !field.urlTemplate) {
+    return field.selector;
+  }
+  return field;
 }
 
 function normalizePlan(value) {
@@ -159,19 +244,77 @@ function normalizePlan(value) {
     if (field) {
       fields[name] = field.constant
         ? { constant: field.constant }
+        : field.currentUrl
+          ? { currentUrl: true }
         : field;
     }
   }
   const headers = {};
   for (const [name, headerValue] of Object.entries(value.headers || {})) {
-    if (!/^(?:user-agent|referer|origin|accept|accept-language|content-type|x-requested-with)$/i.test(name)) continue;
+    if (!/^(?:user-agent|referer|origin|accept|accept-language|content-type|x-requested-with|x-fingerprint)$/i.test(name)) continue;
     headers[name] = String(headerValue).slice(0, 2048);
+  }
+  let latestChapter = null;
+  if (kind === "detail" && value.latestChapter && typeof value.latestChapter === "object") {
+    const candidate = value.latestChapter;
+    const urlTemplate = String(candidate.urlTemplate || "").trim().slice(0, 4096);
+    const list = selectorOnly(candidate.list);
+    const title = normalizeLatestField(candidate.title);
+    const count = selectorOnly(candidate.count);
+    const values = {};
+    for (const [name, selector] of Object.entries(candidate.values || {}).slice(0, 16)) {
+      if (!/^[A-Za-z_$][\w$]*$/.test(name)) continue;
+      const normalized = selectorOnly(selector);
+      if (normalized) values[name] = normalized;
+    }
+    const pageSize = Math.max(1, Math.min(200, Number(candidate.pageSize) || 50));
+    if (/^https?:\/\//i.test(urlTemplate) && list && title && Object.keys(values).length) {
+      latestChapter = {
+        mode: "template",
+        urlTemplate,
+        responseType: candidate.responseType === "html" ? "html" : "json",
+        list,
+        title,
+        count,
+        countSource: candidate.countSource === "menu" ? "menu" : "detail",
+        values,
+        pageSize,
+      };
+    } else {
+      const tocSelector = selectorOnly(candidate.tocSelector);
+      const url = normalizeLatestField(candidate.url);
+      if (candidate.mode === "direct" && candidate.responseType === "json" && list && title && url) {
+        latestChapter = {
+          mode: "direct",
+          responseType: "json",
+          list,
+          title,
+          url,
+          reverse: Boolean(candidate.reverse),
+          pageSize,
+        };
+      } else if (candidate.responseType === "html" && list && title && url
+        && (tocSelector || candidate.samePage)) {
+        latestChapter = {
+          mode: "html-toc",
+          responseType: "html",
+          tocSelector,
+          samePage: Boolean(candidate.samePage),
+          dynamicHtml: Boolean(candidate.dynamicHtml),
+          list,
+          title,
+          url,
+          reverse: Boolean(candidate.reverse),
+          pageSize,
+        };
+      }
+    }
   }
   return {
     version: 1,
     kind,
     host: /^https?:\/\//i.test(String(value.host || "")) ? String(value.host).slice(0, 2048) : "",
-    responseType: value.responseType === "json" ? "json" : "html",
+    responseType: ["json", "embedded-json"].includes(value.responseType) ? value.responseType : "html",
     list: selectorOnly(value.list),
     tocSelector: selectorOnly(value.tocSelector),
     charset: /^(?:gbk|utf-8)$/i.test(String(value.charset || "").trim())
@@ -179,8 +322,10 @@ function normalizePlan(value) {
       : "",
     // Legado chapterList leading "-" / reverseChapters → reverse before ascending sort.
     reverse: Boolean(value.reverse),
+    preserveOrder: Boolean(value.preserveOrder),
     fields,
     headers,
+    ...(latestChapter ? { latestChapter } : {}),
   };
 }
 
@@ -204,9 +349,126 @@ export function decodeBridgePlan(encoded) {
   }
 }
 
+function multiFieldResultUrlTemplate(script) {
+  const returnMatch = String(script || "").match(/\breturn\b/i);
+  if (!returnMatch) return null;
+  const expression = String(script).slice(returnMatch.index + returnMatch[0].length);
+  const parts = [];
+  let cursor = 0;
+  let depth = 0;
+  let expectTerm = true;
+
+  const whitespace = () => {
+    while (/\s/.test(expression[cursor] || "")) cursor += 1;
+  };
+  while (cursor < expression.length) {
+    whitespace();
+    if (cursor >= expression.length) break;
+    if (expression[cursor] === ";" && depth === 0 && !expectTerm) {
+      cursor += 1;
+      whitespace();
+      if (cursor !== expression.length) return null;
+      break;
+    }
+    if (expectTerm && expression[cursor] === "(") {
+      depth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (!expectTerm && expression[cursor] === ")") {
+      if (depth === 0) return null;
+      depth -= 1;
+      cursor += 1;
+      continue;
+    }
+    if (!expectTerm && expression[cursor] === "+") {
+      expectTerm = true;
+      cursor += 1;
+      continue;
+    }
+    if (!expectTerm) return null;
+
+    const field = expression.slice(cursor).match(
+      /^String\s*\(\s*result\.([A-Za-z_$][\w$]*)\s*\)/,
+    );
+    if (field) {
+      parts.push({ field: field[1] });
+      cursor += field[0].length;
+      expectTerm = false;
+      continue;
+    }
+    const literal = expression.slice(cursor).match(/^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/);
+    if (!literal) return null;
+    try {
+      parts.push({ literal: staticStringLiteral(literal[0]) });
+    } catch {
+      return null;
+    }
+    cursor += literal[0].length;
+    expectTerm = false;
+  }
+
+  if (expectTerm || depth !== 0) return null;
+  const fields = parts.filter((part) => part.field).map((part) => part.field);
+  if (fields.length < 2) return null;
+  const urlTemplate = parts.map((part) => part.field ? `{{${part.field}}}` : part.literal).join("");
+  if (!/^https?:\/\//i.test(urlTemplate) || urlTemplate.length > 2_048) return null;
+  return { selector: fields[0], urlTemplate };
+}
+
+function jsonFieldUrlTemplate(rule) {
+  const source = String(rule || "").trim();
+  if (!/^https?:\/\//i.test(source)) return null;
+  const fields = [];
+  let urlTemplate = source.replace(
+    /\{\{\s*\$\.(\.?)([A-Za-z_$][\w$]*)\s*\}\}/g,
+    (_match, recursive, field) => {
+      fields.push({ field, recursive: Boolean(recursive) });
+      return `{{raw:${field}}}`;
+    },
+  );
+  urlTemplate = urlTemplate.replace(
+    /(?<!\{)\{\s*\$\.(\.?)([A-Za-z_$][\w$]*)\s*\}(?!\})/g,
+    (_match, recursive, field) => {
+      fields.push({ field, recursive: Boolean(recursive) });
+      return `{{raw:${field}}}`;
+    },
+  );
+  if (!fields.length || urlTemplate.length > 2_048) return null;
+  const primary = fields[0];
+  return {
+    selector: primary.recursive ? `@json-recursive:${encodeURIComponent(primary.field)}` : primary.field,
+    urlTemplate,
+  };
+}
+
 function inferredScriptField(rule, preferredNames = []) {
   const source = String(rule || "").trim();
-  if (!/^@js:/i.test(source)) return rule;
+  if (!/^@js:/i.test(source)) return jsonFieldUrlTemplate(source) || rule;
+  if (/return\s+String\(\s*\(?\s*params\.responseUrl\b/i.test(source)) {
+    return { currentUrl: true };
+  }
+  const hostTemplate = source.match(
+    /return\s+\(?\s*String\(\s*config\.host\s*\)\s*\+\s*("(?:\\.|[^"\\])*")\s*\+\s*String\(result\.([A-Za-z_$][\w$]*)\)(?:\s*\+\s*("(?:\\.|[^"\\])*"))?\s*\)?\s*;/i,
+  );
+  if (hostTemplate) {
+    try {
+      return {
+        selector: hostTemplate[2],
+        hostPrefix: true,
+        matchTemplate: {
+          pattern: "^([\\s\\S]+)$",
+          prefix: JSON.parse(hostTemplate[1]),
+          suffix: hostTemplate[3] ? JSON.parse(hostTemplate[3]) : "",
+          hostPrefix: true,
+        },
+      };
+    } catch {
+      return "";
+    }
+  }
+  const multiFieldUrl = multiFieldResultUrlTemplate(source);
+  if (multiFieldUrl) return multiFieldUrl;
   const threePart = source.match(
     /return\s+\(?\s*("(?:\\.|[^"\\])*")\s*\+\s*String\(result\.([A-Za-z_$][\w$]*)\)\s*\+\s*("(?:\\.|[^"\\])*")\s*\)?\s*;/i,
   );
@@ -319,6 +581,7 @@ export function compileDetailBridgePlan(action, headers = {}) {
       cover: inferredScriptField(action.cover, [/cover/i, /pic/i, /img/i, /icon/i]) || action.cover,
       status: action.status,
       wordCount: action.wordCount,
+      tocUrl: action.tocUrl,
     },
     headers,
   });
@@ -337,7 +600,8 @@ export function compileChapterBridgePlan(action, { tocSelector = "", headers = {
     tocSelector,
     reverse: Boolean(reverse || action.reverseChapters || action.reverse),
     fields: {
-      title: inferredScriptField(action.title, [/title/i, /name/i, /chapter/i]),
+      title: inferredScriptField(action.title, [/title/i, /name/i, /chapter/i])
+        || (/queryInfo\.(?:bookName|name)/i.test(String(action.title || "")) ? { constant: "播放" } : ""),
       url: urlRule,
       updateTime: action.updateTime,
     },
@@ -377,10 +641,23 @@ function xpathValues(document, expression, context = document, { maxNodes = Infi
 function htmlDocument(value) {
   // Prefer a lean parse: scripts/styles are irrelevant for selector extraction
   // and dominate CPU/memory on large catalogue pages.
-  return new JSDOM(String(value || ""), {
-    contentType: "text/html",
-    pretendToBeVisual: false,
-  }).window.document;
+  const source = String(value || "")
+    .replace(/<script\b[^>]*>[\s\S]*?(?:<\/script>|$)/gi, (tag) => (
+      /\btype\s*=\s*["']application\/(?:ld\+)?json(?:\s*;[^"']*)?["']/i.test(tag) ? tag : ""
+    ))
+    .replace(/<style\b[^>]*>[\s\S]*?(?:<\/style>|$)/gi, "");
+  const xml = /^\s*(?:<\?xml\b|<(?:rss|feed)\b)/i.test(source);
+  try {
+    return new JSDOM(source, {
+      contentType: xml ? "text/xml" : "text/html",
+      pretendToBeVisual: false,
+    }).window.document;
+  } catch {
+    return new JSDOM(source, {
+      contentType: "text/html",
+      pretendToBeVisual: false,
+    }).window.document;
+  }
 }
 
 function nodeText(node, content = false) {
@@ -428,11 +705,14 @@ export function htmlToPlainText(value) {
 
 function htmlSelect(rule, input, { list = false, content = false, maxNodes = Infinity } = {}) {
   if (!rule) return list ? [] : "";
-  const itemInput = Boolean(input?.nodeType);
+  const itemInput = Boolean(input?.nodeType && input.nodeType !== 9);
   // List fields must be evaluated relative to the matched item. Reusing its
   // owner document avoids constructing a new JSDOM for every field of every
   // book/chapter (large catalogues commonly contain thousands of chapters).
-  const document = itemInput ? (input.ownerDocument || input) : htmlDocument(input);
+  const document = itemInput
+    ? (input.ownerDocument || input)
+    : input?.nodeType === 9 ? input : htmlDocument(input);
+  if (list && String(rule).trim() === "." && !itemInput) return document.documentElement ? [document.documentElement] : [];
   for (const alternative of String(rule).split(/\s*\|\|\s*/).filter(Boolean)) {
     try {
       let expression = alternative;
@@ -460,21 +740,114 @@ function htmlSelect(rule, input, { list = false, content = false, maxNodes = Inf
 }
 
 function jsonPathSingle(input, path) {
+  const recursive = String(path || "").trim().match(/^@json-recursive:([^:]+)(?::(values))?$/);
+  if (recursive) {
+    let selector = "";
+    try { selector = decodeURIComponent(recursive[1]); } catch { return []; }
+    const [first, ...rest] = selector.split(/[/.]/).filter(Boolean);
+    if (!first) return [];
+    const found = [];
+    const visit = (value) => {
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item);
+        return;
+      }
+      if (!value || typeof value !== "object") return;
+      if (Object.hasOwn(value, first)) {
+        const raw = typeof value[first] === "number" && !Number.isSafeInteger(value[first])
+          && typeof value[`${first}Str`] === "string"
+          ? value[`${first}Str`]
+          : value[first];
+        const selected = rest.length ? jsonPathSingle(raw, rest.join("/")) : raw;
+        if (selected !== undefined && selected !== null) found.push(selected);
+      }
+      for (const child of Object.values(value)) visit(child);
+    };
+    visit(input);
+    if (!recursive[2]) return found.flatMap((value) => Array.isArray(value) ? value : [value]);
+    return found.flatMap((value) => {
+      if (Array.isArray(value)) return value;
+      if (value && typeof value === "object") return Object.values(value);
+      return value === undefined || value === null ? [] : [value];
+    });
+  }
+  const union = String(path || "").trim().match(/^@json-union:(.+)$/);
+  if (union) {
+    const rows = [];
+    for (const encoded of union[1].split(",").filter(Boolean)) {
+      let selector = "";
+      try { selector = decodeURIComponent(encoded); } catch { continue; }
+      const value = jsonPathSingle(input, selector);
+      if (Array.isArray(value)) rows.push(...value);
+      else if (value !== undefined && value !== null && value !== "") rows.push(value);
+    }
+    return rows;
+  }
+  const filter = parseJsonFilter(path);
+  if (filter) return executeJsonFilter(input, filter);
   let value = input;
   const normalized = String(path || "").trim().replace(/^@json:/i, "").replace(/^\$\.?/, "")
-    .replace(/\[\*\]/g, "").replace(/\[(\d+)\]/g, "/$1").replace(/\./g, "/");
+    .replace(/\[\*\]/g, "")
+    .replace(/\[((?:\d+\s*,\s*)+\d+)\]/g, (_match, indices) => `/@indices:${indices.replace(/\s+/g, "")}`)
+    .replace(/\[(\d+)\]/g, "/$1").replace(/\./g, "/");
   for (const key of normalized.split("/").filter(Boolean)) {
-    if (Array.isArray(value) && !/^\d+$/.test(key)) {
+    if (Array.isArray(value) && /^@indices:(?:\d+,)+\d+$/.test(key)) {
+      value = key.slice("@indices:".length).split(",")
+        .map((index) => value[Number(index)])
+        .filter((item) => item !== undefined && item !== null);
+    } else if (Array.isArray(value) && !/^\d+$/.test(key)) {
       value = value.flatMap((item) => {
         const child = item?.[key];
         if (Array.isArray(child)) return child;
         return child === undefined || child === null ? [] : [child];
       });
     } else {
-      value = value?.[key];
+      const direct = value?.[key];
+      value = typeof direct === "number" && !Number.isSafeInteger(direct)
+        && typeof value?.[`${key}Str`] === "string"
+        ? value[`${key}Str`]
+        : direct;
     }
   }
   return value;
+}
+
+function parseJsonFilter(path) {
+  const match = String(path || "").trim().match(/^@json-filter:(recursive|direct):([^:]*):([^:]+):(.+)$/);
+  if (!match) return null;
+  try {
+    const values = match[4].split(",").map((value) => decodeURIComponent(value));
+    if (!values.length) return null;
+    return {
+      recursive: match[1] === "recursive",
+      base: decodeURIComponent(match[2]),
+      field: decodeURIComponent(match[3]),
+      values: new Set(values.map(String)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function executeJsonFilter(input, filter) {
+  const root = filter.base ? jsonPathSingle(input, filter.base) : input;
+  const candidates = [];
+  const visit = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    candidates.push(value);
+    if (filter.recursive) {
+      for (const child of Object.values(value)) visit(child);
+    }
+  };
+  visit(root);
+  return candidates.filter((candidate) => {
+    const value = jsonPathSingle(candidate, filter.field);
+    return value !== undefined && value !== null && filter.values.has(String(value));
+  });
 }
 
 function jsonPath(input, path) {
@@ -486,11 +859,51 @@ function jsonPath(input, path) {
   return undefined;
 }
 
+function embeddedJsonArray(input, selector) {
+  const name = String(selector || "").match(/^@embedded-json-array:([A-Za-z_$][\w$]*)$/)?.[1];
+  if (!name) return [];
+  const source = String(input || "");
+  const assignment = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*\\[`, "g");
+  const found = assignment.exec(source);
+  if (!found) return [];
+  const start = found.index + found[0].lastIndexOf("[");
+  let quote = "";
+  let escaped = false;
+  let depth = 0;
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === "[") depth += 1;
+    else if (character === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          const value = JSON.parse(source.slice(start, index + 1));
+          return Array.isArray(value) ? value : [];
+        } catch {
+          return [];
+        }
+      }
+    }
+  }
+  return [];
+}
+
 function select(plan, rule, input, options = {}) {
   const field = normalizeField(rule);
   if (!field) return options.list ? [] : "";
   if (field.constant) return field.constant;
-  if (plan.responseType === "json") {
+  if (field.currentUrl) return String(options.baseUrl || "");
+  if (plan.responseType === "json" || plan.responseType === "embedded-json") {
     const value = field.selector ? jsonPath(input, field.selector) : input;
     if (options.list) return Array.isArray(value) ? value : [];
     if (Array.isArray(value)) return value.map((item) => String(item ?? "")).filter(Boolean).join("\n");
@@ -511,10 +924,10 @@ function transformed(plan, rule, input, options = {}) {
     if (match) value = `${field.matchTemplate.hostPrefix ? plan.host : ""}${field.matchTemplate.prefix}${match[1] || ""}${field.matchTemplate.suffix}`;
   }
   if (field?.hostPrefix && value && !/^https?:\/\//i.test(value)) value = `${plan.host}${value}`;
-  return value;
+  return String(value || "").trim() || field?.fallback || "";
 }
 
-function expandUrlTemplate(template, item, baseUrl) {
+function expandUrlTemplate(template, item, baseUrl, selectedValue = "") {
   let bookId = "";
   let comicId = "";
   let entityId = "";
@@ -543,23 +956,75 @@ function expandUrlTemplate(template, item, baseUrl) {
     ...pageIds,
     ...(item && typeof item === "object" && !Array.isArray(item) ? item : {}),
   };
-  return String(template || "").replace(/\{\{(base:)?([A-Za-z_$][\w$]*)\}\}/g, (_, base, name) => {
-    if (base || name === "bookId") return encodeURIComponent(String(values.bookId || bookId || ""));
+  const selectedName = String(template || "").match(/\{\{(?:(?:raw):)?(?!base:)([A-Za-z_$][\w$]*)\}\}/)?.[1];
+  if (selectedName && selectedValue && (values[selectedName] === undefined || values[selectedName] === null)) {
+    values[selectedName] = selectedValue;
+  }
+  return String(template || "").replace(/\{\{(?:(base|raw):)?([A-Za-z_$][\w$]*)\}\}/g, (_, mode, name) => {
+    if (mode === "base" || name === "bookId") return encodeURIComponent(String(values.bookId || bookId || ""));
     const value = values[name] ?? pageIds[name];
+    if (mode === "raw") return String(value == null ? "" : value).split("/").map(encodeURIComponent).join("/");
     return encodeURIComponent(value == null ? "" : String(value));
   });
 }
 
-function absolute(value, baseUrl) {
+function siteDomain(hostname) {
+  const parts = String(hostname || "").toLowerCase().split(".").filter(Boolean);
+  if (parts.length <= 2) return parts.join(".");
+  const second = parts.at(-2);
+  const countrySuffix = parts.at(-1)?.length === 2 && /^(?:ac|co|com|edu|gov|net|org)$/.test(second);
+  return parts.slice(countrySuffix ? -3 : -2).join(".");
+}
+
+function absolute(value, baseUrl, preferredHost = "") {
   const source = String(value || "").trim();
   if (!source) return "";
-  try { return new URL(source, baseUrl).toString(); } catch { return ""; }
+  let base = baseUrl;
+  if (/^\/(?!\/)/.test(source) && /^https?:\/\//i.test(String(preferredHost || ""))) {
+    try {
+      const response = new URL(baseUrl);
+      const preferred = new URL(preferredHost);
+      if (response.origin !== preferred.origin
+        && siteDomain(response.hostname) === siteDomain(preferred.hostname)) {
+        base = preferred.toString();
+      }
+    } catch {
+      // Resolve against the response URL below.
+    }
+  }
+  try { return new URL(source, base).toString(); } catch { return ""; }
 }
 
 export function bridgeTocUrl(page, baseUrl, plan) {
   if (!plan.tocSelector || plan.responseType !== "html") return "";
-  const value = htmlSelect(plan.tocSelector, page);
-  return absolute(value, baseUrl);
+  const document = htmlDocument(page);
+  const selected = absolute(htmlSelect(plan.tocSelector, document), baseUrl);
+  const candidates = [];
+  let order = 0;
+  for (const anchor of document.querySelectorAll("a[href]")) {
+    const raw = String(anchor.getAttribute("href") || "").trim();
+    if (!raw || /^(?:javascript|#)/i.test(raw)) continue;
+    const url = absolute(raw, baseUrl);
+    if (!url) continue;
+    const text = String(anchor.textContent || "").replace(/\s+/g, " ").trim();
+    let score = -order;
+    if (selected && url === selected) score += 600;
+    if (/(?:章节目录|全部章节|目录列表|目录|chapter\s*list|catalog|directory|table\s+of\s+contents)/i.test(text)) score += 1_000;
+    if (/(?:mainindex|rcatalog|catalog|chapter[-_/]?list|chapters|directory|mulu|index\/?)\b/i.test(url)) score += 300;
+    if (/(?:点击阅读|开始阅读|立即阅读|继续阅读|下一章|上一章|read\s*now|continue\s*reading)/i.test(text)) score -= 500;
+    if (/(?:\/c\/\d+|\/chapter\/\d+|\/chapters?\/\d+|\/read\/\d+)(?:\/|$)/i.test(new URL(url).pathname)) score -= 250;
+    candidates.push({ url, score });
+    order += 1;
+  }
+  if (selected && !candidates.some((item) => item.url === selected)) {
+    candidates.push({ url: selected, score: 600 });
+  }
+  const best = candidates.sort((left, right) => right.score - left.score)[0];
+  // A caller may already be on the catalogue URL returned by bookDetail.
+  // When the original toc selector no longer matches there, following an
+  // arbitrary navigation link turns search/login pages into fake chapters.
+  if (!selected && (!best || best.score < 300)) return "";
+  return best?.url || selected;
 }
 
 /** Per-response defaults. Full catalogues are served via page/offset, not truncation. */
@@ -658,8 +1123,9 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
   if (plan.responseType === "json") {
     try { input = JSON.parse(String(body || "")); } catch { throw new TypeError("上游响应不是规则声明的 JSON"); }
   }
+  const parsedInput = plan.responseType === "html" ? htmlDocument(input) : input;
   if (plan.kind === "text") {
-    let content = transformed(plan, plan.fields.content, input, { content: plan.responseType === "html" });
+    let content = transformed(plan, plan.fields.content, parsedInput, { content: plan.responseType === "html" });
     // Novel text adapters historically returned innerHTML; Xiangse shows tags
     // literally unless we normalize to plain text with paragraph breaks.
     if (plan.responseType === "html" || /<[a-z][\s\S]*>/i.test(String(content || ""))) {
@@ -670,7 +1136,9 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
   if (plan.kind === "detail") {
     const result = {};
     for (const [name, rule] of Object.entries(plan.fields)) {
-      result[name] = transformed(plan, rule, input, { content: false });
+      result[name] = transformed(plan, rule, parsedInput, { content: false, baseUrl });
+      const field = normalizeField(rule);
+      if (field?.urlTemplate) result[name] = expandUrlTemplate(field.urlTemplate, input, baseUrl, result[name]);
     }
     if (result.cover) result.cover = absolute(result.cover, baseUrl);
     return result;
@@ -683,13 +1151,15 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     ? undefined
     : start + Math.max(pageSize, 0) + 1;
   const scanCap = resolveBridgeScanCap(plan.kind, needValid, limits);
-  const items = plan.responseType === "json"
+  const items = plan.responseType === "json" || plan.responseType === "embedded-json"
     ? (() => {
-      const value = jsonPath(input, plan.list);
+      const value = plan.responseType === "embedded-json"
+        ? embeddedJsonArray(input, plan.list)
+        : jsonPath(input, plan.list);
       const list = Array.isArray(value) ? value : [];
       return Number.isFinite(scanCap) ? list.slice(0, scanCap) : list;
     })()
-    : htmlSelect(plan.list, input, { list: true, maxNodes: scanCap });
+    : htmlSelect(plan.list, parsedInput, { list: true, maxNodes: scanCap });
   if (pageSize === 0) {
     return { data: [], hasMore: false, offset: start, pageSize };
   }
@@ -698,17 +1168,19 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     const rows = [];
     for (const item of items) {
       const row = {};
-      for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item);
+      for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item, { baseUrl });
       const urlField = normalizeField(plan.fields.url);
       if (urlField?.urlTemplate) {
-        row.url = expandUrlTemplate(urlField.urlTemplate, item, baseUrl);
+        row.url = expandUrlTemplate(urlField.urlTemplate, item, baseUrl, row.url);
       } else {
-        row.url = absolute(row.url, baseUrl);
+        row.url = absolute(row.url, baseUrl, plan.host);
       }
       if (!row.title || !row.url) continue;
       rows.push(row);
     }
-    const ordered = orderChaptersAscending(rows, { reverseHint: Boolean(plan.reverse) });
+    const ordered = plan.preserveOrder
+      ? rows
+      : orderChaptersAscending(rows, { reverseHint: Boolean(plan.reverse) });
     const page = ordered.slice(start, start + pageSize);
     // Full page ⇒ assume more (upstream JSON menus like getBookMenu page by
     // pageNum). Previously hasMore stayed false when items.length < scanCap,
@@ -726,8 +1198,13 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
   let hasMore = false;
   for (const item of items) {
     const row = {};
-    for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item);
-    row.url = absolute(row.url, baseUrl);
+    for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item, { baseUrl });
+    const urlField = normalizeField(plan.fields.url);
+    row.url = urlField?.urlTemplate
+      ? expandUrlTemplate(urlField.urlTemplate, item, baseUrl, row.url)
+      : absolute(row.url, baseUrl, plan.host);
+    const coverField = normalizeField(plan.fields.cover);
+    if (coverField?.urlTemplate) row.cover = expandUrlTemplate(coverField.urlTemplate, item, baseUrl, row.cover);
     if (row.cover) row.cover = absolute(row.cover, baseUrl);
     if (!row.name || !row.url) continue;
     if (seenValid < start) {
@@ -752,4 +1229,18 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     offset: start,
     pageSize,
   };
+}
+
+export function executeBridgeSelector(body, baseUrl, responseType, selector, { list = false } = {}) {
+  const plan = normalizePlan({
+    kind: "detail",
+    host: baseUrl,
+    responseType,
+    fields: { name: selector },
+  });
+  let input = body;
+  if (plan.responseType === "json") {
+    try { input = JSON.parse(String(body || "")); } catch { throw new TypeError("上游响应不是规则声明的 JSON"); }
+  }
+  return select(plan, plan.fields.name, input, { baseUrl, list });
 }

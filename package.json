@@ -13,9 +13,10 @@
   "exports": "./src/index.js",
   "scripts": {
     "test": "node --test",
-    "test:live": "RUN_LIVE_TESTS=1 node --test test/live-alicesw.test.js",
+    "test:live": "RUN_XBS_LIVE=1 node --test test/live-xbs.test.js",
     "test:xbs-live": "RUN_XBS_LIVE=1 node --test test/live-xbs.test.js",
     "validate:xbs": "node ./bin/validate-xbs.js",
+    "audit:sources": "node ./bin/audit-sources.js",
     "convert": "node ./bin/read2xsgg.js",
     "publish:library": "node ./bin/publish-library.js",
     "rebase:library": "node ./bin/rebase-library.js",
@@ -33,6 +34,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "iconv-lite": "^0.6.3",
     "jimp": "^1.6.1",
     "jsdom": "^24.1.3"
   }

@@ -9,7 +9,9 @@ function scoreKinds(html, baseUrl = "") {
   const imgCount = (lower.match(/<img\b/g) || []).length;
   const linkCount = (lower.match(/<a\b/g) || []).length;
   const audioHits = (lower.match(/<audio\b|\.mp3\b|\.m4a\b|audio\/mpeg|听书|有声|电台/g) || []).length;
-  const videoHits = (lower.match(/<video\b|\.m3u8\b|\.mp4\b|application\/x-mpegurl|影视|播放器|电影|剧集/g) || []).length;
+  const videoHits = (lower.match(
+    /<video\b|\.m3u8\b|\.mp4\b|application\/x-mpegurl|影视|视频|播放器|电影|剧集|href\s*=\s*["'][^"']*\/(?:video|videos|watch|play)\//g,
+  ) || []).length;
   const comicHits = (lower.match(/漫画|comic|manga|manhua|章节图片|阅读漫画/g) || []).length;
   const novelHits = (lower.match(/小说|章节|目录|作者|最新章节|全文|正文|book|novel|chapter/g) || []).length;
   const imgRatio = linkCount > 0 ? imgCount / linkCount : imgCount;

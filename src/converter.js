@@ -1,7 +1,6 @@
 import { convertRule, inferResponseType } from "./selectors.js";
 import { convertRequest, parseHeaders, parseLooseJson } from "./requests.js";
 import { detectLegadoCharset, xiangseEncodeFields } from "./charset.js";
-import { adaptLegadoSource, bookDetailRequestInfoOverride, chapterListRequestInfoOverride } from "./siteAdapters.js";
 import { decoderForLegadoImageRule } from "./imageDecoder.js";
 import { compileComicExtractionPlan, encodeComicExtractionPlan } from "./comicPlan.js";
 import {
@@ -14,6 +13,7 @@ import {
 } from "./mediaPlan.js";
 import { encodeCatalogPlan, normalizeCatalogPlan } from "./catalogPlan.js";
 import { hasUnsupportedLegadoRuntime } from "./legadoJs.js";
+import { compileSignedRequestPlan, encodeSignedRequestPlan } from "./requestPlan.js";
 import {
   compileBookBridgePlan,
   compileChapterBridgePlan,
@@ -181,7 +181,7 @@ function wrapMediaContent(contentRule, imageProxyBase = "") {
     "  || url.match(/https?:\\/\\/[^\\s\"'<>]+/i)",
     "  || (url.charAt(0) === \"/\" ? [null, url] : null);",
     "if (m) url = m[1] || m[0];",
-    "url = encodeURI(url);",
+    "try { url = encodeURI(decodeURI(url)); } catch (e) { url = encodeURI(url); }",
     "return JSON.stringify({",
     "  url: url,",
     "  httpHeaders: (config && config.httpHeaders) || {},",
@@ -202,13 +202,45 @@ function directMediaContent(imageProxyBase = "") {
     'if (!url && typeof result === "string" && /^(?:https?:)?\\/\\//i.test(result.trim())) url = result.trim();',
     'if (url.indexOf("//") === 0) url = "https:" + url;',
     'else if (url && !/^https?:\\/\\//i.test(url)) url = config.host + (url.charAt(0) === "/" ? url : "/" + url);',
-    "url = encodeURI(url);",
+    "try { url = encodeURI(decodeURI(url)); } catch (e) { url = encodeURI(url); }",
     "return JSON.stringify({",
     "  url: url,",
     "  httpHeaders: (config && config.httpHeaders) || {},",
     "  forbidCache: true",
     "});",
   ].join("\n");
+}
+
+function directMediaChapterContent(host, imageProxyBase) {
+  const base = String(imageProxyBase || "").replace(/\/$/, "");
+  if (!base) return null;
+  return {
+    ...commonAction("chapterContent", host, "json"),
+    requestInfo: runtimeAdapterRequestInfo(`${base}/adapter/direct-media?url=`),
+    content: [
+      "$.url||@js:",
+      'var url = String(result || "").trim();',
+      "try { url = encodeURI(decodeURI(url)); } catch (e) { url = encodeURI(url); }",
+      "return JSON.stringify({",
+      "  url: url,",
+      "  httpHeaders: (config && config.httpHeaders) || {},",
+      "  forbidCache: true",
+      "});",
+    ].join("\n"),
+  };
+}
+
+function singleMediaChapterList(host, imageProxyBase) {
+  const base = String(imageProxyBase || "").replace(/\/$/, "");
+  if (!base) return null;
+  return {
+    ...commonAction("chapterList", host, "json"),
+    requestInfo: runtimeAdapterRequestInfo(`${base}/adapter/single-chapter?url=`, { preferDetail: true }),
+    list: "$.data",
+    title: "title",
+    url: "url",
+    moreKeys: { pageSize: 1, maxPage: 1 },
+  };
 }
 
 /** A known encrypted comic API can be rendered through the server image proxy. */
@@ -248,7 +280,7 @@ function proxiedLineImageContent(contentRule, imageProxyBase, decoder) {
   return selector ? `${selector}||${proxyJs}` : proxyJs;
 }
 
-function nativeJmRequestInfo() {
+function runtimeResultRequestInfo() {
   return [
     "@js:",
     'var q = (params && params.queryInfo) || {};',
@@ -260,7 +292,7 @@ function nativeJmRequestInfo() {
     'u = String(u || "").trim();',
     'if (u.indexOf("//") == 0) u = "https:" + u;',
     'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
-    "return encodeURI(u);",
+    "try { return encodeURI(decodeURI(u)); } catch (e) { return encodeURI(u); }",
   ].join("\n");
 }
 
@@ -403,6 +435,9 @@ function bridgeBookAction(action, bridgeBase, headers) {
     });
   }
   const plan = compileBookBridgePlan(action, { ...headers, ...(action.httpHeaders || {}) });
+  if (!plan.fields.cat && String(action._categoryTitle || "").trim()) {
+    plan.fields.cat = { constant: String(action._categoryTitle).trim().slice(0, 200) };
+  }
   if (!plan.list || !plan.fields.name || !plan.fields.url) return action;
   const endpoint = bridgeEndpoint(bridgeBase, "books", plan);
   const pageSize = actionPageSize(action, 20);
@@ -432,9 +467,10 @@ function bridgeBookAction(action, bridgeBase, headers) {
   });
 }
 
-function bridgeDetailAction(action, bridgeBase, headers) {
+function bridgeDetailAction(action, bridgeBase, headers, latestChapter = null) {
   if (!action?.bookName || !action?.requestInfo) return action;
   const plan = compileDetailBridgePlan(action, { ...headers, ...(action.httpHeaders || {}) });
+  if (latestChapter) plan.latestChapter = latestChapter;
   if (!plan.fields.name) return action;
   const endpoint = bridgeEndpoint(bridgeBase, "detail", plan);
   const requestInfo = bridgeRequestInfo(action.requestInfo, endpoint);
@@ -450,10 +486,12 @@ function bridgeDetailAction(action, bridgeBase, headers) {
     ...(plan.fields.cover ? { cover: "$.cover" } : {}),
     status: "$.status",
     wordCount: "$.wordCount",
+    ...(plan.fields.tocUrl ? { tocUrl: "$.tocUrl" } : {}),
   });
 }
 
 function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {} } = {}) {
+  if (/\/adapter\/single-chapter\?/i.test(String(action?.requestInfo || ""))) return action;
   if (!action?.list || !action?.title || !action?.url) return action;
   // Only HTML link selectors belong in plan.tocSelector. JSON/API tocUrl is
   // already compiled into requestInfo (absolute getBookMenu-style URLs).
@@ -480,9 +518,15 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
   // Bridged rows are `{ data: [...] }`. A raw upstream nextPageUrl (e.g.
   // getBookMenu) still returns `{ list: [...] }` with data:null — Xiangse then
   // reads list:"$.data" and the chapter catalogue goes empty after page 1.
-  const nextPageUrl = action.nextPageUrl
+  let nextPageUrl = action.nextPageUrl
     ? bridgeRequestInfo(action.nextPageUrl, endpoint, { pageSize, serverPaging: false, preferDetail: true })
     : "";
+  // HTML catalogues are fetched once and sliced with page=%@pageIndex&slice=1.
+  // 香色 chapterList 翻页靠 nextPageUrl + maxPage，不会只靠 requestInfo 的 pageIndex，
+  // 缺 nextPageUrl 时客户端永远只拉第 1 页（常见就是只有 100 章）。
+  if (!nextPageUrl && serverPaging && requestInfo) {
+    nextPageUrl = requestInfo;
+  }
   const { reverseChapters: _reverseChapters, reverse: _reverse, ...rest } = action;
   const maxPage = Number(action.moreKeys?.maxPage) > 0
     ? action.moreKeys.maxPage
@@ -589,6 +633,72 @@ function upstreamPageSizeFromTocUrl(tocUrl) {
   return Number.isInteger(size) && size > 0 ? Math.min(200, size) : 0;
 }
 
+function latestChapterBridgeDescriptor(tocUrl, detailRules, chapterAction, tocResponseType) {
+  const { url: raw } = splitLegadoUrlOptions(tocUrl);
+  if (!/^https?:\/\//i.test(raw) || !chapterAction?.list || !chapterAction?.title) return null;
+  const initPath = simpleJsonPath(detailRules?.init);
+  let template = String(raw).replace(/\{\{\s*page\s*\}\}/gi, "__PAGE__");
+  template = template.replace(
+    /([?&](?:pageNum|pageIndex|page)=)(?:\d+|\{\{\s*page\s*\}\})/gi,
+    "$1__PAGE__",
+  );
+  const values = {};
+  const paths = new Map();
+  const placeholder = (path) => {
+    const normalizedPath = String(path || "").replace(/\./g, "/");
+    const fullPath = initPath && !normalizedPath.startsWith(`${initPath}/`)
+      ? `${initPath}/${normalizedPath}`
+      : normalizedPath;
+    if (!paths.has(fullPath)) paths.set(fullPath, `value${paths.size + 1}`);
+    const name = paths.get(fullPath);
+    values[name] = fullPath;
+    return `{{${name}}}`;
+  };
+  template = template.replace(
+    /\{\{\s*\$\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\}\}/g,
+    (_match, path) => placeholder(path),
+  );
+  template = template.replace(
+    /(?<!\{)\{\s*(?:\$\.)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\}(?!\})/g,
+    (_match, path) => placeholder(path),
+  );
+  if (!Object.keys(values).length) return null;
+  const countNames = [
+    "sections", "chapterCount", "chaptersCount", "totalChapters",
+    "episodeCount", "episodesCount", "trackCount", "programCount", "total",
+  ];
+  return {
+    urlTemplate: template,
+    responseType: tocResponseType === "html" ? "html" : "json",
+    list: chapterAction.list,
+    title: chapterAction.title,
+    count: countNames.map((name) => initPath ? `${initPath}/${name}` : name).join("||"),
+    values,
+    pageSize: upstreamPageSizeFromTocUrl(tocUrl) || Number(chapterAction.moreKeys?.pageSize) || 50,
+  };
+}
+
+function buildRegexTocRequestInfo(tocUrl) {
+  const { url: raw } = splitLegadoUrlOptions(tocUrl);
+  const match = String(raw || "").trim().match(
+    /^\{\{\s*baseUrl\s*\}\}##([\s\S]{1,512}?)##([\s\S]{1,2048})$/i,
+  );
+  if (!match) return "";
+  try {
+    new RegExp(match[1]);
+  } catch {
+    return "";
+  }
+  return [
+    "@js:",
+    "var q = (typeof params !== \"undefined\" && params.queryInfo) || {};",
+    "var u = String(q.detailUrl || q.url || q.chapterUrl || \"\");",
+    "if (!u && typeof result === \"string\") u = result;",
+    "if (!u && result && typeof result === \"object\") u = String(result.detailUrl || result.url || \"\");",
+    `return u.replace(new RegExp(${JSON.stringify(match[1])}), ${JSON.stringify(match[2])});`,
+  ].join("\n");
+}
+
 function buildJsonApiTocRequestInfo(tocUrl) {
   const { url: raw } = splitLegadoUrlOptions(tocUrl);
   if (!/^https?:\/\//i.test(raw)) return "";
@@ -664,21 +774,30 @@ function buildJsonApiTocNextPageUrl(tocUrl) {
 function compileHttpChapterUrlField(chapterUrl) {
   const { url: raw } = splitLegadoUrlOptions(chapterUrl);
   if (!/^https?:\/\//i.test(raw)) return null;
-  if (!/\{\{\s*\$\./.test(raw) && !/baseUrl\.match/.test(raw)) return null;
+  if (!/\{\{?\s*\$\.\.?/.test(raw) && !/baseUrl\.match/.test(raw)) return null;
 
-  let template = raw;
+  let template = raw.replace(
+    /(?<!\{)\{\s*\$\.([A-Za-z_$][\w$]*)\s*\}(?!\})/g,
+    "{{$1}}",
+  );
+  const recursiveFields = new Set(
+    [...template.matchAll(/\{\{\s*\$\.\.([A-Za-z_$][\w$]*)\s*\}\}/g)].map((match) => match[1]),
+  );
   // baseUrl.match(/bookId=(\d+)/)[1] → {{base:bookId}}
   template = template.replace(
     /\{\{\s*baseUrl\.match\(\/((?:\\.|[^/])+)\/\)\[1\]\s*\}\}/gi,
     () => "{{base:bookId}}",
   );
   template = template.replace(/\{\{\s*java\.get\(\s*["']entityType["']\s*\)\s*\}\}/gi, "1");
+  template = template.replace(/\{\{\s*\$\.\.([A-Za-z_$][\w$]*)\s*\}\}/g, "{{$1}}");
   template = template.replace(/\{\{\s*\$\.([A-Za-z_$][\w$]*)\s*\}\}/g, "{{$1}}");
   if (!/\{\{[A-Za-z_]/.test(template)) return null;
 
-  const primary = (template.match(/\{\{(id)\}\}/i) || template.match(/\{\{(section|url|path)\}\}/i))?.[1] || "id";
+  const primary = (template.match(/\{\{(id)\}\}/i)
+    || template.match(/\{\{(section|url|path)\}\}/i)
+    || template.match(/\{\{([A-Za-z_$][\w$]*)\}\}/))?.[1] || "id";
   return {
-    selector: primary,
+    selector: recursiveFields.has(primary) ? `@json-recursive:${encodeURIComponent(primary)}` : primary,
     replacements: [],
     hostPrefix: false,
     matchTemplate: null,
@@ -723,20 +842,6 @@ function compatibleTextRule(original, converted) {
   return result;
 }
 
-function nativeJmChapterList(host) {
-  return {
-    // 与已可用的 6444 相同：香色直接按详情 URL 拉取 HTML 目录。
-    // 禁漫的原始规则 list 已定位到 <a>，再写 //a/@href 会在香色中错失当前节点。
-    ...commonAction("chapterList", host, "html"),
-    // 不能写成 "%@result"：部分香色漫画动作不会展开这个占位符，
-    // 会实际请求 https://host/%@result。按 6444 的运行时方式显式取值。
-    requestInfo: nativeJmRequestInfo(),
-    list: "//ul[contains(@class, 'btn-toolbar')]//a | //a[contains(@class, 'reading')]",
-    title: "//h3/text() || //a/text() || @js:\nreturn String(result || '').trim();",
-    url: "//@href",
-  };
-}
-
 /**
  * Generic HTML-comic bridge. The service extracts lazy/direct page images and
  * returns {urls}; 香色 receives its native comic payload after image proxying.
@@ -744,24 +849,106 @@ function nativeJmChapterList(host) {
 function proxiedHtmlComicChapterContent(host, imageProxyBase, decoder = "auto", extractionPlan = null) {
   const base = String(imageProxyBase).replace(/\/$/, "");
   const encodedPlan = encodeComicExtractionPlan(extractionPlan);
-  const endpoint = `${base}/adapter/images?${encodedPlan ? `plan=${encodedPlan}&` : ""}url=`;
+  const endpoint = `${base}/adapter/images?${encodedPlan ? `plan=${encodedPlan}&` : ""}v=2&url=`;
   const imageEndpoint = `${base}/image/${decoder}?url=`;
   return {
     ...commonAction("chapterContent", host, "json"),
     requestInfo: runtimeAdapterRequestInfo(endpoint),
     content: [
-      "$.urls||@js:",
+      "$.proxyUrls||$.urls||@js:",
       'var images = Array.isArray(result) ? result : [];',
+      'var q = (params && params.queryInfo) || {};',
+      'var referer = String(q.chapterUrl || q.url || q.detailUrl || "");',
+      'var suffix = referer ? "&referer=" + encodeURIComponent(referer) : "";',
       `var endpoint = ${JSON.stringify(imageEndpoint)};`,
-      'var urls = images.map(function (url) { return endpoint + encodeURIComponent(String(url || "")); }).filter(Boolean);',
+      'var urls = images.map(function (url) { var value = String(url || ""); return /\\/image\\/[A-Za-z0-9_-]+\\?url=/.test(value) ? value : endpoint + encodeURIComponent(value) + suffix; }).filter(Boolean);',
       'return JSON.stringify({urls: urls, httpHeaders: {}});',
     ].join("\n"),
   };
 }
 
+/** Optional per-source CDN play rewrite (hosts → /media or path proxy). */
+function normalizeMediaProxy(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const hosts = [...new Set(
+    (Array.isArray(value.hosts) ? value.hosts : [])
+      .map((item) => String(item || "").trim().toLowerCase())
+      .filter(Boolean),
+  )];
+  if (!hosts.length) return null;
+  const pathPrefix = String(value.pathPrefix || "").trim().replace(/\/$/, "");
+  return {
+    hosts,
+    cacheBust: value.cacheBust !== false,
+    // Same-origin path proxy with a valid TLS certificate (needed on iOS).
+    // Empty → legacy `/media?url=&referer=` byte proxy.
+    pathPrefix: pathPrefix && pathPrefix.startsWith("/") ? pathPrefix : "",
+  };
+}
+
+function escapeRegexLiteral(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Finalize play URL in generated 香色 JS. When mediaProxy is set and imageProxyBase
+ * is available, matching CDN hosts are rewritten either to a same-origin path proxy
+ * (`pathPrefix`) or to `/media?url=&referer=`.
+ * Sets `proxiedPlay` so the caller skips encodeURI (which would double-encode `%`).
+ */
+function mediaPlayUrlFinalizeJs(imageProxyBase, mediaProxy) {
+  const plan = normalizeMediaProxy(mediaProxy);
+  if (!plan) return ["var proxiedPlay = false;"];
+  const hostAlt = plan.hosts.map(escapeRegexLiteral).join("|");
+  const hostTest = `/^https:\\/\\/(?:${hostAlt})\\//i`;
+  const lines = ["var proxiedPlay = false;"];
+  if (plan.cacheBust) {
+    lines.push(
+      `if (${hostTest}.test(url) && url.indexOf("?") < 0) {`,
+      "  url += \"?v=\" + Date.now();",
+      "}",
+    );
+  }
+  const base = String(imageProxyBase || "").replace(/\/$/, "");
+  if (base && plan.pathPrefix) {
+    lines.push(
+      `if (${hostTest}.test(url)) {`,
+      "  var m = String(url).match(/^https?:\\/\\/[^/?#]+(\\/[^?#]*)(\\?[^#]*)?(#.*)?$/i);",
+      "  if (m) {",
+      `    url = ${JSON.stringify(`${base}${plan.pathPrefix}`)} + m[1] + (m[2] || "");`,
+      "    proxiedPlay = true;",
+      "  }",
+      "}",
+    );
+  } else if (base) {
+    lines.push(
+      `if (${hostTest}.test(url)) {`,
+      "  var proxyRef = String(headers.Referer || headers.referer || \"\").trim();",
+      `  var proxied = ${JSON.stringify(`${base}/media?url=`)} + encodeURIComponent(url);`,
+      "  if (proxyRef) proxied += \"&referer=\" + encodeURIComponent(proxyRef);",
+      "  url = proxied;",
+      "  proxiedPlay = true;",
+      "}",
+    );
+  }
+  return lines;
+}
+
+function mergeChapterRefererJs() {
+  return [
+    "var q = (params && params.queryInfo) || {};",
+    "if (!headers.Referer && !headers.referer) {",
+    "  var ref = String(q.chapterUrl || \"\").trim();",
+    "  if (!ref || ref === String(q.detailUrl || \"\")) ref = \"\";",
+    "  if (/^https?:\\/\\//i.test(ref)) headers.Referer = ref;",
+    "}",
+  ];
+}
+
 /** Generic server-side audio/video URL extraction. Play URL is returned with
- * source httpHeaders so the client can satisfy Referer/Cookie anti-leech. */
-function proxiedMediaChapterContent(host, imageProxyBase, kind, extractionPlan) {
+ * source httpHeaders so the client can satisfy Referer/Cookie anti-leech.
+ * Sources may opt into /media proxy rewrite via read2xsgg.mediaProxy (CDN TLS / anti-leech). */
+function proxiedMediaChapterContent(host, imageProxyBase, kind, extractionPlan, mediaProxy = null) {
   const base = String(imageProxyBase).replace(/\/$/, "");
   const encodedPlan = encodeMediaExtractionPlan(extractionPlan);
   const endpoint = `${base}/adapter/media?kind=${kind}&plan=${encodedPlan}&url=`;
@@ -786,14 +973,66 @@ function proxiedMediaChapterContent(host, imageProxyBase, kind, extractionPlan) 
       "for (var k2 in extra) {",
       "  if (Object.prototype.hasOwnProperty.call(extra, k2)) headers[k2] = extra[k2];",
       "}",
-      "var q = (params && params.queryInfo) || {};",
-      "if (!headers.Referer && !headers.referer) {",
-      "  var ref = String(q.chapterUrl || \"\").trim();",
-      "  if (!ref || ref === String(q.detailUrl || \"\")) ref = \"\";",
-      "  if (/^https?:\\/\\//i.test(ref)) headers.Referer = ref;",
-      "}",
+      ...mergeChapterRefererJs(),
+      ...mediaPlayUrlFinalizeJs(imageProxyBase, mediaProxy),
       "return JSON.stringify({",
-      "  url: encodeURI(url),",
+      "  url: proxiedPlay ? url : (function () { try { return encodeURI(decodeURI(url)); } catch (e) { return encodeURI(url); } })(),",
+      "  httpHeaders: headers,",
+      "  forbidCache: true",
+      "});",
+    ].join("\n"),
+  };
+}
+
+function webViewMediaChapterContent(host, kind, imageProxyBase = "", mediaProxy = null, options = {}) {
+  const mediaSelector = kind === "video"
+    ? "//video/@src||//source/@src||//audio/@src"
+    : "//meta[@name='read2xsgg-play']/@content||//audio/@src||//source/@src||//video/@src";
+  const delay = Number(options.webViewJsDelay);
+  const webViewJsDelay = Number.isFinite(delay) && delay > 0 ? delay : 3;
+  const skipUrls = Array.isArray(options.webViewSkipUrls)
+    ? options.webViewSkipUrls
+    : ["google-analytics.com", "doubleclick.net"];
+  const webViewJs = String(options.webViewMediaJs || "").trim();
+  const requestLines = [
+    "@js:",
+    "var q = (params && params.queryInfo) || {};",
+    "var u = (typeof result == \"string\" && result && result != \"%@result\") ? result : \"\";",
+    "if (!u) u = q.chapterUrl || q.url || q.detailUrl || \"\";",
+    "if (!u && result && typeof result == \"object\") u = result.url || result.detailUrl || \"\";",
+    "if (u == \"%@result\") u = \"\";",
+    "u = String(u || \"\").trim();",
+    "if (u.indexOf(\"//\") == 0) u = \"https:\" + u;",
+    "else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == \"/\" ? u : \"/\" + u);",
+    "return {",
+    "  url: u,",
+    "  webView: \"\",",
+    `  webViewJsDelay: ${webViewJsDelay},`,
+    `  webViewSkipUrls: ${JSON.stringify(skipUrls)},`,
+  ];
+  if (webViewJs) {
+    requestLines.push(`  webViewJs: ${JSON.stringify(webViewJs)},`);
+  }
+  requestLines.push(
+    "  httpHeaders: config.httpHeaders || {},",
+    "  forbidCache: true",
+    "};",
+  );
+  return {
+    ...commonAction("chapterContent", host, "html"),
+    requestInfo: requestLines.join("\n"),
+    content: [
+      `${mediaSelector}||@js:`,
+      "var url = String(result || \"\").trim();",
+      "var headers = {};",
+      "var baseHeaders = (config && config.httpHeaders) || {};",
+      "for (var k in baseHeaders) {",
+      "  if (Object.prototype.hasOwnProperty.call(baseHeaders, k)) headers[k] = baseHeaders[k];",
+      "}",
+      ...mergeChapterRefererJs(),
+      ...mediaPlayUrlFinalizeJs(imageProxyBase, mediaProxy),
+      "return JSON.stringify({",
+      "  url: proxiedPlay ? url : (function () { try { return encodeURI(decodeURI(url)); } catch (e) { return encodeURI(url); } })(),",
       "  httpHeaders: headers,",
       "  forbidCache: true",
       "});",
@@ -956,6 +1195,22 @@ function simpleJsonPath(rule) {
   return match ? match[1].replace(/\./g, "/") : "";
 }
 
+function applyJsonInitPath(rule, initPath, responseType) {
+  if (!initPath || responseType !== "json") return rule;
+  const source = String(rule || "");
+  const scriptMarker = source.match(/\|\|\s*@js:/i);
+  const selector = scriptMarker ? source.slice(0, scriptMarker.index) : source;
+  const suffix = scriptMarker ? source.slice(scriptMarker.index) : "";
+  const alternatives = selector.split("||").map((value) => value.trim()).filter(Boolean);
+  if (!alternatives.length || alternatives.some((value) => (
+    !/^[A-Za-z_$][\w$-]*(?:\/(?:[A-Za-z_$][\w$-]*|\d+|\*))*$/.test(value)
+  ))) return rule;
+  const prefixed = alternatives.map((value) => (
+    value === initPath || value.startsWith(`${initPath}/`) ? value : `${initPath}/${value}`
+  )).join("||");
+  return `${prefixed}${suffix}`;
+}
+
 /**
  * 阅读漫画源常用 `$.tags + java.timeFormat(...)` 作为分类展示。
  * 香色没有 java.timeFormat；保留 tags 才能让客户端对书籍类型/分类做匹配。
@@ -1029,7 +1284,7 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
     if (rules[from] !== undefined && rules[from] !== "") {
       if (from === "coverUrl") {
         const convertedCover = convertCoverRule(rules[from], responseType, warningFor);
-        if (convertedCover) result[to] = convertedCover;
+        if (convertedCover) result[to] = applyJsonInitPath(convertedCover, initPath, responseType);
         continue;
       }
       if (from === "kind") {
@@ -1038,7 +1293,7 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
           warningFor("kind", rules[from])("列表分类字段依赖阅读专用 JavaScript，已忽略以避免香色丢弃整个列表");
           continue;
         }
-        result[to] = convertedKind;
+        result[to] = applyJsonInitPath(convertedKind, initPath, responseType);
         continue;
       }
       const convertedRule = compatibleTextRule(
@@ -1048,9 +1303,9 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
       // 阅读 ruleBookInfo.init 会将后续 JSONPath 的根切换到该节点。
       // 香色没有 init 字段，因此对无歧义的简单 JSONPath 显式补回前缀。
       const rulePath = initPath && responseType === "json" ? simpleJsonPath(rules[from]) : "";
-      const resolvedRule = rulePath && rulePath !== initPath && !rulePath.startsWith(`${initPath}/`)
-        ? `${initPath}/${rulePath}`
-        : convertedRule;
+      const resolvedRule = rulePath
+        ? applyJsonInitPath(rulePath, initPath, responseType)
+        : applyJsonInitPath(convertedRule, initPath, responseType);
       result[to] = resolvedRule;
     }
   }
@@ -1104,17 +1359,153 @@ function mapTocRules(rules, responseType, warningFor) {
   return result;
 }
 
-function buildBookAction({ actionID, host, request, rules, headers, warnings, sourceName, section }) {
-  const responseType = inferResponseType(rules);
+function normalizeMappedJsonTocRules(rules = {}) {
+  const script = String(rules.chapterList || "");
+  const embedded = script.match(/result\.match\(\/([A-Za-z_$][\w$]*)\\s\*=/);
+  if (embedded) return { ...rules, chapterList: `@embedded-json-array:${embedded[1]}` };
+  const mapping = script.match(/\.map\(\s*([A-Za-z_$][\w$]*)\s*=>\s*\(\s*\{([\s\S]*?)\}\s*\)\s*\)/);
+  if (!mapping) return rules;
+  const aliases = new Map();
+  for (const property of splitTopLevelProperties(mapping[2])) {
+    const pair = property.match(/^([A-Za-z_$][\w$]*|["'][^"']+["'])\s*:\s*([\s\S]+)$/);
+    if (!pair) continue;
+    const key = pair[1].replace(/^["']|["']$/g, "");
+    const value = mappedJsonExpression(pair[2], mapping[1]);
+    if (value) aliases.set(key, value);
+  }
+  if (!aliases.size) return rules;
+  const normalized = { ...rules };
+  const narrowed = script.match(
+    /\.filter\(\s*([A-Za-z_$][\w$]*)\s*=>\s*\1\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*={2,3}\s*(["'])([\s\S]*?)\3\s*\)/,
+  );
+  if (narrowed && script.includes(`@.${narrowed[2]}`)) {
+    normalized.chapterList = script.replace(
+      /\[\?\([\s\S]*?\)\]/,
+      `[?(@.${narrowed[2]}=='${narrowed[4].replace(/'/g, "\\'")}')]`,
+    );
+  }
+  for (const field of ["chapterName", "chapterUrl", "updateTime"]) {
+    const alias = String(rules[field] || "").trim().replace(/^\$\.?/, "");
+    if (aliases.has(alias)) normalized[field] = aliases.get(alias);
+  }
+  return normalized;
+}
+
+function splitTopLevelProperties(source) {
+  const parts = [];
+  let current = "";
+  let quote = "";
+  let round = 0;
+  let square = 0;
+  let curly = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      current += character;
+      if (character === quote && source[index - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      quote = character;
+      current += character;
+      continue;
+    }
+    if (character === "(") round += 1;
+    else if (character === ")") round -= 1;
+    else if (character === "[") square += 1;
+    else if (character === "]") square -= 1;
+    else if (character === "{") curly += 1;
+    else if (character === "}") curly -= 1;
+    if (character === "," && round === 0 && square === 0 && curly === 0) {
+      if (current.trim()) parts.push(current.trim());
+      current = "";
+    } else current += character;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+function mappedJsonExpression(expression, variable) {
+  const member = String(expression || "").trim().match(
+    new RegExp(`^${variable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)$`),
+  );
+  if (member) return `$.${member[1]}`;
+  const escaped = variable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const prefixed = String(expression || "").trim().match(
+    new RegExp(`^(["'])([\\s\\S]*?)\\1\\s*\\+\\s*${escaped}\\.([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)$`),
+  );
+  if (prefixed) return `${prefixed[2]}{{$.${prefixed[3]}}}`;
+  const suffixed = String(expression || "").trim().match(
+    new RegExp(`^${escaped}\\.([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)\\s*\\+\\s*(["'])([\\s\\S]*?)\\2$`),
+  );
+  if (suffixed) return `{{$.${suffixed[1]}}}${suffixed[3]}`;
+  return "";
+}
+
+function normalizeMappedJsonBookRules(rules = {}) {
+  const script = String(rules.bookList || "");
+  if (!/(?:JSON\.parse|\.json\s*\()/.test(script) || !/\.map\s*\(/.test(script)) return rules;
+  const mapping = script.match(
+    /\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\.map\(\s*([A-Za-z_$][\w$]*)\s*=>\s*\(\s*\{([\s\S]*?)\}\s*\)\s*\)/,
+  );
+  if (!mapping) return rules;
+  const [root, ...path] = mapping[1].split(".");
+  if (!root || !path.length) return rules;
+  const aliases = new Map();
+  for (const property of splitTopLevelProperties(mapping[3])) {
+    const pair = property.match(/^([A-Za-z_$][\w$]*|["'][^"']+["'])\s*:\s*([\s\S]+)$/);
+    if (!pair) continue;
+    const key = pair[1].replace(/^["']|["']$/g, "");
+    const value = mappedJsonExpression(pair[2], mapping[2]);
+    if (value) aliases.set(key, value);
+  }
+  if (!aliases.size) return rules;
+  const normalized = { ...rules, bookList: `$.${path.join(".")}[*]` };
+  for (const field of ["name", "bookUrl", "coverUrl", "author", "intro", "kind", "lastChapter", "wordCount", "status"]) {
+    const alias = String(rules[field] || "").trim().replace(/^\$\.?/, "");
+    if (aliases.has(alias)) normalized[field] = aliases.get(alias);
+  }
+  return normalized;
+}
+
+function buildBookAction({ actionID, host, request, rules, headers, warnings, sourceName, section, imageProxyBase = "" }) {
+  const normalizedRules = normalizeMappedJsonBookRules(rules);
+  const responseType = inferResponseType(normalizedRules);
   const warningFor = createWarningCollector(warnings, sourceName, section);
   const action = {
     ...commonAction(actionID, host, responseType),
     ...convertRequest(request, { headers, warn: warningFor("request", request), fallback: actionID === "searchBook" ? "" : "%@result" }),
-    ...mapBookRules(rules, responseType, warningFor, { listContext: true }),
+    ...mapBookRules(normalizedRules, responseType, warningFor, { listContext: true }),
   };
+  const httpDetailUrl = responseType === "json" ? compileHttpChapterUrlField(rules.bookUrl) : null;
+  if (httpDetailUrl) action.detailUrl = httpDetailUrl;
+  const signedRequest = compileSignedRequestPlan(request);
+  if (signedRequest && imageProxyBase) {
+    const encoded = encodeSignedRequestPlan(signedRequest);
+    const adapter = `${String(imageProxyBase).replace(/\/$/, "")}/adapter/request?plan=${encoded}`;
+    action.requestInfo = [
+      "@js:",
+      `let url = ${JSON.stringify(adapter + "&keyWord=")} + encodeURIComponent(params.keyWord || "") + "&pageIndex=" + params.pageIndex;`,
+      "return url;",
+    ].join("\n");
+    warningFor("request", request)("已将查询串 MD5 请求头签名编译为通用受限请求适配器");
+  }
+  const signedDetail = compileSignedRequestPlan(rules.bookUrl);
+  if (signedDetail?.valueField && imageProxyBase) {
+    const encoded = encodeSignedRequestPlan(signedDetail);
+    const adapter = `${String(imageProxyBase).replace(/\/$/, "")}/adapter/request?plan=${encoded}&value=`;
+    action.detailUrl = [
+      `$.${signedDetail.valueField}`,
+      "@js:",
+      `return ${JSON.stringify(adapter)} + result;`,
+    ].join("||");
+    warningFor("bookUrl", rules.bookUrl)("已将条目字段 MD5 请求头签名编译为通用详情请求适配器");
+  }
   if (rules.bookList && !action.moreKeys) {
     action.moreKeys = { pageSize: listPageSizeForRequest(action.requestInfo || request, null) };
   }
+  const verifyKeyWord = String(rules.checkKeyWord || "").split(/[|,，\n]/)[0].trim();
+  if (verifyKeyWord) action._verifyKeyWord = verifyKeyWord.slice(0, 200);
   return action;
 }
 
@@ -1182,14 +1573,37 @@ function listPageSizeForRequest(template, configured) {
 function extractExploreEntriesFromJs(script) {
   const entries = [];
   const seen = new Set();
-  const pushAll = (chunk) => {
-    for (const entry of extractTitleUrlLinesFromText(chunk)) {
-      const key = `${entry.group || ""}|${entry.title}|${entry.url}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      entries.push(entry);
+  const decodeLiteral = (literal) => {
+    try {
+      if (literal.startsWith('"')) return JSON.parse(literal);
+      return literal.slice(1, -1)
+        .replace(/\\'/g, "'")
+        .replace(/\\n/g, "\n")
+        .replace(/\\r/g, "\r")
+        .replace(/\\t/g, "\t")
+        .replace(/\\\\/g, "\\");
+    } catch {
+      return "";
     }
   };
+  const push = (entry) => {
+    const key = `${entry.group || ""}|${entry.title}|${entry.url}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    entries.push(entry);
+  };
+  const pushAll = (chunk) => {
+    for (const entry of extractTitleUrlLinesFromText(chunk)) {
+      push(entry);
+    }
+  };
+  const literal = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
+  const tuplePattern = new RegExp(`\\[\\s*(${literal})\\s*,\\s*(${literal})\\s*\\]`, "g");
+  for (const match of String(script || "").matchAll(tuplePattern)) {
+    const title = decodeLiteral(match[1]).trim();
+    const url = decodeLiteral(match[2]).trim();
+    if (title && /^(?:\/|https?:\/\/)/i.test(url)) push({ title, url, group: "" });
+  }
   for (const match of String(script || "").matchAll(/`([\s\S]*?)`/g)) pushAll(match[1]);
   for (const match of String(script || "").matchAll(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g)) {
     try {
@@ -1227,11 +1641,14 @@ function materializeCatalogExploreEntries(source, imageProxyBase, warningFor) {
   );
   return entityEntries.map((entry) => {
     const pageSize = Math.min(50, Math.max(1, Number(entry.pageSize) || plan.pageSize || 20));
+    const requestPageSize = Math.min(50, Math.max(1, Number(entry.requestPageSize) || plan.pageSize || pageSize));
     return {
       title: String(entry.title).trim(),
       group: entry.group ? String(entry.group).trim() : "",
       pageSize,
-      url: `${base}/adapter/catalog?plan=${encoded}&entityId=${encodeURIComponent(String(entry.entityId).trim())}&page=__READ2XSGG_PAGE__&pageSize=${pageSize}`,
+      // 香色只替换 requestInfo 里的 %@pageIndex；内部哨兵 __READ2XSGG_PAGE__
+      // 仅用于 requestFilters 注入后再由 @js 二次替换。catalog 直链必须用官方占位符。
+      url: `${base}/adapter/catalog?plan=${encoded}&entityId=${encodeURIComponent(String(entry.entityId).trim())}&page=%@pageIndex&pageSize=${requestPageSize}`,
     };
   });
 }
@@ -1331,6 +1748,7 @@ function compactBookWorld(entries, { host, rules, responseType, warningFor }) {
       ...mapBookRules(rules, responseType, warningFor, { listContext: true }),
       moreKeys: { pageSize, requestFilters: `_category\n${requestFilters.join("\n")}` },
       _sIndex: 0,
+      _categoryTitle: "分类",
     },
   };
 }
@@ -1428,14 +1846,13 @@ function buildBookWorld(source, context) {
       ...mapBookRules(rules, responseType, warningFor, { listContext: true }),
       moreKeys: { pageSize },
       _sIndex: index,
+      _categoryTitle: title,
     };
   });
   return result;
 }
 
 function convertOne(source, warnings, options = {}) {
-  const adaptedFrom = String(source.bookSourceUrl ?? "");
-  source = adaptLegadoSource(source);
   const sourceName = String(source.bookSourceName ?? source.name ?? "未命名书源").trim() || "未命名书源";
   const stored = resolveLegadoStoredRules(source);
   source = stored.source;
@@ -1444,15 +1861,9 @@ function convertOne(source, warnings, options = {}) {
   if (stored.changed) {
     warningForSource("storedRules", `${stored.changed} fields`)("已将阅读 @put/@get 状态规则编译为当前列表项或详情页的静态选择器/JSON 字段模板");
   }
-  if (/alicesw\.com/i.test(adaptedFrom)) {
-    warningForSource("siteAdapter", adaptedFrom)("已按 alicesw.com 实际页面结构修正阅读规则后再转换");
-  }
-  if (/(?:jmcomic|18comic|comic18j)/i.test(adaptedFrom)) {
-    warningForSource("siteAdapter", adaptedFrom)("已提取禁漫动态发现分类，并显式补齐分类列表规则");
-  }
   const searchRules = getRules(source, "ruleSearch", "searchRule");
   const detailRules = getRules(source, "ruleBookInfo", "bookInfoRule");
-  const tocRules = getRules(source, "ruleToc", "tocRule");
+  const tocRules = normalizeMappedJsonTocRules(getRules(source, "ruleToc", "tocRule"));
   const exploreRulesEarly = getRules(source, "ruleExplore", "exploreRule");
   const headers = portableHeaders(mergeLegadoUrlOptionHeaders({
     ...parseHeaders(source.header, warningForSource("header", source.header)),
@@ -1472,7 +1883,7 @@ function convertOne(source, warnings, options = {}) {
     );
   }
   const contentRules = getRules(source, "ruleContent", "contentRule");
-  const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode);
+  const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode, source.jsLib);
   const comicExtractionPlan = compileComicExtractionPlan(contentRules.content, headers);
   // Generic: lift declared metadata from rule objects (esp. ruleContent) or
   // source-root read2xsgg — never keyed by source name/domain.
@@ -1488,12 +1899,7 @@ function convertOne(source, warnings, options = {}) {
       },
     )
     : null;
-  const isJmComic = resolvedType === "comic" && (
-    ["jm-scramble", "id-md5-reverse-tiles"].includes(imageDecoder)
-      || String(imageDecoder || "").startsWith("id-md5-reverse-tiles-")
-      || /(?:jmcomic|18comic|comic18j)/i.test(adaptedFrom)
-  );
-  const isPrefixAesDecoder = imageDecoder === "mwwz-aes" || String(imageDecoder || "").startsWith("aes-cbc-prefix-iv-");
+  const isPrefixAesDecoder = String(imageDecoder || "").startsWith("aes-cbc-prefix-iv-");
   if (contentRules.imageDecode) {
     const warning = createWarningCollector(warnings, sourceName, "chapterContent")("imageDecode", contentRules.imageDecode);
     if (imageDecoder && options.imageProxyBase) {
@@ -1510,13 +1916,28 @@ function convertOne(source, warnings, options = {}) {
     );
   }
   const context = { host, headers, warnings, sourceName, imageProxyBase: options.imageProxyBase || "" };
+  const stateBackedSingleMedia = (resolvedType === "audio" || resolvedType === "video")
+    && /\bjava\.get\s*\(/i.test(String(tocRules.chapterList || ""))
+    && /^[A-Za-z_$][\w$]*$/.test(String(tocRules.chapterUrl || "").trim());
+  const effectiveSearchRules = stateBackedSingleMedia
+    ? {
+      ...searchRules,
+      bookList: inferResponseType(searchRules) === "json"
+        && !/^\s*(?:@?json:|\$)/i.test(String(searchRules.bookList || ""))
+        ? `@json:${searchRules.bookList}`
+        : searchRules.bookList,
+      bookUrl: String(tocRules.chapterUrl).trim(),
+    }
+    : searchRules;
 
   const detailResponseType = inferResponseType(detailRules);
   const detailWarningFor = createWarningCollector(warnings, sourceName, "bookDetail");
-  const tocResponseType = inferResponseType(tocRules);
+  const tocResponseType = /^@embedded-json-array:/i.test(String(tocRules.chapterList || ""))
+    ? "embedded-json"
+    : inferResponseType(tocRules);
   const tocWarningFor = createWarningCollector(warnings, sourceName, "chapterList");
-  // 漫蛙 AES 规则的正文端点返回 {data:{images,pagination}} JSON；原 content
-  // 只有 @js，单靠规则推断会误判为 HTML，导致香色先做 DOM 解析后正文为空。
+  // Prefix-IV AES rules commonly decode a JSON image manifest. The algorithm
+  // signature is taken from the source rule, never from its host or name.
   const contentResponseType = isPrefixAesDecoder && resolvedType === "comic"
     ? "json"
     : inferResponseType(contentRules);
@@ -1529,16 +1950,13 @@ function convertOne(source, warnings, options = {}) {
 
   const bookDetail = {
     ...commonAction("bookDetail", host, detailResponseType),
-    // 禁漫和香色的漫画详情动作不会可靠展开 %@result；使用与目录相同的运行时 URL 解析。
-    requestInfo: isJmComic ? nativeJmRequestInfo() : (bookDetailRequestInfoOverride(source) || "%@result"),
+    requestInfo: runtimeResultRequestInfo(),
     ...mapDetailRules(detailRules, detailResponseType, detailWarningFor),
   };
 
   // 《香色闺阁书源规则》§七：chapterList.requestInfo 的 result = 书籍详情页 URL。
-  // 站点适配可覆盖 requestInfo，把详情 URL 改写成独立目录页。
   // 官方 bookDetail 无 tocUrl；若阅读源带 tocUrl，仅作额外提取字段，不能代替 §七 的 result 语义。
-  const requestInfoOverride = chapterListRequestInfoOverride(source);
-  let chapterListRequestInfo = requestInfoOverride || "%@result";
+  let chapterListRequestInfo = runtimeResultRequestInfo();
   let jsonApiToc = false;
   if (detailRules.tocUrl) {
     if (isDetailUrlAlias(detailRules.tocUrl)) {
@@ -1546,10 +1964,11 @@ function convertOne(source, warnings, options = {}) {
       detailWarningFor("tocUrl", detailRules.tocUrl)(
         "阅读 tocUrl 为 baseUrl（目录即详情页），章节列表直接请求详情 URL",
       );
-      chapterListRequestInfo = requestInfoOverride || "%@result";
+      chapterListRequestInfo = runtimeResultRequestInfo();
     } else {
-      const absoluteTocRequest = buildJsonApiTocRequestInfo(detailRules.tocUrl);
-      if (absoluteTocRequest && !requestInfoOverride) {
+      const absoluteTocRequest = buildJsonApiTocRequestInfo(detailRules.tocUrl)
+        || buildRegexTocRequestInfo(detailRules.tocUrl);
+      if (absoluteTocRequest) {
         chapterListRequestInfo = absoluteTocRequest;
         jsonApiToc = true;
         detailWarningFor("tocUrl", detailRules.tocUrl)(
@@ -1560,28 +1979,26 @@ function convertOne(source, warnings, options = {}) {
           responseType: detailResponseType,
           warn: detailWarningFor("tocUrl", detailRules.tocUrl),
         });
-        if (!requestInfoOverride) {
-          const nameTemplate = String(detailRules.name || "").trim().match(/^\{\{\s*([\s\S]*?)\s*\}\}$/)?.[0];
-          const tocTemplate = String(detailRules.tocUrl || "");
-          if (nameTemplate && tocTemplate.includes(nameTemplate)) {
-            const request = tocTemplate.split(nameTemplate).join("{{book.name}}");
-            chapterListRequestInfo = convertRequest(request, {
-              headers,
-              warn: tocWarningFor("request", request),
-              fallback: "%@result",
-            }).requestInfo;
-            detailWarningFor("tocUrl", detailRules.tocUrl)("目录 URL 与详情书名使用同一字段，已改为从香色 queryInfo.bookName 构造目录请求");
-          } else {
-            // 非官方字段兜底：部分客户端若把 tocUrl 写入 queryInfo 则可直连目录
-            chapterListRequestInfo = [
-              "@js:",
-              "var q = params.queryInfo || {};",
-              'var u = (typeof result === "string") ? result : "";',
-              'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
-              "u = String(q.tocUrl || q.detailUrl || u || q.url || \"\");",
-              "return u;",
-            ].join("\n");
-          }
+        const nameTemplate = String(detailRules.name || "").trim().match(/^\{\{\s*([\s\S]*?)\s*\}\}$/)?.[0];
+        const tocTemplate = String(detailRules.tocUrl || "");
+        if (nameTemplate && tocTemplate.includes(nameTemplate)) {
+          const request = tocTemplate.split(nameTemplate).join("{{book.name}}");
+          chapterListRequestInfo = convertRequest(request, {
+            headers,
+            warn: tocWarningFor("request", request),
+            fallback: runtimeResultRequestInfo(),
+          }).requestInfo;
+          detailWarningFor("tocUrl", detailRules.tocUrl)("目录 URL 与详情书名使用同一字段，已改为从香色 queryInfo.bookName 构造目录请求");
+        } else {
+          // 非官方字段兜底：部分客户端若把 tocUrl 写入 queryInfo 则可直连目录
+          chapterListRequestInfo = [
+            "@js:",
+            "var q = params.queryInfo || {};",
+            'var u = (typeof result === "string") ? result : "";',
+            'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
+            "u = String(q.tocUrl || q.detailUrl || u || q.url || \"\");",
+            "return u;",
+          ].join("\n");
         }
         detailWarningFor("tocUrl", detailRules.tocUrl)(
           "阅读源含 tocUrl：已写入 bookDetail.tocUrl；章节请求仍以书源规则§七的 result（详情 URL）为准，请实测目录页",
@@ -1605,18 +2022,21 @@ function convertOne(source, warnings, options = {}) {
     contentRules.content,
     contentWarningFor("content", contentRules.content),
   );
+  const portableContentRule = portableContent ?? contentRules.content;
   let content = contentRules.content !== undefined
-    ? convertRule(portableContent ?? contentRules.content, {
-      responseType: contentResponseType,
-      warn: contentWarningFor("content", contentRules.content),
-    })
+    ? compatibleTextRule(
+      portableContentRule,
+      convertRule(portableContentRule, {
+        responseType: contentResponseType,
+        warn: contentWarningFor("content", contentRules.content),
+      }),
+    )
     : undefined;
   if (isPrefixAesDecoder && options.imageProxyBase && resolvedType === "comic") {
     // This API returns JSON {data:{images:[{url}]}}. Rebuild the small result in
     // 香色 JS instead of preserving Legado's src/source.getVariable() runtime calls.
     content = proxiedJsonImageContent(options.imageProxyBase, imageDecoder);
-  } else if ((["jm-scramble", "id-md5-reverse-tiles"].includes(imageDecoder)
-    || String(imageDecoder || "").startsWith("id-md5-reverse-tiles-"))
+  } else if (String(imageDecoder || "").startsWith("id-md5-reverse-tiles-")
     && options.imageProxyBase && resolvedType === "comic") {
     content = proxiedLineImageContent(content, options.imageProxyBase, imageDecoder);
   } else if (content && resolvedType === "comic") {
@@ -1641,11 +2061,12 @@ function convertOne(source, warnings, options = {}) {
       actionID: "searchBook",
       host,
       request: source.searchUrl,
-      rules: searchRules,
+      rules: effectiveSearchRules,
       headers,
       warnings,
       sourceName,
       section: "searchBook",
+      imageProxyBase: options.imageProxyBase,
     }),
     bookDetail,
     chapterList: {
@@ -1678,8 +2099,7 @@ function convertOne(source, warnings, options = {}) {
     },
     chapterContent: {
       ...commonAction("chapterContent", host, contentResponseType),
-      // 禁漫正文 URL 与详情/目录一样必须从香色运行时上下文取值，不能裸用 %@result。
-      requestInfo: isJmComic ? nativeJmRequestInfo() : "%@result",
+      requestInfo: runtimeResultRequestInfo(),
       ...(content !== undefined ? { content } : {}),
       ...((contentRules.nextContentUrl || contentRules.nextUrl) ? {
         nextPageUrl: convertRule(contentRules.nextContentUrl || contentRules.nextUrl, {
@@ -1689,14 +2109,13 @@ function convertOne(source, warnings, options = {}) {
         moreKeys: { maxPage: 50 },
       } : {}),
     },
-    bookWorld: buildBookWorld(source, context),
+    bookWorld: buildBookWorld(
+      stateBackedSingleMedia ? { ...source, ruleSearch: effectiveSearchRules } : source,
+      context,
+    ),
     ...structuredClone(EMPTY_ACTIONS),
   };
 
-  if (isJmComic) {
-    // 7584 参照 6444 使用香色原生 HTML 目录动作，避免 JSON 动作在部分版本中空列表。
-    converted.chapterList = nativeJmChapterList(host);
-  }
   if (useHtmlComicImageAdapter) {
     converted.chapterContent = proxiedHtmlComicChapterContent(
       host,
@@ -1706,16 +2125,45 @@ function convertOne(source, warnings, options = {}) {
     );
   }
   const hasSourceRegex = Boolean(String(contentRules.sourceRegex || "").trim());
+  const chapterRequestsWebView = /\bwebView\b/i.test(String(tocRules.chapterUrl || ""));
   const mediaRuleNeedsServer = contentResponseType === "json"
     || hasSourceRegex
+    || chapterRequestsWebView
     || /(?:\bjava\.|\bPackages\b|\bandroid\.|\bsource\.|\bbook\.|\bjavaScript\.)/i
       .test(String(contentRules.content || ""))
     || mediaPlanHasResolution(mediaExtractionPlan)
     || (mediaExtractionPlan?.properties || []).some((name) => /(?:path|url|uri|play|track|src|stream)/i.test(name));
+  const forceWebViewMedia = Boolean(source?.read2xsgg?.forceWebViewMedia);
+  const mediaProxy = normalizeMediaProxy(source?.read2xsgg?.mediaProxy);
   const hasMediaChapterUrl = Boolean(tocRules.chapterUrl && String(tocRules.chapterUrl).trim() !== "-");
-  if ((resolvedType === "audio" || resolvedType === "video") && !contentRules.content && hasMediaChapterUrl) {
-    converted.chapterContent.content = directMediaContent(options.imageProxyBase);
-    contentWarningFor("content", contentRules.content)("正文为空但章节规则提供媒体 URL，已自动将章节 URL 作为播放地址");
+  const trivialDirectMediaContent = !hasSourceRegex
+    && /^(?:@js:|<js>)?\s*(?:return\s+)?(?:baseUrl|result)\s*;?\s*(?:<\/js>)?$/i
+      .test(String(contentRules.content || "").trim());
+  const useDirectChapterMedia = hasMediaChapterUrl && (!contentRules.content || trivialDirectMediaContent);
+  if ((resolvedType === "audio" || resolvedType === "video") && useDirectChapterMedia) {
+    converted.chapterContent = directMediaChapterContent(host, options.imageProxyBase)
+      || { ...converted.chapterContent, content: directMediaContent(options.imageProxyBase) };
+    contentWarningFor("content", contentRules.content)("正文直接返回章节值，已将章节 URL 作为播放地址");
+  }
+  if (stateBackedSingleMedia) {
+    converted.chapterList = singleMediaChapterList(host, options.imageProxyBase) || converted.chapterList;
+    tocWarningFor("chapterList", tocRules.chapterList)(
+      "目录依赖阅读状态缓存，已将搜索项媒体字段转换为通用单章节动作",
+    );
+  }
+  if ((resolvedType === "audio" || resolvedType === "video")
+    && !converted.chapterList.url
+    && contentRules.content) {
+    converted.chapterList = singleMediaChapterList(host, options.imageProxyBase) || {
+      ...converted.chapterList,
+      list: ".",
+      title: "@js:\nreturn String((params.queryInfo && params.queryInfo.bookName) || \"播放\");",
+      url: "@js:\nreturn String((params.queryInfo && (params.queryInfo.detailUrl || params.queryInfo.url)) || result || \"\");",
+      moreKeys: { pageSize: 1, maxPage: 1 },
+    };
+    tocWarningFor("chapterUrl", tocRules.chapterUrl)(
+      "媒体目录没有章节 URL，已将当前详情页转换为单章节入口并保留正文媒体解析",
+    );
   }
   if (resolvedType === "comic" && converted.chapterList.list && !converted.chapterList.url) {
     converted.chapterList.url = [
@@ -1725,12 +2173,31 @@ function convertOne(source, warnings, options = {}) {
     ].join("\n");
     tocWarningFor("chapterUrl", tocRules.chapterUrl)("单章节图片源没有 chapterUrl，已使用当前详情页作为章节地址");
   }
-  if ((resolvedType === "audio" || resolvedType === "video") && options.imageProxyBase && mediaRuleNeedsServer) {
+  if ((resolvedType === "audio" || resolvedType === "video") && forceWebViewMedia) {
+    converted.chapterContent = webViewMediaChapterContent(
+      host,
+      resolvedType,
+      options.imageProxyBase || "",
+      mediaProxy,
+      {
+        webViewMediaJs: source?.read2xsgg?.webViewMediaJs || "",
+        webViewJsDelay: source?.read2xsgg?.webViewJsDelay,
+        webViewSkipUrls: source?.read2xsgg?.webViewSkipUrls,
+      },
+    );
+    contentWarningFor("content", contentRules.content)(
+      "已按源声明改由香色 WebView 加载章节页并读取页面播放器 audio/video 地址",
+    );
+  } else if ((resolvedType === "audio" || resolvedType === "video")
+    && options.imageProxyBase
+    && mediaRuleNeedsServer
+    && !useDirectChapterMedia) {
     converted.chapterContent = proxiedMediaChapterContent(
       host,
       options.imageProxyBase,
       resolvedType,
       mediaExtractionPlan,
+      mediaProxy,
     );
     if (mediaPlanHasResolution(mediaExtractionPlan)) {
       contentWarningFor("content", contentRules.content)(
@@ -1810,12 +2277,15 @@ function convertOne(source, warnings, options = {}) {
   }
 
   if (options.imageProxyBase) {
+    const latestChapter = jsonApiToc
+      ? latestChapterBridgeDescriptor(detailRules.tocUrl, detailRules, converted.chapterList, tocResponseType)
+      : null;
     converted.bookWorld = Object.fromEntries(Object.entries(converted.bookWorld || {}).map(([title, action]) => ([
       title,
       bridgeBookAction(action, options.imageProxyBase, headers),
     ])));
     converted.searchBook = bridgeBookAction(converted.searchBook, options.imageProxyBase, headers);
-    converted.bookDetail = bridgeDetailAction(converted.bookDetail, options.imageProxyBase, headers);
+    converted.bookDetail = bridgeDetailAction(converted.bookDetail, options.imageProxyBase, headers, latestChapter);
     converted.chapterList = bridgeChapterAction(converted.chapterList, options.imageProxyBase, {
       tocSelector: jsonApiToc ? "" : (bookDetail.tocUrl || ""),
       headers,
@@ -1927,24 +2397,6 @@ function nonPortableOnlineMediaReason() {
   return "";
 }
 
-function hasAdaptedMirrorHost(source) {
-  const blob = [
-    source?.bookSourceUrl,
-    source?.bookSourceName,
-    source?.loginUrl,
-    source?.ruleContent?.imageDecode,
-  ].join("\n");
-  // 在线适配可能把 bookSourceUrl 改写成临时镜像域名，因此同时看名称/登录脚本/解扰特征。
-  if (/(?:jmcomic|18comic|comic18j|mwwz|manwake|漫蛙|禁漫)/i.test(blob)) return true;
-  if (/BitmapFactory|Canvas\s*\(\s*img\s*\)|GLOBAL_IMAGE_ROUTES|api\/comic\/image/i.test(blob)) return true;
-  const decoder = decoderForLegadoImageRule(source?.ruleContent?.imageDecode);
-  if (!decoder) return false;
-  return decoder === "jm-scramble"
-    || decoder === "mwwz-aes"
-    || String(decoder).startsWith("id-md5-reverse-tiles")
-    || String(decoder).startsWith("aes-cbc-prefix-iv-");
-}
-
 function sourceUsesLoginGet(source) {
   const blob = [
     source?.searchUrl,
@@ -1960,7 +2412,7 @@ function sourceUsesLoginGet(source) {
 function nonPortableImageDecodeReason(source, options = {}) {
   const contentRules = getRules(source, "ruleContent", "contentRule");
   if (!contentRules.imageDecode) return "";
-  const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode);
+  const imageDecoder = decoderForLegadoImageRule(contentRules.imageDecode, source.jsLib);
   if (!imageDecoder) {
     return "未知 imageDecode，漫画图片将花屏";
   }
@@ -1972,7 +2424,6 @@ function nonPortableImageDecodeReason(source, options = {}) {
 
 function nonPortableLoginReason(source) {
   if (!(source?.loginUrl || source?.loginUi || source?.loginCheckJs)) return "";
-  if (hasAdaptedMirrorHost(source)) return "";
   if (!sourceUsesLoginGet(source)) return "";
   return "依赖登录/分流变量 Get(...)，香色无法复现阅读登录 UI";
 }

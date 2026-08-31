@@ -9,6 +9,14 @@ function quoteXPath(value) {
 const TEXT_PROPERTIES = new Set(["text", "textNodes", "ownText", "html"]);
 const ATTR_PROPERTIES = new Set(["href", "src", "content", "value", "title", "alt", "data-src"]);
 const RELATIVE_PROPERTIES = new Set([...TEXT_PROPERTIES, ...ATTR_PROPERTIES]);
+const HTML_ELEMENTS = new Set([
+  "html", "body", "main", "header", "footer", "nav", "article", "section", "aside",
+  "div", "span", "p", "a", "ul", "ol", "li", "dl", "dt", "dd",
+  "table", "thead", "tbody", "tfoot", "tr", "th", "td",
+  "h1", "h2", "h3", "h4", "h5", "h6", "img", "picture", "source",
+  "audio", "video", "iframe", "form", "input", "button", "label", "select", "option",
+  "strong", "b", "em", "i", "small", "time", "br", "pre", "code", "blockquote",
+]);
 
 function propertyToXPath(name, { bare = false } = {}) {
   if (name === "html") return "";
@@ -302,9 +310,14 @@ function legadoHtmlToXPath(selector) {
   if (RELATIVE_PROPERTIES.has(source) || (source.startsWith("@") && RELATIVE_PROPERTIES.has(source.slice(1)))) {
     return propertyToXPath(source.startsWith("@") ? source.slice(1) : source, { bare: true }) || ".";
   }
+  const bareAttribute = source.match(/^@([A-Za-z_][\w:-]*)$/);
+  if (bareAttribute) return `//@${bareAttribute[1]}`;
 
   if (source.includes("@")) {
     const segments = source.split("@").filter(Boolean);
+    if (/^title$/i.test(segments[0] || "") && /^(?:text|textNodes|ownText|html)$/i.test(segments[1] || "")) {
+      return `//title${propertyToXPath(segments[1])}`;
+    }
     // text.下一页@href → //a[contains(.,'下一页')]/@href
     // 不能用 //*[contains]/@href：祖先节点先命中且无 href 时，香色取首节点会得到空。
     if (segments[0]?.startsWith("text.") && segments.length >= 2) {
@@ -316,7 +329,13 @@ function legadoHtmlToXPath(selector) {
         return head + rest;
       }
     }
-    return segments.map((segment, index) => legacySegmentToXPath(segment, index === 0)).join("");
+    return segments.map((segment, index) => {
+      if (index > 0 && /^[A-Za-z_][\w:-]*$/.test(segment)
+        && !TEXT_PROPERTIES.has(segment)
+        && !ATTR_PROPERTIES.has(segment)
+        && !HTML_ELEMENTS.has(segment.toLowerCase())) return `/@${segment}`;
+      return legacySegmentToXPath(segment, index === 0);
+    }).join("");
   }
   if (source.startsWith("id.") || source.startsWith("class.") || source.startsWith("tag.") || source.startsWith("text.")) {
     return legacySegmentToXPath(source, true);
@@ -333,6 +352,16 @@ function jsonPathToXsgg(path, warn) {
     jsSuffix = jsMatch[1].replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
     source = source.slice(0, jsMatch.index);
   }
+  const filtered = encodeSimpleJsonFilter(source, jsSuffix);
+  if (filtered) {
+    warn("JSONPath 条件筛选已转换为通用规则桥接筛选器");
+    return filtered;
+  }
+  const recursiveRoot = source.trim().match(/^\$\.\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)(\.\*|\[\*\])?$/);
+  if (recursiveRoot && !jsSuffix) {
+    warn("JSONPath 根级递归下降已转换为通用递归选择器");
+    return `@json-recursive:${encodeURIComponent(recursiveRoot[1])}${recursiveRoot[2] ? ":values" : ""}`;
+  }
   if (source.includes("..")) {
     // `$..data[*]` / `$..content` from public comic/novel APIs almost always
     // mean the root field of that name. Only warn when recursion sits under a
@@ -348,6 +377,7 @@ function jsonPathToXsgg(path, warn) {
     warn("JSONPath 过滤表达式在香色中没有完全等价语法，已保留父级数组路径");
     source = source.replace(/\[\?\([\s\S]*?\)\]|\[\([\s\S]*?\)\]/g, "");
   }
+  const rootArray = /^\$\.?\[\*\]$/.test(source.trim());
   const converted = source
     .replace(/^\$\.?/, "")
     .replace(/\[['"]([^'"]+)['"]\]/g, "/$1")
@@ -356,10 +386,43 @@ function jsonPathToXsgg(path, warn) {
     .replace(/\.\*/g, "")
     .replace(/\./g, "/")
     .replace(/^\/+|\/+$/g, "");
-  if (!jsSuffix) return converted;
+  if (!jsSuffix) return converted || (rootArray || /^\$$/.test(source.trim()) ? "." : "");
   return converted
     ? `${converted}||${jsSuffix}`
     : jsSuffix;
+}
+
+function encodeSimpleJsonFilter(source, jsSuffix = "") {
+  const match = String(source || "").trim().match(/^(.*?)(?:\[\?\(([\s\S]+)\)\])(?:\[\*\])?\s*$/);
+  if (!match) return "";
+  const conditions = match[2].split(/\s*\|\|\s*/).map((condition) => (
+    condition.trim().replace(/^\(+|\)+$/g, "").trim()
+  ));
+  const parsed = conditions.map((condition) => condition.match(
+    /^@\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*={2,3}\s*(["'])([\s\S]*?)\2$/,
+  ));
+  if (!parsed.length || parsed.some((condition) => !condition)) return "";
+  const field = parsed[0][1];
+  if (parsed.some((condition) => condition[1] !== field)) return "";
+  let values = [...new Set(parsed.map((condition) => condition[3]))];
+
+  // A common Legado form first selects several node types and then narrows the
+  // result in a short JS filter. Preserve that narrower declarative condition.
+  const scriptValue = String(jsSuffix || "").match(
+    new RegExp(`(?:item|it|node|track|result)\\.${field.replace(/\./g, "\\.")}\\s*={2,3}\\s*(["'])([\\s\\S]*?)\\1`, "i"),
+  );
+  if (scriptValue && values.includes(scriptValue[2])) values = [scriptValue[2]];
+
+  let base = match[1].trim().replace(/^\$\.?/, "");
+  const recursive = /\.\.$/.test(base) || /^\$\.\.$/.test(match[1].trim());
+  base = base.replace(/\.\.$/, "").replace(/\[\*\]/g, "").replace(/\./g, "/").replace(/^\/+|\/+$/g, "");
+  return [
+    "@json-filter",
+    recursive ? "recursive" : "direct",
+    encodeURIComponent(base),
+    encodeURIComponent(field.replace(/\./g, "/")),
+    values.map((value) => encodeURIComponent(value)).join(","),
+  ].join(":");
 }
 
 function stripLegadoRegexOptions(replacement, warn) {
@@ -452,7 +515,12 @@ function expandMustacheRule(rule, warn) {
     if (marks === "@@") {
       warn("阅读 {{@@...}}（全部匹配）已按普通选择器转换，聚合语义请实测");
     }
-    fragments.push(inner);
+    // The first `@` normally marks a selector expression and is not part of
+    // the selector (`{{@class.item@text}}`). Explicit parser directives are
+    // different: stripping it from `{{@css:...}}` turns `css` into an HTML
+    // tag and produces an unusable `//css[...]` XPath.
+    const explicitDirective = /^(?:css|json):/i.test(inner) ? `@${inner}` : inner;
+    fragments.push(explicitDirective);
   }
 
   if (!fragments.length) return trimmed;
@@ -483,6 +551,9 @@ function looksLikeHtmlRule(value) {
   if (/^(?:@js:|<js>)/i.test(trimmed)) return false;
   if (/^\s*(?:@?json:|\$[.[])/i.test(trimmed)) return false;
   if (looksLikeNativeXPath(trimmed)) return true;
+  if (/^(?:html|body|main|article|section|div|span|p|a|ul|ol|li|table|thead|tbody|tr|td|th|img|picture|source|audio|video|h[1-6])$/i.test(trimmed)) {
+    return true;
+  }
   // A composed absolute URL is an output value, not an HTML selector. Treating
   // `https://.../{{$.id}}` as XPath solely because it contains `//` makes a
   // JSON detail response enter the DOM parser.
@@ -558,6 +629,12 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   if (typeof rule !== "string") return String(rule);
   let trimmed = rule.trim();
   if (!trimmed) return "";
+  if (/^@embedded-json-array:[A-Za-z_$][\w$]*$/.test(trimmed)) return trimmed;
+
+  if (/\{\{\s*\$\.\.[A-Za-z_$]/.test(trimmed)) {
+    trimmed = trimmed.replace(/\{\{\s*\$\.\.([A-Za-z_$][\w$]*)\s*\}\}/g, (_match, field) => `{{$.${field}}}`);
+    warn("列表项中的 JSONPath 递归字段已收敛为当前对象字段");
+  }
 
   // Placeholder list/detail rules seen in public stubs (`NA`, `-`).
   if (/^(?:NA|N\/A|null|none|-)$/i.test(trimmed)) return "";
@@ -610,8 +687,10 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   // Absolute or relative JSON URL / field templates:
   // `/pc/book/{$.id}` / `{$.free}{$.name}` / `https://x/{{$.id}}`.
   // Rewrite before HTML/JSONPath branching so `{$.field}` is not treated as a path.
-  if ((/\{\{\s*\$\./.test(trimmed) || /(?<!\{)\{(\$\.[^}]+)\}(?!\})/.test(trimmed))
-    && !looksLikeHtmlRule(trimmed.replace(/\{(?:\{\s*)?\$\.[^}]+\}(?:\})?/g, "x"))) {
+  const hasJsonFieldTemplate = /\{\{\s*\$\./.test(trimmed) || /(?<!\{)\{(\$\.[^}]+)\}(?!\})/.test(trimmed);
+  const hasSourceBaseTemplate = /\{\{\s*Url\s*\(\s*\)\s*\}\}/i.test(trimmed);
+  if (hasJsonFieldTemplate
+    && (hasSourceBaseTemplate || !looksLikeHtmlRule(trimmed.replace(/\{(?:\{\s*)?\$\.[^}]+\}(?:\})?/g, "x")))) {
     let template = trimmed;
     let scriptBody = "";
     let cleanupPattern = "";
@@ -681,7 +760,7 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
     const script = rewriteLegadoJavaScript(
       trailingJs[2].trim().replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, ""),
     );
-    if (/(?:\bjava\.|\bPackages\b|\bsource\.|\bbook\.|traditionalToSimplified|\beval\s*\()/i.test(script)) {
+    if (hasUnsupportedLegadoRuntime(script)) {
       warn("选择器后的阅读专用 JavaScript 在香色不可执行，已保留基础选择器并忽略该后处理");
       return head;
     }
@@ -711,6 +790,10 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
     const parts = trimmed.split("&&").map((part) => part.trim()).filter(Boolean);
     if (parts.length > 1) {
       const convertedParts = parts.map((part) => convertRule(part, { responseType, warn }));
+      if (responseType === "json" && convertedParts.every(Boolean)) {
+        warn("阅读的 JSON &&（合并全部匹配）已转换为数组合并选择器");
+        return `@json-union:${convertedParts.map((part) => encodeURIComponent(part)).join(",")}`;
+      }
       if (convertedParts.every((part) => part.startsWith("/") || part.startsWith("("))) {
         warn("阅读的 &&（拼接全部匹配）已近似转换为 XPath 并集；若结果不符合预期请手工调整");
         return convertedParts.join(" | ");
@@ -754,6 +837,15 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
 export function inferResponseType(rules = {}) {
   const values = Object.values(rules).filter((value) => typeof value === "string" && value.trim());
   if (!values.length) return "html";
+  if (values.some((value) => /\bJSON\.parse\s*\(\s*(?:src|result)\s*\)/.test(value))) return "json";
+
+  // The collection selector describes the response root. Bare item fields such
+  // as `title`, `url` or `src` are valid JSON properties but also resemble HTML
+  // attributes, so they must not overrule an explicit JSONPath collection.
+  const collectionRule = [rules.bookList, rules.chapterList].find((value) => (
+    typeof value === "string" && value.trim()
+  ));
+  if (collectionRule && /^\s*(?:@?json:|\$[.[]|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*\[\*\])/i.test(collectionRule)) return "json";
 
   const explicitJsonCount = values.filter((value) => (
     /^\s*(?:@?json:|\$[.[])/i.test(value) || /\{\{\s*\$\.[^}]+\}\}/.test(value)

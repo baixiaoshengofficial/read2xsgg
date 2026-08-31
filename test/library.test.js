@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createAppServer, createLibraryStore, encodeXbs, serverConfig } from "../src/index.js";
+import { createAppServer, createLibraryStore, decodeXbs, encodeXbs, serverConfig } from "../src/index.js";
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -175,6 +175,52 @@ test("管理 API 需要 ADMIN_TOKEN；公开 /library 仅 done 可取", async (c
   assert.match(await ui.text(), /源管理/);
 });
 
+test("公开 library 下载会按当前请求 BASE_URL 重写历史桥接 origin", async (context) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-library-rebase-"));
+  const store = createLibraryStore(dir);
+  const app = createAppServer({
+    config: {
+      ...serverConfig({ DATA_DIR: dir }),
+      dataDir: dir,
+    },
+    recoverJobs: false,
+  });
+  const base = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const oldOrigin = "http://192.168.100.3:6001";
+  const job = await store.createJob({
+    url: "https://example.com/legacy.json",
+    name: "legacy",
+    imageProxyBase: oldOrigin,
+  });
+  const json = Buffer.from(JSON.stringify({
+    示例: {
+      sourceName: "示例",
+      chapterList: {
+        requestInfo: `${oldOrigin}/adapter/chapters?plan=abc&url=https%3A%2F%2Fupstream.example%2Fbook%2F1`,
+      },
+    },
+  }, null, 2));
+  await store.saveArtifacts(job.id, { json, xbs: encodeXbs(json) });
+  await store.updateJob(job.id, { status: "done", count: 1 });
+
+  const response = await fetch(`${base}/library/${job.id}.xbs`, {
+    headers: {
+      "X-Forwarded-Host": "xs.chenqinfeng.cn",
+      "X-Forwarded-Proto": "http",
+    },
+  });
+  assert.equal(response.status, 200);
+  const sources = JSON.parse(decodeXbs(Buffer.from(await response.arrayBuffer())).toString("utf8"));
+  assert.match(sources["示例"].chapterList.requestInfo, /^https:\/\/xs\.chenqinfeng\.cn\/adapter\/chapters/);
+  assert.match(sources["示例"].chapterList.requestInfo, /https%3A%2F%2Fupstream\.example/);
+  assert.doesNotMatch(sources["示例"].chapterList.requestInfo, /192\.168\.100\.3/);
+});
+
 test("未配置 ADMIN_TOKEN 时管理接口 503", async (context) => {
   const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-noadmin-"));
   const app = createAppServer({
@@ -324,7 +370,6 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
     await store.saveArtifacts(job.id, { xbs: encodeXbs(staleJson), json: staleJson });
     await store.updateJob(job.id, { status: "done", count: 1 });
 
-    let seenAdapt;
     const published = await publishLibraryArtifact({
       store,
       jobId: job.id,
@@ -337,13 +382,9 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
       imageProxyBase: "https://convert.example",
       verify: false,
       convertParsed: async (parsed, config, proxy, options = {}) => {
-        seenAdapt = options.adapt;
         const { convertParsedSource } = await import("../src/convertOnline.js");
         return convertParsedSource(parsed, config, proxy, {
           ...options,
-          adaptOnlineSources: async () => {
-            throw new Error("offline publish must not adapt");
-          },
           filterReachableSources: async (sources) => ({ input: sources, skipped: [] }),
           downloadSource: async () => {
             throw new Error("offline publish must not download");
@@ -351,7 +392,6 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
         });
       },
     });
-    assert.equal(seenAdapt, false);
     assert.equal(published.job.id, job.id);
     assert.equal(published.job.status, "done");
     assert.equal(published.job.publishedFrom, "payload");
@@ -359,7 +399,7 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
     assert.ok(published.job.sourcePayloadHash);
 
     const payload = await store.readSourcePayload(job.id);
-    assert.equal(payload.ruleContent.mediaResolution.request.url, "{{origin}}/nlinka");
+    assert.equal(payload.ruleContent.mediaResolution.request.url, "{{origin}}/glink");
     // Root-style umask 0077 must not leave payload/metadata 0600 for the service user.
     assert.equal((await stat(path.join(dir, "artifacts", `${job.id}.source.json`))).mode & 0o777, 0o644);
     assert.equal((await stat(path.join(dir, "artifacts", `${job.id}.xbs`))).mode & 0o777, 0o644);
@@ -370,11 +410,10 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
     const sources = JSON.parse(decodeXbs(xbs).toString("utf8"));
     const converted = sources["恋听🎧💜"];
     assert.ok(converted);
-    const planMatch = String(converted.chapterContent.requestInfo).match(/plan=([A-Za-z0-9_-]+)/);
-    assert.ok(planMatch);
-    const plan = decodeMediaExtractionPlan(planMatch[1], "audio");
-    assert.equal(mediaPlanHasResolution(plan), true);
-    assert.equal(plan.resolution.request.url, "{{origin}}/nlinka");
+    assert.match(converted.chapterContent.requestInfo, /adapter\/media/);
+    assert.match(converted.chapterContent.content, /ting55-cdn/);
+    assert.doesNotMatch(converted.chapterContent.requestInfo, /webView:\s*""/);
+    assert.doesNotMatch(converted.chapterContent.content, /\/media\?url=/);
   } finally {
     process.umask(previousUmask);
     await rm(dir, { recursive: true, force: true });
@@ -434,9 +473,8 @@ test("retry 优先使用已发布 source payload，不回落缺 mediaResolution 
     },
     convertParsed: async (parsed, _config, _proxy, options = {}) => {
       payloadConverts += 1;
-      assert.equal(parsed.ruleContent.mediaResolution.request.url, "{{origin}}/nlinka");
-      // Payload retries must stay offline: never re-run adaptOnlineSources.
-      assert.equal(options.adapt, false);
+      assert.equal(parsed.ruleContent.mediaResolution.request.url, "{{origin}}/glink");
+      assert.equal(typeof options.fullVerify, "boolean");
       const json = Buffer.from(`${JSON.stringify({
         "payload-retry-audio": {
           sourceName: "payload-retry-audio",
@@ -493,13 +531,62 @@ test("retry 优先使用已发布 source payload，不回落缺 mediaResolution 
   }
 });
 
-test("publishLibraryArtifact：verify=true 才允许 adapt", async () => {
+test("publishLibraryArtifact：含 catalogPlan 时缺少 imageProxyBase 会失败", async () => {
   const { publishLibraryArtifact } = await import("../src/index.js");
-  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-publish-adapt-"));
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-publish-catalog-"));
+  const fixture = JSON.parse(
+    await readFile(path.resolve("sources/migrations/lrts.legado.json"), "utf8"),
+  );
+  try {
+    const store = createLibraryStore(dir);
+    const job = await store.createJob({
+      url: "https://example.com/legacy-remote.json",
+      name: "legacy-remote",
+      imageProxyBase: "",
+    });
+    await assert.rejects(
+      () => publishLibraryArtifact({
+        store,
+        jobId: job.id,
+        source: fixture,
+        config: serverConfig({
+          PREFLIGHT_SOURCES: "false",
+          VERIFY_CONVERTED_SOURCES: "false",
+          ANALYZE_FALLBACK: "false",
+        }),
+        imageProxyBase: "",
+        verify: false,
+      }),
+      /catalogPlan.*imageProxyBase/,
+    );
+    // Wrapped payloads must also be detected.
+    await assert.rejects(
+      () => publishLibraryArtifact({
+        store,
+        jobId: job.id,
+        source: { sources: [fixture] },
+        config: serverConfig({
+          PREFLIGHT_SOURCES: "false",
+          VERIFY_CONVERTED_SOURCES: "false",
+          ANALYZE_FALLBACK: "false",
+        }),
+        imageProxyBase: "",
+        verify: false,
+      }),
+      /catalogPlan.*imageProxyBase/,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("publishLibraryArtifact：verify=true 会启用完整校验选项", async () => {
+  const { publishLibraryArtifact } = await import("../src/index.js");
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-publish-verify-"));
   const fixture = JSON.parse(
     await readFile(path.resolve("sources/migrations/lian-ting.legado.json"), "utf8"),
   );
-  fixture.bookSourceName = "verify-adapt-audio";
+  fixture.bookSourceName = "verify-audio";
   fixture.bookSourceUrl = "https://audio.fixture.example/";
   try {
     const store = createLibraryStore(dir);
@@ -508,8 +595,7 @@ test("publishLibraryArtifact：verify=true 才允许 adapt", async () => {
       name: "legacy-remote",
       imageProxyBase: "https://convert.example",
     });
-    let seenAdapt;
-    let adapted = false;
+    let seenFullVerify;
     await publishLibraryArtifact({
       store,
       jobId: job.id,
@@ -522,21 +608,16 @@ test("publishLibraryArtifact：verify=true 才允许 adapt", async () => {
       imageProxyBase: "https://convert.example",
       verify: true,
       convertParsed: async (parsed, config, proxy, options = {}) => {
-        seenAdapt = options.adapt;
+        seenFullVerify = options.fullVerify;
         const { convertParsedSource } = await import("../src/convertOnline.js");
         return convertParsedSource(parsed, config, proxy, {
           ...options,
-          adaptOnlineSources: async (input) => {
-            adapted = true;
-            return input;
-          },
           filterReachableSources: async (sources) => ({ input: sources, skipped: [] }),
           downloadSource: async () => Buffer.from("{}"),
         });
       },
     });
-    assert.equal(seenAdapt, true);
-    assert.equal(adapted, true);
+    assert.equal(seenFullVerify, true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -570,7 +651,7 @@ test("convert/publish：opaque 正文仍捕获嵌套 ruleContent.mediaResolution
       mediaResolution: fixture.ruleContent.mediaResolution,
     },
   };
-  assert.equal(declaredMediaResolution(source).request.url, "{{origin}}/nlinka");
+  assert.equal(declaredMediaResolution(source).request.url, "{{origin}}/glink");
   assert.equal(source.read2xsgg?.mediaResolution, undefined);
 
   const convertedOffline = convertLegado(source, {
@@ -583,7 +664,7 @@ test("convert/publish：opaque 正文仍捕获嵌套 ruleContent.mediaResolution
   assert.ok(offlineMatch);
   const offlinePlan = decodeMediaExtractionPlan(offlineMatch[1], "audio");
   assert.equal(mediaPlanHasResolution(offlinePlan), true);
-  assert.equal(offlinePlan.resolution.request.url, "{{origin}}/nlinka");
+  assert.equal(offlinePlan.resolution.request.url, "{{origin}}/glink");
   assert.deepEqual(offlinePlan.resolution.response.properties, ["url", "ourl"]);
 
   const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-nested-mr-"));
@@ -609,7 +690,7 @@ test("convert/publish：opaque 正文仍捕获嵌套 ruleContent.mediaResolution
     });
     assert.equal(published.job.publishedFrom, "payload");
     const payload = await store.readSourcePayload(job.id);
-    assert.equal(payload.ruleContent.mediaResolution.request.url, "{{origin}}/nlinka");
+    assert.equal(payload.ruleContent.mediaResolution.request.url, "{{origin}}/glink");
     assert.equal(payload.read2xsgg?.mediaResolution, undefined);
 
     const xbs = await store.readArtifact(job.id, "xbs");
@@ -620,7 +701,7 @@ test("convert/publish：opaque 正文仍捕获嵌套 ruleContent.mediaResolution
     assert.ok(planMatch);
     const plan = decodeMediaExtractionPlan(planMatch[1], "audio");
     assert.equal(mediaPlanHasResolution(plan), true);
-    assert.equal(plan.resolution.request.url, "{{origin}}/nlinka");
+    assert.equal(plan.resolution.request.url, "{{origin}}/glink");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -688,7 +769,6 @@ test("管理 API publish 用声明式 source 覆盖制品", async (context) => {
   const sources = JSON.parse(decodeXbs(Buffer.from(await ready.arrayBuffer())).toString("utf8"));
   const converted = sources["迁移示例听书"];
   assert.ok(converted);
-  const planMatch = String(converted.chapterContent.requestInfo).match(/plan=([A-Za-z0-9_-]+)/);
-  assert.ok(planMatch);
-  assert.equal(mediaPlanHasResolution(decodeMediaExtractionPlan(planMatch[1], "audio")), true);
+  assert.match(converted.chapterContent.requestInfo, /adapter\/media/);
+  assert.doesNotMatch(converted.chapterContent.requestInfo, /webView:\s*""/);
 });

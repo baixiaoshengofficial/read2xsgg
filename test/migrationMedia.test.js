@@ -105,6 +105,14 @@ test("LRTS 迁移 fixture：分类菜单与播放 JSON 走通用计划，无域�
   const worldBlob = JSON.stringify(converted.bookWorld);
   assert.match(worldBlob, /\/adapter\/catalog\?/);
   assert.doesNotMatch(worldBlob, /\/adapter\/lrts-books/);
+  // Xiangse only substitutes %@pageIndex in plain requestInfo; internal
+  // __READ2XSGG_PAGE__ would be sent literally and break client paging.
+  assert.match(worldBlob, /page=%@pageIndex/);
+  assert.doesNotMatch(worldBlob, /page=__READ2XSGG_PAGE__/);
+  assert.match(worldBlob, /entityId=14/);
+  assert.match(worldBlob, /entityId=8/);
+  assert.match(worldBlob, /entityId=9042/);
+  assert.doesNotMatch(worldBlob, /entityId=13[^0-9]/);
   assert.equal(converted.searchBook.moreKeys.pageSize, 15);
   assert.equal(converted.chapterList.list, "$.data");
   assert.match(converted.chapterList.requestInfo, /\/adapter\/chapters\?/);
@@ -178,37 +186,41 @@ test("LRTS 迁移 fixture：分类菜单与播放 JSON 走通用计划，无域�
   assert.ok(warnings.some((item) => /catalog 适配器|idList/.test(String(item.message || ""))));
 });
 
-test("恋听迁移 fixture：显式 mediaResolution 可执行；legacy WebView XBS 给可移植诊断", async () => {
+test("恋听迁移 fixture：/adapter/media + /ting55-cdn；mediaResolution 可离线执行", async () => {
   assert.equal(
     declaredMediaResolution(lianTingFixture)?.request?.url,
-    "{{origin}}/nlinka",
+    "{{origin}}/glink",
   );
-  assert.equal(lianTingFixture.read2xsgg?.mediaResolution, undefined);
+  assert.equal(lianTingFixture.read2xsgg?.forceWebViewMedia, false);
   const { sources, warnings } = convertLegado(lianTingFixture, {
     imageProxyBase: "https://convert.example",
   });
   const converted = sources["恋听🎧💜"];
   assert.ok(converted);
   assert.match(converted.chapterContent.requestInfo, /\/adapter\/media\?/);
-  const planMatch = converted.chapterContent.requestInfo.match(/plan=([A-Za-z0-9_-]+)/);
-  assert.ok(planMatch);
-  const plan = decodeMediaExtractionPlan(planMatch[1], "audio");
-  assert.ok(mediaPlanHasResolution(plan));
-  assert.equal(plan.resolution.request.url, "{{origin}}/nlinka");
-  assert.equal(plan.resolution.request.method, "POST");
-  assert.deepEqual(plan.resolution.response.properties, ["url", "ourl"]);
-  assert.ok(warnings.some((item) => /多步媒体流程/.test(String(item.message || ""))));
+  assert.doesNotMatch(converted.chapterContent.requestInfo, /webView:\s*""/);
+  assert.match(converted.chapterContent.content, /ting55-cdn/);
+  assert.doesNotMatch(converted.chapterContent.content, /\/media\?url=/);
+  assert.ok(warnings.some((item) => /媒体解析计划|mediaResolution|glink/i.test(String(item.message || ""))));
 
   const html = `
     <html><head>
       <meta name="_c" content="token-c"/>
       <meta name="_b" content="14917"/>
       <meta name="_cp" content="1"/>
-      <meta name="_p" content="0"/>
+      <meta name="_p" content="11"/>
       <meta name="_l" content="1"/>
     </head></html>
   `;
   const calls = [];
+  const plan = {
+    version: 1,
+    kind: "audio",
+    properties: ["url"],
+    attributes: [],
+    urlHints: [],
+    resolution: lianTingFixture.ruleContent.mediaResolution,
+  };
   const urls = await executeMediaResolution(
     html,
     "https://media.example/book/14917-1",
@@ -223,26 +235,29 @@ test("恋听迁移 fixture：显式 mediaResolution 可执行；legacy WebView X
     },
   );
   assert.deepEqual(urls, ["https://cdn.example/a/14917.mp3"]);
-  assert.equal(calls[0].url, "https://media.example/nlinka");
+  assert.equal(calls[0].url, "https://media.example/glink");
   assert.equal(calls[0].init.method, "POST");
   assert.equal(calls[0].init.headers.xt, "token-c");
   assert.match(String(calls[0].init.body), /bookId=14917/);
+  assert.match(String(calls[0].init.body), /isPay=11/);
   assert.match(String(calls[0].init.body), /page=1/);
 
-  // Xiangse H5 leftover detailUrl in queryInfo.url must not beat chapter `result`.
-  const requestJs = String(converted.chapterContent.requestInfo).replace(/^@js:\s*/i, "");
-  const buildRequest = new Function("config", "params", "result", requestJs);
-  const detail = "https://ting55.com/book/14917";
-  const chapter = "https://ting55.com/book/14917-1";
-  const leftover = buildRequest(
-    { host: "https://ting55.com", httpHeaders: null },
-    { queryInfo: { detailUrl: detail, url: detail }, pageIndex: 1 },
-    chapter,
-  );
-  assert.match(decodeURIComponent(leftover.split("&url=").pop()), /\/book\/14917-1$/);
-  assert.doesNotMatch(decodeURIComponent(leftover.split("&url=").pop()), /\/book\/14917$/);
-  assert.match(converted.chapterContent.content, /payload\.httpHeaders/);
-  assert.match(converted.chapterContent.content, /baseHeaders/);
+  const contentRule = String(converted.chapterContent.content);
+  const script = contentRule.replace(/^@js:\s*/i, "");
+  const playFn = new Function("config", "params", "result", script);
+  const detail = "https://m.ting55.com/book/14917";
+  const chapter = "https://m.ting55.com/book/14917-1";
+  const played = JSON.parse(playFn(
+    { host: "https://m.ting55.com", httpHeaders: { "User-Agent": "UA" } },
+    { queryInfo: { detailUrl: detail, chapterUrl: chapter } },
+    {
+      url: "https://pp.ting55.com/a/14917.mp3",
+      httpHeaders: { Referer: chapter },
+    },
+  ));
+  assert.match(played.url, /^https:\/\/convert\.example\/ting55-cdn\/a\/14917\.mp3\?v=\d+$/);
+  assert.equal(played.httpHeaders.Referer, chapter);
+  assert.equal(played.forbidCache, true);
 
   // Published-style legacy XBS (05004abd): WebView + sourceRegex only — converter
   // must diagnose and must not invent a follow-up gateway.

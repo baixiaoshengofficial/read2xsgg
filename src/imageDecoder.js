@@ -1,8 +1,7 @@
 import { createDecipheriv, createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { Jimp, JimpMime } from "jimp";
-
-const MWWZ_AES_KEY = Buffer.from("0B6666A0-BB59-1381-B746-a0E4C9AC", "utf8");
 
 /** Return the MIME type only when the bytes have a well-known image signature. */
 export function imageMimeType(buffer) {
@@ -19,14 +18,6 @@ export function imageMimeType(buffer) {
 
 export class ImageDecodeError extends Error {}
 
-function mwwzAesCbc(buffer) {
-  if (buffer.length <= 16) throw new ImageDecodeError("图片密文长度不足，无法进行 AES 解密");
-  const decipher = createDecipheriv("aes-256-cbc", MWWZ_AES_KEY, buffer.subarray(0, 16));
-  const plain = Buffer.concat([decipher.update(buffer.subarray(16)), decipher.final()]);
-  if (!imageMimeType(plain)) throw new ImageDecodeError("AES 解密结果不是可识别图片");
-  return plain;
-}
-
 function aesCbcPrefixIv(buffer, { key } = {}) {
   let keyBytes;
   try {
@@ -42,18 +33,25 @@ function aesCbcPrefixIv(buffer, { key } = {}) {
   return plain;
 }
 
-const DEFAULT_ID_TILE_PLAN = {
-  bypassToken: "qyyuapi.com",
-  minimumId: 220980,
-  middleId: 268850,
-  upperId: 421925,
-  fixedTiles: 10,
-  middleModulo: 10,
-  upperModulo: 8,
-  factor: 2,
-};
+function aesCbcFixedIv(buffer, { key, iv } = {}) {
+  let keyBytes;
+  let ivBytes;
+  try {
+    keyBytes = Buffer.from(String(key || ""), "base64url");
+    ivBytes = Buffer.from(String(iv || ""), "base64url");
+  } catch {
+    throw new ImageDecodeError("AES 图片规则的密钥或 IV 编码无效");
+  }
+  if (![16, 24, 32].includes(keyBytes.length) || ivBytes.length !== 16) {
+    throw new ImageDecodeError("AES 图片规则的密钥或 IV 长度无效");
+  }
+  const decipher = createDecipheriv(`aes-${keyBytes.length * 8}-cbc`, keyBytes, ivBytes);
+  const plain = Buffer.concat([decipher.update(buffer), decipher.final()]);
+  if (!imageMimeType(plain)) throw new ImageDecodeError("AES 解密结果不是可识别图片");
+  return plain;
+}
 
-function idTileCount(bookId, imageId, plan = DEFAULT_ID_TILE_PLAN) {
+function idTileCount(bookId, imageId, plan) {
   const bookNumber = Number(bookId);
   if (bookNumber < plan.minimumId) return 0;
   if (bookNumber < plan.middleId) return plan.fixedTiles;
@@ -64,7 +62,7 @@ function idTileCount(bookId, imageId, plan = DEFAULT_ID_TILE_PLAN) {
 }
 
 /**
- * Jimp 1.x cannot decode WebP, while 禁漫的当前 CDN primarily returns WebP.
+ * Jimp 1.x cannot decode WebP, while some image sources return WebP.
  * ImageMagick is installed in the production image and is used only as a byte
  * format bridge; tile reassembly remains deterministic JavaScript below.
  */
@@ -132,7 +130,8 @@ async function reverseVerticalTiles(buffer, tiles, label) {
 }
 
 /** Reverse vertical tiles whose count is derived from two numeric URL IDs. */
-async function idMd5ReverseTiles(buffer, { url, idTilePlan = DEFAULT_ID_TILE_PLAN } = {}) {
+async function idMd5ReverseTiles(buffer, { url, idTilePlan } = {}) {
+  if (!idTilePlan) throw new ImageDecodeError("ID 分块图片缺少参数化计划");
   if ((idTilePlan.bypassToken && String(url || "").includes(idTilePlan.bypassToken)) || imageMimeType(buffer) === "image/gif") return buffer;
   let parsed;
   try {
@@ -184,18 +183,22 @@ async function md5ReverseTiles(buffer, { url, modulo = 10, add = 5 } = {}) {
   return reverseVerticalTiles(buffer, tiles, "MD5 分块");
 }
 
-const DECODERS = {
-  "mwwz-aes": { decode: mwwzAesCbc, processImageBytes: false },
-  "jm-scramble": { decode: idMd5ReverseTiles, processImageBytes: true },
-  "id-md5-reverse-tiles": { decode: idMd5ReverseTiles, processImageBytes: true },
-  "md5-reverse-tiles": { decode: md5ReverseTiles, processImageBytes: true },
-};
+const DECODERS = {};
+const DECODER_PROBE_PATH = fileURLToPath(new URL("./imageDecoderProbe.js", import.meta.url));
 
 function decoderDefinition(name) {
   const direct = DECODERS[String(name).toLowerCase()];
   if (direct) return { ...direct, context: {} };
   const aes = String(name).match(/^aes-cbc-prefix-iv-([A-Za-z0-9_-]+)$/i);
   if (aes) return { decode: aesCbcPrefixIv, processImageBytes: false, context: { key: aes[1] } };
+  const fixedAes = String(name).match(/^aes-cbc-fixed-iv-([A-Za-z0-9_-]+)-([A-Za-z0-9_-]+)$/i);
+  if (fixedAes) {
+    return {
+      decode: aesCbcFixedIv,
+      processImageBytes: false,
+      context: { key: fixedAes[1], iv: fixedAes[2] },
+    };
+  }
   const idTiles = String(name).match(/^id-md5-reverse-tiles-([A-Za-z0-9_-]+)$/i);
   if (idTiles) {
     let plan;
@@ -226,8 +229,8 @@ export function supportedImageDecoders() {
 /**
  * Decode an upstream comic image.
  *
- * Normal image bytes always pass through untouched. `auto` tries every registered
- * non-destructive decoder and accepts a result only if it has a valid image header.
+ * Normal image bytes always pass through untouched. Encrypted or scrambled bytes
+ * require an algorithm and parameters extracted from the source rule.
  */
 export async function decodeImage(buffer, decoder = "auto", context = {}) {
   const input = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
@@ -239,11 +242,11 @@ export async function decodeImage(buffer, decoder = "auto", context = {}) {
     if (directMime) return { buffer: input, mimeType: directMime, decoder: "passthrough" };
     throw new ImageDecodeError("上游响应不是可识别的图片");
   }
-  // Auto must never alter already-valid image pixels. Pixel-scramble decoders are
-  // only invoked explicitly after a source rule has positively identified a site.
+  // Auto must never alter already-valid image pixels. Pixel transformations are
+  // only invoked after a source rule has positively identified an algorithm.
   if (requestedType === "auto" && directMime) return { buffer: input, mimeType: directMime, decoder: "passthrough" };
-  const candidates = requestedType === "auto" ? ["mwwz-aes"] : [requested];
-  if (!candidates.length) throw new ImageDecodeError("没有可用的图片解码器");
+  if (requestedType === "auto") throw new ImageDecodeError("无法从图片字节推断解码算法；源规则必须提供算法参数");
+  const candidates = [requested];
 
   let lastError;
   for (const name of candidates) {
@@ -264,7 +267,33 @@ export async function decodeImage(buffer, decoder = "auto", context = {}) {
 }
 
 /** Detect imageDecode implementations that the proxy can reproduce safely. */
-export function decoderForLegadoImageRule(rule) {
+export function decoderFromJavaScript(source) {
+  return decoderCandidatesFromJavaScript(source)[0] || null;
+}
+
+export function decoderCandidatesFromJavaScript(source) {
+  const script = String(source || "");
+  if (!script || Buffer.byteLength(script) > 256 * 1024) return [];
+  const result = spawnSync(process.execPath, [DECODER_PROBE_PATH], {
+    input: script,
+    encoding: "utf8",
+    timeout: 1_500,
+    maxBuffer: 64 * 1024,
+    env: {},
+    cwd: "/tmp",
+  });
+  try {
+    const decoders = JSON.parse(String(result.stdout || "[]"));
+    return Array.isArray(decoders) ? decoders.filter((decoder) => (
+      /^aes-cbc-prefix-iv-[A-Za-z0-9_-]+$/.test(decoder)
+      || /^aes-cbc-fixed-iv-[A-Za-z0-9_-]+-[A-Za-z0-9_-]+$/.test(decoder)
+    )).slice(0, 16) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function decoderForLegadoImageRule(rule, jsLibrary = "") {
   const source = String(rule || "");
   if (
     /createSymmetricCrypto\s*\(\s*["']AES\/CBC\/PKCS5Padding/i.test(source)
@@ -297,7 +326,7 @@ export function decoderForLegadoImageRule(rule) {
       && plan.minimumId < plan.middleId && plan.middleId <= plan.upperId) {
       return `id-md5-reverse-tiles-${Buffer.from(JSON.stringify(plan), "utf8").toString("base64url")}`;
     }
-    return "id-md5-reverse-tiles";
+    return null;
   }
   if (
     /src\.indexOf\(\s*["']sr:1["']\s*\)/.test(source)
@@ -310,6 +339,10 @@ export function decoderForLegadoImageRule(rule) {
     const modulo = Number(formula?.[1]);
     const add = Number(formula?.[2]);
     if (modulo >= 1 && modulo <= 64 && add >= 1 && add <= 64) return `md5-reverse-tiles-${modulo}-${add}`;
+  }
+  if (/^\s*(?:return\s+)?[A-Za-z_$][\w$]*\s*\(\s*result\s*\)\s*;?\s*$/.test(source)
+    && String(jsLibrary || "").trim()) {
+    return decoderFromJavaScript(jsLibrary);
   }
   return null;
 }

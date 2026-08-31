@@ -192,19 +192,19 @@ https://xs.chenqinfeng.de/url/www.novel-site.example.xbs
 例如阅读源是：
 
 ```text
-https://www.yckceo.com/yuedu/shuyuans/json/id/1193.json
+https://www.example.com/sources/all.json
 ```
 
 对应订阅地址：
 
 ```text
-https://xs.chenqinfeng.de/source/www.yckceo.com/yuedu/shuyuans/json/id/1193.json.xbs
+https://xs.chenqinfeng.de/source/www.example.com/sources/all.json.xbs
 ```
 
-单个书源示例（爱丽丝书屋）：
+单个书源示例：
 
 ```text
-https://xs.chenqinfeng.de/source/www.yckceo.com/yuedu/shuyuan/json/id/7585.json.xbs
+https://xs.chenqinfeng.de/source/www.example.com/sources/one.json.xbs
 ```
 
 兼容别名（旧订阅可继续用）：`/xbs/...`、`/x.xbs?u=...`、`/convert.xbs?url=...`、`/analyze.xbs?url=...`。
@@ -230,11 +230,11 @@ node ./bin/server.js
 
 ```text
 {转换站}/image?url=https://cdn.example.com/image.jpg
-{转换站}/image/mwwz-aes?url=https://cdn.example.com/encrypted-image
-{转换站}/image/jm-scramble?url=https://cdn.example.com/photos/230000/1.jpg
+{转换站}/image/aes-cbc-prefix-iv-MDEyMzQ1Njc4OWFiY2RlZg?url=https://cdn.example.com/encrypted-image
+{转换站}/image/md5-reverse-tiles-10-5?url=https://cdn.example.com/scrambled-image
 ```
 
-`/image` 会直通 JPEG、PNG、GIF、WebP 等常见图片，并尝试已注册的解码能力。在线转换不会按站点域名选择解码器，而是分析阅读源 `imageDecode` 中的算法：AES-CBC 前缀 IV 会自动提取 16/24/32 字节密钥；MD5 分块倒序会自动提取取模数和偏移量；书号/图片号分块会按规则形态启用对应能力。旧的 `/image/mwwz-aes`、`/image/jm-scramble` 地址仅作为兼容别名保留。代理只会返回验证过图片文件头的结果，且与在线转换一样禁止访问内网地址。
+`/image` 只直通 JPEG、PNG、GIF、WebP 等可识别图片；无法从图片字节推断算法。在线转换会分析阅读源 `imageDecode` 的规则形态：AES-CBC 前缀 IV 会提取 16/24/32 字节密钥；MD5 分块倒序会提取取模数和偏移量；书号/图片号分块只有在阈值、取模数和倍数全部提取成功后才生成参数化解码地址。不保留站点别名、固定密钥或固定默认参数。代理只返回验证过图片文件头的结果，且与在线转换一样禁止访问内网地址。
 
 在线转换时，所有漫画正文都会使用规则驱动的通用桥接。转换器先把阅读 `ruleContent.content` 编译成一个不含可执行代码的提取计划，自动识别 JSON/JavaScript 属性（如 `imageUrl`、`pageSrc`、`url`）和 HTML 属性（如 `src`、`data-original`、`data-src`）；服务端再按该计划解析 HTML、JSON API、Next/React 分片脚本、`img/source` 标签或纯 URL 列表，最后返回香色原生的 `{urls:[...]}`。对于带 `page` / `pageIndex` 等查询参数的 JSON 漫画接口，还会自动识别 `current_page`、`total_pages`、`total`、`page_size` 及其驼峰别名，并发拉取、按页序去重合并全部图片。没有明确字段提示时，会自动发现包含图片 URL 的属性组并选择最可信的连续序列。原阅读源的 User-Agent、Referer、Cookie 等请求头会经过清理后随安全提取计划传给正文上游；Host、Content-Length 和连接级请求头不会透传。整个过程不使用站点域名作为判断条件，也不会执行阅读源携带的任意 JavaScript。
 
@@ -321,6 +321,7 @@ Compose 支持通过环境变量调整：
 | `MAX_SOURCE_BYTES` | `33554432` | 在线阅读源最大字节数（32 MiB，可容纳大型聚合源） |
 | `MAX_IMAGE_BYTES` | `26214400` | 单张代理图片最大字节数 |
 | `MAX_MEDIA_BYTES` | `83886080` | 单次 `/media` 代理最大字节数（约 80 MiB） |
+| `INSECURE_MEDIA_HOSTS` | 空 | `/media` 允许跳过 TLS 校验的主机名列表（逗号/空格分隔）；必须显式配置 |
 | `MAX_REDIRECTS` | `5` | 最大重定向次数 |
 | `MAX_CONCURRENT` | `8` | 最大并发转换数 |
 | `CACHE_TTL_SECONDS` | `300` | 内存缓存时间，设为 `0` 可关闭 |
@@ -331,6 +332,7 @@ Compose 支持通过环境变量调整：
 | `PREFLIGHT_SOURCES` | `true` | 转换前探测上游站点是否可达（origin）；设为 `false` 可跳过探活以加快转换，但会死站也会进入 XBS |
 | `PREFLIGHT_DEEP_SOURCES` | `false` | 实测分类列表、第一本书、章节和正文；仅在 `PREFLIGHT_SOURCES=true` 时生效。聚合源成本高，默认关闭 |
 | `PREFLIGHT_TIMEOUT_MS` | `3000` | 单个上游站点预检/抽测超时时间 |
+| `PREFLIGHT_CONFIRM_TIMEOUT_MS` | `10000` | 快速预检失败后，使用实际入口再次确认不可达的超时时间 |
 | `PREFLIGHT_CONCURRENCY` | `8` | 上游站点并发预检/抽测数量；不建议在小内存容器中调高 |
 | `VERIFY_CONVERTED_SOURCES` | `true` | 转换后抽测分类列表与目录是否非空；失败进入识站修复，再失败则跳过 |
 | `ANALYZE_FALLBACK` | `true` | 抽测失败时用启发式识站生成可用香色源；仍失败则跳过坏源 |

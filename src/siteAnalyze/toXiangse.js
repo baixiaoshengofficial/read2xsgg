@@ -56,6 +56,7 @@ function baseSource(discovery, { sourceName = "", miniAppVersion = "2.56.1", sou
   const name = String(sourceName || discovery.title || host).trim() || host;
   const listCover = String(discovery.listCoverSelector || "").trim();
   const detailCover = String(discovery.detailCoverSelector || "").trim();
+  const detailLastChapter = String(discovery.detailLastChapterSelector || "").trim();
   const searchRequest = String(discovery.searchRequestInfo || "").trim();
   const encode = discovery.searchEncode && typeof discovery.searchEncode === "object"
     ? discovery.searchEncode
@@ -66,6 +67,7 @@ function baseSource(discovery, { sourceName = "", miniAppVersion = "2.56.1", sou
     detailUrl: discovery.detailUrlSelector || ".//a/@href||//@href",
     ...(listCover ? { cover: listCover } : {}),
   };
+  const listPageSize = Math.max(1, Math.min(200, Number(discovery.listPageSize) || 20));
   return {
     sourceName: name,
     sourceUrl: host,
@@ -77,10 +79,10 @@ function baseSource(discovery, { sourceName = "", miniAppVersion = "2.56.1", sou
     bookWorld: {
       站点首页: {
         ...commonAction("bookWorld", host, "html"),
-        requestInfo: discovery.listUrl || host,
+        requestInfo: discovery.listRequestInfo || discovery.listUrl || host,
         ...listFields,
         ...encode,
-        moreKeys: { pageSize: 20 },
+        moreKeys: { pageSize: listPageSize },
         _sIndex: 0,
       },
     },
@@ -97,15 +99,23 @@ function baseSource(discovery, { sourceName = "", miniAppVersion = "2.56.1", sou
       ...commonAction("bookDetail", host, "html"),
       requestInfo: "%@result",
       bookName: "//h1|//h2",
-      ...(detailCover ? { cover: detailCover } : listCover ? { cover: listCover } : {}),
+      ...(discovery.tocSelector ? { tocUrl: discovery.tocSelector } : {}),
+      ...(detailCover ? { cover: detailCover } : {}),
+      ...(detailLastChapter ? { lastChapterTitle: detailLastChapter } : {}),
       ...encode,
     },
     chapterList: {
-      ...commonAction("chapterList", host, "html"),
-      requestInfo: "%@result",
+      ...commonAction("chapterList", host, discovery.chapterResponseFormatType || "html"),
+      requestInfo: discovery.chapterRequestInfo || "%@result",
       list: discovery.chapterListSelector,
       title: discovery.chapterTitleSelector || "normalize-space(.//a)||normalize-space(/html/body/*)",
       url: discovery.chapterUrlSelector || ".//a/@href||./@href||//@href",
+      ...(Number(discovery.chapterPageSize) > 0 ? {
+        moreKeys: {
+          pageSize: Number(discovery.chapterPageSize),
+          ...(Number(discovery.chapterMaxPage) > 0 ? { maxPage: Number(discovery.chapterMaxPage) } : {}),
+        },
+      } : {}),
       ...encode,
     },
   };
@@ -120,8 +130,8 @@ export function novelDiscoveryToXiangse(discovery, options = {}) {
   return {
     ...base,
     chapterContent: {
-      ...commonAction("chapterContent", discovery.host, "html"),
-      requestInfo: "%@result",
+      ...commonAction("chapterContent", discovery.host, discovery.contentResponseFormatType || "html"),
+      requestInfo: discovery.contentRequestInfo || "%@result",
       content: withNovelHtmlStripped(discovery.contentSelector),
     },
   };
@@ -133,9 +143,8 @@ export function comicDiscoveryToXiangse(discovery, options = {}) {
   return {
     ...base,
     chapterContent: {
-      ...commonAction("chapterContent", discovery.host, "html"),
-      requestInfo: "%@result",
-      responseFormatType: "html",
+      ...commonAction("chapterContent", discovery.host, discovery.contentResponseFormatType || "html"),
+      requestInfo: discovery.contentRequestInfo || "%@result",
       content: discovery.contentSelector,
     },
   };
@@ -148,8 +157,8 @@ export function mediaDiscoveryToXiangse(discovery, options = {}) {
   return {
     ...base,
     chapterContent: {
-      ...commonAction("chapterContent", discovery.host, "html"),
-      requestInfo: "%@result",
+      ...commonAction("chapterContent", discovery.host, discovery.contentResponseFormatType || "html"),
+      requestInfo: discovery.contentRequestInfo || "%@result",
       content: discovery.contentSelector,
     },
   };
@@ -157,6 +166,11 @@ export function mediaDiscoveryToXiangse(discovery, options = {}) {
 
 export function discoveryToXiangse(discovery, options = {}) {
   if (!discovery?.kind) return null;
+  if (discovery.source && typeof discovery.source === "object") {
+    const source = structuredClone(discovery.source);
+    source.sourceName = String(options.sourceName || source.sourceName || discovery.title || discovery.host).trim();
+    return source;
+  }
   if (discovery.kind === "text") return novelDiscoveryToXiangse(discovery, options);
   if (discovery.kind === "comic") return comicDiscoveryToXiangse(discovery, options);
   if (discovery.kind === "audio" || discovery.kind === "video") {

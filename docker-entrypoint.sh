@@ -8,7 +8,7 @@ data_dir="${DATA_DIR:-/data}"
 if [ "$(id -u)" = "0" ]; then
   mkdir -p "$data_dir"
   chown -R node:node "$data_dir"
-  exec su-exec node "$@"
+  exec gosu node "$@"
 fi
 
 exec "$@"

@@ -104,6 +104,23 @@ function homeHasSearchHint(document) {
   return [...document.querySelectorAll("a[href]")].some((a) => /search/i.test(a.getAttribute("href") || ""));
 }
 
+function pathSearchRequest(document, homeUrl) {
+  let url;
+  try { url = new URL(homeUrl); } catch { return ""; }
+  if (!/search|query|find/i.test(url.pathname)) return "";
+  const input = document.querySelector("input[type='search'],input[placeholder*='搜索'],input.search-bar");
+  const current = String(input?.getAttribute("value") || input?.value || "").trim();
+  if (!current) return "";
+  const segments = url.pathname.split("/");
+  const index = segments.findIndex((segment) => {
+    try { return decodeURIComponent(segment) === current; } catch { return false; }
+  });
+  if (index < 0) return "";
+  segments[index] = "%@keyWord";
+  url.pathname = segments.join("/");
+  return url.toString().replace(/%25%40keyWord/gi, "%@keyWord").replace(/%40keyWord/gi, "%@keyWord");
+}
+
 /**
  * Discover a usable search request from homepage forms / search widgets.
  * Returns Xiangse requestInfo (+ optional GBK encode fields).
@@ -155,6 +172,10 @@ export function discoverSearchRequest(document, homeUrl, { html = "", headers = 
   const best = candidates.find((item) => item.requestInfo);
   const encode = xiangseEncodeFields(sniffCharsetFromHtml(html || document.documentElement?.outerHTML || "", headers));
   if (!best) {
+    const pathRequest = pathSearchRequest(document, homeUrl);
+    if (pathRequest) {
+      return { requestInfo: pathRequest, method: "get", keywordName: "path", ...encode };
+    }
     if (!homeHasSearchHint(document)) return null;
     return {
       requestInfo: "/modules/article/search.php?searchkey=%@keyWord",

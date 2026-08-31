@@ -1,3 +1,5 @@
+import iconv from "iconv-lite";
+
 /** Xiangse Windows code page for GBK / GB2312 / GB18030. */
 export const XIANGSE_GBK_ENCODE = "2147485234";
 
@@ -41,6 +43,37 @@ export function xiangseEncodeFields(charset) {
 export function isXiangseGbkEncode(action) {
   return String(action?.responseEncode || action?.requestParamsEncode || "") === XIANGSE_GBK_ENCODE
     || normalizeCharsetName(action?.charset) === "gbk";
+}
+
+function formEncodeBytes(buffer) {
+  let encoded = "";
+  for (const byte of buffer) {
+    if ((byte >= 0x30 && byte <= 0x39)
+      || (byte >= 0x41 && byte <= 0x5a)
+      || (byte >= 0x61 && byte <= 0x7a)
+      || byte === 0x2a || byte === 0x2d || byte === 0x2e || byte === 0x5f) {
+      encoded += String.fromCharCode(byte);
+    } else if (byte === 0x20) {
+      encoded += "+";
+    } else {
+      encoded += `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+    }
+  }
+  return encoded;
+}
+
+/** Encode an application/x-www-form-urlencoded body using the action charset. */
+export function encodeFormBody(params, action = {}) {
+  if (!isXiangseGbkEncode(action)) {
+    return new URLSearchParams(
+      Object.entries(params || {}).map(([key, value]) => [key, String(value)]),
+    ).toString();
+  }
+  return Object.entries(params || {}).map(([key, value]) => {
+    const encodedKey = formEncodeBytes(iconv.encode(String(key), "gbk"));
+    const encodedValue = formEncodeBytes(iconv.encode(String(value), "gbk"));
+    return `${encodedKey}=${encodedValue}`;
+  }).join("&");
 }
 
 export function sniffCharsetFromHtml(buffer, headers = {}) {

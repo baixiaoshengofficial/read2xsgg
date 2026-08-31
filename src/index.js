@@ -7,9 +7,15 @@ export {
   xiangseEncodeFields,
   XIANGSE_GBK_ENCODE,
 } from "./charset.js";
-export { loadXbsSources, runXbsPipeline } from "./xbsRuntime.js";
+export {
+  isPlayableMediaResponse,
+  loadXbsSources,
+  runXbsChapterContent,
+  runXbsPipeline,
+} from "./xbsRuntime.js";
 export { convertRule, cssToXPath, inferResponseType } from "./selectors.js";
-export { convertRequest } from "./requests.js";
+export { convertRequest, refreshEphemeralHeaders } from "./requests.js";
+export { compileSignedRequestPlan, decodeSignedRequestPlan, encodeSignedRequestPlan, signedRequestTarget } from "./requestPlan.js";
 export { decodeXbs, encodeXbs } from "./xbs.js";
 export { decodeImage, decoderForLegadoImageRule, imageMimeType, supportedImageDecoders } from "./imageDecoder.js";
 export { compileComicExtractionPlan, decodeComicExtractionPlan, encodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
@@ -50,6 +56,12 @@ export {
   discoveryToXiangse,
   kindLabel,
   withNovelHtmlStripped,
+  repairChapterFromBook,
+  repairDetailFromBook,
+  discoverContentRule,
+  repairContentFromChapter,
+  repairBooksFromRequests,
+  repairChaptersFromBookJson,
 } from "./siteAnalyze/index.js";
 export { convertOnlineSource, convertParsedSource } from "./convertOnline.js";
 export { createLibraryStore } from "./libraryStore.js";
@@ -64,10 +76,15 @@ export { createJobWorker } from "./jobWorker.js";
 export { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
 export {
   resolveBookTargetUrl,
+  resolveBookTargetRequest,
+  resolveBookTargetRequests,
+  resolveBookTargetUrls,
   resolveChapterListUrls,
   extractBookIdFromUrl,
+  usableComicContentReport,
+  usableComicPageUrl,
   verifyConvertedSource,
   verifyConvertedSources,
 } from "./verifySource.js";
-export { downloadAsFetch, ruleUsesForbiddenSinglePipeJs, validateXiangseSource } from "./xiangseValidate.js";
-export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadMedia, downloadSource, filterReachableSources, HttpError, jmChapterEntries, jmImageUrls, jmMirrorCandidates, mwwzCategoryEntries, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaUrls, pageText, pageTocUrl, serverConfig, sourceUrlCandidates, startServer } from "./server.js";
+export { downloadAsFetch, filterValidXiangseSources, repairXiangseEntrypoints, ruleUsesForbiddenSinglePipeJs, validateXiangseSource } from "./xiangseValidate.js";
+export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadMedia, downloadSource, filterReachableSources, HttpError, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaPlaylist, pageMediaUrls, pageText, pageTocUrl, serverConfig, sourceUrlCandidates, startServer } from "./server.js";

@@ -42,8 +42,10 @@ export function legadoTemplateExpression(value) {
   if (/^java\.put\(\s*['"]key['"]\s*,\s*key\s*\)(?:\s*;\s*key)?$/i.test(expression)) {
     return "params.keyWord";
   }
+  if (/^java\.(?:t2s|s2t)\(\s*key\s*\)$/i.test(expression)) return "params.keyWord";
   if (/^(?:java\.)?encodeURI(?:Component)?\(\s*key\s*\)$/i.test(expression)) return "encodeURIComponent(params.keyWord)";
-  if (/^source\.bookSourceUrl$/i.test(expression)) return "config.host";
+  if (/^source\.(?:bookSourceUrl|key|getKey\s*\(\s*\))$/i.test(expression)) return "config.host";
+  if (/^Url\s*\(\s*\)$/i.test(expression)) return "config.host";
   if (/^[\d\s()+*/%.-]*\bpage\b[\d\s()+*/%.-]*$/i.test(expression)) {
     return expression.replace(/\bpage\b/gi, "params.pageIndex");
   }
@@ -171,6 +173,7 @@ function ensureJavaScriptReturn(value) {
  */
 export function rewriteLegadoJavaScript(value) {
   let source = String(value || "")
+    .replace(/<\/js>/gi, "")
     // Older Legado collections also use `{$.id}` (one brace) in JSON URL
     // templates. Normalise only this narrow field form; ordinary JS objects
     // are deliberately untouched.
@@ -185,6 +188,11 @@ export function rewriteLegadoJavaScript(value) {
     legadoTemplateExpression(expression) || template
   ));
   source = source.replace(/\bjava\.encodeURI\s*\(/g, "encodeURIComponent(");
+  source = source
+    .replace(/\bsource\.getKey\s*\(\s*\)/gi, "config.host")
+    .replace(/\bsource\.(?:key|bookSourceUrl)\b/gi, "config.host")
+    .replace(/^\s*(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie)\s*\([^;\n]*\)\s*;?\s*$/gim, "")
+    .replace(/^\s*java\.put\s*\(\s*['"][^'"]+['"]\s*,\s*[^;\n]+\)\s*;?\s*$/gim, "");
   source = rewriteBareRuntimeIdentifiers(source);
   return ensureJavaScriptReturn(source);
 }

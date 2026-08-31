@@ -1,4 +1,4 @@
-FROM node:20-alpine
+FROM node:20-bookworm-slim
 
 WORKDIR /app
 
@@ -10,7 +10,8 @@ ENV NODE_ENV=production \
     GIT_SHA=${GIT_SHA}
 
 COPY package.json package-lock.json LICENSE README.md ./
-RUN apk add --no-cache imagemagick libwebp-tools su-exec \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends imagemagick webp gosu ca-certificates curl \
     && npm ci --omit=dev \
     && mkdir -p /data \
     && chown node:node /data
@@ -23,14 +24,14 @@ COPY docker-entrypoint.sh /usr/local/bin/read2xsgg-entrypoint
 RUN chmod 0755 /usr/local/bin/read2xsgg-entrypoint
 
 # The entrypoint fixes ownership of a host bind mount, then immediately drops
-# to this unprivileged user with su-exec before starting Node.
+# to this unprivileged user with gosu before starting Node.
 USER root
 
 EXPOSE 3000
 VOLUME ["/data"]
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+HEALTHCHECK --interval=30s --timeout=15s --start-period=5s --retries=3 \
+  CMD curl --fail --silent --show-error --max-time 10 http://127.0.0.1:3000/healthz >/dev/null
 
 ENTRYPOINT ["/usr/local/bin/read2xsgg-entrypoint"]
 CMD ["node", "./bin/server.js"]

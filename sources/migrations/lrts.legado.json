@@ -19,37 +19,43 @@
     {
       "title": "武侠仙侠",
       "group": "有声小说",
-      "entityId": "12",
-      "pageSize": 20
-    },
-    {
-      "title": "都市言情",
-      "group": "有声小说",
-      "entityId": "13",
-      "pageSize": 20
-    },
-    {
-      "title": "科幻灵异",
-      "group": "有声小说",
       "entityId": "14",
       "pageSize": 20
     },
     {
-      "title": "历史军事",
+      "title": "都市传说",
       "group": "有声小说",
-      "entityId": "15",
+      "entityId": "8",
       "pageSize": 20
     },
     {
-      "title": "游戏竞技",
+      "title": "历史幻想",
       "group": "有声小说",
-      "entityId": "16",
+      "entityId": "12",
       "pageSize": 20
     },
     {
-      "title": "悬疑推理",
+      "title": "科幻空间",
       "group": "有声小说",
-      "entityId": "17",
+      "entityId": "3021",
+      "pageSize": 20
+    },
+    {
+      "title": "网游竞技",
+      "group": "有声小说",
+      "entityId": "9042",
+      "pageSize": 20
+    },
+    {
+      "title": "热血军事",
+      "group": "有声小说",
+      "entityId": "9041",
+      "pageSize": 20
+    },
+    {
+      "title": "推理小说",
+      "group": "文学",
+      "entityId": "9139",
       "pageSize": 20
     }
   ],

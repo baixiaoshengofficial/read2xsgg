@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { normalizeCatalogPlan } from "./catalogPlan.js";
 import { convertParsedSource } from "./convertOnline.js";
 
 function parseSourceInput(source) {
@@ -16,6 +17,20 @@ function parseSourceInput(source) {
 
 function payloadFingerprint(parsed) {
   return createHash("sha256").update(JSON.stringify(parsed)).digest("hex");
+}
+
+function sourceList(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  if (!parsed || typeof parsed !== "object") return [];
+  if (parsed.bookSourceUrl || parsed.bookSourceName || parsed.read2xsgg) return [parsed];
+  for (const key of ["sources", "bookSources", "data"]) {
+    if (Array.isArray(parsed[key])) return parsed[key];
+  }
+  return [parsed];
+}
+
+function hasCatalogPlan(parsed) {
+  return sourceList(parsed).some((source) => Boolean(normalizeCatalogPlan(source?.read2xsgg?.catalogPlan)));
 }
 
 /**
@@ -43,6 +58,9 @@ export async function publishLibraryArtifact({
 
   const parsed = parseSourceInput(source);
   const proxyBase = String(imageProxyBase || job.imageProxyBase || "").trim();
+  if (!proxyBase && hasCatalogPlan(parsed)) {
+    throw new Error("源含声明式 catalogPlan，发布时必须提供公开代理地址 imageProxyBase；否则分类会降级成搜索入口");
+  }
   const publishConfig = {
     ...config,
     // Deterministic publication defaults to convert-only; callers opt into verify.
@@ -54,9 +72,6 @@ export async function publishLibraryArtifact({
   const result = await convertParsed(parsed, publishConfig, proxyBase, {
     fullVerify: Boolean(verify),
     analyzeFallback: Boolean(verify),
-    // Default publish is offline/deterministic: do not mutate via adaptOnlineSources.
-    // Only when the caller opts into verify may adaptation run (e.g. mirror refresh).
-    adapt: Boolean(verify),
   });
 
   await store.saveSourcePayload(id, parsed);

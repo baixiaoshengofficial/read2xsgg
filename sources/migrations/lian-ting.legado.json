@@ -1,10 +1,10 @@
 {
-  "bookSourceComment": "[read2xsgg] 原正文仅 WebView+sourceRegex，无多步播放协议；本 fixture 提供声明式 mediaResolution（章节 meta → POST {{origin}}/nlinka → url/ourl）。已发布 XBS 05004abd7dbd27c1 需用本源重新转换。",
+  "bookSourceComment": "[read2xsgg] iOS 播放：/adapter/media 取 glink 直链后改写到 https://xs…/ting55-cdn/（国内 VPS 反代 + 合法证书）。pp.ting55.com 证书错误且机房出口 404，不能直链给 AVPlayer。",
   "bookSourceGroup": "快速书源,有声书源",
   "bookSourceName": "恋听🎧💜",
   "bookSourceType": 1,
-  "bookSourceUrl": "https://ting55.com/",
-  "bookUrlPattern": "https://ting55.com/book/\\d+",
+  "bookSourceUrl": "https://m.ting55.com/",
+  "bookUrlPattern": "https://(?:m\\.)?ting55\\.com/book/\\d+",
   "customButton": false,
   "customOrder": 905,
   "enabled": true,
@@ -12,6 +12,9 @@
   "enabledExplore": true,
   "eventListener": false,
   "exploreUrl": "推荐::/tuijian<,/page/{{page}}>\n玄幻::/category/1<,/page/{{page}}>\n武侠::/category/2<,/page/{{page}}>\n都市::/category/3<,/page/{{page}}>\n言情::/category/4<,/page/{{page}}>\n穿越::/category/5<,/page/{{page}}>\n科幻::/category/6<,/page/{{page}}>\n推理::/category/7<,/page/{{page}}>\n恐怖::/category/8<,/page/{{page}}>\n惊悚::/category/9<,/page/{{page}}>\n历史::/category/10<,/page/{{page}}>\n经典::/category/11<,/page/{{page}}>\n相声::/category/12<,/page/{{page}}>\n评书::/category/14<,/page/{{page}}>\n讲坛::/category/13<,/page/{{page}}>",
+  "header": {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 9; MIX 2S Build/PKQ1.180729.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/72.0.3626.121 Mobile Safari/537.36"
+  },
   "lastUpdateTime": 1741627207537,
   "respondTime": 1839,
   "ruleBookInfo": {
@@ -24,7 +27,7 @@
     "name": "class.binfo@h1@text##有声小说|\\（.*"
   },
   "ruleContent": {
-    "content": "[name=\"_c\"]@content@js:\nvar body=baseUrl.replace(/.+\\/book\\/(\\d+)-(\\d+)/,\"bookId=$1&isPay=0&page=$2\");\nvar url=\"/nlinka,\";\nvar headers={\n  \"Content-Type\":\"application/x-www-form-urlencoded\",\n  Referer:baseUrl,\n  xt:result,\n  l:\"1\"\n};\nvar options={\n  method:\"post\",\n  headers:JSON.stringify(headers),\n  body:body\n};\nJSON.parse(java.ajax(url+JSON.stringify(options))).url\n",
+    "content": "[name=\"_c\"]@content@js:\nvar body=baseUrl.replace(/.+\\/book\\/(\\d+)-(\\d+)/,\"bookId=$1&isPay=0&page=$2\");\nvar url=\"/glink,\";\nvar headers={\n  \"Content-Type\":\"application/x-www-form-urlencoded\",\n  Referer:baseUrl,\n  xt:result,\n  l:\"1\"\n};\nvar options={\n  method:\"post\",\n  headers:JSON.stringify(headers),\n  body:body\n};\nJSON.parse(java.ajax(url+JSON.stringify(options))).url\n",
     "mediaResolution": {
       "extract": [
         { "name": "xt", "source": "meta", "key": "_c" },
@@ -34,7 +37,7 @@
         { "name": "isPay", "source": "meta", "key": "_p", "default": "0" }
       ],
       "request": {
-        "url": "{{origin}}/nlinka",
+        "url": "{{origin}}/glink",
         "method": "POST",
         "headers": {
           "Content-Type": "application/x-www-form-urlencoded",
@@ -48,30 +51,36 @@
     }
   },
   "ruleExplore": {
-    "author": "class.info@tag.p.1@text##作者：",
-    "bookList": "class.category-list@ul@li",
-    "bookUrl": "class.info@h4@a@href",
+    "author": "tag.dd@tag.p.0@text##作者：",
+    "bookList": "class.clist@tag.a",
+    "bookUrl": "href",
     "coverUrl": "img@src",
-    "kind": "class.info@tag.p.0@text&&\nclass.info@tag.p.2@text&&\nclass.info@tag.p.3@text##时间：|状态：|类别：",
-    "name": "class.info@h4@a@text##（.*"
+    "kind": "tag.dd@tag.p.1@text&&\ntag.dd@tag.p.2@text##播音：|状态：",
+    "name": "tag.h3@text##（.*"
   },
   "ruleSearch": {
-    "author": "class.info@tag.p.1@text##播音：",
-    "bookList": "class.category-list@ul@li",
-    "bookUrl": "class.info@h4@a@href",
+    "author": "tag.dd@tag.p.1@text##播音：",
+    "bookList": "class.slist@tag.a",
+    "bookUrl": "href",
     "coverUrl": "img@src",
-    "kind": "class.info@tag.p.0@text&&\nclass.info@tag.p.2@text&&\nclass.info@tag.p.3@text##时间：|状态：",
+    "kind": "tag.dd@tag.p.0@text&&\ntag.dd@tag.p.2@text##作者：|状态：",
     "lastChapter": "",
-    "name": "class.info@h4@a@text##（.*"
+    "name": "tag.h3@text##（.*"
   },
   "ruleToc": {
-    "chapterList": "class.plist@li",
-    "chapterName": "tag.a@text",
-    "chapterUrl": "tag.a@href"
+    "chapterList": "class.plist@tag.a",
+    "chapterName": "text",
+    "chapterUrl": "href"
   },
-  "searchUrl": "https://ting55.com/search/{{key}}/page/{{page}}",
+  "searchUrl": "https://m.ting55.com/search/{{key}}/page/{{page}}",
   "weight": 0,
   "read2xsgg": {
-    "notes": "Published library XBS 05004abd7dbd27c1 used empty media plan (href only). Reconvert from this fixture to embed MediaResolutionPlan."
+    "forceWebViewMedia": false,
+    "mediaProxy": {
+      "hosts": ["pp.ting55.com"],
+      "pathPrefix": "/ting55-cdn",
+      "cacheBust": true
+    },
+    "notes": "播放 URL 改写到国内 VPS /ting55-cdn 反代，满足 iOS 证书校验。"
   }
 }

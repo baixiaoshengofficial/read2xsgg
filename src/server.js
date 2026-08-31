@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createDecipheriv, createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
@@ -9,25 +9,42 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 import { JSDOM } from "jsdom";
+import { Jimp, JimpMime } from "jimp";
 import { convertOnlineSource } from "./convertOnline.js";
 import { createLibraryStore } from "./libraryStore.js";
 import { createJobWorker } from "./jobWorker.js";
 import { analyzeSite } from "./siteAnalyze/index.js";
+import {
+  decodeSsrEpisodePlan,
+  extractSsrEpisodeCatalog,
+  ssrEpisodePageUrl,
+} from "./siteAnalyze/ssrEpisodes.js";
 import { createDownloader, redirectLimitForMethod } from "./httpTransport.js";
 import { decodeTextBuffer } from "./charset.js";
-import { ImageDecodeError, decodeImage, supportedImageDecoders } from "./imageDecoder.js";
+import {
+  ImageDecodeError,
+  decodeImage,
+  decoderCandidatesFromJavaScript,
+  supportedImageDecoders,
+} from "./imageDecoder.js";
 import { decodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
+import { dynamicComicApiImages } from "./siteAnalyze/dynamicComic.js";
+import { dynamicHtmlRequestUrl } from "./siteAnalyze/dynamicHtml.js";
 import {
   decodeMediaExtractionPlan,
   mediaPlanIsLegacyHrefOnly,
   MEDIA_RECONVERSION_DIAGNOSTIC,
   normalizeMediaExtractionPlan,
   resolveChapterMediaUrls,
+  unpackDeanEdwards,
 } from "./mediaPlan.js";
 import { decodeCatalogPlan, executeCatalogPlan } from "./catalogPlan.js";
 import { encodeXbs } from "./xbs.js";
-import { parseHeaders } from "./requests.js";
+import { rebaseArtifactPair } from "./rebaseLibrary.js";
+import { parseHeaders, refreshEphemeralHeaders } from "./requests.js";
+import { decodeSignedRequestPlan, signedRequestTarget } from "./requestPlan.js";
 import { resolveChapterListUrls } from "./verifySource.js";
+import { isDateOnlyMetadata } from "./elementValidation.js";
 import {
   bridgeTocUrl,
   compileBookBridgePlan,
@@ -36,11 +53,14 @@ import {
   compileTextBridgePlan,
   decodeBridgePlan,
   executeBridgePlan,
+  executeBridgeSelector,
   orderChaptersAscending,
 } from "./bridgePlan.js";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PUBLIC_DIR = path.resolve(MODULE_DIR, "../public");
+const generatedCoverCache = new Map();
+const imageScriptDecoderCache = new Map();
 
 export class HttpError extends Error {
   constructor(status, message) {
@@ -59,6 +79,16 @@ function boolean(value, fallback = false) {
   return /^(?:1|true|yes|on)$/i.test(String(value));
 }
 
+/** Comma/space-separated host list. `undefined`/`null` → defaults; empty string → []. */
+function hostList(value, defaultHosts = []) {
+  if (value === undefined || value === null) return [...defaultHosts];
+  const text = String(value).trim();
+  if (!text) return [];
+  return [...new Set(
+    text.split(/[,\s]+/).map((item) => item.trim().toLowerCase()).filter(Boolean),
+  )];
+}
+
 export function serverConfig(environment = process.env) {
   return {
     version: environment.npm_package_version || environment.APP_VERSION || "0.2.0",
@@ -75,11 +105,16 @@ export function serverConfig(environment = process.env) {
     maxCacheEntries: integer(environment.MAX_CACHE_ENTRIES, 100),
     allowPrivateNetworks: boolean(environment.ALLOW_PRIVATE_NETWORKS),
     allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS, true),
+    // Explicit opt-in hosts for which /media may skip TLS verification.
+    insecureMediaHosts: hostList(environment.INSECURE_MEDIA_HOSTS),
     // Origin 探活默认开启：过滤明显死站，避免「能导入却点不开」。
     // 深度预检（分类→章节→正文）成本高，聚合源默认关闭；精选发布可显式开启。
     preflightSources: boolean(environment.PREFLIGHT_SOURCES, true),
     preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES, false),
     preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 3_000),
+    // A failed fast probe is not proof that a site is dead. Retry all declared
+    // entry candidates with a longer timeout before filtering the source.
+    preflightConfirmTimeoutMs: integer(environment.PREFLIGHT_CONFIRM_TIMEOUT_MS, 10_000),
     // Verify/preflight share this pool; 8 keeps large jobs moving without
     // starving small containers as badly as 16+.
     preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 8),
@@ -89,7 +124,7 @@ export function serverConfig(environment = process.env) {
     analyzeTimeoutMs: integer(environment.ANALYZE_TIMEOUT_MS, 8_000),
     // Wall-clock budget for verify phase; remainder kept unverified.
     verifyBudgetMs: integer(environment.VERIFY_BUDGET_MS, 20_000),
-    // Skip verify entirely above this count (aggregate shuyuans).
+    // Skip synchronous verification above this aggregate source count.
     verifyMaxSources: integer(environment.VERIFY_MAX_SOURCES, 50),
     // Async WebUI jobs: 0 = unbounded full verify (default). Set >0 to cap wall time.
     jobVerifyBudgetMs: integer(environment.JOB_VERIFY_BUDGET_MS, 0, 0),
@@ -105,8 +140,6 @@ export function serverConfig(environment = process.env) {
     maxBridgeBooks: integer(environment.MAX_BRIDGE_BOOKS, integer(environment.MAX_BRIDGE_BOOK_PAGE_SIZE, 40)),
     maxBridgeChapters: integer(environment.MAX_BRIDGE_CHAPTERS, integer(environment.MAX_BRIDGE_CHAPTER_PAGE_SIZE, 100)),
     corsOrigin: environment.CORS_ORIGIN || "*",
-    mwwzDiscoveryUrl: environment.MWWZ_DISCOVERY_URL || "https://www.manwake.cc/",
-    jmDiscoveryUrl: environment.JM_DISCOVERY_URL || "https://jmcomicqa.cc/",
     dataDir: environment.DATA_DIR || "./data",
     adminToken: String(environment.ADMIN_TOKEN || "").trim(),
     jobConcurrency: integer(environment.JOB_CONCURRENCY, 1),
@@ -179,6 +212,8 @@ function requestBuffer(url, resolved, config, {
   label = "下载资源",
   method = "GET",
   body = null,
+  allowInvalidTls = false,
+  signal,
 } = {}) {
   const requester = url.protocol === "https:" ? httpsRequest : httpRequest;
   const payload = body == null ? null : Buffer.isBuffer(body) ? body : Buffer.from(String(body), "utf8");
@@ -188,7 +223,8 @@ function requestBuffer(url, resolved, config, {
       method: requestMethod,
       headers: {
         Accept: accept || "application/json,text/plain;q=0.9,*/*;q=0.1",
-        "User-Agent": "read2xsgg/0.2",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
         ...(payload ? { "Content-Length": String(payload.length) } : {}),
         ...headers,
       },
@@ -197,16 +233,18 @@ function requestBuffer(url, resolved, config, {
         else callback(null, resolved.address, resolved.family);
       },
       ...(!isIP(url.hostname) ? { servername: url.hostname } : {}),
+      ...(url.protocol === "https:" && allowInvalidTls ? { rejectUnauthorized: false } : {}),
     }, (response) => {
       const status = response.statusCode ?? 0;
       if (status >= 300 && status < 400 && response.headers.location) {
         response.resume();
-        // Do not replay POST bodies across redirects.
-        if (requestMethod !== "GET" && requestMethod !== "HEAD") {
+        const switchToGet = requestMethod === "POST" && [301, 302, 303].includes(status);
+        // Never replay non-idempotent request bodies across redirects.
+        if (requestMethod !== "GET" && requestMethod !== "HEAD" && !switchToGet) {
           reject(new HttpError(502, `${label}失败：上游对 ${requestMethod} 返回重定向 HTTP ${status}`));
           return;
         }
-        resolve({ redirect: new URL(response.headers.location, url) });
+        resolve({ redirect: new URL(response.headers.location, url), switchToGet });
         return;
       }
       if (status < 200 || status >= 300) {
@@ -249,7 +287,23 @@ function requestBuffer(url, resolved, config, {
       });
       response.on("error", reject);
     });
-    request.setTimeout(config.fetchTimeoutMs, () => request.destroy(new HttpError(504, `${label}超时（${config.fetchTimeoutMs}ms）`)));
+    const timeoutError = () => new HttpError(504, `${label}超时（${config.fetchTimeoutMs}ms）`);
+    // ClientRequest#setTimeout starts after a socket is connected. Keep an
+    // independent wall-clock timer so a TCP SYN or TLS handshake cannot hold
+    // a verification worker indefinitely.
+    const hardTimer = setTimeout(() => request.destroy(timeoutError()), config.fetchTimeoutMs);
+    request.once("close", () => clearTimeout(hardTimer));
+    request.setTimeout(config.fetchTimeoutMs, () => request.destroy(timeoutError()));
+    const abortRequest = () => request.destroy(signal?.reason instanceof Error
+      ? signal.reason
+      : new Error(`${label}已取消`));
+    if (signal) {
+      if (signal.aborted) abortRequest();
+      else {
+        signal.addEventListener("abort", abortRequest, { once: true });
+        request.once("close", () => signal.removeEventListener("abort", abortRequest));
+      }
+    }
     request.on("error", (error) => reject(error instanceof HttpError ? error : new HttpError(502, `${label}失败：${error.message}`)));
     if (payload) request.end(payload);
     else request.end();
@@ -268,16 +322,20 @@ export async function downloadSource(sourceUrl, config = serverConfig(), headers
   } catch {
     throw new HttpError(400, "阅读源地址不是有效 URL");
   }
-  const method = String(options?.method || "GET").toUpperCase();
-  const body = options?.body ?? null;
-  const maxRedirects = redirectLimitForMethod(method, config.maxRedirects);
+  let method = String(options?.method || "GET").toUpperCase();
+  let body = options?.body ?? null;
+  const requestHeaders = { ...headers };
+  const maxRedirects = method === "POST" && options?.followPostRedirects
+    ? config.maxRedirects
+    : redirectLimitForMethod(method, config.maxRedirects);
   for (let redirects = 0; redirects <= maxRedirects; redirects += 1) {
     const resolved = await resolveTarget(current, config);
     const result = await requestBuffer(current, resolved, config, {
       label: "下载阅读源",
-      headers,
+      headers: requestHeaders,
       method,
-      body: redirects === 0 ? body : null,
+      body,
+      signal: options?.signal,
     });
     if (result.buffer) {
       Object.defineProperty(result.buffer, "httpHeaders", {
@@ -285,10 +343,22 @@ export async function downloadSource(sourceUrl, config = serverConfig(), headers
         enumerable: false,
         configurable: true,
       });
+      Object.defineProperty(result.buffer, "read2xsggResponseUrl", {
+        value: current.toString(),
+        enumerable: false,
+        configurable: true,
+      });
       return result.buffer;
     }
     if (redirects === maxRedirects) throw new HttpError(502, `阅读源重定向次数超过 ${maxRedirects}`);
     current = result.redirect;
+    if (result.switchToGet) {
+      method = "GET";
+      body = null;
+      for (const key of Object.keys(requestHeaders)) {
+        if (["content-type", "content-length"].includes(key.toLowerCase())) delete requestHeaders[key];
+      }
+    }
   }
   throw new HttpError(502, "下载阅读源失败");
 }
@@ -325,20 +395,72 @@ function probeRequest(url, resolved, config, headers = {}, method = "HEAD") {
       response.resume();
       resolve({ status: response.statusCode || 0, location: response.headers.location });
     });
-    request.setTimeout(config.preflightTimeoutMs, () => request.destroy(new Error("preflight timeout")));
+    const abortProbe = () => request.destroy(new Error("preflight timeout"));
+    // setTimeout() alone does not bound DNS/TCP/TLS connection setup.
+    const hardTimer = setTimeout(abortProbe, config.preflightTimeoutMs);
+    request.once("close", () => clearTimeout(hardTimer));
+    request.setTimeout(config.preflightTimeoutMs, abortProbe);
     request.on("error", reject);
     request.end();
   });
 }
 
-async function sourceOriginReachable(source, config) {
-  let current;
-  try {
-    current = new URL(String(source?.bookSourceUrl || source?.sourceUrl || source?.url || "").split("#", 1)[0]);
-  } catch {
-    return false;
+function sourceOriginCandidates(source) {
+  const candidates = [];
+  const seen = new Set();
+  const add = (value, base = "") => {
+    const raw = String(value || "").trim().split("##", 1)[0].split("#", 1)[0];
+    if (!raw || /<js>|@js:/i.test(raw)) return;
+    try {
+      const substituted = raw
+        .replace(/\{\{\s*(?:key|keyword|searchKey)\s*\}\}/gi, encodeURIComponent("小说"))
+        .replace(/\{\{\s*(?:page|pageIndex)\s*\}\}/gi, "1")
+        .replace(/%@keyWord/g, encodeURIComponent("小说"))
+        .replace(/%@pageIndex/g, "1");
+      if (/\{\{|%@/.test(substituted)) return;
+      const parsed = new URL(substituted, base || undefined);
+      if (!/^https?:$/.test(parsed.protocol)) return;
+      parsed.hash = "";
+      const href = parsed.toString();
+      if (!seen.has(href)) {
+        seen.add(href);
+        candidates.push(parsed);
+      }
+    } catch {
+      // Ignore malformed absolute URLs embedded in legacy rules.
+    }
+  };
+  const base = String(source?.bookSourceUrl || source?.sourceUrl || source?.url || "");
+  add(base);
+  for (const field of [source?.searchUrl, source?.exploreUrl]) {
+    const text = typeof field === "string" ? field : JSON.stringify(field || "");
+    for (const line of text.split(/\r?\n/).slice(0, 20)) {
+      const request = line.includes("::") ? line.slice(line.indexOf("::") + 2) : line;
+      const clean = request.trim().replace(/,\s*\{[\s\S]*$/, "");
+      if (clean && !/^\s*(?:<js>|@js:)/i.test(clean)) add(clean, base);
+    }
+    for (const match of text.matchAll(/https?:\/\/[^\s"'<>\\,)]+/gi)) add(match[0]);
   }
-  if (!/^https?:$/.test(current.protocol)) return false;
+  if (candidates[0]) {
+    const alternate = new URL(candidates[0]);
+    alternate.protocol = alternate.protocol === "http:" ? "https:" : "http:";
+    add(alternate.toString());
+  }
+  const withRoots = [];
+  const outputSeen = new Set();
+  for (const candidate of candidates) {
+    for (const value of [candidate, new URL("/", candidate.origin)]) {
+      if (outputSeen.has(value.href)) continue;
+      outputSeen.add(value.href);
+      withRoots.push(value);
+    }
+  }
+  return withRoots.slice(0, 12);
+}
+
+async function sourceOriginReachable(source, config) {
+  const candidates = sourceOriginCandidates(source);
+  if (!candidates.length) return "";
   let headers = {};
   try {
     headers = source?.httpHeaders && typeof source.httpHeaders === "object"
@@ -348,24 +470,54 @@ async function sourceOriginReachable(source, config) {
     headers = {};
   }
   if (source?.httpUserAgent) headers["User-Agent"] = String(source.httpUserAgent);
-  for (let redirects = 0; redirects <= Math.min(config.maxRedirects, 3); redirects += 1) {
-    try {
-      const resolved = await resolveTarget(current, config);
-      const result = await probeRequest(current, resolved, config, headers);
-      if (result.status >= 300 && result.status < 400 && result.location) {
-        current = new URL(result.location, current);
-        continue;
+  const probeCandidates = async (probeConfig) => {
+    for (const candidate of candidates) {
+      let current = candidate;
+      for (let redirects = 0; redirects <= Math.min(config.maxRedirects, 3); redirects += 1) {
+        try {
+          const resolved = await resolveTarget(current, probeConfig);
+          // GET is more widely supported than HEAD and the response body is
+          // immediately drained, so this remains a low-cost origin probe.
+          const result = await probeRequest(current, resolved, probeConfig, headers, "GET");
+          if (result.status >= 300 && result.status < 400 && result.location) {
+            current = new URL(result.location, current);
+            continue;
+          }
+          if (result.status > 0 && result.status < 500 && ![401, 403].includes(result.status)) return current.origin;
+          break;
+        } catch {
+          break;
+        }
       }
-      if ([401, 403].includes(result.status) || result.status >= 500) {
-        const getResult = await probeRequest(current, resolved, config, headers, "GET");
-        return getResult.status > 0 && getResult.status < 500 && ![401, 403].includes(getResult.status);
-      }
-      return result.status > 0 && result.status < 500;
-    } catch {
-      return false;
     }
+    return "";
+  };
+  const fast = await probeCandidates(config);
+  if (fast) return fast;
+  const confirmTimeoutMs = Math.max(
+    Number(config.preflightTimeoutMs) || 1,
+    Number(config.preflightConfirmTimeoutMs) || 10_000,
+  );
+  return probeCandidates({ ...config, preflightTimeoutMs: confirmTimeoutMs });
+}
+
+function sourceWithReachableOrigin(source, reachableOrigin) {
+  let declared;
+  let reachable;
+  try {
+    declared = new URL(String(source?.bookSourceUrl || source?.sourceUrl || source?.url || "").split("#", 1)[0]);
+    reachable = new URL(reachableOrigin);
+  } catch {
+    return source;
   }
-  return false;
+  if (declared.hostname !== reachable.hostname || declared.origin === reachable.origin) return source;
+  const replaceOrigin = (value) => {
+    if (typeof value === "string") return value.split(declared.origin).join(reachable.origin);
+    if (Array.isArray(value)) return value.map(replaceOrigin);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceOrigin(item)]));
+  };
+  return replaceOrigin(structuredClone(source));
 }
 
 function firstRequestFilter(action) {
@@ -528,13 +680,68 @@ function bridgePageOptions(adapterTarget, config = {}) {
   };
 }
 
-function prepareBridgeHtml(buffer, charsetHint = "", maxBytes = 2 * 1024 * 1024) {
+function firstPageUrlForDuplicateCheck(value) {
+  let url;
+  try {
+    url = new URL(String(value || ""));
+  } catch {
+    return "";
+  }
+  for (const key of ["page", "pageNum", "pageIndex", "p", "pn"]) {
+    const current = url.searchParams.get(key);
+    if (/^\d+$/.test(String(current || "")) && Number(current) > 1) {
+      url.searchParams.set(key, "1");
+      return url.toString();
+    }
+  }
+  const path = url.pathname;
+  const replacements = [
+    [/\/page\/([2-9]\d*)(?=\/|$)/i, "/page/1"],
+    [/(\/list\/)([2-9]\d*)(?=\/|$)/i, "$11"],
+    [/([_-])([2-9]\d*)(\.html?)$/i, "$11$3"],
+  ];
+  for (const [pattern, replacement] of replacements) {
+    if (!pattern.test(path)) continue;
+    url.pathname = path.replace(pattern, replacement);
+    return url.toString();
+  }
+  return "";
+}
+
+function bridgeRowSignature(row) {
+  if (!row || typeof row !== "object") return "";
+  return [
+    row.name || row.title || "",
+    row.url || "",
+    row.author || "",
+  ].map((item) => String(item || "").trim().slice(0, 160)).join("|");
+}
+
+function bridgeRowsMostlySame(leftRows, rightRows) {
+  const left = (Array.isArray(leftRows) ? leftRows : []).map(bridgeRowSignature).filter(Boolean).slice(0, 20);
+  const right = (Array.isArray(rightRows) ? rightRows : []).map(bridgeRowSignature).filter(Boolean).slice(0, 20);
+  if (!left.length || !right.length) return false;
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+  let overlap = 0;
+  for (const value of rightSet) {
+    if (leftSet.has(value)) overlap += 1;
+  }
+  return overlap >= Math.min(leftSet.size, rightSet.size);
+}
+
+function bridgeHtmlText(buffer, charsetHint = "", maxBytes = 2 * 1024 * 1024) {
   let text = pageText(buffer, charsetHint);
   if (Buffer.byteLength(text, "utf8") > maxBytes) {
     // Keep the head of the document where lists usually live; truncating mid-tag
     // is acceptable because JSDOM recovers and we already cap extracted rows.
     text = Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
   }
+  return text;
+}
+
+function prepareBridgeHtml(buffer, charsetHint = "", maxBytes = 2 * 1024 * 1024) {
+  const text = bridgeHtmlText(buffer, charsetHint, maxBytes);
   // Drop script/style payloads before DOM construction — they inflate CPU without
   // helping XPath book/chapter extraction.
   return text
@@ -544,10 +751,11 @@ function prepareBridgeHtml(buffer, charsetHint = "", maxBytes = 2 * 1024 * 1024)
 
 async function executeDeclarativeUrl(plan, targetUrl, config, { chapters = false, limit, offset = 0 } = {}) {
   const page = await downloadSource(targetUrl, config, plan.headers);
+  const responseUrl = String(page?.read2xsggResponseUrl || targetUrl);
   const text = prepareBridgeHtml(page, plan.charset, config.maxBridgeHtmlBytes);
   const options = { limit, offset, limits: bridgeExecuteLimits(config) };
   if (chapters && plan.tocSelector) {
-    const tocUrl = bridgeTocUrl(text, targetUrl, plan);
+    const tocUrl = bridgeTocUrl(text, responseUrl, plan);
     if (tocUrl) {
       try {
         const tocPage = await downloadSource(tocUrl, config, plan.headers);
@@ -563,7 +771,162 @@ async function executeDeclarativeUrl(plan, targetUrl, config, { chapters = false
       }
     }
   }
-  return executeBridgePlan(text, targetUrl, plan, options);
+  return executeBridgePlan(text, responseUrl, plan, options);
+}
+
+function usableLatestChapterTitle(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return Boolean(text)
+    && !/^\d+(?:\.\d+)?$/.test(text)
+    && !isDateOnlyMetadata(text)
+    && !/^(?:最新更新|最新章[節节]|更新至|最新)$/i.test(text)
+    && !/^(?:返回顶部|回到顶部|回顶部|置顶|首页|目录|上一[章节页]?|下一[章节页]?|加载更多)\s*[↑⇧▲]?$/i.test(text);
+}
+
+function usableDerivedChapterTitle(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return usableLatestChapterTitle(text) || /^\d+(?:\.\d+)?$/.test(text);
+}
+
+async function enrichBridgeDetailLatest(output, detailBody, detailUrl, plan, config) {
+  const latest = plan.latestChapter;
+  if (!latest || usableLatestChapterTitle(output?.lastChapterTitle)) return output;
+  try {
+    if (latest.mode === "direct") {
+      const chapters = executeBridgePlan(detailBody, detailUrl, {
+        kind: "chapters",
+        host: plan.host,
+        responseType: latest.responseType,
+        list: latest.list,
+        reverse: Boolean(latest.reverse),
+        preserveOrder: true,
+        fields: { title: latest.title, url: latest.url },
+      }, {
+        limit: 12_000,
+        limits: { maxPageSize: 12_000, maxScanChapters: 12_000 },
+      });
+      const title = orderChaptersAscending(chapters.data || [], {
+        reverseHint: Boolean(latest.reverse),
+      }).at(-1)?.title || "";
+      return usableDerivedChapterTitle(title) ? { ...output, lastChapterTitle: title } : output;
+    }
+    if (latest.mode === "html-toc") {
+      let menuUrl = detailUrl;
+      if (latest.tocSelector) {
+        menuUrl = bridgeTocUrl(detailBody, detailUrl, {
+          kind: "chapters",
+          host: plan.host,
+          responseType: "html",
+          tocSelector: latest.tocSelector,
+          list: latest.list,
+          fields: { title: latest.title, url: latest.url },
+        }) || "";
+      }
+      // A stale toc selector often means the site moved its catalogue back
+      // onto the detail page. Chapter bridge execution already falls back this
+      // way; detail metadata enrichment must follow the same behavior.
+      if (!menuUrl) menuUrl = detailUrl;
+      let normalizedMenuUrl = normalizeRemoteUrl(menuUrl || detailUrl);
+      let menuBody = detailBody;
+      let dynamicMenuBody = detailBody;
+      if (normalizedMenuUrl !== detailUrl) {
+        const menuPage = await downloadSource(
+          normalizedMenuUrl,
+          config,
+          refreshEphemeralHeaders(plan.headers),
+        );
+        dynamicMenuBody = bridgeHtmlText(menuPage, plan.charset, config.maxBridgeHtmlBytes);
+        menuBody = prepareBridgeHtml(menuPage, plan.charset, config.maxBridgeHtmlBytes);
+      }
+      if (latest.dynamicHtml) {
+        const dynamicUrl = dynamicHtmlRequestUrl(dynamicMenuBody, normalizedMenuUrl);
+        if (dynamicUrl) {
+          const dynamicPage = await downloadSource(dynamicUrl, config, {
+            ...refreshEphemeralHeaders(plan.headers),
+            Referer: normalizedMenuUrl,
+          });
+          normalizedMenuUrl = String(dynamicPage?.read2xsggResponseUrl || dynamicUrl);
+          menuBody = prepareBridgeHtml(dynamicPage, plan.charset, config.maxBridgeHtmlBytes);
+        }
+      }
+      // Metadata enrichment needs the actual catalogue tail, not the client
+      // page size (normally 100). Keep the same hard scan ceiling as chapter
+      // bridge execution so large catalogues do not report page-one metadata.
+      const maxChapters = 12_000;
+      const menuCandidates = [{ body: menuBody, url: normalizedMenuUrl }];
+      if (normalizedMenuUrl !== detailUrl) menuCandidates.push({ body: detailBody, url: detailUrl });
+      for (const candidate of menuCandidates) {
+        const chapters = executeBridgePlan(candidate.body, candidate.url, {
+          kind: "chapters",
+          host: plan.host,
+          responseType: "html",
+          list: latest.list,
+          preserveOrder: true,
+          fields: { title: latest.title, url: latest.url },
+        }, {
+          limit: maxChapters,
+          limits: { maxPageSize: maxChapters, maxScanChapters: maxChapters },
+        });
+        const nonChapterUrls = new Set([detailUrl, normalizedMenuUrl].map((value) => {
+          try { return new URL(value).toString(); } catch { return String(value || ""); }
+        }));
+        const chapterRows = (chapters.data || []).filter((item) => {
+          if (!usableDerivedChapterTitle(item?.title)) return false;
+          let itemUrl = String(item?.url || "");
+          try { itemUrl = new URL(itemUrl).toString(); } catch { /* keep raw URL */ }
+          return itemUrl && !nonChapterUrls.has(itemUrl)
+            && String(item.title).trim() !== String(output?.name || "").trim();
+        });
+        const title = (latest.reverse ? chapterRows[0] : chapterRows.at(-1))?.title || "";
+        if (usableDerivedChapterTitle(title)) return { ...output, lastChapterTitle: title };
+      }
+      return output;
+    }
+    let menuTemplate = latest.urlTemplate;
+    for (const [name, selector] of Object.entries(latest.values)) {
+      const value = executeBridgeSelector(detailBody, detailUrl, plan.responseType, selector);
+      if (!String(value || "").trim()) return output;
+      menuTemplate = menuTemplate.split(`{{${name}}}`).join(encodeURIComponent(String(value).trim()));
+    }
+    let firstMenu = null;
+    let countValue = latest.count && latest.countSource !== "menu"
+      ? executeBridgeSelector(detailBody, detailUrl, plan.responseType, latest.count)
+      : "";
+    if (latest.count && latest.countSource === "menu") {
+      const firstUrl = normalizeRemoteUrl(menuTemplate.split("__PAGE__").join("1"));
+      const firstPage = await downloadSource(firstUrl, config, refreshEphemeralHeaders(plan.headers));
+      const firstBody = prepareBridgeHtml(firstPage, plan.charset, config.maxBridgeHtmlBytes);
+      countValue = executeBridgeSelector(firstBody, firstUrl, latest.responseType, latest.count);
+      firstMenu = { url: firstUrl, body: firstBody };
+    }
+    const count = Number(String(countValue || "").match(/\d+/)?.[0] || 0);
+    const lastPage = count > 0 ? Math.max(1, Math.ceil(count / latest.pageSize)) : 1;
+    const pages = [...new Set([lastPage, Math.max(1, lastPage - 1), 1])];
+    for (const page of pages) {
+      const menuUrl = normalizeRemoteUrl(menuTemplate.split("__PAGE__").join(String(page)));
+      let menuBody;
+      if (page === 1 && firstMenu?.url === menuUrl) menuBody = firstMenu.body;
+      else {
+        const menuPage = await downloadSource(menuUrl, config, refreshEphemeralHeaders(plan.headers));
+        menuBody = prepareBridgeHtml(menuPage, plan.charset, config.maxBridgeHtmlBytes);
+      }
+      const chapters = executeBridgePlan(menuBody, menuUrl, {
+        kind: "chapters",
+        host: plan.host,
+        responseType: latest.responseType,
+        list: latest.list,
+        fields: {
+          title: latest.title,
+          url: { currentUrl: true },
+        },
+      }, { limit: latest.pageSize, limits: bridgeExecuteLimits(config) });
+      const title = chapters.data?.at(-1)?.title || "";
+      if (usableDerivedChapterTitle(title)) return { ...output, lastChapterTitle: title };
+    }
+  } catch {
+    // Optional metadata enrichment must not make an otherwise usable detail fail.
+  }
+  return output;
 }
 
 /**
@@ -635,8 +998,8 @@ async function sourceContentReachable(source, chapterUrl, config) {
     return urls.length > 0;
   }
 
-  // Native JM and other fully portable XSGG actions do not expose a safe
-  // server-side plan. Their static action-chain gate remains authoritative.
+  // Fully portable XSGG actions do not expose a safe server-side plan. Their
+  // static action-chain gate remains authoritative.
   return true;
 }
 
@@ -661,7 +1024,14 @@ async function sourceBridgeChainReachable(source, config) {
       const books = await executeDeclarativeUrl(bookBridge.plan, targetUrl, deepConfig, { limit: 3 });
       for (const book of (books.data || []).slice(0, 3)) {
         if (!book?.url) continue;
-        for (const chapterPageUrl of resolveChapterListUrls(chapterBridge.requestInfo, book.url)) {
+        // Reachability preflight may explore a same-resource HTML page so a
+        // repairable API detail is not filtered before the repair pipeline.
+        // Strict post-conversion verification only executes represented URLs.
+        const chapterPageUrls = [...new Set([
+          ...resolveChapterListUrls(chapterBridge.requestInfo, book.url),
+          ...chapterPageCandidates(book.url),
+        ])];
+        for (const chapterPageUrl of chapterPageUrls) {
           try {
             const chapters = await executeDeclarativeUrl(chapterBridge.plan, chapterPageUrl, deepConfig, { chapters: true, limit: 2 });
             for (const chapter of (chapters.data || []).slice(0, 2)) {
@@ -680,6 +1050,22 @@ async function sourceBridgeChainReachable(source, config) {
   // requests can be represented and exercised safely, importing it would only
   // recreate the previous "visible source, empty category" failure mode.
   return false;
+}
+
+function legacySourceList(input) {
+  if (Array.isArray(input)) return input;
+  if (!input || typeof input !== "object") return [];
+  if (input.bookSourceUrl || input.bookSourceName) return [input];
+  for (const key of ["sources", "bookSources", "data"]) {
+    if (Array.isArray(input[key])) return input[key];
+  }
+  return [];
+}
+
+function htmlAttribute(tag, name) {
+  const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(tag).match(new RegExp(`(?:^|\\s)${escaped}\\s*=\\s*(?:(["'])([\\s\\S]*?)\\1|([^\\s>]+))`, "i"));
+  return match ? (match[2] ?? match[3]) : null;
 }
 
 export async function filterReachableSources(input, config, { onProgress = null } = {}) {
@@ -728,7 +1114,7 @@ export async function filterReachableSources(input, config, { onProgress = null 
         phase: "preflight",
         done: processed,
         total: sources.length,
-        kept: results.filter((value) => value === true).length,
+        kept: results.filter((value) => value && value !== false).length,
         skipped: results.filter((value) => value === false).length,
         unverified: 0,
         current: activeList[0] || "",
@@ -744,33 +1130,32 @@ export async function filterReachableSources(input, config, { onProgress = null 
       cursor += 1;
       const source = sources[index];
       const label = sourceLabel(source);
-      let key = String(source?.bookSourceUrl || source?.sourceUrl || source?.url || "");
-      try {
-        key = new URL(key.split("#", 1)[0]).origin;
-      } catch {
-        // Invalid URLs intentionally remain unique and fail the probe.
-      }
+      const candidateOrigins = sourceOriginCandidates(source).map((url) => url.origin);
+      const key = candidateOrigins.length
+        ? candidateOrigins.join("|")
+        : String(source?.bookSourceUrl || source?.sourceUrl || source?.url || "");
       active.add(label);
       report();
       try {
         if (!originTasks.has(key)) originTasks.set(key, sourceOriginReachable(source, config));
-        const originReachable = await originTasks.get(key);
-        if (!originReachable) {
+        const reachableOrigin = await originTasks.get(key);
+        if (!reachableOrigin) {
           results[index] = false;
           processed += 1;
           continue;
         }
+        const preparedSource = sourceWithReachableOrigin(source, reachableOrigin);
         // Aggregates often contain renamed copies of exactly the same source.
         // Share their expensive list→chapter→content probe while keeping the
         // original entries and names intact in the converted output.
         const chainKey = JSON.stringify([
-          Object.entries(source?.bookWorld || {})[0] || null,
-          source?.chapterList || null,
-          source?.chapterContent || null,
-          source?.httpHeaders || null,
+          Object.entries(preparedSource?.bookWorld || {})[0] || null,
+          preparedSource?.chapterList || null,
+          preparedSource?.chapterContent || null,
+          preparedSource?.httpHeaders || null,
         ]);
-        if (!deepTasks.has(chainKey)) deepTasks.set(chainKey, sourceBridgeChainReachable(source, config));
-        results[index] = await deepTasks.get(chainKey);
+        if (!deepTasks.has(chainKey)) deepTasks.set(chainKey, sourceBridgeChainReachable(preparedSource, config));
+        results[index] = await deepTasks.get(chainKey) ? preparedSource : false;
         processed += 1;
       } finally {
         active.delete(label);
@@ -782,7 +1167,7 @@ export async function filterReachableSources(input, config, { onProgress = null 
   const reachable = [];
   const skipped = [];
   sources.forEach((source, index) => {
-    if (results[index]) reachable.push(source);
+    if (results[index]) reachable.push(results[index]);
     else {
       skipped.push({
         source: String(source?.bookSourceName || source?.sourceName || source?.name || "未命名书源"),
@@ -798,10 +1183,15 @@ export async function filterReachableSources(input, config, { onProgress = null 
 function normalizeRemoteUrl(value) {
   let source = String(value ?? "").trim();
   if (!source) throw new HttpError(400, "缺少图片 URL");
-  try {
-    source = decodeURIComponent(source);
-  } catch {
-    throw new HttpError(400, "图片 URL 编码无效");
+  // URLSearchParams and adapter raw-target parsing already decode the outer
+  // url= value. Decoding an absolute URL again corrupts encoded JSON/query
+  // values such as %7B%22pageNo%22..., changing the upstream request.
+  if (!/^https?:\/\//i.test(source)) {
+    try {
+      source = decodeURIComponent(source);
+    } catch {
+      throw new HttpError(400, "图片 URL 编码无效");
+    }
   }
   let url;
   try {
@@ -814,7 +1204,25 @@ function normalizeRemoteUrl(value) {
   return url.toString();
 }
 
-export async function downloadImage(imageUrl, decoder = "auto", config = serverConfig()) {
+function absolutizeHtmlResourceUrls(html, baseUrl) {
+  const dom = new JSDOM(String(html || ""), { url: baseUrl });
+  const attributes = ["href", "src", "data-src", "data-original", "poster", "action"];
+  for (const element of dom.window.document.querySelectorAll(attributes.map((name) => `[${name}]`).join(","))) {
+    for (const name of attributes) {
+      const value = String(element.getAttribute(name) || "").trim();
+      if (!value || /^(?:#|data:|javascript:|mailto:|tel:)/i.test(value)) continue;
+      try {
+        const resolved = new URL(value, baseUrl);
+        if (/^https?:$/.test(resolved.protocol)) element.setAttribute(name, resolved.toString());
+      } catch {
+        // Preserve malformed optional attributes; extraction ignores them.
+      }
+    }
+  }
+  return dom.serialize();
+}
+
+export async function downloadImage(imageUrl, decoder = "auto", config = serverConfig(), referer = "") {
   let current;
   try {
     current = new URL(normalizeRemoteUrl(imageUrl));
@@ -822,6 +1230,8 @@ export async function downloadImage(imageUrl, decoder = "auto", config = serverC
     if (error instanceof HttpError) throw error;
     throw new HttpError(400, "图片 URL 不是有效 URL");
   }
+  let normalizedReferer = "";
+  if (referer) normalizedReferer = normalizeRemoteUrl(referer);
   for (let redirects = 0; redirects <= config.maxRedirects; redirects += 1) {
     const resolved = await resolveTarget(current, config);
     const result = await requestBuffer(current, resolved, config, {
@@ -830,7 +1240,7 @@ export async function downloadImage(imageUrl, decoder = "auto", config = serverC
       accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
       // A same-origin Referer works for sources which reject empty Referer, while
       // keeping the endpoint free of caller-controlled request headers.
-      headers: { Referer: `${current.protocol}//${current.host}/` },
+      headers: { Referer: normalizedReferer || `${current.protocol}//${current.host}/` },
     });
     if (!result.buffer) {
       if (redirects === config.maxRedirects) throw new HttpError(502, `图片重定向次数超过 ${config.maxRedirects}`);
@@ -866,8 +1276,26 @@ function mediaMimeType(url, contentType = "") {
   return declared || "application/octet-stream";
 }
 
+function mediaHostAllowsInvalidTls(url, config = {}) {
+  const hosts = Array.isArray(config.insecureMediaHosts) ? config.insecureMediaHosts : [];
+  const hostname = String(url?.hostname || "").toLowerCase();
+  return Boolean(hostname) && hosts.some((host) => String(host || "").toLowerCase() === hostname);
+}
+
+function safeMediaHeaders(headers = {}) {
+  const result = {};
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) return result;
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    const name = String(rawName || "").trim();
+    const value = String(rawValue ?? "").replace(/[\r\n]+/g, " ").trim();
+    if (!value) continue;
+    if (/^(?:referer|user-agent|cookie)$/i.test(name)) result[name] = value;
+  }
+  return result;
+}
+
 /** Fetch a remote audio/video URL the same way /image fetches comics (Referer + SSRF guards). */
-export async function downloadMedia(mediaUrl, config = serverConfig()) {
+export async function downloadMedia(mediaUrl, config = serverConfig(), headers = {}) {
   let current;
   try {
     current = new URL(normalizeRemoteUrl(mediaUrl));
@@ -877,11 +1305,16 @@ export async function downloadMedia(mediaUrl, config = serverConfig()) {
   }
   for (let redirects = 0; redirects <= config.maxRedirects; redirects += 1) {
     const resolved = await resolveTarget(current, config);
+    const requestHeaders = safeMediaHeaders(headers);
     const result = await requestBuffer(current, resolved, config, {
       maxBytes: config.maxMediaBytes,
       label: "下载媒体",
       accept: "audio/*,video/*,application/vnd.apple.mpegurl,application/x-mpegURL,*/*;q=0.8",
-      headers: { Referer: `${current.protocol}//${current.host}/` },
+      headers: {
+        Referer: `${current.protocol}//${current.host}/`,
+        ...requestHeaders,
+      },
+      allowInvalidTls: mediaHostAllowsInvalidTls(current, config),
     });
     if (!result.buffer) {
       if (redirects === config.maxRedirects) throw new HttpError(502, `媒体重定向次数超过 ${config.maxRedirects}`);
@@ -895,204 +1328,6 @@ export async function downloadMedia(mediaUrl, config = serverConfig()) {
     };
   }
   throw new HttpError(502, "下载媒体失败");
-}
-
-function legacySourceList(input) {
-  if (Array.isArray(input)) return input;
-  if (!input || typeof input !== "object") return [];
-  if (input.bookSourceUrl || input.bookSourceName) return [input];
-  for (const key of ["sources", "bookSources", "data"]) {
-    if (Array.isArray(input[key])) return input[key];
-  }
-  return [];
-}
-
-function isMwwzSource(source) {
-  return /(?:mwwz|manwake|漫蛙)/i.test(String(source?.bookSourceUrl || ""))
-    && /(?:manwake|GLOBAL_IMAGE_ROUTES|api\/comic\/image)/i.test(String(source?.loginUrl || "") + String(source?.ruleContent?.imageDecode || ""));
-}
-
-function isJmSource(source) {
-  const runtimeRules = `${source?.loginUrl || ""}\n${source?.ruleContent?.imageDecode || ""}`;
-  return /(?:jmcomic|18comic|comic18j)/i.test(String(source?.bookSourceUrl || ""))
-    || (/(?:BitmapFactory\.decodeByteArray|new\s+Canvas)/i.test(runtimeRules) && /(?:photos|bookId|imgId)/i.test(runtimeRules));
-}
-
-export function mwwzMirrorCandidates(releasePage, baseUrl) {
-  const result = [];
-  for (const match of String(releasePage || "").matchAll(/<a\s+[^>]*href=["']([^"']+)["'][^>]*>/gi)) {
-    try {
-      const url = new URL(match[1], baseUrl);
-      if (/^https?:$/.test(url.protocol) && !result.includes(url.origin)) result.push(url.origin);
-    } catch {
-      // Ignore malformed published links and continue with the remaining mirrors.
-    }
-  }
-  return result;
-}
-
-function htmlAttribute(tag, name) {
-  const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = String(tag).match(new RegExp(`\\b${escaped}\\s*=\\s*(?:(["'])([\\s\\S]*?)\\1|([^\\s>]+))`, "i"));
-  return match ? (match[2] ?? match[3]) : null;
-}
-
-function htmlText(value) {
-  return String(value)
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#(x[\da-f]+|\d+);/gi, (_, code) => {
-      const numeric = String(code).toLowerCase().startsWith("x") ? Number.parseInt(code.slice(1), 16) : Number.parseInt(code, 10);
-      return Number.isFinite(numeric) ? String.fromCodePoint(numeric) : _;
-    })
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/**
- * 漫蛙的阅读 exploreUrl 依赖 java.ajax + Jsoup 动态抓取 /cate，香色无法执行。
- * 在线转换时取一次公开分类页，把每个分类固化为同语义的 API 请求。
- */
-export function mwwzCategoryEntries(categoryPage) {
-  const entries = [];
-  const seen = new Set();
-  for (const match of String(categoryPage || "").matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
-    const attributes = match[1];
-    const href = htmlAttribute(attributes, "href");
-    const tag = htmlAttribute(attributes, "data-value");
-    if (!href || tag === null || !/^\/cate(?:\/|$)/.test(href)) continue;
-    const title = htmlText(match[2]);
-    const identity = `${href}\n${tag}`;
-    if (!title || seen.has(identity)) continue;
-    seen.add(identity);
-    entries.push({ title, path: href, tag });
-  }
-  return entries;
-}
-
-function mwwzExploreRequest(path, tag) {
-  const payload = {
-    page: { page: "{{page}}", pageSize: 10 },
-    category: "comic",
-    sort: 0,
-    comic: { status: -1, day: 0, tag },
-    video: { year: 0, typeId: 0, typeId1: 0, area: "", lang: "", status: -1, day: 0 },
-    novel: { status: -1, day: 0, sortId: 0 },
-  };
-  // page must be a JSON number, not the string "{{page}}". JSON.stringify
-  // provides safe escaping for the tag, then this narrow replacement restores
-  // the runtime page placeholder used by convertRequest().
-  const body = JSON.stringify(payload).replace('"{{page}}"', "{{page}}");
-  return `{{Get('url')}}/api${path},${JSON.stringify({ method: "POST", body })}`;
-}
-
-async function resolveMwwzMirror(config) {
-  let discovery;
-  try {
-    discovery = await downloadSource(config.mwwzDiscoveryUrl, config);
-  } catch {
-    return "";
-  }
-  const candidates = mwwzMirrorCandidates(discovery.toString("utf8"), config.mwwzDiscoveryUrl);
-  for (const origin of candidates) {
-    try {
-      const body = await downloadSource(`${origin}/api/search?keyword=test&type=mh&page=1&pageSize=1`, config);
-      const parsed = JSON.parse(body.toString("utf8"));
-      if (Array.isArray(parsed?.data?.list)) return origin;
-    } catch {
-      // Mirrors frequently rotate; test the next published address.
-    }
-  }
-  return "";
-}
-
-export function jmMirrorCandidates(discoveryPage, baseUrl, runtimeRules = "") {
-  const result = [];
-  const add = (value) => {
-    let raw = htmlText(value).trim();
-    if (!raw) return;
-    if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`;
-    try {
-      const url = new URL(raw, baseUrl);
-      if (/^https?:$/.test(url.protocol) && !result.includes(url.origin)) result.push(url.origin);
-    } catch {
-      // Ignore malformed published links.
-    }
-  };
-  for (const match of String(discoveryPage || "").matchAll(/<span\b[^>]*>([\s\S]*?)<\/span>/gi)) add(match[1]);
-  for (const match of String(runtimeRules || "").matchAll(/https?:\/\/[a-z0-9.-]+(?::\d+)?/gi)) add(match[0]);
-  return result;
-}
-
-async function resolveJmMirror(config, sources) {
-  let discovery = "";
-  try {
-    discovery = (await downloadSource(config.jmDiscoveryUrl, config)).toString("utf8");
-  } catch {
-    // The source itself contains fallback international domains; try those next.
-  }
-  const runtimeRules = sources.map((source) => source?.loginUrl || "").join("\n");
-  const candidates = jmMirrorCandidates(discovery, config.jmDiscoveryUrl, runtimeRules);
-  for (const origin of candidates) {
-    try {
-      const body = await downloadSource(`${origin}/albums?o=mr&page=1`, config);
-      const html = body.toString("utf8");
-      if (/class=["'][^"']*\blist-col\b/i.test(html) && /class=["'][^"']*\bvideo-title\b/i.test(html)) return origin;
-    } catch {
-      // Cloudflare and published mirrors rotate independently; test the next one.
-    }
-  }
-  return "";
-}
-
-export async function adaptOnlineSources(input, config) {
-  const sources = legacySourceList(input);
-  const hasMwwz = sources.some(isMwwzSource);
-  const jmSources = sources.filter(isJmSource);
-  if (!hasMwwz && !jmSources.length) return input;
-  const mwwzMirror = hasMwwz ? await resolveMwwzMirror(config) : "";
-  const jmMirror = jmSources.length ? await resolveJmMirror(config, jmSources) : "";
-
-  let categories = [];
-  if (mwwzMirror) {
-    try {
-      const categoryPage = await downloadSource(`${mwwzMirror}/cate`, config);
-      categories = mwwzCategoryEntries(categoryPage.toString("utf8"));
-    } catch {
-      // The mirror remains useful for search/detail even if its category page is
-      // temporarily blocked. Keep the original exploration rule in that case.
-    }
-  }
-
-  const cloned = structuredClone(input);
-  for (const source of legacySourceList(cloned)) {
-    if (isMwwzSource(source) && mwwzMirror) {
-      source.bookSourceUrl = mwwzMirror;
-      // The original header is a Legado @js expression. 香色 needs a concrete UA.
-      source.header = JSON.stringify({
-        "User-Agent": "Mozilla/5.0 (Linux; Android 9) Mobile Safari/537.36",
-        Referer: `${mwwzMirror}/`,
-      });
-      if (categories.length) {
-        source.exploreUrl = categories.map(({ title, path, tag }) => ({
-          title,
-          url: mwwzExploreRequest(path, tag),
-          pageSize: 10,
-        }));
-      }
-    }
-    if (isJmSource(source) && jmMirror) {
-      source.bookSourceUrl = jmMirror;
-      source.header = JSON.stringify({
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-        Referer: `${jmMirror}/`,
-      });
-    }
-  }
-  return cloned;
 }
 
 /**
@@ -1132,24 +1367,23 @@ export function normalizeEmbeddedSourceUrl(value) {
   throw new HttpError(400, "无法解析阅读源地址，请使用 https://host/path 或 host/path");
 }
 
-/**
- * yckceo 的 shuyuans（聚合/跳转）与 shuyuan（直接 JSON）接口并不总是同步：
- * 有些 ID 在复数接口有效，有些会返回“数据不存在”的 HTML。保留原地址优先，
- * 仅在解析失败时尝试对应的直接 JSON 地址。
- */
 export function sourceUrlCandidates(sourceUrl) {
-  const result = [sourceUrl];
-  try {
-    const url = new URL(sourceUrl);
-    if (/(?:^|\.)yckceo\.com$/i.test(url.hostname) && /\/shuyuans\/json\/id\//i.test(url.pathname)) {
-      const fallback = new URL(url);
-      fallback.pathname = fallback.pathname.replace(/\/shuyuans\/json\/id\//i, "/shuyuan/json/id/");
-      if (fallback.toString() !== sourceUrl) result.push(fallback.toString());
-    }
-  } catch {
-    // normalizeEmbeddedSourceUrl already validates public request input.
+  const candidates = [sourceUrl];
+  let parsed;
+  try { parsed = new URL(sourceUrl); } catch { return candidates; }
+  const segments = parsed.pathname.split("/");
+  for (let index = segments.length - 2; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (!/^[a-z][a-z0-9_-]{3,}s$/i.test(segment)) continue;
+    const alternate = new URL(parsed);
+    const next = [...segments];
+    next[index] = segment.slice(0, -1);
+    alternate.pathname = next.join("/");
+    const value = alternate.toString();
+    if (!candidates.includes(value)) candidates.push(value);
+    break;
   }
-  return result;
+  return candidates;
 }
 
 /**
@@ -1219,21 +1453,34 @@ function imageRequestFromRequest(request) {
   else if (parsed.pathname.startsWith("/image/")) decoder = parsed.pathname.slice("/image/".length);
   else return null;
   if (!/^(?:auto|passthrough|[a-z0-9-]+)$/i.test(decoder)) throw new HttpError(400, "图片解码器名称无效");
-  return { imageUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "", decoder };
+  return {
+    imageUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "",
+    decoder,
+    referer: parsed.searchParams.get("referer") || parsed.searchParams.get("ref") || "",
+  };
 }
 
 function mediaProxyRequestFromRequest(request) {
   const parsed = new URL(request.url || "/", "http://read2xsgg.local");
   if (parsed.pathname !== "/media") return null;
-  return { mediaUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "" };
+  const referer = parsed.searchParams.get("referer") || parsed.searchParams.get("ref") || "";
+  return {
+    mediaUrl: parsed.searchParams.get("url") || parsed.searchParams.get("u") || "",
+    httpHeaders: referer ? { Referer: referer } : {},
+  };
 }
 
 function adapterRequestFromRequest(request) {
   const parsed = new URL(request.url || "/", "http://read2xsgg.local");
-  const type = parsed.pathname === "/adapter/jm/chapters" ? "jm-chapters"
-    : parsed.pathname === "/adapter/catalog" ? "catalog"
-    : parsed.pathname === "/adapter/images" || parsed.pathname === "/adapter/jm/images" ? "page-images"
+  const type = parsed.pathname === "/adapter/catalog" ? "catalog"
+    : parsed.pathname === "/adapter/cover" ? "generated-cover"
+    : parsed.pathname === "/adapter/request" ? "signed-request"
+    : parsed.pathname === "/adapter/images" ? "page-images"
       : parsed.pathname === "/adapter/media" ? "page-media"
+        : parsed.pathname === "/adapter/media-playlist" ? "media-playlist"
+          : parsed.pathname === "/adapter/episode-list" ? "episode-list"
+        : parsed.pathname === "/adapter/direct-media" ? "direct-media"
+          : parsed.pathname === "/adapter/single-chapter" ? "single-chapter"
         : parsed.pathname === "/adapter/toc" ? "toc-redirect"
           : parsed.pathname === "/adapter/books" ? "bridge-books"
             : parsed.pathname === "/adapter/detail" ? "bridge-detail"
@@ -1244,12 +1491,16 @@ function adapterRequestFromRequest(request) {
   let extractionPlan;
   let bridgePlan;
   let catalogPlan;
+  let requestPlan;
+  let ssrEpisodePlan;
   try {
     extractionPlan = type === "page-media"
       ? decodeMediaExtractionPlan(parsed.searchParams.get("plan") || "", parsed.searchParams.get("kind") || "audio")
       : type === "page-images" ? decodeComicExtractionPlan(parsed.searchParams.get("plan") || "") : null;
     if (type.startsWith("bridge-")) bridgePlan = decodeBridgePlan(parsed.searchParams.get("plan") || "");
     if (type === "catalog") catalogPlan = decodeCatalogPlan(parsed.searchParams.get("plan") || "");
+    if (type === "signed-request") requestPlan = decodeSignedRequestPlan(parsed.searchParams.get("plan") || "");
+    if (type === "episode-list") ssrEpisodePlan = decodeSsrEpisodePlan(parsed.searchParams.get("plan") || "");
   } catch (error) {
     throw new HttpError(400, error.message);
   }
@@ -1263,16 +1514,59 @@ function adapterRequestFromRequest(request) {
   return {
     type,
     sourceUrl: type.startsWith("bridge-") ? rawSourceUrl : (parsed.searchParams.get("url") || parsed.searchParams.get("u") || ""),
+    referer: parsed.searchParams.get("referer") || parsed.searchParams.get("ref") || "",
     entityId: parsed.searchParams.get("entityId") || "",
     hint: parsed.searchParams.get("hint") || "",
     selector: parsed.searchParams.get("selector") || "",
+    resolveDynamicHtml: parsed.searchParams.get("resolve") === "html",
+    kind: parsed.searchParams.get("kind") === "video" ? "video" : "audio",
+    coverKind: ["text", "comic", "audio", "video"].includes(parsed.searchParams.get("kind"))
+      ? parsed.searchParams.get("kind")
+      : "text",
     extractionPlan,
     bridgePlan,
     catalogPlan,
-    page: parsed.searchParams.get("page") || "1",
+    requestPlan,
+    ssrEpisodePlan,
+    keyWord: parsed.searchParams.get("keyWord") || "",
+    value: parsed.searchParams.get("value") || "",
+    page: parsed.searchParams.get("page") || parsed.searchParams.get("pageIndex") || "1",
     pageSize: parsed.searchParams.get("pageSize") || "",
     slice: parsed.searchParams.get("slice") === "1",
   };
+}
+
+async function generatedCover(kind) {
+  const normalized = ["text", "comic", "audio", "video"].includes(kind) ? kind : "text";
+  if (generatedCoverCache.has(normalized)) return generatedCoverCache.get(normalized);
+  const colors = {
+    text: [39, 64, 96],
+    comic: [218, 167, 54],
+    audio: [196, 73, 83],
+    video: [34, 137, 128],
+  };
+  const promise = (async () => {
+    const [red, green, blue] = colors[normalized];
+    const width = 360;
+    const height = 480;
+    const image = new Jimp({ width, height, color: 0xf4f5f7ff });
+    image.scan(0, 0, width, height, function paint(x, y, index) {
+      const header = y < 112;
+      const footer = y > 404;
+      const inset = x > 42 && x < 318 && y > 148 && y < 366;
+      const stripe = x > 82 && x < 278 && y > 190 && y < 210;
+      const secondStripe = x > 82 && x < 242 && y > 230 && y < 250;
+      const thirdStripe = x > 82 && x < 266 && y > 270 && y < 290;
+      const accent = header || footer || stripe || secondStripe || thirdStripe;
+      this.bitmap.data[index] = accent ? red : inset ? 255 : 244;
+      this.bitmap.data[index + 1] = accent ? green : inset ? 255 : 245;
+      this.bitmap.data[index + 2] = accent ? blue : inset ? 255 : 247;
+      this.bitmap.data[index + 3] = 255;
+    });
+    return image.getBuffer(JimpMime.png);
+  })();
+  generatedCoverCache.set(normalized, promise);
+  return promise;
 }
 
 function plainText(value) {
@@ -1283,6 +1577,42 @@ function plainText(value) {
     .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function withoutCookieHeaders(headers) {
+  const output = {};
+  let removed = false;
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (/^cookie$/i.test(name)) {
+      removed = true;
+      continue;
+    }
+    output[name] = value;
+  }
+  return { headers: output, removed };
+}
+
+function withoutCookieMediaPlan(plan) {
+  if (!plan || typeof plan !== "object") return { plan, removed: false };
+  const topLevel = withoutCookieHeaders(plan.headers);
+  const resolutionHeaders = withoutCookieHeaders(plan.resolution?.request?.headers);
+  if (!topLevel.removed && !resolutionHeaders.removed) return { plan, removed: false };
+  return {
+    plan: {
+      ...plan,
+      ...(topLevel.removed ? { headers: topLevel.headers } : {}),
+      ...(resolutionHeaders.removed ? {
+        resolution: {
+          ...plan.resolution,
+          request: {
+            ...plan.resolution.request,
+            headers: resolutionHeaders.headers,
+          },
+        },
+      } : {}),
+    },
+    removed: true,
+  };
 }
 
 export function pageTocUrl(page, baseUrl, hint = "", selector = "") {
@@ -1326,6 +1656,14 @@ function isLocalHost(host) {
   return bare === "localhost" || bare.endsWith(".localhost") || isIP(bare) !== 0;
 }
 
+function isLoopbackHost(host) {
+  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+  if (bare === "localhost" || bare.endsWith(".localhost")) return true;
+  if (isIP(bare) === 4) return bare === "127.0.0.1" || bare.startsWith("127.");
+  if (isIP(bare) === 6) return bare === "::1" || bare === "0:0:0:0:0:0:0:1";
+  return false;
+}
+
 function forwardedProtocol(request) {
   const forwarded = String(request.headers.forwarded || "").match(/(?:^|[;,]\s*)proto=\"?([^;,\s\"]+)/i)?.[1];
   const xForwarded = String(request.headers["x-forwarded-proto"] || "").split(",")[0].trim();
@@ -1340,6 +1678,23 @@ function publicHost(request) {
   return /^[a-z0-9.[\]-]+(?::\d+)?$/i.test(host) ? host : "";
 }
 
+function linkedBridgePageUrl(html, baseUrl, pageIndex) {
+  const wanted = Number(pageIndex);
+  if (!Number.isInteger(wanted) || wanted <= 1) return "";
+  const document = new JSDOM(String(html || "")).window.document;
+  let fallback = "";
+  for (const anchor of document.querySelectorAll("a[href]")) {
+    const text = String(anchor.textContent || "").replace(/\s+/g, " ").trim();
+    if (text !== String(wanted)) continue;
+    let url;
+    try { url = new URL(anchor.getAttribute("href"), baseUrl); } catch { continue; }
+    if (!/^https?:$/.test(url.protocol)) continue;
+    if (url.origin === new URL(baseUrl).origin) return url.toString();
+    fallback ||= url.toString();
+  }
+  return fallback;
+}
+
 /**
  * Derive the browser-visible converter origin rather than requiring a deployment
  * variable. Reverse proxies conventionally provide X-Forwarded-Proto/Forwarded;
@@ -1349,8 +1704,21 @@ function publicBaseUrl(request) {
   const host = publicHost(request);
   if (!host) return "";
   const hostname = host.startsWith("[") ? (host.match(/^\[([^\]]+)\]/)?.[1] || "") : host.replace(/:\d+$/, "");
-  const protocol = forwardedProtocol(request) || (request.socket.encrypted ? "https" : (isLocalHost(hostname) ? "http" : "https"));
+  const local = isLocalHost(hostname);
+  const forwarded = forwardedProtocol(request);
+  const protocol = request.socket.encrypted || forwarded === "https"
+    ? "https"
+    : local
+      ? (forwarded || "http")
+      : "https";
   return `${protocol}://${host}`;
+}
+
+function shouldRebaseLibraryToRequestBase(request) {
+  const host = publicHost(request);
+  if (!host) return false;
+  const hostname = host.startsWith("[") ? (host.match(/^\[([^\]]+)\]/)?.[1] || "") : host.replace(/:\d+$/, "");
+  return !isLoopbackHost(hostname);
 }
 
 function help(config) {
@@ -1364,13 +1732,13 @@ function help(config) {
       library: "/library/{id}.xbs",
       site: "/url/www.novel-site.example.xbs",
       siteRule: "识站订阅 = {本站}/url/ + 去掉 https:// 后的小说站主机（或主机/路径） + .xbs",
-      source: "/source/www.yckceo.com/yuedu/shuyuans/json/id/1193.json.xbs",
+      source: "/source/www.example.com/legado.json.xbs",
       sourceRule: "阅读源订阅 = {本站}/source/ + 去掉 https:// 后的阅读源地址 + .xbs；大聚合源建议用 /ui/ 异步转换",
       sourceAlias: "/xbs/www.example.com/legado.json.xbs",
       easyQuery: "/x.xbs?u=https://www.example.com/legado.json",
       convert: "/convert.xbs?url=https://www.example.com/legado.json",
       json: "/j/www.example.com/legado.json",
-      image: "/image/mwwz-aes?url=https://cdn.example.com/encrypted-image",
+      image: "/image?decoder=passthrough&url=https://cdn.example.com/image.jpg",
       media: "/media?url=https://cdn.example.com/chapter.mp3",
       health: "/healthz",
       jobs: "/api/jobs",
@@ -1486,44 +1854,6 @@ function jobIdFromPath(pathname) {
   return { id: match[1], action: match[2] || "" };
 }
 
-function jmAnchorEntries(fragment, baseUrl) {
-  const entries = [];
-  const seen = new Set();
-  for (const match of String(fragment || "").matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
-    const href = htmlAttribute(match[1], "href");
-    if (!href || /^javascript:/i.test(href)) continue;
-    let url;
-    try {
-      url = new URL(href, baseUrl);
-    } catch {
-      continue;
-    }
-    if (!/^\/photo\/\d+/i.test(url.pathname) || seen.has(url.toString())) continue;
-    const title = htmlText(match[2]);
-    if (!title) continue;
-    seen.add(url.toString());
-    entries.push({ title, url: url.toString() });
-  }
-  return entries;
-}
-
-export function jmChapterEntries(detailPage, baseUrl) {
-  const html = String(detailPage || "");
-  for (const match of html.matchAll(/<ul\b([^>]*)>([\s\S]*?)<\/ul>/gi)) {
-    const className = htmlAttribute(match[1], "class") || "";
-    if (!/(?:^|\s)btn-toolbar(?:\s|$)/i.test(className)) continue;
-    const chapters = orderChaptersAscending(jmAnchorEntries(match[2], baseUrl));
-    if (chapters.length) return chapters;
-  }
-  for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
-    const className = htmlAttribute(match[1], "class") || "";
-    if (!/(?:^|\s)reading(?:\s|$)/i.test(className)) continue;
-    const chapters = orderChaptersAscending(jmAnchorEntries(match[0], baseUrl));
-    if (chapters.length) return chapters;
-  }
-  return [];
-}
-
 /**
  * Extract a comic page's image sequence without knowing the site beforehand.
  * Chapter images normally form the largest same-directory sequence, whereas
@@ -1543,7 +1873,12 @@ function normalizedImageUrl(value, baseUrl) {
     && !/\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(raw)) return "";
   try {
     const url = new URL(raw, baseUrl);
-    return /^https?:$/.test(url.protocol) ? url.toString() : "";
+    if (!/^https?:$/.test(url.protocol)) return "";
+    const identity = `${url.hostname}${url.pathname}`.toLowerCase();
+    if (/(?:^|[\/_.-])(?:logo|icon|avatar|default|loading|placeholder|no[_-]?img|nopic|mascot|status|float[a-z0-9_-]*|cross|banner|qrcode|qr-code)(?:[\/_.-]|$)/i.test(identity)) {
+      return "";
+    }
+    return url.toString();
   } catch {
     return "";
   }
@@ -1607,7 +1942,10 @@ function pickObjectImageUrl(value, baseUrl, hints) {
 /** Prefer the last digit run before the extension (page_10.jpg → 10, not a leading id). */
 function imageFilenameNumber(pathname) {
   const file = String(pathname || "").split("/").pop() || "";
-  const match = file.match(/(\d+)(?=\.[A-Za-z0-9]+$)/) || file.match(/(\d+)(?=[?#]|$)/);
+  const stem = file.replace(/\.[A-Za-z0-9]+$/, "");
+  const match = stem.match(/^(\d+)$/)
+    || stem.match(/^(?:page|img|image|pic|picture|p)[_-]?(\d+)$/i)
+    || stem.match(/(?:^|[_-])(\d+)$/);
   return match ? Number(match[1]) : null;
 }
 
@@ -1638,6 +1976,72 @@ function maybeReorderByFilename(urls) {
       || left.index - right.index
     ))
     .map((item) => item.value);
+}
+
+function dominantImageDirectory(urls) {
+  if (!Array.isArray(urls) || urls.length < 4) return urls || [];
+  const groups = new Map();
+  for (const value of urls) {
+    try {
+      const parsed = new URL(value);
+      const key = `${parsed.origin}${parsed.pathname.replace(/\/[^/]*$/, "/")}`;
+      const group = groups.get(key) || [];
+      group.push(value);
+      groups.set(key, group);
+    } catch {
+      // Ignore invalid values while selecting the dominant page sequence.
+    }
+  }
+  let largest = [];
+  for (const group of groups.values()) if (group.length > largest.length) largest = group;
+  const substantial = [...groups.values()].filter((group) => group.length >= 3);
+  if (!substantial.length) return urls;
+  const first = substantial[0];
+  return first.length >= Math.ceil(largest.length * 0.5) ? first : largest;
+}
+
+function base64ImageUrls(document, baseUrl) {
+  for (const match of String(document || "").matchAll(/["']([A-Za-z0-9+/_-]{100,}={0,2})["']/g)) {
+    const encoded = match[1];
+    if (encoded.length > 4 * 1024 * 1024) continue;
+    let decoded = "";
+    try {
+      decoded = Buffer.from(encoded.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    } catch {
+      continue;
+    }
+    if ((decoded.match(/https?:\/\//gi) || []).length < 2) continue;
+    const urls = [];
+    for (const urlMatch of decoded.matchAll(/https?:\/\/[^\s"'<>$|,;\\]+/gi)) {
+      const url = normalizedImageUrl(urlMatch[0], baseUrl);
+      if (url && /\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(url) && !urls.includes(url)) {
+        urls.push(url);
+      }
+    }
+    if (urls.length >= 2) return dominantImageDirectory(urls);
+  }
+  return [];
+}
+
+function packedImageUrls(document, baseUrl) {
+  for (const match of String(document || "").matchAll(/<script\b[^>]*>([\s\S]*?eval\(function\(p,a,c,k,e,[dr]\)[\s\S]*?)<\/script>/gi)) {
+    const unpacked = unpackDeanEdwards(match[1]);
+    if (!unpacked) continue;
+    const urls = [];
+    for (const urlMatch of unpacked.matchAll(/https?:\/\/[^\s"'<>$|,;\\\]]+/gi)) {
+      const url = normalizedImageUrl(urlMatch[0], baseUrl);
+      if (url && !urls.includes(url)) {
+        urls.push(url);
+      }
+    }
+    const explicitImages = urls.every((url) => /\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(url));
+    const minimum = explicitImages ? 2 : 3;
+    if (urls.length >= minimum) {
+      const dominant = dominantImageDirectory(urls);
+      if (dominant.length >= minimum) return dominant;
+    }
+  }
+  return [];
 }
 
 function propertyImageUrls(document, baseUrl, extractionPlan) {
@@ -1760,21 +2164,24 @@ function propertyImageUrls(document, baseUrl, extractionPlan) {
   };
   for (const sequence of sequences) consider(sequence.key, sequence.urls, { fromArray: true });
   for (const [key, urls] of groups) consider(key, urls);
-  return maybeReorderByFilename(best);
+  return maybeReorderByFilename(dominantImageDirectory(best));
 }
 
 export function pageImageUrls(page, baseUrl, extractionPlan = null) {
   const html = String(page || "");
   const plan = normalizeComicExtractionPlan(extractionPlan);
+  const encodedUrls = base64ImageUrls(html, baseUrl);
+  if (encodedUrls.length > 1) return encodedUrls;
+  const unpackedUrls = packedImageUrls(html, baseUrl);
+  if (unpackedUrls.length > 1) return unpackedUrls;
   let embeddedUrls = [];
   for (const document of hydrationDocuments(html)) {
     const found = propertyImageUrls(document, baseUrl, plan);
-    if (found.length > 1) return found;
-    if (found.length) embeddedUrls = found;
+    if (found.length > embeddedUrls.length) embeddedUrls = found;
   }
 
-  const lazyUrls = [];
-  const directUrls = [];
+  const lazyEntries = [];
+  const directEntries = [];
   const seen = new Set();
   const attributes = [...new Set([
     ...plan.attributes,
@@ -1810,33 +2217,54 @@ export function pageImageUrls(page, baseUrl, extractionPlan = null) {
     if (!lazy && (!imageExtension
       || /(?:ad|avatar|banner|blank|captcha|icon|loading|logo)/i.test(pathname))) continue;
     seen.add(key);
-    (lazy ? lazyUrls : directUrls).push(key);
+    let order = null;
+    for (const name of ["data-index", "data-page", "data-page-index", "data-page-number", "data-order", "data-seq"]) {
+      const value = htmlAttribute(match[2], name);
+      if (!value || !/^\d+$/.test(value.trim())) continue;
+      order = Number(value);
+      break;
+    }
+    (lazy ? lazyEntries : directEntries).push({
+      url: key,
+      order,
+      position: match.index,
+    });
   }
-  const candidates = lazyUrls.length ? lazyUrls : directUrls;
+  const candidates = lazyEntries.length ? lazyEntries : directEntries;
   if (candidates.length < 2) {
-    if (candidates.length) return candidates;
-    if (embeddedUrls.length) return embeddedUrls;
+    if (embeddedUrls.length > candidates.length) return dominantImageDirectory(embeddedUrls);
+    if (candidates.length) return candidates.map((entry) => entry.url);
     const plainUrls = [];
     for (const match of html.replace(/\\\//g, "/").matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
       const url = normalizedImageUrl(match[0], baseUrl);
       if (url && /\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(url) && !plainUrls.includes(url)) plainUrls.push(url);
     }
-    return plainUrls;
+    return dominantImageDirectory(plainUrls);
   }
 
   const groups = new Map();
-  for (const value of candidates) {
-    const parsed = new URL(value);
+  for (const entry of candidates) {
+    const parsed = new URL(entry.url);
     const directory = parsed.pathname.replace(/\/[^/]*$/, "/");
     const group = groups.get(directory) || [];
-    group.push(value);
+    group.push(entry);
     groups.set(directory, group);
   }
   let largest = [];
   for (const group of groups.values()) {
     if (group.length > largest.length) largest = group;
   }
-  return maybeReorderByFilename(largest);
+  const explicitlyOrdered = largest.filter((entry) => Number.isFinite(entry.order)).length;
+  if (explicitlyOrdered >= Math.ceil(largest.length * 0.6)) {
+    return largest
+      .slice()
+      .sort((left, right) => (
+        (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER)
+        || left.position - right.position
+      ))
+      .map((entry) => entry.url);
+  }
+  return maybeReorderByFilename(largest.map((entry) => entry.url));
 }
 
 const PAGE_QUERY_KEYS = new Set([
@@ -1927,16 +2355,237 @@ export function comicPageUrls(page, requestUrl, maxPages = 50) {
   return urls;
 }
 
-async function downloadComicImageSequence(sourceUrl, config, extractionPlan) {
-  if (/\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(sourceUrl)) return [sourceUrl];
+function imageDecoderScriptCandidates(page, baseUrl) {
+  const candidates = [];
+  const seen = new Set();
+  const document = new JSDOM(String(page || ""), { url: baseUrl }).window.document;
+  for (const element of document.querySelectorAll("script[src], link[rel='preload'][as='script'][href]")) {
+    const raw = element.getAttribute("src") || element.getAttribute("href");
+    let url;
+    try { url = new URL(raw, baseUrl).toString(); } catch { continue; }
+    if (!/^https?:/i.test(url) || seen.has(url)) continue;
+    seen.add(url);
+    const identity = `${url} ${element.getAttribute("id") || ""} ${element.getAttribute("class") || ""}`;
+    const filename = new URL(url).pathname.split("/").pop() || "";
+    let score = 0;
+    if (/(?:decrypt|decipher|decode|crypto|cipher)/i.test(identity)) score += 200;
+    if (/(?:chapter|reader|image|comic|picture|\bpic\b)/i.test(identity)) score += 80;
+    if (/(?:jquery|swiper|toastr|template|validator|common|analytics)/i.test(filename)) score -= 100;
+    if (score > 0) candidates.push({ url, score });
+  }
+  return candidates.sort((left, right) => right.score - left.score).slice(0, 4);
+}
+
+async function imageDecoderContextSource(page, baseUrl, config) {
+  let origin;
+  try { origin = new URL(baseUrl).origin; } catch { return ""; }
+  const urls = [];
+  for (const match of String(page || "").matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi)) {
+    let url;
+    try { url = new URL(match[1], baseUrl); } catch { continue; }
+    if (url.origin !== origin || urls.includes(url.toString())) continue;
+    const filename = url.pathname.split("/").pop() || "";
+    if (!/(?:base|util|config|security|crypto|cipher|common)/i.test(filename)) continue;
+    if (/(?:jquery|bootstrap|cloudflare|analytics|signalr|sweetalert|vendor)/i.test(filename)) continue;
+    urls.push(url.toString());
+  }
+  const chunks = [];
+  let bytes = 0;
+  for (const url of urls.slice(0, 6)) {
+    try {
+      const body = await downloadSource(url, config);
+      if (bytes + body.length > 128 * 1024) continue;
+      chunks.push(body.toString("utf8"));
+      bytes += body.length;
+    } catch {
+      // Decoder dependencies are optional; candidates still require real-image verification.
+    }
+  }
+  return chunks.join("\n");
+}
+
+function decodedScriptLiteral(quote, value) {
+  try {
+    if (quote === '"') return JSON.parse(`"${value}"`);
+    return value
+      .replace(/\\'/g, "'")
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
+      .replace(/\\t/g, "\t")
+      .replace(/\\\\/g, "\\");
+  } catch {
+    return "";
+  }
+}
+
+function pageScriptLiteralContext(page) {
+  const values = new Map();
+  const blocked = new Set(["window", "self", "globalThis", "process", "require", "module", "exports"]);
+  for (const script of String(page || "").matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
+    for (const match of script[1].matchAll(/(?:\b(?:var|let|const)\s+|[,;]\s*)([A-Za-z_$][\w$]*)\s*=\s*(["'])((?:\\.|(?!\2)[\s\S])*?)\2/g)) {
+      if (blocked.has(match[1]) || values.has(match[1])) continue;
+      const value = decodedScriptLiteral(match[2], match[3]);
+      if (value.length <= 64 * 1024) values.set(match[1], value);
+      if (values.size >= 32) break;
+    }
+  }
+  return {
+    source: [...values].map(([name, value]) => `var ${name} = ${JSON.stringify(value)};`).join("\n"),
+    values: [...values.values()],
+  };
+}
+
+async function cachedScriptImageDecoder(scriptUrl, config, contextSource = "") {
+  const cacheKey = `${scriptUrl}#${createHash("sha256").update(contextSource).digest("base64url").slice(0, 16)}`;
+  if (imageScriptDecoderCache.has(cacheKey)) return imageScriptDecoderCache.get(cacheKey);
+  const pending = (async () => {
+    try {
+      const body = await downloadSource(scriptUrl, config);
+      return decoderCandidatesFromJavaScript(`${contextSource}\n${body.toString("utf8")}`);
+    } catch {
+      return [];
+    }
+  })();
+  imageScriptDecoderCache.set(cacheKey, pending);
+  if (imageScriptDecoderCache.size > 256) {
+    imageScriptDecoderCache.delete(imageScriptDecoderCache.keys().next().value);
+  }
+  return pending;
+}
+
+function aesDecoderPayload(decoder, input) {
+  const prefix = String(decoder || "").match(/^aes-cbc-prefix-iv-([A-Za-z0-9_-]+)$/i);
+  const fixed = String(decoder || "").match(/^aes-cbc-fixed-iv-([A-Za-z0-9_-]+)-([A-Za-z0-9_-]+)$/i);
+  if (!prefix && !fixed) return null;
+  const key = Buffer.from((prefix || fixed)[1], "base64url");
+  const iv = prefix ? input.subarray(0, 16) : Buffer.from(fixed[2], "base64url");
+  const ciphertext = prefix ? input.subarray(16) : input;
+  if (![16, 24, 32].includes(key.length) || iv.length !== 16 || !ciphertext.length) return null;
+  try {
+    const decipher = createDecipheriv(`aes-${key.length * 8}-cbc`, key, iv);
+    return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  } catch {
+    return null;
+  }
+}
+
+async function dynamicScriptPageImages(page, pageUrl, extractionPlan, config) {
+  const context = pageScriptLiteralContext(page);
+  if (!context.source) return [];
+  const decoders = [];
+  for (const candidate of imageDecoderScriptCandidates(page, pageUrl)) {
+    for (const decoder of await cachedScriptImageDecoder(candidate.url, config, context.source)) {
+      if (!decoders.includes(decoder)) decoders.push(decoder);
+    }
+  }
+  if (!decoders.length) return [];
+  const payloads = context.values.filter((value) => (
+    value.length >= 128 && value.length <= 4 * 1024 * 1024 && /^[A-Za-z0-9+/]+={0,2}$/.test(value)
+  ));
+  for (const encoded of payloads) {
+    const encrypted = Buffer.from(encoded, "base64");
+    for (const decoder of decoders) {
+      const plain = aesDecoderPayload(decoder, encrypted);
+      if (!plain) continue;
+      let parsed;
+      try { parsed = JSON.parse(plain.toString("utf8")); } catch { continue; }
+      const declaredHost = String(parsed?.host || parsed?.hostname || "").replace(/^www\./i, "");
+      if (declaredHost && new URL(pageUrl).hostname.replace(/^www\./i, "") !== declaredHost) continue;
+      const urls = propertyImageUrls(JSON.stringify(parsed), pageUrl, extractionPlan);
+      if (urls.length >= 2) return urls;
+    }
+  }
+  return [];
+}
+
+async function verifiedPageImageDecoder(page, pageUrl, urls, config) {
+  const firstUrl = urls?.[0];
+  if (!firstUrl) return "auto";
+  try {
+    await downloadImage(firstUrl, "auto", config, pageUrl);
+    return "auto";
+  } catch {
+    // Encrypted bytes and anti-leech failures both require a declared decoder
+    // that succeeds against the actual first generated image request.
+  }
+  const context = pageScriptLiteralContext(page);
+  const dependencySource = await imageDecoderContextSource(page, pageUrl, config);
+  const contextSource = [context.source, dependencySource].filter(Boolean).join("\n");
+  for (const candidate of imageDecoderScriptCandidates(page, pageUrl)) {
+    const decoders = await cachedScriptImageDecoder(candidate.url, config, contextSource);
+    for (const decoder of decoders) {
+      try {
+        await downloadImage(firstUrl, decoder, config, pageUrl);
+        return decoder;
+      } catch {
+        // A script may describe another asset class. Continue until one proves
+        // itself against the chapter's real first image bytes.
+      }
+    }
+  }
+  return "";
+}
+
+async function downloadComicImageSequence(sourceUrl, config, extractionPlan, contextUrl = sourceUrl) {
+  if (/\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(sourceUrl)) {
+    return { urls: [sourceUrl], decoder: "auto" };
+  }
   const maxPages = Number.isInteger(config.maxComicPages) ? config.maxComicPages : 50;
   const maxImages = Number.isInteger(config.maxComicImages) ? config.maxComicImages : 2_000;
   const concurrency = Number.isInteger(config.comicPageConcurrency) ? config.comicPageConcurrency : 4;
   const firstPage = await downloadSource(sourceUrl, config, extractionPlan?.headers);
   const firstText = firstPage.toString("utf8");
-  const firstImages = pageImageUrls(firstText, sourceUrl, extractionPlan);
-  const followingPages = comicPageUrls(firstText, sourceUrl, maxPages);
-  if (!followingPages.length) return firstImages.slice(0, maxImages);
+  let decoderPage = firstText;
+  let decoderPageUrl = sourceUrl;
+  if (contextUrl && contextUrl !== sourceUrl) {
+    try {
+      const contextPage = await downloadSource(contextUrl, config, extractionPlan?.headers);
+      decoderPage = contextPage.toString("utf8");
+      decoderPageUrl = contextUrl;
+    } catch {
+      // The API response remains usable when the optional chapter context fails.
+    }
+  }
+  let firstImages = pageImageUrls(firstText, sourceUrl, extractionPlan);
+  let sequenceText = firstText;
+  let sequenceUrl = sourceUrl;
+  const dynamicHtmlUrl = dynamicHtmlRequestUrl(firstText, sourceUrl);
+  if (dynamicHtmlUrl) {
+    try {
+      const dynamicPage = await downloadSource(dynamicHtmlUrl, config, {
+        ...(extractionPlan?.headers || {}),
+        Referer: sourceUrl,
+      });
+      const dynamicText = dynamicPage.toString("utf8");
+      const dynamicImages = pageImageUrls(dynamicText, dynamicHtmlUrl, extractionPlan);
+      if (dynamicImages.length >= 2) {
+        firstImages = dynamicImages;
+        sequenceText = dynamicText;
+        sequenceUrl = dynamicHtmlUrl;
+      }
+    } catch {
+      // The static page and other generic script/API discovery paths remain available.
+    }
+  }
+  if (firstImages.length <= 1) {
+    const scriptedImages = await dynamicScriptPageImages(firstText, sourceUrl, extractionPlan, config);
+    if (scriptedImages.length > firstImages.length) firstImages = scriptedImages;
+  }
+  if (firstImages.length <= 1) {
+    const dynamic = await dynamicComicApiImages(firstText, sourceUrl, {
+      download: createSourceDownloader(config),
+      headers: extractionPlan?.headers || {},
+      maxImages,
+      maxRequests: maxPages,
+      concurrency,
+    });
+    if (dynamic.urls.length > firstImages.length) firstImages = dynamic.urls;
+  }
+  const followingPages = comicPageUrls(sequenceText, sequenceUrl, maxPages);
+  if (!followingPages.length) {
+    const urls = firstImages.slice(0, maxImages);
+    return { urls, decoder: await verifiedPageImageDecoder(decoderPage, decoderPageUrl, urls, config) };
+  }
 
   const pageResults = Array.from({ length: followingPages.length }, () => []);
   let cursor = 0;
@@ -1964,11 +2613,8 @@ async function downloadComicImageSequence(sourceUrl, config, extractionPlan) {
     images.push(url);
     if (images.length >= maxImages) break;
   }
-  return images;
+  return { urls: images, decoder: await verifiedPageImageDecoder(decoderPage, decoderPageUrl, images, config) };
 }
-
-// Backward-compatible export for callers that previously used the JM-specific name.
-export const jmImageUrls = pageImageUrls;
 
 const AUDIO_ONLY_EXTENSION = /\.(?:aac|flac|m4a|m4b|mp3|oga|ogg|opus|wav)(?:[?#]|$)/i;
 const VIDEO_ONLY_EXTENSION = /\.(?:mp4|m4v|mov|mkv|ts|webm)(?:[?#]|$)/i;
@@ -1996,6 +2642,29 @@ function normalizedMediaUrl(value, baseUrl, kind, { allowGeneric = false } = {})
   try {
     const url = new URL(raw, baseUrl);
     if (!/^https?:$/.test(url.protocol) || NON_MEDIA_EXTENSION.test(url.toString())) return "";
+    for (const key of ["url", "src", "source", "play", "video", "audio", "media", "stream", "file"]) {
+      let nested = String(url.searchParams.get(key) || "").trim();
+      if (!nested) continue;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const decoded = decodeURIComponent(nested);
+          if (decoded === nested) break;
+          nested = decoded;
+        } catch {
+          break;
+        }
+      }
+      try {
+        const nestedUrl = new URL(nested, baseUrl);
+        const value = nestedUrl.toString();
+        if (!/^https?:$/.test(nestedUrl.protocol) || !mediaExtensionPattern(kind).test(value)) continue;
+        if (kind === "audio" && VIDEO_ONLY_EXTENSION.test(value)) continue;
+        if (kind === "video" && AUDIO_ONLY_EXTENSION.test(value)) continue;
+        return value;
+      } catch {
+        // Try other semantic query parameters.
+      }
+    }
     if (kind === "audio" && VIDEO_ONLY_EXTENSION.test(url.toString())) return "";
     if (kind === "video" && AUDIO_ONLY_EXTENSION.test(url.toString())) return "";
     if (!allowGeneric && !mediaExtensionPattern(kind).test(url.toString())) return "";
@@ -2036,11 +2705,14 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
   let order = 0;
   const add = (keyValue, value, allowGeneric = false) => {
     const key = String(keyValue || "").toLowerCase();
-    const semantic = /(?:url|uri|src|source|audio|sound|voice|track|play|video|media|stream|hls|m3u8|file|path)/i.test(key);
+    const semantic = /(?:url|uri|src|source|address|audio|sound|voice|track|play|video|media|stream|hls|m3u8|file|path)/i.test(key);
     if (!semantic && !hints.has(key) && !allowGeneric) return;
     // Legacy href-only plans must never promote navigation hrefs into play URLs.
     if (legacyHrefOnly && key === "href") return;
-    const url = normalizedMediaUrl(value, baseUrl, kind, { allowGeneric: allowGeneric || hints.has(key) || semantic });
+    const transformedValue = plan.resultPrefix && value != null && !/^(?:https?:)?\/\//i.test(String(value).trim())
+      ? `${plan.resultPrefix}${String(value)}`
+      : value;
+    const url = normalizedMediaUrl(transformedValue, baseUrl, kind, { allowGeneric: allowGeneric || hints.has(key) || semantic });
     if (!url || candidates.has(url)) return;
     const extension = mediaExtensionPattern(kind).test(url);
     // Chapter HTML (and mobile alternate twins with the same path) are never media.
@@ -2103,6 +2775,16 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
       add(attribute, value, attribute !== "href");
     }
   }
+  for (const match of text.matchAll(/\b([\w:-]{1,80})\s*=\s*(["'])([\s\S]*?)\2/g)) {
+    const name = match[1].toLowerCase();
+    const value = match[3].replace(/&amp;/gi, "&");
+    const semantic = /(?:url|uri|src|source|address|audio|sound|voice|track|play|video|media|stream|file|path)/i.test(name);
+    if (!semantic && !/[|\r\n]/.test(value)) continue;
+    for (const part of value.split(/[|\r\n]+/)) {
+      const mediaLike = mediaExtensionPattern(kind).test(part);
+      if (semantic || mediaLike) add(name, part, mediaLike);
+    }
+  }
   for (const match of text.replace(/\\\//g, "/").matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
     // sourceRegex-derived extension hints (e.g. ".mp3") promote matching URLs
     // even when they sit outside semantic JSON keys. Skip bare page links: the
@@ -2116,6 +2798,68 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
   return [...candidates.entries()]
     .sort((left, right) => right[1] - left[1])
     .map(([url]) => url);
+}
+
+export function pageMediaPlaylist(page, baseUrl, kind = "audio") {
+  const rows = [];
+  const seen = new Set();
+  const add = (title, value) => {
+    const url = normalizedMediaUrl(value, baseUrl, kind);
+    if (!url) return;
+    let identity = url;
+    try {
+      const normalized = new URL(url);
+      // `_` is the conventional cache-buster added by media/player clients;
+      // it does not identify a different episode. Preserve auth/signature
+      // parameters because those can be required to play the media.
+      normalized.searchParams.delete("_");
+      normalized.hash = "";
+      identity = normalized.toString();
+    } catch {
+      // The URL was already validated; exact-string deduplication is enough.
+    }
+    if (seen.has(identity)) return;
+    seen.add(identity);
+    let fallback = "播放";
+    try {
+      fallback = decodeURIComponent(new URL(url).pathname.split("/").filter(Boolean).at(-1) || fallback)
+        .replace(/\.[A-Za-z0-9]{2,5}$/, "");
+    } catch {
+      // Keep the stable fallback title.
+    }
+    const label = plainText(title);
+    rows.push({ title: /^https?:\/\//i.test(label) ? fallback : label || fallback, url });
+  };
+  for (const tag of String(page || "").matchAll(/<([a-z][\w:-]*)\b([^>]*)>/gi)) {
+    const attributes = new Map();
+    for (const match of tag[2].matchAll(/\b([\w:-]{1,80})\s*=\s*(["'])([\s\S]*?)\2/g)) {
+      attributes.set(match[1].toLowerCase(), match[3].replace(/&amp;/gi, "&"));
+    }
+    const address = [...attributes.entries()]
+      .filter(([name, value]) => /(?:address|audio|sound|voice|track|play|video|media|stream|source|src|url)/i.test(name)
+        && /[|\r\n]/.test(value))
+      .map(([, value]) => value.split(/[|\r\n]+/).filter(Boolean))
+      .sort((left, right) => right.length - left.length)[0];
+    if (!address || address.length < 2) continue;
+    const titles = [...attributes.entries()]
+      .filter(([name, value]) => /(?:title|name|label|caption)/i.test(name) && /[|\r\n]/.test(value))
+      .map(([, value]) => value.split(/[|\r\n]+/))
+      .find((values) => values.length === address.length) || [];
+    address.forEach((url, index) => add(titles[index], url));
+  }
+  if (rows.length) return rows;
+  const document = new JSDOM(String(page || ""), { url: baseUrl }).window.document;
+  for (const element of document.querySelectorAll("audio[src],audio source[src],video[src],video source[src],a[href]")) {
+    const value = element.getAttribute("src") || element.getAttribute("href") || "";
+    const title = element.getAttribute("title") || element.getAttribute("data-title")
+      || visibleTextForMedia(element.closest("a") || element);
+    add(title, value);
+  }
+  return rows;
+}
+
+function visibleTextForMedia(node) {
+  return String(node?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 160);
 }
 
 function cacheSet(cache, key, value, config) {
@@ -2190,7 +2934,27 @@ export function createAppServer(options = {}) {
         const job = await store.getJob(libraryTarget.id);
         if (!job) throw new HttpError(404, "书库条目不存在");
         if (job.status !== "done") throw new HttpError(409, `转换尚未完成（${job.status}）`);
-        const body = await store.readArtifact(libraryTarget.id, libraryTarget.format === "json" ? "json" : "xbs");
+        let jsonBody = await store.readArtifact(libraryTarget.id, "json");
+        let xbsBody = await store.readArtifact(libraryTarget.id, "xbs");
+        if (job.imageProxyBase && shouldRebaseLibraryToRequestBase(request)) {
+          const currentBase = publicBaseUrl(request);
+          if (currentBase) {
+            try {
+              const rebased = rebaseArtifactPair({
+                json: jsonBody,
+                xbs: xbsBody,
+                oldOrigin: job.imageProxyBase,
+                newOrigin: currentBase,
+              });
+              jsonBody = rebased.json;
+              xbsBody = rebased.xbs;
+            } catch {
+              // A broken historical artifact should not make an existing library
+              // URL unusable; serving the stored bytes is still better than 500.
+            }
+          }
+        }
+        const body = libraryTarget.format === "json" ? jsonBody : xbsBody;
         if (!body) throw new HttpError(404, "制品不存在");
         if (libraryTarget.format === "json") {
           response.writeHead(200, {
@@ -2282,7 +3046,7 @@ export function createAppServer(options = {}) {
           if (method !== "POST") throw new HttpError(405, "发布仅支持 POST");
           const job = await store.getJob(jobRoute.id);
           if (!job) throw new HttpError(404, "任务不存在");
-          const raw = await readRequestBody(request);
+          const raw = await readRequestBody(request, { maxBytes: config.maxSourceBytes });
           let body = {};
           try {
             body = raw.length ? JSON.parse(raw.toString("utf8")) : {};
@@ -2381,6 +3145,33 @@ export function createAppServer(options = {}) {
 
       const adapterTarget = adapterRequestFromRequest(request);
       if (adapterTarget) {
+        if (adapterTarget.type === "generated-cover") {
+          const cover = await generatedCover(adapterTarget.coverKind);
+          response.writeHead(200, {
+            ...commonHeaders,
+            "Content-Type": "image/png",
+            "Content-Length": cover.length,
+            "Cache-Control": "public, max-age=86400",
+          });
+          response.end(method === "HEAD" ? undefined : cover);
+          return;
+        }
+        if (adapterTarget.type === "signed-request") {
+          const target = signedRequestTarget(adapterTarget.requestPlan, {
+            keyWord: adapterTarget.keyWord,
+            pageIndex: adapterTarget.page,
+            value: adapterTarget.value,
+          });
+          const body = await downloadSource(target.url, config, target.headers);
+          response.writeHead(200, {
+            ...commonHeaders,
+            "Content-Type": body.httpHeaders?.["content-type"] || "application/json; charset=utf-8",
+            "Content-Length": body.length,
+            "Cache-Control": "no-store",
+          });
+          response.end(body);
+          return;
+        }
         if (adapterTarget.type === "catalog") {
           if (!adapterTarget.catalogPlan) throw new HttpError(400, "缺少分类目录计划");
           if (!adapterTarget.entityId) throw new HttpError(400, "缺少 entityId");
@@ -2426,9 +3217,24 @@ export function createAppServer(options = {}) {
               html = cachedHtml.value;
             } else {
               if (cachedHtml) cache.delete(htmlCacheKey);
-              const page = await downloadSource(pageUrl, config, adapterTarget.bridgePlan.headers);
+              const page = await downloadSource(pageUrl, config, refreshEphemeralHeaders(adapterTarget.bridgePlan.headers));
               html = prepareBridgeHtml(page, charset, htmlBudget);
               cacheSet(cache, htmlCacheKey, html, config);
+            }
+            let followedPageLink = false;
+            if (adapterTarget.type === "bridge-books" && Number(adapterTarget.page) > 1) {
+              const linkedUrl = linkedBridgePageUrl(html, pageUrl, adapterTarget.page);
+              if (linkedUrl && linkedUrl !== pageUrl) {
+                const normalizedLinkedUrl = normalizeRemoteUrl(linkedUrl);
+                const linkedPage = await downloadSource(
+                  normalizedLinkedUrl,
+                  config,
+                  refreshEphemeralHeaders(adapterTarget.bridgePlan.headers),
+                );
+                html = prepareBridgeHtml(linkedPage, charset, htmlBudget);
+                pageUrl = normalizedLinkedUrl;
+                followedPageLink = true;
+              }
             }
             if (adapterTarget.type === "bridge-chapters" && adapterTarget.bridgePlan.tocSelector) {
               const tocUrl = bridgeTocUrl(html, pageUrl, adapterTarget.bridgePlan);
@@ -2442,7 +3248,7 @@ export function createAppServer(options = {}) {
                     tocHtml = cachedToc.value;
                   } else {
                     if (cachedToc) cache.delete(tocCacheKey);
-                    const tocPage = await downloadSource(tocPageUrl, config, adapterTarget.bridgePlan.headers);
+                    const tocPage = await downloadSource(tocPageUrl, config, refreshEphemeralHeaders(adapterTarget.bridgePlan.headers));
                     tocHtml = prepareBridgeHtml(tocPage, charset, htmlBudget);
                     cacheSet(cache, tocCacheKey, tocHtml, config);
                   }
@@ -2461,7 +3267,76 @@ export function createAppServer(options = {}) {
               }
             }
             if (!output) {
-              output = executeBridgePlan(html, pageUrl, adapterTarget.bridgePlan, paging);
+              output = executeBridgePlan(
+                html,
+                pageUrl,
+                adapterTarget.bridgePlan,
+                followedPageLink ? { ...paging, offset: 0 } : paging,
+              );
+            }
+            if (adapterTarget.type === "bridge-detail") {
+              output = await enrichBridgeDetailLatest(
+                output,
+                html,
+                pageUrl,
+                adapterTarget.bridgePlan,
+                config,
+              );
+            }
+            const planHasUserAgent = Object.keys(adapterTarget.bridgePlan.headers || {})
+              .some((name) => name.toLowerCase() === "user-agent");
+            if (!planHasUserAgent
+              && adapterTarget.bridgePlan.responseType === "html"
+              && Array.isArray(output?.data)
+              && output.data.length === 0) {
+              // Responsive sites often serve unrelated DOM trees to mobile and
+              // desktop clients. Retry the declared rule against the other
+              // common representation before treating a reachable list as stale.
+              const desktopPage = await downloadSource(pageUrl, config, {
+                ...refreshEphemeralHeaders(adapterTarget.bridgePlan.headers),
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              });
+              const desktopHtml = prepareBridgeHtml(desktopPage, charset, htmlBudget);
+              const desktopOutput = executeBridgePlan(
+                desktopHtml,
+                pageUrl,
+                adapterTarget.bridgePlan,
+                followedPageLink ? { ...paging, offset: 0 } : paging,
+              );
+              if (Array.isArray(desktopOutput?.data) && desktopOutput.data.length) {
+                output = desktopOutput;
+              }
+            }
+            if (adapterTarget.type === "bridge-books" && Array.isArray(output?.data) && output.data.length) {
+              const page1Url = firstPageUrlForDuplicateCheck(pageUrl);
+              if (page1Url && page1Url !== pageUrl) {
+                try {
+                  const normalizedPage1 = normalizeRemoteUrl(page1Url);
+                  const page1CacheKey = `bridge-html:${adapterTarget.type}:${normalizedPage1}:${charset}:${adapterTarget.bridgePlan?.list || ""}`;
+                  let page1Html = "";
+                  const cachedPage1 = config.cacheTtlMs > 0 ? cache.get(page1CacheKey) : null;
+                  if (cachedPage1 && cachedPage1.expiresAt > Date.now()) {
+                    page1Html = cachedPage1.value;
+                  } else {
+                    if (cachedPage1) cache.delete(page1CacheKey);
+                    const page1 = await downloadSource(normalizedPage1, config, refreshEphemeralHeaders(adapterTarget.bridgePlan.headers));
+                    page1Html = prepareBridgeHtml(page1, charset, htmlBudget);
+                    cacheSet(cache, page1CacheKey, page1Html, config);
+                  }
+                  const page1Output = executeBridgePlan(
+                    page1Html,
+                    normalizedPage1,
+                    adapterTarget.bridgePlan,
+                    { ...paging, offset: 0 },
+                  );
+                  if (bridgeRowsMostlySame(page1Output.data, output.data)) {
+                    output = { ...output, data: [], hasMore: false, duplicateOfPage1: true };
+                  }
+                } catch {
+                  // Duplicate-page detection is a guardrail; parsing the
+                  // requested page is still better than failing the adapter.
+                }
+              }
             }
           } catch (error) {
             if (error instanceof HttpError) throw error;
@@ -2485,59 +3360,197 @@ export function createAppServer(options = {}) {
             active -= 1;
           }
           if (!targetUrl) throw new HttpError(422, "详情页没有解析到目录链接");
+          if (adapterTarget.resolveDynamicHtml) {
+            active += 1;
+            let output;
+            let outputUrl = targetUrl;
+            try {
+              const cataloguePage = await downloadSource(targetUrl, config, { Referer: sourceUrl });
+              const catalogueHtml = cataloguePage.toString("utf8");
+              const dynamicUrl = dynamicHtmlRequestUrl(catalogueHtml, targetUrl);
+              if (dynamicUrl) {
+                output = await downloadSource(dynamicUrl, config, { Referer: targetUrl });
+                outputUrl = dynamicUrl;
+              } else {
+                output = cataloguePage;
+              }
+            } finally {
+              active -= 1;
+            }
+            response.writeHead(200, {
+              ...commonHeaders,
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "public, max-age=120",
+            });
+            response.end(absolutizeHtmlResourceUrls(
+              decodeTextBuffer(output, { headers: output?.httpHeaders || {} }),
+              outputUrl,
+            ));
+            return;
+          }
           response.writeHead(302, { ...commonHeaders, Location: targetUrl, "Cache-Control": "public, max-age=300" });
           response.end();
           return;
         }
+        if (adapterTarget.type === "direct-media") {
+          const directUrl = normalizeRemoteUrl(sourceUrl);
+          sendJson(response, 200, { url: directUrl }, {
+            ...commonHeaders,
+            "Cache-Control": "no-store",
+          });
+          return;
+        }
+        if (adapterTarget.type === "single-chapter") {
+          const directUrl = normalizeRemoteUrl(sourceUrl);
+          sendJson(response, 200, { data: [{ title: "播放", url: directUrl }] }, {
+            ...commonHeaders,
+            "Cache-Control": "no-store",
+          });
+          return;
+        }
+        if (adapterTarget.type === "media-playlist") {
+          active += 1;
+          let data;
+          try {
+            const page = await downloadSource(sourceUrl, config);
+            data = pageMediaPlaylist(page.toString("utf8"), sourceUrl, adapterTarget.kind);
+          } finally {
+            active -= 1;
+          }
+          if (!data.length) throw new HttpError(422, "页面没有解析到媒体目录");
+          sendJson(response, 200, { data }, {
+            ...commonHeaders,
+            "Cache-Control": "no-store",
+          });
+          return;
+        }
+        if (adapterTarget.type === "episode-list") {
+          active += 1;
+          let output;
+          try {
+            const detailPage = await downloadSource(sourceUrl, config);
+            const detailHtml = detailPage.toString("utf8");
+            const detailCatalog = extractSsrEpisodeCatalog(detailHtml, sourceUrl);
+            if (!detailCatalog.entityId || !detailCatalog.version || !detailCatalog.urlTemplate) {
+              throw new HttpError(422, "详情页没有解析到可分页节目元数据");
+            }
+            const pageIndex = Math.max(1, Math.min(10_000, Number(adapterTarget.page) || 1));
+            const upstreamUrl = ssrEpisodePageUrl(
+              adapterTarget.ssrEpisodePlan,
+              detailCatalog,
+              pageIndex,
+            );
+            const page = await downloadSource(upstreamUrl, config);
+            const catalog = extractSsrEpisodeCatalog(
+              page.toString("utf8"),
+              sourceUrl,
+              detailCatalog.urlTemplate,
+            );
+            if (!catalog.rows.length) throw new HttpError(422, "分页节目接口没有解析到目录");
+            const total = Math.max(detailCatalog.total, catalog.total, adapterTarget.ssrEpisodePlan.total || 0);
+            const pageSize = Math.max(1, Number(adapterTarget.ssrEpisodePlan.pageSize) || catalog.rows.length);
+            output = {
+              data: catalog.rows.map(({ title, url }) => ({ title, url })),
+              total,
+              hasMore: pageIndex * pageSize < total,
+            };
+          } finally {
+            active -= 1;
+          }
+          sendJson(response, 200, output, {
+            ...commonHeaders,
+            "Cache-Control": "public, max-age=120",
+          });
+          return;
+        }
         active += 1;
         let values;
+        let pageImageDecoder = "auto";
         try {
           if (adapterTarget.type === "page-media") {
             const download = createSourceDownloader(config);
-            const headers = adapterTarget.extractionPlan?.headers || {};
+            const referer = adapterTarget.referer
+              ? normalizeRemoteUrl(adapterTarget.referer)
+              : sourceUrl;
+            const headers = {
+              ...(adapterTarget.extractionPlan?.headers || {}),
+              ...(/^https?:\/\//i.test(String(referer || "")) ? { Referer: referer } : {}),
+            };
             values = await resolveChapterMediaUrls(
-              async () => (await download(sourceUrl, headers)).toString("utf8"),
+              async () => download(sourceUrl, headers),
               sourceUrl,
               adapterTarget.extractionPlan,
               download,
               pageMediaUrls,
             );
+            if (!values.length) {
+              const retryHeaders = withoutCookieHeaders(headers);
+              const retryPlan = withoutCookieMediaPlan(adapterTarget.extractionPlan);
+              if (retryHeaders.removed || retryPlan.removed) {
+                values = await resolveChapterMediaUrls(
+                  async () => download(sourceUrl, retryHeaders.headers),
+                  sourceUrl,
+                  retryPlan.plan,
+                  download,
+                  pageMediaUrls,
+                );
+              }
+            }
           } else if (adapterTarget.type === "page-images") {
-            values = await downloadComicImageSequence(sourceUrl, config, adapterTarget.extractionPlan);
+            const sequence = await downloadComicImageSequence(
+              sourceUrl,
+              config,
+              adapterTarget.extractionPlan,
+              adapterTarget.referer || sourceUrl,
+            );
+            values = sequence.urls;
+            pageImageDecoder = sequence.decoder;
             if (!values?.length) {
               const detailPage = await downloadSource(sourceUrl, config, adapterTarget.extractionPlan?.headers);
-              values = pageImageUrls(detailPage.toString("utf8"), sourceUrl, adapterTarget.extractionPlan);
+              const detailText = detailPage.toString("utf8");
+              values = pageImageUrls(detailText, sourceUrl, adapterTarget.extractionPlan);
+              pageImageDecoder = await verifiedPageImageDecoder(detailText, sourceUrl, values, config);
             }
-          } else {
-            const detailPage = await downloadSource(sourceUrl, config, adapterTarget.extractionPlan?.headers);
-            const html = detailPage.toString("utf8");
-            values = adapterTarget.type === "jm-chapters"
-              ? jmChapterEntries(html, sourceUrl)
-              : pageImageUrls(html, sourceUrl, adapterTarget.extractionPlan);
           }
         } finally {
           active -= 1;
         }
         if (!values.length) {
-          const message = adapterTarget.type === "jm-chapters" ? "详情页没有解析到章节"
-            : adapterTarget.type === "page-media"
+          const message = adapterTarget.type === "page-media"
               ? (mediaPlanIsLegacyHrefOnly(adapterTarget.extractionPlan)
                 ? MEDIA_RECONVERSION_DIAGNOSTIC
                 : "页面没有解析到媒体地址")
               : "页面没有解析到图片";
           throw new HttpError(422, message);
         }
+        if (adapterTarget.type === "page-images" && !pageImageDecoder) {
+          throw new HttpError(422, "页面图片需要解密，但没有发现经真实图片验证可用的通用解密计划");
+        }
         let payload;
-        if (adapterTarget.type === "jm-chapters") payload = { chapters: values };
-        else if (adapterTarget.type === "page-media") {
+        if (adapterTarget.type === "page-media") {
           // Xiangse player objects need httpHeaders for Referer/Cookie anti-leech.
           // Echo the chapter page as Referer; content JS merges over source headers.
           payload = { url: values[0] };
-          if (/^https?:\/\//i.test(String(sourceUrl || ""))) {
-            payload.httpHeaders = { Referer: String(sourceUrl) };
+          const referer = adapterTarget.referer || sourceUrl;
+          if (/^https?:\/\//i.test(String(referer || ""))) {
+            payload.httpHeaders = { Referer: normalizeRemoteUrl(referer) };
           }
-        } else payload = { urls: values };
-        sendJson(response, 200, payload, { ...commonHeaders, "Cache-Control": "public, max-age=300" });
+        } else {
+          const imageEndpoint = `${publicBaseUrl(request).replace(/\/$/, "")}/image/${pageImageDecoder}?url=`;
+          const refererSuffix = `&referer=${encodeURIComponent(adapterTarget.referer || sourceUrl)}`;
+          payload = {
+            urls: values,
+            proxyUrls: values.map((value) => (
+              `${imageEndpoint}${encodeURIComponent(String(value || ""))}${refererSuffix}`
+            )),
+          };
+        }
+        sendJson(response, 200, payload, {
+          ...commonHeaders,
+          "Cache-Control": ["page-media", "page-images"].includes(adapterTarget.type)
+            ? "no-store"
+            : "public, max-age=300",
+        });
         return;
       }
       const imageTarget = imageRequestFromRequest(request);
@@ -2547,7 +3560,7 @@ export function createAppServer(options = {}) {
         active += 1;
         let image;
         try {
-          image = await downloadImage(imageTarget.imageUrl, imageTarget.decoder, config);
+          image = await downloadImage(imageTarget.imageUrl, imageTarget.decoder, config, imageTarget.referer);
         } finally {
           active -= 1;
         }
@@ -2569,7 +3582,7 @@ export function createAppServer(options = {}) {
         active += 1;
         let media;
         try {
-          media = await downloadMedia(mediaTarget.mediaUrl, config);
+          media = await downloadMedia(mediaTarget.mediaUrl, config, mediaTarget.httpHeaders);
         } finally {
           active -= 1;
         }
@@ -2604,6 +3617,7 @@ export function createAppServer(options = {}) {
           analyzed = await analyzeSite(target.siteUrl, {
             download,
             timeoutMs: config.analyzeTimeoutMs,
+            adapterBase: publicBaseUrl(request),
           });
         } finally {
           active -= 1;
