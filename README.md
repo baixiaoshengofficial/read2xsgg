@@ -276,6 +276,7 @@ Compose **默认同步路径**开启 origin 探活、抽测与识站修复；仅
 - `VERIFY_BUDGET_MS=20000` / `VERIFY_MAX_SOURCES=50`（仅同步 `/source`；超限跳过抽测直接保留）
 - `JOB_VERIFY_BUDGET_MS=0`（WebUI 异步任务抽测墙钟预算；`0` 为完整抽测不限时）
 - `PREFLIGHT_CONCURRENCY=8`（探活与抽测共用并发；同源识站结果会复用）
+- `PREFLIGHT_RETRIES=3`（单个站点探活的总尝试次数；超时、TLS 断开或限流后会跳过该站点并继续任务）
 - `ADMIN_TOKEN`（写在 `.env`，WebUI / `/api/jobs` 必需）
 - `DATA_DIR=/data`
 - `CACHE_TTL_SECONDS=300`（同步转换结果的内存与磁盘缓存有效期）

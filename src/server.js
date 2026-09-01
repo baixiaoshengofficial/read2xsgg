@@ -115,6 +115,10 @@ export function serverConfig(environment = process.env) {
     // A failed fast probe is not proof that a site is dead. Retry all declared
     // entry candidates with a longer timeout before filtering the source.
     preflightConfirmTimeoutMs: integer(environment.PREFLIGHT_CONFIRM_TIMEOUT_MS, 10_000),
+    // Each source is isolated during aggregate conversion. One quick probe and
+    // two confirmation attempts balance transient rate limits against keeping a
+    // large import moving when an upstream site is unavailable.
+    preflightRetries: integer(environment.PREFLIGHT_RETRIES, 3),
     // Verify/preflight share this pool; 8 keeps large jobs moving without
     // starving small containers as badly as 16+.
     preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 8),
@@ -492,13 +496,19 @@ async function sourceOriginReachable(source, config) {
     }
     return "";
   };
-  const fast = await probeCandidates(config);
-  if (fast) return fast;
   const confirmTimeoutMs = Math.max(
     Number(config.preflightTimeoutMs) || 1,
     Number(config.preflightConfirmTimeoutMs) || 10_000,
   );
-  return probeCandidates({ ...config, preflightTimeoutMs: confirmTimeoutMs });
+  const attempts = Math.max(1, Number(config.preflightRetries) || 3);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const probeConfig = attempt === 0
+      ? config
+      : { ...config, preflightTimeoutMs: confirmTimeoutMs };
+    const reachable = await probeCandidates(probeConfig);
+    if (reachable) return reachable;
+  }
+  return "";
 }
 
 function sourceWithReachableOrigin(source, reachableOrigin) {
@@ -1141,7 +1151,6 @@ export async function filterReachableSources(input, config, { onProgress = null 
         const reachableOrigin = await originTasks.get(key);
         if (!reachableOrigin) {
           results[index] = false;
-          processed += 1;
           continue;
         }
         const preparedSource = sourceWithReachableOrigin(source, reachableOrigin);
@@ -1156,8 +1165,13 @@ export async function filterReachableSources(input, config, { onProgress = null 
         ]);
         if (!deepTasks.has(chainKey)) deepTasks.set(chainKey, sourceBridgeChainReachable(preparedSource, config));
         results[index] = await deepTasks.get(chainKey) ? preparedSource : false;
-        processed += 1;
+      } catch {
+        // A timeout, TLS reset, or rate-limit disconnect must only reject this
+        // source. Letting one upstream socket error reject a worker used to
+        // abort an entire aggregate import.
+        results[index] = false;
       } finally {
+        processed += 1;
         active.delete(label);
         report();
       }

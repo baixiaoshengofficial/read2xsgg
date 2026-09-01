@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { bridgeTocUrl, compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, compileMediaResolutionFromRule, compileTextBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan, filterValidXiangseSources, hasUnsupportedLegadoRuntime, htmlToPlainText, inferResponseType } from "../src/index.js";
+import { bridgeTocUrl, compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, compileMediaResolutionFromRule, compileTextBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan, filterValidXiangseSources, hasUnsupportedLegadoRuntime, htmlToPlainText, inferResponseType, validateXiangseSource } from "../src/index.js";
 
 const sampleSource = {
   bookSourceName: "示例书源",
@@ -2127,6 +2127,162 @@ test("依赖 Android API 的媒体正文通过在线通用提取器转换", () =
   assert.equal(converted.sourceType, "video");
   assert.match(converted.chapterContent.requestInfo, /convert\.example\/adapter\/media\?kind=video/);
   assert.match(converted.chapterContent.content, /payload\.url/);
+});
+
+test("媒体适配正文不会追加阅读文本 replaceRegex 脚本", () => {
+  const source = {
+    bookSourceName: "媒体替换隔离",
+    bookSourceUrl: "https://media.example.com",
+    bookSourceType: 4,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".item", name: ".name@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".episode", chapterName: "text", chapterUrl: "href" },
+    ruleContent: {
+      content: '@js:java.getString("iframe@src")',
+      replaceRegex: "##{{book.durChapterTitle}}##",
+    },
+  };
+  const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const content = sources["媒体替换隔离"].chapterContent.content;
+
+  assert.equal((content.match(/\|\|\s*@js:/gi) || []).length, 0);
+  assert.doesNotMatch(content, /book\.durChapterTitle/);
+  assert.match(content, /payload\.url/);
+});
+
+test("依赖阅读 baseUrl 的媒体脚本交给通用服务端提取器", () => {
+  const source = {
+    bookSourceName: "媒体上下文隔离",
+    bookSourceUrl: "https://media.example.com",
+    bookSourceType: 4,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".item", name: ".name@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".episode", chapterName: "text", chapterUrl: "href" },
+    ruleContent: { content: "@js:return baseUrl + '/play.mp4';" },
+  };
+  const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const chapterContent = sources["媒体上下文隔离"].chapterContent;
+
+  assert.match(chapterContent.requestInfo, /\/adapter\/media\?kind=video/);
+  assert.doesNotMatch(chapterContent.content, /\bbaseUrl\b/);
+  assert.match(chapterContent.content, /payload\.url/);
+});
+
+test("纯 JavaScript 字段映射阅读 src/baseUrl 到香色运行时上下文", () => {
+  const converted = convertRule(
+    "@js:return src.match(/token=(\\w+)/)[1] + '@' + baseUrl;",
+    { responseType: "html" },
+  );
+
+  assert.doesNotMatch(converted, /\bsrc\b/);
+  assert.doesNotMatch(converted, /\bbaseUrl\b/);
+  assert.match(converted, /result\.match/);
+  assert.match(converted, /params\.responseUrl/);
+  assert.equal(hasUnsupportedLegadoRuntime(converted), false);
+});
+
+test("站点根地址模板映射为香色 host", () => {
+  const host = convertRequest("{{host}}/search?q={{key}}").requestInfo;
+  const current = convertRequest("{{getCurrentUrl()}}/search?q={{key}}").requestInfo;
+  const connected = convertRequest("{{java.connect(source.getKey()).raw().request().url()}}/search?q={{key}}").requestInfo;
+
+  for (const requestInfo of [host, current, connected]) {
+    assert.match(requestInfo, /config\.host/);
+    assert.doesNotMatch(requestInfo, /\{\{|getCurrentUrl|java\.connect/);
+    assert.equal(hasUnsupportedLegadoRuntime(requestInfo), false);
+  }
+});
+
+test("函数参数中的 key/page 不会被误写为对象属性", () => {
+  const converted = convertRequest("@js:return qmSearchUrl.call(this, key, page);").requestInfo;
+
+  assert.match(converted, /qmSearchUrl\.call\(this, params\.keyWord, params\.pageIndex\)/);
+  assert.doesNotMatch(converted, /key:\s*params|page:\s*params/);
+});
+
+test("对象属性值和纯表达式请求会生成合法返回值", () => {
+  const objectValue = convertRequest("@js:return JSON.stringify({index: page, keyword: key});").requestInfo;
+  const expression = convertRequest('@js:"https://api.example/search," + JSON.stringify({method:"POST",body:"q=" + key})').requestInfo;
+
+  assert.match(objectValue, /index:\s*params\.pageIndex/);
+  assert.doesNotMatch(objectValue, /index:\s*page:/);
+  assert.match(expression, /return\s*\(/);
+  assert.equal(hasUnsupportedLegadoRuntime(expression), false);
+});
+
+test("source.getKey POST 模板和 @js 静态 URL 包装还原为声明式请求", () => {
+  const sourceHost = convertRequest('{{source.getKey()}}/search,{"method":"POST","body":"q={{key}}&page={{page}}"}').requestInfo;
+  const wrapped = convertRequest('@js:https://api.example/search,{"method":"POST","body":"q={{key}}"}').requestInfo;
+
+  for (const requestInfo of [sourceHost, wrapped]) {
+    assert.match(requestInfo, /return\s+\{/);
+    assert.equal(hasUnsupportedLegadoRuntime(requestInfo), false);
+  }
+  assert.match(sourceHost, /config\.host/);
+});
+
+test("内嵌 Base64 正文段转换为香色纯 JavaScript 解码器", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "Base64 正文";
+  source.ruleContent.content = `<js>
+var blocks = result.match(/PHA\\+[A-Za-z0-9+\\/]+={0,2}/g);
+blocks.map(function (item) { return java.base64Decode(item); }).join('\\n');
+</js>`;
+  const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const content = sources["Base64 正文"].chapterContent.content;
+
+  assert.match(content, /\batob\b/);
+  assert.match(content, /decodeURIComponent/);
+  assert.doesNotMatch(content, /\bjava\./);
+  assert.equal(hasUnsupportedLegadoRuntime(content), false);
+});
+
+test("静态 Java DOM 脚本通过通用桥接器转换目录和正文", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "Java DOM 桥接";
+  source.ruleToc = {
+    chapterList: "@js:var doc=org.jsoup.Jsoup.parse(result);return doc.select('ol.chapters li');",
+    chapterName: "a@text",
+    chapterUrl: "a@href",
+  };
+  source.ruleContent.content = "@js:var doc=org.jsoup.Jsoup.parse(result);var el=doc.select('#chapter-content').first();return el.html();";
+
+  const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const converted = sources["Java DOM 桥接"];
+  const chapterPlan = decodeBridgePlan(converted.chapterList.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)?.[1]);
+  const textPlan = decodeBridgePlan(converted.chapterContent.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)?.[1]);
+
+  assert.match(chapterPlan.list, /chapters/);
+  assert.match(textPlan.fields.content.selector, /chapter-content/);
+  assert.equal(hasUnsupportedLegadoRuntime(converted.chapterContent.content), false);
+  assert.equal(validateXiangseSource(converted).ok, true);
+});
+
+test("缺少章节 URL 的单页内容使用当前详情页", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "同页单章节";
+  source.ruleToc = { chapterList: "article", chapterName: "h1@text" };
+
+  const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const converted = sources["同页单章节"];
+  const plan = decodeBridgePlan(converted.chapterList.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)?.[1]);
+
+  assert.equal(plan.fields.url.currentUrl, true);
+  assert.equal(validateXiangseSource(converted).ok, true);
+});
+
+test("单字段章节标题表达式可由目录桥接器提取", () => {
+  const plan = compileChapterBridgePlan({
+    host: "https://example.com",
+    responseFormatType: "json",
+    list: "$.items",
+    title: "@js:return '第' + result.no + '集';",
+    url: "$.url",
+  });
+
+  assert.equal(plan.fields.title.selector, "no");
 });
 
 test("JSON 音视频正文通过通用提取器兼容上游字段改名", () => {

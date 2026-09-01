@@ -138,6 +138,34 @@ function portableJavaGetStringRule(rule, warn) {
   return selector;
 }
 
+function portableEmbeddedBase64ContentRule(rule, warn) {
+  const source = String(rule ?? "");
+  if (!/\bjava\.base64Decode\s*\(/i.test(source)) return null;
+  let matcher = "";
+  if (/PHA\\?\+\[A-Za-z0-9/i.test(source)) {
+    matcher = "String(result || '').match(/PHA\\+[A-Za-z0-9+\\/]+={0,2}/g) || []";
+  } else if (/qsbs\\?\.bb\s*\(/i.test(source)) {
+    matcher = "Array.from(String(result || '').matchAll(/qsbs\\.bb\\(['\"]([^'\"]+)['\"]\\)/g), function (item) { return item[1]; })";
+  }
+  if (!matcher) return null;
+  warn("已将页面内嵌 Base64 正文段转换为香色纯 JavaScript 解码规则");
+  return [
+    "@js:",
+    `var blocks = ${matcher};`,
+    "var decodeUtf8 = function (value) {",
+    "  var binary = atob(String(value || ''));",
+    "  var escaped = '';",
+    "  for (var i = 0; i < binary.length; i++) {",
+    "    escaped += '%' + ('0' + binary.charCodeAt(i).toString(16)).slice(-2);",
+    "  }",
+    "  try { return decodeURIComponent(escaped); } catch (e) { return binary; }",
+    "};",
+    "return blocks.map(function (item) {",
+    "  try { return decodeUtf8(item); } catch (e) { return ''; }",
+    "}).filter(Boolean).join('\\n');",
+  ].join("\n");
+}
+
 /** 漫画正文：若规则取出的是图片 URL 列表，包成 <img> 供香色 comic 渲染。 */
 function wrapComicImageContent(contentRule) {
   if (!contentRule || /<img\s/i.test(contentRule)) return contentRule;
@@ -548,7 +576,7 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
 }
 
 function bridgeTextAction(action, bridgeBase, headers) {
-  if (!action?.content || /^@js:/i.test(String(action.content).trim())) return action;
+  if (!action?.content) return action;
   const plan = compileTextBridgePlan(action, { ...headers, ...(action.httpHeaders || {}) });
   if (!plan.fields.content) return action;
   const endpoint = bridgeEndpoint(bridgeBase, "text", plan);
@@ -1355,6 +1383,14 @@ function mapTocRules(rules, responseType, warningFor) {
   if (responseType === "html" && result.list && /(?:^|@)href(?:$|##)/i.test(String(rules.chapterUrl || ""))) {
     result.list = `(${result.list})[self::a[@href] or .//a[@href]]`;
   }
+  if (result.list && result.title && !result.url && (rules.chapterUrl === undefined || rules.chapterUrl === "")) {
+    result.url = [
+      "@js:",
+      "var q = (params && params.queryInfo) || {};",
+      'return String(params.responseUrl || q.detailUrl || q.url || result || config.host || "");',
+    ].join("\n");
+    warningFor("chapterUrl", rules.chapterUrl)("目录未声明章节 URL，已将当前详情页作为章节地址（同页章节）");
+  }
   if (reverseChapters) result.reverseChapters = true;
   return result;
 }
@@ -2018,7 +2054,10 @@ function convertOne(source, warnings, options = {}) {
     detailWarningFor("tocUrl", detailRules.tocUrl)("HTML 详情页的独立目录链接已改由通用目录跳转器解析，避免依赖非标准 queryInfo.tocUrl");
   }
 
-  const portableContent = portableJavaGetStringRule(
+  const portableContent = portableEmbeddedBase64ContentRule(
+    contentRules.content,
+    contentWarningFor("content", contentRules.content),
+  ) ?? portableJavaGetStringRule(
     contentRules.content,
     contentWarningFor("content", contentRules.content),
   );
@@ -2129,7 +2168,7 @@ function convertOne(source, warnings, options = {}) {
   const mediaRuleNeedsServer = contentResponseType === "json"
     || hasSourceRegex
     || chapterRequestsWebView
-    || /(?:\bjava\.|\bPackages\b|\bandroid\.|\bsource\.|\bbook\.|\bjavaScript\.)/i
+    || /(?:\bjava\.|\bPackages\b|\bandroid\.|\bsource\.|\bbook\.|\bjavaScript\.|\bbaseUrl\b)/i
       .test(String(contentRules.content || ""))
     || mediaPlanHasResolution(mediaExtractionPlan)
     || (mediaExtractionPlan?.properties || []).some((name) => /(?:path|url|uri|play|track|src|stream)/i.test(name));
@@ -2236,7 +2275,10 @@ function convertOne(source, warnings, options = {}) {
   // apply replaceRegex / replaceRegex array onto content field. 2.56.1 的
   // 可用参考源统一用 `selector||@js:` 传递选择器结果。
   const replaceRegex = contentRules.replaceRegex ?? contentRules.replace;
-  if (converted.chapterContent.content && replaceRegex) {
+  // Media/image adapters already normalize their JSON payload server-side.
+  // Appending Legado's text replacement script after that payload creates a
+  // second `||@js:` block and makes the whole content rule invalid in Xiangse.
+  if (resolvedType === "text" && converted.chapterContent.content && replaceRegex) {
     const patterns = Array.isArray(replaceRegex) ? replaceRegex : [replaceRegex];
     const body = patterns
       .map((pattern) => compileReplaceRegexStatement(String(pattern), contentWarningFor("replaceRegex", pattern)))

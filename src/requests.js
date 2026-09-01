@@ -259,6 +259,11 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
 
   if (/^@js:/i.test(source) || /^<js>/i.test(source)) {
     const normalized = source.replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
+    const declarative = normalized.replace(/^@js:\s*/i, "").trim();
+    if (/^https?:\/\/[^\s,]+\s*,\s*\{/i.test(declarative)) {
+      warn("已将 @js 包装的静态 URL 请求还原为声明式请求");
+      return convertRequest(declarative, { headers, warn, fallback });
+    }
     const rewritten = rewriteLegadoJavaScript(normalized);
     if (rewritten !== normalized) warn("已将阅读 JavaScript 中的分页、关键词或结果字段模板转换为香色运行时表达式");
     else warn("阅读请求中的 JavaScript/模板表达式无法可靠翻译，已保留原规则供人工修改");
@@ -311,7 +316,10 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
     return { requestInfo: lines.join("\n"), ...encoding, ...actionHeaders };
   }
 
-  if (/^\{\{/i.test(url) && !/\{\{\s*(?:key|page|Get|get)/i.test(url)) {
+  const hasUnsupportedTemplate = [...url.matchAll(/\{\{\s*([\s\S]*?)\s*\}\}/g)].some((match) => (
+    !legadoTemplateExpression(match[1]) && !/^(?:Get|get)\s*\(/i.test(match[1])
+  ));
+  if (/^\{\{/i.test(url) && hasUnsupportedTemplate) {
     warn("阅读请求中的 JavaScript/模板表达式无法可靠翻译，已保留原规则供人工修改");
     return { requestInfo: `@js:\n${source}` };
   }

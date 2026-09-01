@@ -45,7 +45,10 @@ export function legadoTemplateExpression(value) {
   if (/^java\.(?:t2s|s2t)\(\s*key\s*\)$/i.test(expression)) return "params.keyWord";
   if (/^(?:java\.)?encodeURI(?:Component)?\(\s*key\s*\)$/i.test(expression)) return "encodeURIComponent(params.keyWord)";
   if (/^source\.(?:bookSourceUrl|key|getKey\s*\(\s*\))$/i.test(expression)) return "config.host";
-  if (/^Url\s*\(\s*\)$/i.test(expression)) return "config.host";
+  if (/^(?:host|(?:getCurrentUrl|Url)\s*\(\s*\))$/i.test(expression)) return "config.host";
+  if (/^java\.connect\(\s*source\.getKey\(\s*\)\s*\)\.raw\(\s*\)\.request\(\s*\)\.url\(\s*\)$/i.test(expression)) {
+    return "config.host";
+  }
   if (/^[\d\s()+*/%.-]*\bpage\b[\d\s()+*/%.-]*$/i.test(expression)) {
     return expression.replace(/\bpage\b/gi, "params.pageIndex");
   }
@@ -116,6 +119,32 @@ function maskedJavaScript(value) {
     .replace(/\/\/[^\r\n]*/g, (match) => " ".repeat(match.length));
 }
 
+function insideObjectLiteral(masked, index) {
+  const stack = [];
+  const pairs = { ")": "(", "]": "[", "}": "{" };
+  for (let cursor = 0; cursor < index; cursor += 1) {
+    const token = masked[cursor];
+    if (token === "(" || token === "[" || token === "{") {
+      stack.push(token);
+    } else if (pairs[token] && stack.at(-1) === pairs[token]) {
+      stack.pop();
+    }
+  }
+  return stack.at(-1) === "{";
+}
+
+function rewrittenIdentifier(masked, index, name, replacement) {
+  const before = masked.slice(0, index);
+  const after = masked.slice(index + name.length);
+  const previous = before.match(/\S\s*$/)?.[0]?.trim() || "";
+  const next = after.match(/^\s*\S/)?.[0]?.trim() || "";
+  if (previous === "." || next === ":") return "";
+  const shorthand = (previous === "{" || previous === ",")
+    && insideObjectLiteral(masked, index)
+    && /^\s*[,}]/.test(after);
+  return shorthand ? `${name}: ${replacement}` : replacement;
+}
+
 function rewriteBareRuntimeIdentifiers(value) {
   let source = String(value || "");
   for (const [name, replacement] of [["page", "params.pageIndex"], ["key", "params.keyWord"]]) {
@@ -124,13 +153,33 @@ function rewriteBareRuntimeIdentifiers(value) {
     const edits = [];
     for (const match of masked.matchAll(new RegExp(`\\b${name}\\b`, "g"))) {
       const index = match.index;
-      const before = masked.slice(0, index);
-      const after = masked.slice(index + name.length);
-      const previous = before.match(/\S\s*$/)?.[0]?.trim() || "";
-      const next = after.match(/^\s*\S/)?.[0]?.trim() || "";
-      if (previous === "." || next === ":") continue;
-      const shorthand = /(?:^|[{,])\s*$/.test(before) && /^\s*[,}]/.test(after);
-      edits.push({ index, text: shorthand ? `${name}: ${replacement}` : replacement });
+      const text = rewrittenIdentifier(masked, index, name, replacement);
+      if (text) edits.push({ index, text });
+    }
+    for (const edit of edits.reverse()) {
+      source = `${source.slice(0, edit.index)}${edit.text}${source.slice(edit.index + name.length)}`;
+    }
+  }
+  return source;
+}
+
+function rewriteImplicitRuntimeAliases(value) {
+  let source = String(value || "");
+  const aliases = [
+    ["src", "result"],
+    [
+      "baseUrl",
+      '(params.responseUrl || (params.queryInfo && (params.queryInfo.chapterUrl || params.queryInfo.url || params.queryInfo.detailUrl)) || config.host || "")',
+    ],
+  ];
+  for (const [name, replacement] of aliases) {
+    let masked = maskedJavaScript(source);
+    if (new RegExp(`\\b(?:var|let|const)\\s+${name}\\b|function\\s*\\([^)]*\\b${name}\\b`).test(masked)) continue;
+    const edits = [];
+    for (const match of masked.matchAll(new RegExp(`\\b${name}\\b`, "g"))) {
+      const index = match.index;
+      const text = rewrittenIdentifier(masked, index, name, replacement);
+      if (text) edits.push({ index, text });
     }
     for (const edit of edits.reverse()) {
       source = `${source.slice(0, edit.index)}${edit.text}${source.slice(edit.index + name.length)}`;
@@ -147,6 +196,15 @@ function ensureJavaScriptReturn(value) {
   let body = source.slice(marker + 4).trim();
   if (!body || /\breturn\b/.test(maskedJavaScript(body))) return source;
 
+  try {
+    // A single expression may contain object literals, callbacks, or template
+    // strings. Compile it before looking for a trailing statement.
+    new Function("config", "params", "result", `return (${body});`);
+    return `${prefix}\nreturn (${body});`;
+  } catch {
+    // Continue with statement-list handling below.
+  }
+
   const finalValue = body.match(/(^|[;\n])(\s*)([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*;?\s*$/);
   if (finalValue && finalValue.index !== undefined) {
     const start = finalValue.index + finalValue[1].length + finalValue[2].length;
@@ -154,13 +212,27 @@ function ensureJavaScriptReturn(value) {
     return `${prefix}\n${body}`;
   }
 
-  if (!/[;{}]|\b(?:if|for|while|try|catch|var|let|const|function)\b/.test(maskedJavaScript(body))) {
+  const masked = maskedJavaScript(body);
+  const stack = [];
+  const pairs = { ")": "(", "]": "[", "}": "{" };
+  let boundary = 0;
+  for (let index = 0; index < masked.length; index += 1) {
+    const token = masked[index];
+    if (token === "(" || token === "[" || token === "{") stack.push(token);
+    else if (pairs[token] && stack.at(-1) === pairs[token]) {
+      stack.pop();
+      if (!stack.length && token === "}") boundary = index + 1;
+    } else if (token === ";" && !stack.length) boundary = index + 1;
+  }
+  const finalExpression = body.slice(boundary).trim().replace(/^;+\s*/, "").replace(/;\s*$/, "");
+  if (finalExpression) {
+    const start = body.lastIndexOf(finalExpression);
+    const candidate = `${body.slice(0, start)}return (${finalExpression});`;
     try {
-      // Compile only: source code is never evaluated here.
-      new Function("config", "params", "result", `return (${body});`);
-      return `${prefix}\nreturn (${body});`;
+      new Function("config", "params", "result", candidate);
+      return `${prefix}\n${candidate}`;
     } catch {
-      return source;
+      // Keep the original script when the final statement is not an expression.
     }
   }
   return source;
@@ -194,12 +266,13 @@ export function rewriteLegadoJavaScript(value) {
     .replace(/^\s*(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie)\s*\([^;\n]*\)\s*;?\s*$/gim, "")
     .replace(/^\s*java\.put\s*\(\s*['"][^'"]+['"]\s*,\s*[^;\n]+\)\s*;?\s*$/gim, "");
   source = rewriteBareRuntimeIdentifiers(source);
+  source = rewriteImplicitRuntimeAliases(source);
   return ensureJavaScriptReturn(source);
 }
 
 export function hasUnsupportedLegadoRuntime(value) {
   const source = String(value || "");
-  if (/\b(?:java\.|Packages\b|android\.|org\.jsoup|source\.(?:get|set|key|variable)|book\.(?:name|author|kind|url)|cookie\.|javaScript\.)|<js>|\{\{|@(?:put|get):|\{\$\./i.test(source)) {
+  if (/\b(?:java\.|Packages\b|android\.|org\.jsoup|source\.|book\.(?:name|author|kind|url)|cookie\.|javaScript\.)|<js>|\{\{|@(?:put|get):|\{\$\./i.test(source)) {
     return true;
   }
   const marker = source.search(/@js:/i);

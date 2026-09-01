@@ -1,5 +1,6 @@
 import { JSDOM } from "jsdom";
 import { isXiangseGbkEncode } from "./charset.js";
+import { convertRule } from "./selectors.js";
 
 const MAX_PLAN_BYTES = 24 * 1024;
 const FIELD_NAMES = new Set([
@@ -535,6 +536,37 @@ function inferredScriptField(rule, preferredNames = []) {
     const field = fields.find((name) => preferred.test(name));
     if (field) return field;
   }
+  const uniqueFields = [...new Set(fields)];
+  if (uniqueFields.length === 1) return uniqueFields[0];
+  return "";
+}
+
+function inferredDomScriptSelector(rule, preferredNames = []) {
+  const source = String(rule || "").trim();
+  if (!/^@js:/i.test(source)) return rule;
+  const selectors = [];
+  const patterns = [
+    /\bjava\.getString(?:List)?\s*\(\s*(['"])([^'"\\\r\n]+)\1/gi,
+    /\bjava\.getElements?\s*\(\s*(['"])([^'"\\\r\n]+)\1/gi,
+    /\.select\s*\(\s*(['"])([^'"\\\r\n]+)\1\s*\)/gi,
+  ];
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const selector = String(match[2] || "").trim();
+      if (!selector || selector.includes("{{") || selector.includes("${")) continue;
+      selectors.push(selector);
+    }
+  }
+  const ranked = [...new Set(selectors)].sort((left, right) => {
+    const score = (value) => preferredNames.reduce((total, pattern, index) => (
+      total + (pattern.test(value) ? preferredNames.length - index : 0)
+    ), 0);
+    return score(right) - score(left);
+  });
+  for (const selector of ranked) {
+    const converted = convertRule(selector, { responseType: "html" });
+    if (converted && !/^@js:/i.test(converted)) return converted;
+  }
   return "";
 }
 
@@ -550,7 +582,7 @@ export function compileBookBridgePlan(action, headers = {}) {
     host: action.host,
     responseType: action.responseFormatType,
     charset: planCharset(action),
-    list: action.list,
+    list: inferredDomScriptSelector(action.list, [/book/i, /item/i, /list/i, /article/i]),
     fields: {
       name: inferredScriptField(action.bookName, [/^(?:book)?name$/i, /title/i, /username/i]),
       url: inferredScriptField(action.detailUrl, [/url/i, /id/i, /username/i]),
@@ -596,13 +628,14 @@ export function compileChapterBridgePlan(action, { tocSelector = "", headers = {
     host: action.host,
     responseType: action.responseFormatType,
     charset: planCharset(action),
-    list: action.list,
+    list: inferredDomScriptSelector(action.list, [/chapter/i, /catalog/i, /directory/i, /content/i, /list/i]),
     tocSelector,
     reverse: Boolean(reverse || action.reverseChapters || action.reverse),
     fields: {
       title: inferredScriptField(action.title, [/title/i, /name/i, /chapter/i])
+        || inferredDomScriptSelector(action.title, [/title/i, /name/i, /text/i, /alt/i])
         || (/queryInfo\.(?:bookName|name)/i.test(String(action.title || "")) ? { constant: "播放" } : ""),
-      url: urlRule,
+      url: urlRule || inferredDomScriptSelector(action.url, [/href/i, /url/i, /src/i]),
       updateTime: action.updateTime,
     },
     headers,
@@ -615,7 +648,12 @@ export function compileTextBridgePlan(action, headers = {}) {
     host: action.host,
     responseType: action.responseFormatType,
     charset: planCharset(action),
-    fields: { content: action.content },
+    fields: {
+      content: inferredDomScriptSelector(
+        action.content,
+        [/content/i, /chapter/i, /article/i, /read/i, /text/i, /txt/i, /body/i],
+      ),
+    },
     headers,
   });
 }

@@ -391,6 +391,38 @@ test("快速预检超时后使用较长时限二次确认", async (context) => {
   assert.deepEqual(result.skipped, []);
 });
 
+test("预检三次超时后只跳过该站点，不中断合集转换", async (context) => {
+  let requests = 0;
+  const upstream = createServer((_request, response) => {
+    requests += 1;
+    setTimeout(() => {
+      if (response.destroyed) return;
+      response.writeHead(200, { "Content-Type": "text/plain" });
+      response.end("too late");
+    }, 100);
+  });
+  const upstreamBase = await listen(upstream);
+  context.after(() => close(upstream));
+  const result = await filterReachableSources([{
+    ...structuredClone(source),
+    bookSourceName: "连续超时",
+    bookSourceUrl: upstreamBase,
+  }], {
+    ...testServerConfig(),
+    allowPrivateNetworks: true,
+    preflightSources: true,
+    preflightTimeoutMs: 10,
+    preflightConfirmTimeoutMs: 10,
+    preflightRetries: 3,
+    preflightConcurrency: 1,
+  });
+  // Each retry may try the source's declared entry, home page, and protocol
+  // fallback. The contract is three retry rounds, not one fixed URL count.
+  assert.ok(requests >= 3);
+  assert.deepEqual(result.input, []);
+  assert.deepEqual(result.skipped, [{ source: "连续超时", reason: "上游站点不可访问" }]);
+});
+
 test("POST 表单可在 302 后切换 GET 且不会重放请求体", async (context) => {
   const requests = [];
   const upstream = createServer((request, response) => {
