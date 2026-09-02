@@ -85,6 +85,20 @@ function isDetailUrlAlias(rule) {
   return /^(?:baseUrl|-|%@result)$/i.test(value);
 }
 
+function isDirectMediaContentRule(rule) {
+  const value = String(rule ?? "").trim();
+  if (!value) return false;
+  if (/^(?:@js:|<js>)?\s*(?:return\s+)?(?:baseUrl|result)\s*;?\s*(?:<\/js>)?$/i.test(value)) {
+    return true;
+  }
+
+  const variable = value.match(
+    /(?:^|[;{}])\s*(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*String\(\s*baseUrl\s*\|\|\s*['"]{2}\s*\)\s*;/,
+  )?.[1];
+  if (!variable) return false;
+  return new RegExp(`\\breturn\\s+${variable.replace(/[$]/g, "\\$")}\\s*;`).test(value);
+}
+
 function normalizeLegadoReplaceRegex(pattern) {
   let source = String(pattern ?? "").trim();
   let replacement = "";
@@ -230,7 +244,6 @@ function directMediaContent(imageProxyBase = "") {
     'if (!url && typeof result === "string" && /^(?:https?:)?\\/\\//i.test(result.trim())) url = result.trim();',
     'if (url.indexOf("//") === 0) url = "https:" + url;',
     'else if (url && !/^https?:\\/\\//i.test(url)) url = config.host + (url.charAt(0) === "/" ? url : "/" + url);',
-    "try { url = encodeURI(decodeURI(url)); } catch (e) { url = encodeURI(url); }",
     "return JSON.stringify({",
     "  url: url,",
     "  httpHeaders: (config && config.httpHeaders) || {},",
@@ -248,7 +261,6 @@ function directMediaChapterContent(host, imageProxyBase) {
     content: [
       "$.url||@js:",
       'var url = String(result || "").trim();',
-      "try { url = encodeURI(decodeURI(url)); } catch (e) { url = encodeURI(url); }",
       "return JSON.stringify({",
       "  url: url,",
       "  httpHeaders: (config && config.httpHeaders) || {},",
@@ -727,21 +739,81 @@ function buildRegexTocRequestInfo(tocUrl) {
   ].join("\n");
 }
 
+function staticJavaScriptString(value) {
+  const source = String(value || "");
+  if (source.length < 2 || source[0] !== source.at(-1) || !["\"", "'"].includes(source[0])) return null;
+  try {
+    if (source[0] === "\"") return JSON.parse(source);
+    return source.slice(1, -1)
+      .replace(/\\'/g, "'")
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
+      .replace(/\\t/g, "\t")
+      .replace(/\\\\/g, "\\");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Legado detail JSON scripts often build a menu URL from one response field:
+ * `'/api/book/' + JSON.parse(result).id + '/chapters'`. Xiangse's chapter
+ * action receives the detail URL, so recover that same field from its path or
+ * query string and preserve the static URL template.
+ */
+function buildDetailJsonScriptTocRequestInfo(tocUrl) {
+  const literal = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
+  const source = String(tocUrl || "").trim()
+    .replace(/^@js:\s*/i, "")
+    .replace(/^return\s+/i, "")
+    .replace(/;\s*$/, "")
+    .trim();
+  const match = source.match(new RegExp(
+    `^\\(?\\s*(${literal})\\s*\\+\\s*(?:JSON\\.parse\\(\\s*result\\s*\\)|result)\\.([A-Za-z_$][\\w$]*)\\s*\\+\\s*(${literal})\\s*\\)?$`,
+  ));
+  if (!match) return "";
+  const prefix = staticJavaScriptString(match[1]);
+  const suffix = staticJavaScriptString(match[3]);
+  if (prefix === null || suffix === null || (!prefix && !suffix)) return "";
+  const field = match[2];
+  return [
+    "@js:",
+    "var q = (typeof params !== \"undefined\" && params.queryInfo) || {};",
+    "var u = String(q.detailUrl || q.url || q.chapterUrl || \"\");",
+    "if (!u && typeof result === \"string\") u = result;",
+    "if (!u && result && typeof result === \"object\") u = String(result.detailUrl || result.url || \"\");",
+    `var id = String(q[${JSON.stringify(field)}] || \"\").trim();`,
+    `var marker = ${JSON.stringify(prefix)};`,
+    "if (!id && marker) {",
+    "  var at = u.indexOf(marker);",
+    "  if (at >= 0) id = u.slice(at + marker.length).split(/[\\/?#]/)[0];",
+    "}",
+    `if (!id) { var queryMatch = u.match(new RegExp(\"[?&]${field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}=([^&#]+)\", \"i\")); if (queryMatch) id = queryMatch[1]; }`,
+    "if (!id) id = u.replace(/[?#][\\s\\S]*$/, \"\").replace(/\\/+$/, \"\").split(\"/\").pop() || \"\";",
+    "try { id = decodeURIComponent(id); } catch (e) {}",
+    "if (!id) return \"\";",
+    `var path = ${JSON.stringify(prefix)} + encodeURIComponent(id) + ${JSON.stringify(suffix)};`,
+    "if (/^https?:\\/\\//i.test(path)) return path;",
+    "return String(config.host || \"\").replace(/\\/$/, \"\") + (path.charAt(0) == \"/\" ? path : \"/\" + path);",
+  ].join("\n");
+}
+
 function buildJsonApiTocRequestInfo(tocUrl) {
   const { url: raw } = splitLegadoUrlOptions(tocUrl);
   if (!/^https?:\/\//i.test(raw)) return "";
-  if (!/\{\{\s*\$\.[A-Za-z_$][\w$]*\s*\}\}|\{(?:\$\.)?[A-Za-z_$][\w$]*\}/.test(raw)) return "";
+  const fieldPath = "[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*";
+  if (!new RegExp(`\\{\\{\\s*\\$.${fieldPath}\\s*\\}\\}|\\{(?:\\$\\.)?${fieldPath}\\}`).test(raw)) return "";
 
   let template = raw
     .replace(/\{\{\s*page\s*\}\}/gi, "__PAGE__")
     .replace(/([?&](?:pageNum|pageIndex|page)=)(?:1|\{\{\s*page\s*\}\})/gi, "$1__PAGE__");
 
   const idFields = [];
-  template = template.replace(/\{\{\s*\$\.([A-Za-z_$][\w$]*)\s*\}\}/g, (_, field) => {
+  template = template.replace(/\{\{\s*\$\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\}\}/g, (_, field) => {
     if (!idFields.includes(field)) idFields.push(field);
     return "__ID__";
   });
-  template = template.replace(/\{(?:\$\.)?([A-Za-z_$][\w$]*)\}/g, (_, field) => {
+  template = template.replace(/\{(?:\$\.)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\}/g, (_, field) => {
     if (!idFields.includes(field)) idFields.push(field);
     return "__ID__";
   });
@@ -763,6 +835,10 @@ function buildJsonApiTocRequestInfo(tocUrl) {
     "    || u.match(/[?&]id=(\\d{1,12})(?!\\d)/i)",
     "    || u.match(/\\/(\\d{1,12})(?:\\/?(?:\\?|$))/);",
     "  if (m) id = m[1];",
+    "  if (!id) {",
+    "    var pathIds = u.replace(/[?#][\\s\\S]*$/, \"\").match(/\\/\\d{1,12}(?=\\/|$)/g) || [];",
+    "    if (pathIds.length) id = pathIds[pathIds.length - 1].slice(1);",
+    "  }",
     "}",
     "if (!id) return \"\";",
     "var page = String((params && params.pageIndex) || 1);",
@@ -776,7 +852,7 @@ function buildJsonApiTocRequestInfo(tocUrl) {
 function buildJsonApiTocNextPageUrl(tocUrl) {
   const { url: raw } = splitLegadoUrlOptions(tocUrl);
   if (!/^https?:\/\//i.test(raw)) return "";
-  if (!/\{\{\s*\$\.[A-Za-z_$][\w$]*\s*\}\}|\{(?:\$\.)?[A-Za-z_$][\w$]*\}/.test(raw)) return "";
+  if (!/\{\{\s*\$\.[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*\}\}|\{(?:\$\.)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\}/.test(raw)) return "";
   const requestInfo = buildJsonApiTocRequestInfo(tocUrl);
   if (!requestInfo) return "";
   return [
@@ -1399,6 +1475,55 @@ function normalizeMappedJsonTocRules(rules = {}) {
   const script = String(rules.chapterList || "");
   const embedded = script.match(/result\.match\(\/([A-Za-z_$][\w$]*)\\s\*=/);
   if (embedded) return { ...rules, chapterList: `@embedded-json-array:${embedded[1]}` };
+  const arrayLoop = script.match(
+    /(?:var\s+)?([A-Za-z_$][\w$]*)\s*=\s*[A-Za-z_$][\w$]*\.([A-Za-z_$][\w$]*)\s*\[\s*[A-Za-z_$][\w$]*\s*\]/,
+  );
+  if (arrayLoop) {
+    const item = arrayLoop[1];
+    const collection = arrayLoop[2];
+    const literal = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
+    const urlTemplate = script.match(new RegExp(
+      `\\burl\\s*:\\s*(${literal})\\s*\\+\\s*encodeURIComponent\\(\\s*${item}\\.([A-Za-z_$][\\w$]*)`,
+    ));
+    const titleField = script.match(new RegExp(
+      `\\btitle\\s*:\\s*${item}\\.([A-Za-z_$][\\w$]*)`,
+    ))?.[1];
+    const prefix = urlTemplate ? staticJavaScriptString(urlTemplate[1]) : null;
+    if (titleField && urlTemplate?.[2] && prefix && /^https?:\/\//i.test(prefix)) {
+      return {
+        ...rules,
+        chapterList: `$.data.${collection}||$.${collection}`,
+        chapterName: `$.${titleField}`,
+        chapterUrl: `${prefix}{{$.${urlTemplate[2]}}}`,
+      };
+    }
+  }
+  const splitSource = script.match(/\b([A-Za-z_$][\w$]*)\.split\(\s*(['"])([^'"\\]{1,16})\2\s*\)/);
+  const sourceVariable = splitSource?.[1] || "";
+  const sourceField = sourceVariable && script.match(new RegExp(
+    `(?:var\\s+)?${sourceVariable}\\s*=\\s*[A-Za-z_$][\\w$]*\\.([A-Za-z_$][\\w$]*)\\s*(?:\\|\\||;)`,
+  ))?.[1];
+  const entrySplit = splitSource && script.slice(splitSource.index + splitSource[0].length).match(
+    /\.split\(\s*(['"])([^'"\\]{1,16})\1\s*\)/,
+  );
+  const pairOffset = splitSource && entrySplit
+    ? splitSource.index + splitSource[0].length + entrySplit.index + entrySplit[0].length
+    : 0;
+  const pairSplit = entrySplit && script.slice(pairOffset).match(
+    /(?:indexOf|split)\(\s*(['"])([^'"\\]{1,8})\1\s*\)/,
+  );
+  if (sourceField && entrySplit?.[2] && pairSplit?.[2]) {
+    return {
+      ...rules,
+      chapterList: [
+        "@json-media-pairs",
+        encodeURIComponent(sourceField),
+        encodeURIComponent(splitSource[3]),
+        encodeURIComponent(entrySplit[2]),
+        encodeURIComponent(pairSplit[2]),
+      ].join(":"),
+    };
+  }
   const mapping = script.match(/\.map\(\s*([A-Za-z_$][\w$]*)\s*=>\s*\(\s*\{([\s\S]*?)\}\s*\)\s*\)/);
   if (!mapping) return rules;
   const aliases = new Map();
@@ -2003,6 +2128,7 @@ function convertOne(source, warnings, options = {}) {
       chapterListRequestInfo = runtimeResultRequestInfo();
     } else {
       const absoluteTocRequest = buildJsonApiTocRequestInfo(detailRules.tocUrl)
+        || buildDetailJsonScriptTocRequestInfo(detailRules.tocUrl)
         || buildRegexTocRequestInfo(detailRules.tocUrl);
       if (absoluteTocRequest) {
         chapterListRequestInfo = absoluteTocRequest;
@@ -2175,9 +2301,7 @@ function convertOne(source, warnings, options = {}) {
   const forceWebViewMedia = Boolean(source?.read2xsgg?.forceWebViewMedia);
   const mediaProxy = normalizeMediaProxy(source?.read2xsgg?.mediaProxy);
   const hasMediaChapterUrl = Boolean(tocRules.chapterUrl && String(tocRules.chapterUrl).trim() !== "-");
-  const trivialDirectMediaContent = !hasSourceRegex
-    && /^(?:@js:|<js>)?\s*(?:return\s+)?(?:baseUrl|result)\s*;?\s*(?:<\/js>)?$/i
-      .test(String(contentRules.content || "").trim());
+  const trivialDirectMediaContent = !hasSourceRegex && isDirectMediaContentRule(contentRules.content);
   const useDirectChapterMedia = hasMediaChapterUrl && (!contentRules.content || trivialDirectMediaContent);
   if ((resolvedType === "audio" || resolvedType === "video") && useDirectChapterMedia) {
     converted.chapterContent = directMediaChapterContent(host, options.imageProxyBase)

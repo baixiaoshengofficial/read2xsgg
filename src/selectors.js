@@ -629,7 +629,8 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   if (typeof rule !== "string") return String(rule);
   let trimmed = rule.trim();
   if (!trimmed) return "";
-  if (/^@embedded-json-array:[A-Za-z_$][\w$]*$/.test(trimmed)) return trimmed;
+  if (/^@embedded-json-array:[A-Za-z_$][\w$]*$/.test(trimmed)
+    || /^@json-media-pairs:[^:]+:[^:]+:[^:]+:[^:]+$/.test(trimmed)) return trimmed;
 
   if (/\{\{\s*\$\.\.[A-Za-z_$]/.test(trimmed)) {
     trimmed = trimmed.replace(/\{\{\s*\$\.\.([A-Za-z_$][\w$]*)\s*\}\}/g, (_match, field) => `{{$.${field}}}`);
@@ -785,6 +786,21 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
     }
   }
 
+  // Legado `%%` interleaves list results by index. It is commonly used when
+  // one API response has more than one possible item shape, so preserving it
+  // as a first-class bridge selector also makes an empty branch harmless.
+  if (trimmed.includes("%%")) {
+    const parts = splitTopLevel(trimmed, "%%");
+    if (parts.length > 1) {
+      const convertedParts = parts.map((part) => convertRule(part, { responseType, warn }));
+      if (responseType === "json" && convertedParts.every(Boolean)) {
+        warn("阅读的 JSON %%（按索引交错匹配）已转换为数组交错选择器");
+        return `@json-interleave:${convertedParts.map((part) => encodeURIComponent(part)).join(",")}`;
+      }
+      return convertedParts.filter(Boolean).join("||");
+    }
+  }
+
   // Legado `&&` joins all matched texts with newline; approximate with XPath union.
   if (trimmed.includes("&&")) {
     const parts = trimmed.split("&&").map((part) => part.trim()).filter(Boolean);
@@ -845,7 +861,7 @@ export function inferResponseType(rules = {}) {
   const collectionRule = [rules.bookList, rules.chapterList].find((value) => (
     typeof value === "string" && value.trim()
   ));
-  if (collectionRule && /^\s*(?:@?json:|\$[.[]|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*\[\*\])/i.test(collectionRule)) return "json";
+  if (collectionRule && /^\s*(?:@?json:|@json-media-pairs:|\$[.[]|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*\[\*\])/i.test(collectionRule)) return "json";
 
   const explicitJsonCount = values.filter((value) => (
     /^\s*(?:@?json:|\$[.[])/i.test(value) || /\{\{\s*\$\.[^}]+\}\}/.test(value)

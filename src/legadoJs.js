@@ -194,13 +194,32 @@ function ensureJavaScriptReturn(value) {
   if (marker < 0) return source;
   const prefix = source.slice(0, marker + 4);
   let body = source.slice(marker + 4).trim();
-  if (!body || /\breturn\b/.test(maskedJavaScript(body))) return source;
+  if (!body) return source;
+  const maskedBody = maskedJavaScript(body);
+  const stackForReturn = [];
+  const returnPairs = { ")": "(", "]": "[", "}": "{" };
+  let hasTopLevelReturn = false;
+  for (let index = 0; index < maskedBody.length; index += 1) {
+    const token = maskedBody[index];
+    if (token === "(" || token === "[" || token === "{") stackForReturn.push(token);
+    else if (returnPairs[token] && stackForReturn.at(-1) === returnPairs[token]) stackForReturn.pop();
+    else if (!stackForReturn.length
+      && maskedBody.startsWith("return", index)
+      && !/[\w$]/.test(maskedBody[index - 1] || "")
+      && !/[\w$]/.test(maskedBody[index + 6] || "")) {
+      hasTopLevelReturn = true;
+      break;
+    }
+  }
+  if (hasTopLevelReturn) return source;
 
+  const expressionBody = body.replace(/;\s*$/, "");
+  const assignedResult = expressionBody.match(/^result\s*=\s*([\s\S]+)$/)?.[1] || expressionBody;
   try {
     // A single expression may contain object literals, callbacks, or template
     // strings. Compile it before looking for a trailing statement.
-    new Function("config", "params", "result", `return (${body});`);
-    return `${prefix}\nreturn (${body});`;
+    new Function("config", "params", "result", `return (${assignedResult});`);
+    return `${prefix}\nreturn (${assignedResult});`;
   } catch {
     // Continue with statement-list handling below.
   }

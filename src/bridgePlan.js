@@ -188,7 +188,7 @@ function normalizeField(rule) {
         pattern: "^([\\s\\S]+)$",
         prefix,
         suffix,
-        hostPrefix: Boolean(prefix && !/^https?:\/\//i.test(prefix)),
+        hostPrefix: /^(?:\/|\.{1,2}\/)/.test(prefix),
       };
     } catch {
       matchTemplate = null;
@@ -470,21 +470,24 @@ function inferredScriptField(rule, preferredNames = []) {
   }
   const multiFieldUrl = multiFieldResultUrlTemplate(source);
   if (multiFieldUrl) return multiFieldUrl;
-  const threePart = source.match(
-    /return\s+\(?\s*("(?:\\.|[^"\\])*")\s*\+\s*String\(result\.([A-Za-z_$][\w$]*)\)\s*\+\s*("(?:\\.|[^"\\])*")\s*\)?\s*;/i,
-  );
+  const stringLiteral = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
+  const threePart = source.match(new RegExp(
+    `return\\s+\\(?\\s*(${stringLiteral})\\s*\\+\\s*(?:String\\(\\s*result\\.([A-Za-z_$][\\w$]*)\\s*\\)|result\\.([A-Za-z_$][\\w$]*))\\s*\\+\\s*(${stringLiteral})\\s*\\)?\\s*;`,
+    "i",
+  ));
   if (threePart) {
     try {
-      const prefix = JSON.parse(threePart[1]);
-      const suffix = JSON.parse(threePart[3]);
+      const prefix = staticStringLiteral(threePart[1]);
+      const suffix = staticStringLiteral(threePart[4]);
+      const hostPrefix = /^(?:\/|\.{1,2}\/)/.test(prefix);
       return {
-        selector: threePart[2],
-        hostPrefix: Boolean(prefix && !/^https?:\/\//i.test(prefix)),
+        selector: threePart[2] || threePart[3],
+        hostPrefix,
         matchTemplate: {
           pattern: "^([\\s\\S]+)$",
           prefix,
           suffix,
-          hostPrefix: Boolean(prefix && !/^https?:\/\//i.test(prefix)),
+          hostPrefix,
         },
       };
     } catch {
@@ -497,14 +500,15 @@ function inferredScriptField(rule, preferredNames = []) {
   if (prefixOnly) {
     try {
       const prefix = JSON.parse(prefixOnly[1]);
+      const hostPrefix = /^(?:\/|\.{1,2}\/)/.test(prefix);
       return {
         selector: prefixOnly[2],
-        hostPrefix: Boolean(prefix && !/^https?:\/\//i.test(prefix)),
+        hostPrefix,
         matchTemplate: {
           pattern: "^([\\s\\S]+)$",
           prefix,
           suffix: "",
-          hostPrefix: Boolean(prefix && !/^https?:\/\//i.test(prefix)),
+          hostPrefix,
         },
       };
     } catch {
@@ -567,6 +571,20 @@ function inferredDomScriptSelector(rule, preferredNames = []) {
     const converted = convertRule(selector, { responseType: "html" });
     if (converted && !/^@js:/i.test(converted)) return converted;
   }
+  // Some list fields parse the serialized item with a regex instead of using
+  // Legado's DOM helpers. Preserve the referenced attribute declaratively.
+  if (preferredNames.some((pattern) => pattern.test("href") || pattern.test("url"))
+    && /(?:getAttribute\s*\(\s*['"]href['"]|\bhref\\?=[\\]?['"])/i.test(source)) {
+    return ".//a[@href]/@href";
+  }
+  if (preferredNames.some((pattern) => pattern.test("src") || pattern.test("img") || pattern.test("cover"))
+    && /(?:getAttribute\s*\(\s*['"](?:src|data-src|data-original)['"]|\b(?:src|data-src|data-original)\\?=[\\]?['"])/i.test(source)) {
+    return ".//img/@src||.//img/@data-src||.//img/@data-original";
+  }
+  if (preferredNames.some((pattern) => pattern.test("title") || pattern.test("name"))
+    && /(?:getAttribute\s*\(\s*['"]title['"]|\btitle\\?=[\\]?['"])/i.test(source)) {
+    return "./@title";
+  }
   return "";
 }
 
@@ -585,12 +603,15 @@ export function compileBookBridgePlan(action, headers = {}) {
     list: inferredDomScriptSelector(action.list, [/book/i, /item/i, /list/i, /article/i]),
     fields: {
       name: inferredScriptField(action.bookName, [/^(?:book)?name$/i, /title/i, /username/i]),
-      url: inferredScriptField(action.detailUrl, [/url/i, /id/i, /username/i]),
+      url: inferredScriptField(action.detailUrl, [/url/i, /id/i, /username/i])
+        || inferredDomScriptSelector(action.detailUrl, [/url/i, /href/i, /id/i]),
       author: action.author,
       desc: action.desc,
       cat: action.cat,
       lastChapterTitle: action.lastChapterTitle,
-      cover: inferredScriptField(action.cover, [/cover/i, /pic/i, /img/i, /icon/i]) || action.cover,
+      cover: inferredScriptField(action.cover, [/cover/i, /pic/i, /img/i, /icon/i])
+        || inferredDomScriptSelector(action.cover, [/cover/i, /pic/i, /img/i, /src/i])
+        || action.cover,
       status: action.status,
       wordCount: action.wordCount,
     },
@@ -778,6 +799,34 @@ function htmlSelect(rule, input, { list = false, content = false, maxNodes = Inf
 }
 
 function jsonPathSingle(input, path) {
+  const mediaPairs = String(path || "").trim().match(/^@json-media-pairs:([^:]+):([^:]+):([^:]+):([^:]+)$/);
+  if (mediaPairs) {
+    let field;
+    let groupSeparator;
+    let entrySeparator;
+    let pairSeparator;
+    try {
+      [, field, groupSeparator, entrySeparator, pairSeparator] = mediaPairs.map((value) => decodeURIComponent(value));
+    } catch {
+      return [];
+    }
+    let encoded = "";
+    const visit = (value) => {
+      if (encoded || !value || typeof value !== "object") return;
+      if (Object.hasOwn(value, field) && typeof value[field] === "string") encoded = value[field];
+      if (!encoded) for (const child of Object.values(value)) visit(child);
+    };
+    visit(input);
+    if (!encoded) return [];
+    const groups = encoded.split(groupSeparator).map((group) => group.split(entrySeparator).flatMap((entry) => {
+      const index = entry.indexOf(pairSeparator);
+      if (index <= 0) return [];
+      const title = entry.slice(0, index).trim();
+      const href = entry.slice(index + pairSeparator.length).trim();
+      return title && href ? [{ text: title, href }] : [];
+    }));
+    return groups.sort((left, right) => right.length - left.length)[0] || [];
+  }
   const recursive = String(path || "").trim().match(/^@json-recursive:([^:]+)(?::(values))?$/);
   if (recursive) {
     let selector = "";
@@ -818,6 +867,25 @@ function jsonPathSingle(input, path) {
       const value = jsonPathSingle(input, selector);
       if (Array.isArray(value)) rows.push(...value);
       else if (value !== undefined && value !== null && value !== "") rows.push(value);
+    }
+    return rows;
+  }
+  const interleave = String(path || "").trim().match(/^@json-interleave:(.+)$/);
+  if (interleave) {
+    const lists = [];
+    for (const encoded of interleave[1].split(",").filter(Boolean)) {
+      let selector = "";
+      try { selector = decodeURIComponent(encoded); } catch { continue; }
+      const value = jsonPathSingle(input, selector);
+      if (Array.isArray(value) && value.length) lists.push(value);
+      else if (value !== undefined && value !== null && value !== "") lists.push([value]);
+    }
+    const rows = [];
+    const length = Math.max(0, ...lists.map((list) => list.length));
+    for (let index = 0; index < length; index += 1) {
+      for (const list of lists) {
+        if (index < list.length) rows.push(list[index]);
+      }
     }
     return rows;
   }
