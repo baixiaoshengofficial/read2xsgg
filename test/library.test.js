@@ -19,6 +19,12 @@ function close(server) {
   return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
 
+// Windows exposes no POSIX permission bits: stat().mode always reports 0o666
+// for writable files regardless of the chmod() the store performs.
+function assertArtifactMode(mode) {
+  if (process.platform !== "win32") assert.equal(mode & 0o777, 0o644);
+}
+
 test("libraryStore 持久化任务与制品", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-lib-"));
   try {
@@ -34,8 +40,8 @@ test("libraryStore 持久化任务与制品", async () => {
     await store.updateJob(job.id, { status: "done", count: 1 });
 
     const artifactDir = path.join(dir, "artifacts");
-    assert.equal((await stat(path.join(artifactDir, `${job.id}.xbs`))).mode & 0o777, 0o644);
-    assert.equal((await stat(path.join(artifactDir, `${job.id}.source.json`))).mode & 0o777, 0o644);
+    assertArtifactMode((await stat(path.join(artifactDir, `${job.id}.xbs`))).mode & 0o777);
+    assertArtifactMode((await stat(path.join(artifactDir, `${job.id}.source.json`))).mode & 0o777);
 
     const listed = await store.listJobs();
     assert.equal(listed[0].id, job.id);
@@ -401,10 +407,10 @@ test("publishLibraryArtifact：显式 payload 覆盖同 id 制品并带上 media
     const payload = await store.readSourcePayload(job.id);
     assert.equal(payload.ruleContent.mediaResolution.request.url, "{{origin}}/glink");
     // Root-style umask 0077 must not leave payload/metadata 0600 for the service user.
-    assert.equal((await stat(path.join(dir, "artifacts", `${job.id}.source.json`))).mode & 0o777, 0o644);
-    assert.equal((await stat(path.join(dir, "artifacts", `${job.id}.xbs`))).mode & 0o777, 0o644);
-    assert.equal((await stat(path.join(dir, "jobs", `${job.id}.json`))).mode & 0o777, 0o644);
-    assert.equal((await stat(path.join(dir, "index.json"))).mode & 0o777, 0o644);
+    assertArtifactMode((await stat(path.join(dir, "artifacts", `${job.id}.source.json`))).mode & 0o777);
+    assertArtifactMode((await stat(path.join(dir, "artifacts", `${job.id}.xbs`))).mode & 0o777);
+    assertArtifactMode((await stat(path.join(dir, "jobs", `${job.id}.json`))).mode & 0o777);
+    assertArtifactMode((await stat(path.join(dir, "index.json"))).mode & 0o777);
 
     const xbs = await store.readArtifact(job.id, "xbs");
     const sources = JSON.parse(decodeXbs(xbs).toString("utf8"));

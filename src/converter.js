@@ -492,8 +492,6 @@ function bridgeRequestInfo(requestInfo, endpoint, { pageSize = 20, serverPaging 
       'if (u && typeof u == "object") u = u.url || "";',
       'u = String(u || "").trim();',
       ...runtimeLegadoRequestOptionStrip(),
-      'if (u.indexOf("//") == 0) u = "https:" + u;',
-      'else if (u && !/^https?:\\/\\//i.test(u)) u = (config.host || "") + (u.charAt(0) == "/" ? u : "/" + u);',
       `return ${finalizeAdapterUrlExpression(pagedEndpoint)} + encodeURIComponent(u);`,
     ].join("\n");
   }
