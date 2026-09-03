@@ -1045,6 +1045,90 @@ test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", as
   assert.deepEqual(await single.json(), { data: [{ title: "播放", url: encoded }] });
 });
 
+test("规则桥接接受空 host 计划中的绝对目标 URL", async (context) => {
+  const upstream = createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ rows: [{ title: "第一章", item_id: "42" }] }));
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const plan = encodeBridgePlan({
+    version: 1,
+    kind: "chapters",
+    host: "",
+    responseType: "json",
+    list: "rows",
+    fields: {
+      title: { selector: "title" },
+      url: { selector: "item_id", urlTemplate: `${upstreamBase}/play?item_id={{item_id}}` },
+    },
+  });
+  const response = await fetch(
+    `${appBase}/adapter/chapters?plan=${plan}&url=${encodeURIComponent(`${upstreamBase}/toc`)}`,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).data, [{
+    title: "第一章",
+    url: `${upstreamBase}/play?item_id=42`,
+  }]);
+});
+
+test("章节桥接从详情 HTML 捕获 ID 后请求目录接口", async (context) => {
+  const requests = [];
+  const upstream = createServer((request, response) => {
+    requests.push(request.url);
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    if (request.url === "/detail/18") {
+      response.end('<main data-mid="18"><h1>漫画</h1></main>');
+      return;
+    }
+    response.end('<div id="allchapterlist"><a data-ct="第一话" data-cs="387"></a></div>');
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const plan = encodeBridgePlan({
+    version: 1,
+    kind: "chapters",
+    host: upstreamBase,
+    responseType: "html",
+    list: "//*[@id='allchapterlist']//a",
+    tocRequest: {
+      pattern: 'data-mid="(.*?)"',
+      prefix: `${upstreamBase}/menu?mid=`,
+      suffix: "&all=1",
+      capture: 1,
+    },
+    fields: {
+      title: { selector: "/@data-ct" },
+      url: {
+        selector: "/@data-cs",
+        urlTemplate: `${upstreamBase}/content?m={{base:bookId}}&c={{raw:id}}`,
+      },
+    },
+  });
+  const response = await fetch(
+    `${appBase}/adapter/chapters?plan=${plan}&url=${encodeURIComponent(`${upstreamBase}/detail/18`)}`,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(requests, ["/detail/18", "/menu?mid=18&all=1"]);
+  assert.deepEqual((await response.json()).data, [{
+    title: "第一话",
+    url: `${upstreamBase}/content?m=18&c=387`,
+  }]);
+});
+
 test("通用媒体适配端点在过期 Cookie 导致空结果时无 Cookie 重试", async (context) => {
   const cookies = [];
   const upstream = createServer((request, response) => {

@@ -136,6 +136,30 @@ function compileReplaceRegexStatement(pattern, warn) {
   return `result = String(result).replace(new RegExp(${JSON.stringify(source)}, "g"), ${JSON.stringify(replacement)});`;
 }
 
+function appendRulePostprocessor(rule, processor) {
+  const current = String(rule || "");
+  const body = String(processor || "").replace(/^\s*@js:\s*/i, "").trim();
+  if (!current || !body) return current;
+
+  const marker = current.match(/\|\|\s*@js:/i);
+  const pureScript = /^\s*@js:/i.test(current);
+  if (marker || pureScript) {
+    const selector = marker ? current.slice(0, marker.index).trim() : "";
+    const previous = marker
+      ? current.slice(marker.index + marker[0].length).trim()
+      : current.replace(/^\s*@js:\s*/i, "").trim();
+    return [
+      selector ? `${selector}||@js:` : "@js:",
+      "var __read2xsggPrevious = (function (result) {",
+      previous,
+      "})(result);",
+      'if (typeof __read2xsggPrevious !== "undefined") result = __read2xsggPrevious;',
+      body,
+    ].join("\n");
+  }
+  return `${current}||@js:\n${body}`;
+}
+
 /**
  * 部分阅读文本源只是用 java.getString('CSS 选择器') 包装 DOM 提取。
  * 香色不能执行 Android JavaScript，但选择器本身是可移植的；仅提取没有
@@ -230,8 +254,7 @@ function wrapMediaContent(contentRule, imageProxyBase = "") {
     "  forbidCache: true",
     "});",
   ].join("\n");
-  if (/\|\|?\s*@js:/i.test(contentRule)) return contentRule;
-  return `${contentRule}||${wrapJs}`;
+  return appendRulePostprocessor(contentRule, wrapJs);
 }
 
 /** Audio/video sources often put the playable URL directly in chapterUrl. */
@@ -362,6 +385,13 @@ function finalizeAdapterUrlExpression(endpoint) {
   return `(${JSON.stringify(endpoint)}).replace(/%@pageIndex/g, String((params && params.pageIndex) || 1))`;
 }
 
+function runtimeLegadoRequestOptionStrip(variable = "u") {
+  return [
+    `var optionAt = ${variable}.lastIndexOf(",{");`,
+    `if (optionAt > 0 && /["']?(?:headers?|method|body|webView)["']?\\s*:/.test(${variable}.slice(optionAt + 1))) ${variable} = ${variable}.slice(0, optionAt).trim();`,
+  ];
+}
+
 function runtimeAdapterRequestInfo(endpoint, { preferDetail = false } = {}) {
   // Chapter lists prefer detailUrl (catalogue seed).
   // Chapter content / media must prefer `result` first: Xiangse H5 commonly keeps
@@ -386,6 +416,7 @@ function runtimeAdapterRequestInfo(endpoint, { preferDetail = false } = {}) {
     ...seedBlock,
     'if (u == "%@result") u = "";',
     'u = String(u || "").trim();',
+    ...runtimeLegadoRequestOptionStrip(),
     'if (u.indexOf("//") == 0) u = "https:" + u;',
     'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
     `return ${finalizeAdapterUrlExpression(endpoint)} + encodeURIComponent(u);`,
@@ -414,6 +445,7 @@ function bridgeRequestInfo(requestInfo, endpoint, { pageSize = 20, serverPaging 
       "}).call(this, seed);",
       'if (u && typeof u == "object") u = u.url || "";',
       'u = String(u || "").trim();',
+      ...runtimeLegadoRequestOptionStrip(),
       `return ${finalizeAdapterUrlExpression(pagedEndpoint)} + encodeURIComponent(u);`,
     ].join("\n");
   }
@@ -430,6 +462,7 @@ function bridgeRequestInfo(requestInfo, endpoint, { pageSize = 20, serverPaging 
       '.replace(/%@keyWord/g, encodeURIComponent((params && params.keyWord) || ""))',
       '.replace(/%@filter/g, String((params && params.filters && params.filters.category) || (params && params.filter) || ""));',
       'u = String(u || "").trim();',
+      ...runtimeLegadoRequestOptionStrip(),
       'if (u.indexOf("//") == 0) u = "https:" + u;',
       'else if (u && !/^https?:\\/\\//i.test(u)) u = (config.host || "") + (u.charAt(0) == "/" ? u : "/" + u);',
       `return ${finalizeAdapterUrlExpression(pagedEndpoint)} + encodeURIComponent(u);`,
@@ -544,6 +577,7 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
   );
   const plan = compileChapterBridgePlan(action, {
     tocSelector: useHtmlToc ? htmlTocSelector : "",
+    tocRequest: action._tocRequest || null,
     headers: { ...headers, ...(action.httpHeaders || {}) },
     reverse: Boolean(action.reverseChapters || action.reverse),
   });
@@ -567,7 +601,12 @@ function bridgeChapterAction(action, bridgeBase, { tocSelector = "", headers = {
   if (!nextPageUrl && serverPaging && requestInfo) {
     nextPageUrl = requestInfo;
   }
-  const { reverseChapters: _reverseChapters, reverse: _reverse, ...rest } = action;
+  const {
+    reverseChapters: _reverseChapters,
+    reverse: _reverse,
+    _tocRequest,
+    ...rest
+  } = action;
   const maxPage = Number(action.moreKeys?.maxPage) > 0
     ? action.moreKeys.maxPage
     : (serverPaging || nextPageUrl ? 500 : 0);
@@ -739,6 +778,45 @@ function buildRegexTocRequestInfo(tocUrl) {
   ].join("\n");
 }
 
+function compileHtmlCaptureTocRequest(tocUrl) {
+  const source = String(tocUrl || "")
+    .replace(/^\s*(?:@js:|<js>)\s*/i, "")
+    .replace(/<\/js>\s*$/i, "");
+  const capture = source.match(
+    /\b(?:var|let|const)?\s*([A-Za-z_$][\w$]*)\s*=\s*result\.match\(\s*\/((?:\\.|[^/\r\n])+)\/[dgimsuvy]*\s*\)/,
+  );
+  if (!capture) return null;
+  const variable = capture[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const literal = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
+  const request = source.match(new RegExp(
+    `(?:^|[;{}\\n])\\s*[A-Za-z_$][\\w$]*\\s*=\\s*(${literal})\\s*\\+\\s*${variable}\\s*\\[\\s*(\\d)\\s*\\]\\s*\\+\\s*(${literal})`,
+  ));
+  if (!request) return null;
+  const prefix = staticJavaScriptString(request[1]);
+  const suffix = staticJavaScriptString(request[3]);
+  const group = Number(request[2]);
+  if (prefix === null || suffix === null || !Number.isInteger(group) || group < 1) return null;
+  if (!/^https?:\/\//i.test(prefix) && !/^(?:\/|\.\.\/|\.\/)/.test(prefix)) return null;
+  try { new RegExp(capture[2]); } catch { return null; }
+  return { pattern: capture[2], prefix, suffix, capture: group };
+}
+
+function compileStoredIdChapterUrl(chapterUrl, convertedRule) {
+  const source = String(chapterUrl || "");
+  const template = source.match(/`(https?:\/\/(?:\\.|[^`])+)`/)?.[1];
+  if (!template || !/\$\{\s*java\.get\s*\(/i.test(template) || !/\$\{\s*result\s*\}/i.test(template)) {
+    return null;
+  }
+  const selector = String(convertedRule || "").split(/\|\|\s*@js:/i, 1)[0].trim();
+  if (!selector || /^@js:/i.test(selector)) return null;
+  const urlTemplate = template
+    .replace(/\$\{\s*java\.get\s*\(\s*['"][^'"]+['"]\s*\)\s*\}/gi, "{{base:bookId}}")
+    .replace(/\$\{\s*result\s*\}/gi, "{{raw:id}}")
+    .replace(/\\`/g, "`");
+  if (/\$\{/.test(urlTemplate) || urlTemplate.length > 2048) return null;
+  return { selector, urlTemplate };
+}
+
 function staticJavaScriptString(value) {
   const source = String(value || "");
   if (source.length < 2 || source[0] !== source.at(-1) || !["\"", "'"].includes(source[0])) return null;
@@ -826,11 +904,11 @@ function buildJsonApiTocRequestInfo(tocUrl) {
     "if (!u && typeof result === \"string\") u = result;",
     "if (!u && result && typeof result === \"object\") u = String(result.detailUrl || result.url || \"\");",
     "if (/(?:getBookMenu|getAlbumMenu|chapterList|toc)\\?/i.test(u) && /[?&](?:pageNum|pageIndex|page)=\\d+/i.test(u)) return u;",
-    "var id = String(q.bookId || q.albumId || q.entityId || q.id || \"\").trim();",
+    "var id = String(q.bookId || q.book_id || q.albumId || q.album_id || q.entityId || q.entity_id || q.itemId || q.item_id || q.id || \"\").trim();",
     "if (!id) {",
     // Prefer book/album/entity ids. Bare `id=` on listen/play URLs is often a
     // per-section key (e.g. bookId+section) and must not seed the menu request.
-    "  var m = u.match(/[?&](?:bookId|albumId|entityId)=(\\d+)/i)",
+    "  var m = u.match(/[?&](?:book_?id|album_?id|entity_?id|item_?id)=(\\d+)/i)",
     "    || u.match(/\\/(?:book|album|comic)\\/(\\d+)/i)",
     "    || u.match(/[?&]id=(\\d{1,12})(?!\\d)/i)",
     "    || u.match(/\\/(\\d{1,12})(?:\\/?(?:\\?|$))/);",
@@ -841,10 +919,12 @@ function buildJsonApiTocRequestInfo(tocUrl) {
     "  }",
     "}",
     "if (!id) return \"\";",
-    "var page = String((params && params.pageIndex) || 1);",
     `var url = ${JSON.stringify(template)};`,
     "url = url.split(\"__ID__\").join(encodeURIComponent(id));",
-    "if (url.indexOf(\"__PAGE__\") >= 0) url = url.split(\"__PAGE__\").join(encodeURIComponent(page));",
+    ...(template.includes("__PAGE__") ? [
+      "var page = String((params && params.pageIndex) || 1);",
+      "url = url.split(\"__PAGE__\").join(encodeURIComponent(page));",
+    ] : []),
     "return url;",
   ].join("\n");
 }
@@ -852,6 +932,7 @@ function buildJsonApiTocRequestInfo(tocUrl) {
 function buildJsonApiTocNextPageUrl(tocUrl) {
   const { url: raw } = splitLegadoUrlOptions(tocUrl);
   if (!/^https?:\/\//i.test(raw)) return "";
+  if (!/[?&](?:pageNum|pageIndex|page)=(?:\{\{|%@|\d+)/i.test(raw)) return "";
   if (!/\{\{\s*\$\.[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*\}\}|\{(?:\$\.)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\}/.test(raw)) return "";
   const requestInfo = buildJsonApiTocRequestInfo(tocUrl);
   if (!requestInfo) return "";
@@ -1443,6 +1524,14 @@ function mapTocRules(rules, responseType, warningFor) {
       reverseChapters = true;
       chapterListRule = stripped[1].trim();
     }
+    // Legado accepts a descending result slice from the last item to index 0.
+    // XPath 1.0 cannot express reversed node order; select the complete set and
+    // let the chapter bridge apply the existing reverse flag before paging.
+    if (/\[\s*-1\s*:\s*0\s*\]/.test(chapterListRule)) {
+      chapterListRule = chapterListRule.replace(/\[\s*-1\s*:\s*0\s*\]/g, "");
+      reverseChapters = true;
+      warningFor("chapterList", rules.chapterList)("目录倒序切片 [-1:0] 已转换为完整列表并在桥接器中倒序");
+    }
   }
   for (const [from, to] of Object.entries(mapping)) {
     const raw = from === "chapterList" ? chapterListRule : rules[from];
@@ -1460,12 +1549,18 @@ function mapTocRules(rules, responseType, warningFor) {
     result.list = `(${result.list})[self::a[@href] or .//a[@href]]`;
   }
   if (result.list && result.title && !result.url && (rules.chapterUrl === undefined || rules.chapterUrl === "")) {
-    result.url = [
-      "@js:",
-      "var q = (params && params.queryInfo) || {};",
-      'return String(params.responseUrl || q.detailUrl || q.url || result || config.host || "");',
-    ].join("\n");
-    warningFor("chapterUrl", rules.chapterUrl)("目录未声明章节 URL，已将当前详情页作为章节地址（同页章节）");
+    const anchorItems = responseType === "html" && /(?:^|@|\s)a(?:\s*$|\[|[.#:@])/i.test(String(chapterListRule || ""));
+    if (anchorItems) {
+      result.url = "./@href";
+      warningFor("chapterUrl", rules.chapterUrl)("目录列表已选中链接元素，缺省章节 URL 已使用当前条目的 href");
+    } else {
+      result.url = [
+        "@js:",
+        "var q = (params && params.queryInfo) || {};",
+        'return String(params.responseUrl || q.detailUrl || q.url || result || config.host || "");',
+      ].join("\n");
+      warningFor("chapterUrl", rules.chapterUrl)("目录未声明章节 URL，已将当前详情页作为章节地址（同页章节）");
+    }
   }
   if (reverseChapters) result.reverseChapters = true;
   return result;
@@ -1629,8 +1724,31 @@ function normalizeMappedJsonBookRules(rules = {}) {
   return normalized;
 }
 
+function normalizeFlattenedJsonBookRules(rules = {}) {
+  const script = String(rules.bookList || "");
+  if (!/^\s*<js>[\s\S]*<\/js>/i.test(script) || !/\.concat\s*\(/.test(script)) return rules;
+  const parsed = script.match(
+    /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*JSON\.parse\s*\(\s*result\s*\)/,
+  );
+  if (!parsed) return rules;
+  const root = parsed[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const loop = script.match(new RegExp(
+    `\\bfor\\s*\\(\\s*(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s+of\\s+${root}\\.([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)\\s*\\)`,
+  ));
+  if (!loop) return rules;
+  const item = loop[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const child = script.match(new RegExp(
+    `\\.concat\\s*\\(\\s*${item}\\.([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)\\s*\\)`,
+  ));
+  if (!child) return rules;
+  return {
+    ...rules,
+    bookList: `$.${loop[2]}[*].${child[1]}[*]`,
+  };
+}
+
 function buildBookAction({ actionID, host, request, rules, headers, warnings, sourceName, section, imageProxyBase = "" }) {
-  const normalizedRules = normalizeMappedJsonBookRules(rules);
+  const normalizedRules = normalizeMappedJsonBookRules(normalizeFlattenedJsonBookRules(rules));
   const responseType = inferResponseType(normalizedRules);
   const warningFor = createWarningCollector(warnings, sourceName, section);
   const action = {
@@ -1639,7 +1757,14 @@ function buildBookAction({ actionID, host, request, rules, headers, warnings, so
     ...mapBookRules(normalizedRules, responseType, warningFor, { listContext: true }),
   };
   const httpDetailUrl = responseType === "json" ? compileHttpChapterUrlField(rules.bookUrl) : null;
-  if (httpDetailUrl) action.detailUrl = httpDetailUrl;
+  // The descriptor form is consumed by the GET bridge. Native POST actions
+  // cannot be re-fetched by that bridge, so retain convertRule's executable
+  // string URL template instead of shipping an invalid object to Xiangse.
+  if (httpDetailUrl
+    && imageProxyBase
+    && !/\b(?:POST\s*:\s*true|httpParams|requestBody|webView)\b/.test(String(action.requestInfo))) {
+    action.detailUrl = httpDetailUrl;
+  }
   const signedRequest = compileSignedRequestPlan(request);
   if (signedRequest && imageProxyBase) {
     const encoded = encodeSignedRequestPlan(signedRequest);
@@ -2106,7 +2231,8 @@ function convertOne(source, warnings, options = {}) {
   // plan compiled from the original content rule and can parse HTML, JSON,
   // hydration scripts or plain URL lists without checking the source domain.
   const useHtmlComicImageAdapter = resolvedType === "comic" && Boolean(options.imageProxyBase)
-    && Boolean(contentRules.content);
+    && (Boolean(contentRules.content)
+      || (contentResponseType === "html" && Boolean(tocRules.chapterList)));
   const contentWarningFor = createWarningCollector(warnings, sourceName, "chapterContent");
 
   const bookDetail = {
@@ -2239,6 +2365,22 @@ function convertOne(source, warnings, options = {}) {
       requestInfo: chapterListRequestInfo,
       ...(() => {
         const mapped = mapTocRules(tocRules, tocResponseType, tocWarningFor);
+        const capturedTocRequest = tocResponseType === "html"
+          ? compileHtmlCaptureTocRequest(detailRules.tocUrl)
+          : null;
+        if (capturedTocRequest) {
+          mapped._tocRequest = capturedTocRequest;
+          tocWarningFor("request", detailRules.tocUrl)(
+            "详情页捕获字段构造的目录请求已转换为通用两步目录桥接",
+          );
+        }
+        const storedIdUrl = compileStoredIdChapterUrl(tocRules.chapterUrl, mapped.url);
+        if (storedIdUrl) {
+          mapped.url = storedIdUrl;
+          tocWarningFor("chapterUrl", tocRules.chapterUrl)(
+            "阅读缓存中的详情 ID 与当前章节字段已转换为桥接 URL 模板",
+          );
+        }
         const httpChapterUrl = options.imageProxyBase
           ? compileHttpChapterUrlField(tocRules.chapterUrl)
           : null;
@@ -2409,23 +2551,10 @@ function convertOne(source, warnings, options = {}) {
       .filter(Boolean)
       .join("\n");
     if (body) {
-      const current = String(converted.chapterContent.content);
-      const marker = current.match(/\|\|\s*@js:/i);
-      if (marker) {
-        const selector = current.slice(0, marker.index).trim();
-        const previous = current.slice(marker.index + marker[0].length).trim();
-        converted.chapterContent.content = [
-          `${selector}||@js:`,
-          "var __read2xsggPrevious = (function (result) {",
-          previous,
-          "})(result);",
-          'if (typeof __read2xsggPrevious !== "undefined") result = __read2xsggPrevious;',
-          body,
-          "return result;",
-        ].join("\n");
-      } else {
-        converted.chapterContent.content += `||@js:\n${body}\nreturn result;`;
-      }
+      converted.chapterContent.content = appendRulePostprocessor(
+        converted.chapterContent.content,
+        `${body}\nreturn result;`,
+      );
     }
   }
 
@@ -2639,7 +2768,19 @@ export function convertLegado(input, options = {}) {
       converted.bookWorld = Object.fromEntries(Object.entries(converted.bookWorld || {}).filter(([, action]) => (
         completePortableAction(action, ["requestInfo", "list", "bookName", "detailUrl"])
       )));
-      const compatibility = portableConvertedSource(converted);
+      let compatibility = portableConvertedSource(converted);
+      if (!compatibility.search && compatibility.world) {
+        const fallback = Object.values(converted.bookWorld)[0];
+        converted.searchBook = { ...fallback, actionID: "searchBook" };
+        warnings.push({
+          source: converted.sourceName,
+          section: "searchBook",
+          field: "compatibility",
+          message: "搜索动作依赖阅读运行时，已用可执行分类入口重建搜索动作",
+          rule: "",
+        });
+        compatibility = portableConvertedSource(converted);
+      }
       if (!compatibility.portable) {
         const failed = Object.entries(compatibility)
           .filter(([key, value]) => key !== "portable" && !value)

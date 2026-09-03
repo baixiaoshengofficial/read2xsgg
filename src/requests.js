@@ -1,4 +1,4 @@
-import { legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
+import { hasUnsupportedLegadoRuntime, legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
 
 /** Refresh anonymous client IDs that are literal millisecond timestamps. */
 export function refreshEphemeralHeaders(headers, now = Date.now()) {
@@ -108,7 +108,7 @@ function splitUrlAndOptions(request) {
 function stripLeadingLegadoSideEffectTemplates(request, warn) {
   let value = String(request ?? "").trim();
   let removed = false;
-  const jsSideEffect = /^@js:\s*(?:(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie|setCookie)\s*\([^;\n]*\)\s*;?\s*)+<\/js>\s*/i;
+  const jsSideEffect = /^(?:@js:|<js>)\s*(?:(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie|setCookie)\s*\([^;\n]*\)\s*;?\s*)+<\/js>\s*/i;
   if (jsSideEffect.test(value)) {
     value = value.replace(jsSideEffect, "");
     removed = true;
@@ -252,6 +252,147 @@ function legadoPageBranchExpression(url, warn) {
   ].join(" + ");
 }
 
+function maskScriptStrings(value) {
+  return String(value || "")
+    .replace(/(['"`])(?:\\.|(?!\1)[\s\S])*?\1/g, (match) => " ".repeat(match.length))
+    .replace(/\/\*[\s\S]*?\*\//g, (match) => " ".repeat(match.length))
+    .replace(/\/\/[^\r\n]*/g, (match) => " ".repeat(match.length));
+}
+
+function splitTopLevelStatements(value) {
+  const source = String(value || "");
+  const masked = maskScriptStrings(source);
+  const stack = [];
+  const pairs = { ")": "(", "]": "[", "}": "{" };
+  const output = [];
+  let start = 0;
+  for (let index = 0; index < masked.length; index += 1) {
+    const token = masked[index];
+    if (token === "(" || token === "[" || token === "{") stack.push(token);
+    else if (pairs[token] && stack.at(-1) === pairs[token]) stack.pop();
+    else if (token === ";" && !stack.length) {
+      output.push(source.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  const tail = source.slice(start).trim();
+  if (tail) output.push(tail);
+  return output.filter(Boolean);
+}
+
+function matchingCallArgument(expression, functionName) {
+  const source = String(expression || "").trim();
+  const prefix = new RegExp(`^${functionName.replace(".", "\\.")}\\s*\\(`, "i").exec(source);
+  if (!prefix) return "";
+  const masked = maskScriptStrings(source);
+  let depth = 0;
+  for (let index = prefix[0].length - 1; index < masked.length; index += 1) {
+    if (masked[index] === "(") depth += 1;
+    else if (masked[index] === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(prefix[0].length, index).trim();
+      }
+    }
+  }
+  return "";
+}
+
+const PORTABLE_REQUEST_GLOBALS = new Set([
+  "key", "page", "params", "config", "true", "false", "null", "undefined",
+  "String", "Number", "Boolean", "Math", "encodeURI", "encodeURIComponent",
+]);
+
+function portableExpressionDependencies(expression, declarations) {
+  const masked = maskScriptStrings(expression);
+  if (/\b(?:new|function|class|await|yield|eval|Function|require|import)\b|=>/.test(masked)) return null;
+  const calls = [...masked.matchAll(/(?:\b([A-Za-z_$][\w$]*)|\.\s*([A-Za-z_$][\w$]*))\s*\(/g)];
+  const safeCalls = new Set([
+    "String", "Number", "Boolean", "encodeURI", "encodeURIComponent",
+    "substring", "substr", "slice", "trim", "toLowerCase", "toUpperCase",
+    "replace", "concat", "padStart", "padEnd", "floor", "ceil", "round", "abs",
+  ]);
+  if (calls.some((match) => !safeCalls.has(match[1] || match[2]))) return null;
+
+  const dependencies = new Set();
+  for (const match of masked.matchAll(/\b[A-Za-z_$][\w$]*\b/g)) {
+    const name = match[0];
+    const before = masked.slice(0, match.index);
+    const after = masked.slice(match.index + name.length);
+    if (/\.\s*$/.test(before) || /^\s*:/.test(after)) continue;
+    if (PORTABLE_REQUEST_GLOBALS.has(name) || safeCalls.has(name)) continue;
+    if (!declarations.has(name)) return null;
+    dependencies.add(name);
+  }
+  return dependencies;
+}
+
+/**
+ * Recover a declarative JSON POST from scripts whose URL/body are portable but
+ * whose optional headers are produced by a Legado-only signing helper. Only the
+ * dependency-closed, side-effect-free declarations needed by URL and body are
+ * retained; the source script is never evaluated.
+ */
+function compilePortableJsonPost(script, headers, warn) {
+  const body = String(script || "").replace(/^@js:\s*/i, "").trim();
+  if (!/\\?["']method\\?["']\s*:\s*\\?["']POST\\?["']/i.test(body)) return null;
+
+  const declarations = new Map();
+  for (const statement of splitTopLevelStatements(body)) {
+    const match = statement.match(/^(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+)$/);
+    if (match) declarations.set(match[1], match[2].trim());
+  }
+  const bodyEntry = [...declarations.entries()].find(([, expression]) => (
+    /^JSON\.stringify\s*\(/i.test(expression)
+  ));
+  if (!bodyEntry) return null;
+  const paramsExpression = matchingCallArgument(bodyEntry[1], "JSON.stringify");
+  if (!/^[{[]/.test(paramsExpression)) return null;
+
+  const urlEntry = [...declarations.entries()].find(([, expression]) => {
+    const literal = expression.match(/^(['"])(https?:\/\/[^'"]+)\1$/i);
+    return Boolean(literal);
+  });
+  if (!urlEntry) return null;
+
+  const required = new Set();
+  const visiting = new Set();
+  const collect = (expression) => {
+    const dependencies = portableExpressionDependencies(expression, declarations);
+    if (!dependencies) return false;
+    for (const name of dependencies) {
+      if (required.has(name)) continue;
+      if (visiting.has(name)) return false;
+      visiting.add(name);
+      if (!collect(declarations.get(name))) return false;
+      visiting.delete(name);
+      required.add(name);
+    }
+    return true;
+  };
+  if (!collect(urlEntry[1]) || !collect(paramsExpression)) return null;
+  required.add(urlEntry[0]);
+
+  const retained = [...declarations.entries()]
+    .filter(([name]) => required.has(name))
+    .map(([name, expression]) => `var ${name} = ${expression};`);
+  const mergedHeaders = { ...headers };
+  if (!hasHeader(mergedHeaders, "Content-Type")) {
+    mergedHeaders["Content-Type"] = "application/json; charset=utf-8";
+  }
+  const candidate = rewriteLegadoJavaScript([
+    "@js:",
+    ...retained,
+    `return {url:${urlEntry[0]},POST:true,httpParams:${paramsExpression},httpHeaders:${objectLiteralFromHeaders(mergedHeaders, warn)}};`,
+  ].join("\n"));
+  if (hasUnsupportedLegadoRuntime(candidate)) return null;
+  warn("阅读请求的 URL 与 JSON 请求体可移植，已忽略无法执行的动态签名头并转换为标准 POST 请求");
+  return {
+    requestInfo: candidate,
+    httpHeaders: mergedHeaders,
+  };
+}
+
 export function convertRequest(request, { headers = {}, warn = () => {}, fallback = "%@result" } = {}) {
   if (!request || request === "-") return { requestInfo: fallback };
   if (typeof request !== "string") return { requestInfo: fallback };
@@ -264,6 +405,8 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
       warn("已将 @js 包装的静态 URL 请求还原为声明式请求");
       return convertRequest(declarative, { headers, warn, fallback });
     }
+    const portablePost = compilePortableJsonPost(normalized, headers, warn);
+    if (portablePost) return portablePost;
     const rewritten = rewriteLegadoJavaScript(normalized);
     if (rewritten !== normalized) warn("已将阅读 JavaScript 中的分页、关键词或结果字段模板转换为香色运行时表达式");
     else warn("阅读请求中的 JavaScript/模板表达式无法可靠翻译，已保留原规则供人工修改");

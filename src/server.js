@@ -3210,7 +3210,9 @@ export function createAppServer(options = {}) {
         let requestedSourceUrl = adapterTarget.sourceUrl;
         if (adapterTarget.bridgePlan) {
           try {
-            requestedSourceUrl = new URL(requestedSourceUrl, adapterTarget.bridgePlan.host).toString();
+            requestedSourceUrl = adapterTarget.bridgePlan.host
+              ? new URL(requestedSourceUrl, adapterTarget.bridgePlan.host).toString()
+              : new URL(requestedSourceUrl).toString();
           } catch {
             throw new HttpError(400, "规则桥接目标 URL 无效");
           }
@@ -3248,6 +3250,35 @@ export function createAppServer(options = {}) {
                 html = prepareBridgeHtml(linkedPage, charset, htmlBudget);
                 pageUrl = normalizedLinkedUrl;
                 followedPageLink = true;
+              }
+            }
+            if (adapterTarget.type === "bridge-chapters" && adapterTarget.bridgePlan.tocRequest) {
+              const requestPlan = adapterTarget.bridgePlan.tocRequest;
+              const match = html.match(new RegExp(requestPlan.pattern));
+              const captured = String(match?.[requestPlan.capture] || "").trim();
+              if (captured) {
+                try {
+                  const requestUrl = new URL(
+                    `${requestPlan.prefix}${captured}${requestPlan.suffix}`,
+                    pageUrl,
+                  ).toString();
+                  const tocPageUrl = normalizeRemoteUrl(requestUrl);
+                  const tocPage = await downloadSource(tocPageUrl, config, {
+                    ...refreshEphemeralHeaders(adapterTarget.bridgePlan.headers),
+                    Referer: pageUrl,
+                  });
+                  const tocHtml = prepareBridgeHtml(tocPage, charset, htmlBudget);
+                  const tocOutput = executeBridgePlan(
+                    tocHtml,
+                    tocPageUrl,
+                    adapterTarget.bridgePlan,
+                    paging,
+                  );
+                  if (Array.isArray(tocOutput.data) && tocOutput.data.length) output = tocOutput;
+                } catch {
+                  // Fall through to a same-page catalogue when the derived API
+                  // is stale or temporarily unavailable.
+                }
               }
             }
             if (adapterTarget.type === "bridge-chapters" && adapterTarget.bridgePlan.tocSelector) {

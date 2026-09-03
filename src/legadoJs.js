@@ -43,8 +43,16 @@ export function legadoTemplateExpression(value) {
     return "params.keyWord";
   }
   if (/^java\.(?:t2s|s2t)\(\s*key\s*\)$/i.test(expression)) return "params.keyWord";
-  if (/^(?:java\.)?encodeURI(?:Component)?\(\s*key\s*\)$/i.test(expression)) return "encodeURIComponent(params.keyWord)";
+  if (/^(?:java\.)?encodeURI(?:Component)?\(\s*key\s*(?:,\s*['"](?:gbk|gb2312|gb18030|utf-?8)['"]\s*)?\)$/i.test(expression)) {
+    return "encodeURIComponent(params.keyWord)";
+  }
   if (/^source\.(?:bookSourceUrl|key|getKey\s*\(\s*\))$/i.test(expression)) return "config.host";
+  if (/^source\.getVariable\(\s*\)\s*\?\s*source\.getVariable\(\s*\)\s*:\s*source\.getKey\(\s*\)$/i.test(expression)) {
+    return "config.host";
+  }
+  if (/^String\(\s*source\.getVariable\(\s*\)\s*!==?\s*['"]['"]\s*\?\s*source\.getVariable\(\s*\)\s*:\s*source\.getKey\(\s*\)\s*\)\.replace\(\s*\/\\\/\$\/\s*,\s*['"]['"]\s*\)$/i.test(expression)) {
+    return 'String(config.host || "").replace(/\\\/$/, "")';
+  }
   if (/^(?:host|(?:getCurrentUrl|Url)\s*\(\s*\))$/i.test(expression)) return "config.host";
   if (/^java\.connect\(\s*source\.getKey\(\s*\)\s*\)\.raw\(\s*\)\.request\(\s*\)\.url\(\s*\)$/i.test(expression)) {
     return "config.host";
@@ -116,7 +124,11 @@ function maskedJavaScript(value) {
   return String(value || "")
     .replace(/(['"`])(?:\\.|(?!\1)[\s\S])*?\1/g, (match) => " ".repeat(match.length))
     .replace(/\/\*[\s\S]*?\*\//g, (match) => " ".repeat(match.length))
-    .replace(/\/\/[^\r\n]*/g, (match) => " ".repeat(match.length));
+    .replace(/\/\/[^\r\n]*/g, (match) => " ".repeat(match.length))
+    // Runtime names inside `/.../` are regex text, not JavaScript globals.
+    // Require an expression-leading token so arithmetic division is retained.
+    .replace(/(^|[=(:,!&|?;{}\[\]\n]\s*)\/(?![/*])(?:\\.|\[(?:\\.|[^\]\\\r\n])*\]|[^/\\\r\n])+\/[dgimsuvy]*/gm,
+      (match, prefix) => `${prefix}${" ".repeat(match.length - prefix.length)}`);
 }
 
 function insideObjectLiteral(masked, index) {
@@ -149,7 +161,7 @@ function rewriteBareRuntimeIdentifiers(value) {
   let source = String(value || "");
   for (const [name, replacement] of [["page", "params.pageIndex"], ["key", "params.keyWord"]]) {
     let masked = maskedJavaScript(source);
-    if (new RegExp(`\\b(?:var|let|const)\\s+${name}\\b|function\\s*\\([^)]*\\b${name}\\b`).test(masked)) continue;
+    if (new RegExp(`\\b(?:var|let|const)\\s+${name}\\b|function(?:\\s+[A-Za-z_$][\\w$]*)?\\s*\\([^)]*\\b${name}\\b`).test(masked)) continue;
     const edits = [];
     for (const match of masked.matchAll(new RegExp(`\\b${name}\\b`, "g"))) {
       const index = match.index;
@@ -167,6 +179,7 @@ function rewriteImplicitRuntimeAliases(value) {
   let source = String(value || "");
   const aliases = [
     ["src", "result"],
+    ["host", "config.host"],
     [
       "baseUrl",
       '(params.responseUrl || (params.queryInfo && (params.queryInfo.chapterUrl || params.queryInfo.url || params.queryInfo.detailUrl)) || config.host || "")',
@@ -174,7 +187,7 @@ function rewriteImplicitRuntimeAliases(value) {
   ];
   for (const [name, replacement] of aliases) {
     let masked = maskedJavaScript(source);
-    if (new RegExp(`\\b(?:var|let|const)\\s+${name}\\b|function\\s*\\([^)]*\\b${name}\\b`).test(masked)) continue;
+    if (new RegExp(`\\b(?:var|let|const)\\s+${name}\\b|function(?:\\s+[A-Za-z_$][\\w$]*)?\\s*\\([^)]*\\b${name}\\b`).test(masked)) continue;
     const edits = [];
     for (const match of masked.matchAll(new RegExp(`\\b${name}\\b`, "g"))) {
       const index = match.index;
@@ -195,6 +208,15 @@ function ensureJavaScriptReturn(value) {
   const prefix = source.slice(0, marker + 4);
   let body = source.slice(marker + 4).trim();
   if (!body) return source;
+  // A trailing comment after the value is common in shared sources (usually a
+  // mirror note). It is not part of the expression and would comment out the
+  // closing parenthesis inserted by the return wrapper.
+  body = body
+    // Requiring a line boundary or actual whitespace avoids treating the `//`
+    // in an URL string as a JavaScript comment.
+    .replace(/(?:^|[ \t\r\n])\/\/[^\r\n]*(?:\r?\n\s*)*$/g, "")
+    .replace(/(?:^|[;\r\n][ \t]*)\/\*[\s\S]*?\*\/\s*$/g, "")
+    .trim();
   const maskedBody = maskedJavaScript(body);
   const stackForReturn = [];
   const returnPairs = { ")": "(", "]": "[", "}": "{" };
@@ -231,7 +253,11 @@ function ensureJavaScriptReturn(value) {
     return `${prefix}\n${body}`;
   }
 
-  const masked = maskedJavaScript(body);
+  // Remove a trailing semicolon before locating the final top-level statement.
+  // Otherwise the semicolon itself becomes the last boundary and expressions
+  // such as `result = value;` or `[item];` are left without a return value.
+  const statementBody = body.replace(/;\s*$/, "");
+  const masked = maskedJavaScript(statementBody);
   const stack = [];
   const pairs = { ")": "(", "]": "[", "}": "{" };
   let boundary = 0;
@@ -243,10 +269,10 @@ function ensureJavaScriptReturn(value) {
       if (!stack.length && token === "}") boundary = index + 1;
     } else if (token === ";" && !stack.length) boundary = index + 1;
   }
-  const finalExpression = body.slice(boundary).trim().replace(/^;+\s*/, "").replace(/;\s*$/, "");
+  const finalExpression = statementBody.slice(boundary).trim().replace(/^;+\s*/, "");
   if (finalExpression) {
-    const start = body.lastIndexOf(finalExpression);
-    const candidate = `${body.slice(0, start)}return (${finalExpression});`;
+    const start = statementBody.lastIndexOf(finalExpression);
+    const candidate = `${statementBody.slice(0, start)}return (${finalExpression});`;
     try {
       new Function("config", "params", "result", candidate);
       return `${prefix}\n${candidate}`;
@@ -269,6 +295,22 @@ export function rewriteLegadoJavaScript(value) {
     // templates. Normalise only this narrow field form; ordinary JS objects
     // are deliberately untouched.
     .replace(/(?<!\{)\{(\$\.[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*(?:\s*\|\|\s*\$\.[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*)*)\}(?!\})/g, "{{$1}}");
+  source = source
+    // Xiangse has no Legado source-variable UI. Empty is the exact initial
+    // value on Legado and therefore selects a script's declared default path.
+    .replace(/\bsource\.getVariable\s*\(\s*\)/gi, '""')
+    // Private jsLib/comment loaders cannot be executed safely. Removing only
+    // this standalone loader lets the declarative remainder be compiled.
+    .replace(/^\s*eval\s*\(\s*String\s*\(\s*source\.bookSourceComment\s*\)\s*\)\s*;?\s*$/gim, "")
+    // Logging has no request semantics and should not make a static fallback
+    // depend on the Android runtime.
+    .replace(/try\s*\{\s*java\.(?:log|toast)\s*\([^;{}]*\)\s*;?\s*\}\s*catch\s*\([^)]*\)\s*\{\s*\}/gi, "")
+    .replace(/^\s*java\.(?:log|toast)\s*\([^;\r\n]*\)\s*;?\s*$/gim, "")
+    // Bare runtime aliases inside template literals are masked from the later
+    // identifier pass, so translate their narrow interpolation form first.
+    .replace(/\$\{\s*host\s*\}/gi, "${config.host}")
+    .replace(/\$\{\s*key\s*\}/gi, "${params.keyWord}")
+    .replace(/\$\{\s*page\s*\}/gi, "${params.pageIndex}");
   source = source.replace(/(["'])((?:\\.|(?!\1)[\s\S])*?)\1/g, (literal, quote, body) => {
     if (!body.includes("{{")) return literal;
     const decoded = decodedStringLiteral(quote, body);
@@ -291,7 +333,8 @@ export function rewriteLegadoJavaScript(value) {
 
 export function hasUnsupportedLegadoRuntime(value) {
   const source = String(value || "");
-  if (/\b(?:java\.|Packages\b|android\.|org\.jsoup|source\.|book\.(?:name|author|kind|url)|cookie\.|javaScript\.)|<js>|\{\{|@(?:put|get):|\{\$\./i.test(source)) {
+  const maskedSource = maskedJavaScript(source);
+  if (/\b(?:java\.|Packages\b|android\.|org\.jsoup|source\.|book\.(?:name|author|kind|url)|cookie\.|javaScript\.)|<js>|\{\{|@(?:put|get):|\{\$\./i.test(maskedSource)) {
     return true;
   }
   const marker = source.search(/@js:/i);
@@ -304,7 +347,7 @@ export function hasUnsupportedLegadoRuntime(value) {
   // 同名变量时保留脚本，否则在线源必须桥接或删除该可选字段。
   const usesUndeclared = (name) => {
     // 属性名（item.src / params.baseUrl）不是隐式全局量。
-    if (new RegExp(`\\b(?:var|let|const)\\s+${name}\\b|function\\s*\\([^)]*\\b${name}\\b`).test(masked)) return false;
+    if (new RegExp(`\\b(?:var|let|const)\\s+${name}\\b|function(?:\\s+[A-Za-z_$][\\w$]*)?\\s*\\([^)]*\\b${name}\\b`).test(masked)) return false;
     for (const match of masked.matchAll(new RegExp(`\\b${name}\\b`, "g"))) {
       const before = masked.slice(0, match.index);
       const after = masked.slice(match.index + name.length);

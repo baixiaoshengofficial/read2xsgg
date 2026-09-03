@@ -187,10 +187,14 @@ function regexOnlyAttributeRule(rule, warn) {
   if (!String(rule).startsWith("##")) return "";
   const [pattern = "", replacement = ""] = String(rule).slice(2).split("##");
   if (!/^\$1(?:#*)?$/.test(replacement)) return "";
-  const attribute = pattern.match(/\b(href|src|data-src|data-original|content)\s*=\s*["']\s*\(\[\^["']/i)?.[1]
-    || pattern.match(/\b(href|src|data-src|data-original|content)\b/i)?.[1];
+  const normalizedPattern = pattern.replace(/\\([-=])/g, "$1");
+  const attribute = normalizedPattern.match(
+    /\b(href|src|content|value|title|alt|data-[A-Za-z0-9_-]+)\s*=\s*["']\s*\(\[\^["']/i,
+  )?.[1] || normalizedPattern.match(
+    /\b(href|src|content|value|title|alt|data-[A-Za-z0-9_-]+)\b/i,
+  )?.[1];
   if (!attribute) return "";
-  const tag = pattern.match(/<\s*(a|img|meta|source)\b/i)?.[1]?.toLowerCase() || "*";
+  const tag = normalizedPattern.match(/<\s*(a|img|meta|source)\b/i)?.[1]?.toLowerCase() || "*";
   warn(`纯 HTML 正则取 ${attribute} 已转换为 XPath 属性选择器`);
   return `//${tag}/@${attribute}`;
 }

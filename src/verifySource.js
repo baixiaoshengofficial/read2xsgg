@@ -469,13 +469,17 @@ export function extractBookIdFromUrl(value) {
   try {
     const page = new URL(raw);
     return page.searchParams.get("bookId")
+      || page.searchParams.get("book_id")
       || page.searchParams.get("albumId")
+      || page.searchParams.get("album_id")
+      || page.searchParams.get("itemId")
+      || page.searchParams.get("item_id")
       || page.searchParams.get("id")
       || (page.pathname.match(/\/(?:book|album|comic)\/(\d+)/i)?.[1] || "")
       || (page.pathname.match(/\/(\d+)(?:\/|$)/)?.[1] || "")
       || "";
   } catch {
-    return raw.match(/[?&](?:bookId|albumId|id)=(\d+)/i)?.[1] || "";
+    return raw.match(/[?&](?:book_?id|album_?id|item_?id|id)=(\d+)/i)?.[1] || "";
   }
 }
 
@@ -539,7 +543,7 @@ export function resolveChapterListUrls(requestInfo, bookUrl, { pageIndex = 1 } =
   // Plain absolute menu URL embedded in requestInfo (rare offline shape).
   const absoluteMenu = source.match(/https?:\/\/[^\s"'\\]+(?:getBookMenu|getAlbumMenu|chapterList|toc)[^\s"'\\]*/i);
   if (absoluteMenu && bookId && !/\/adapter\/|__ID__|%@|\{\{/.test(absoluteMenu[0])) {
-    push(absoluteMenu[0].replace(/([?&](?:bookId|albumId|id)=)[^&]*/i, `$1${encodeURIComponent(bookId)}`)
+    push(absoluteMenu[0].replace(/([?&](?:book_?id|album_?id|item_?id|id)=)[^&]*/i, `$1${encodeURIComponent(bookId)}`)
       .replace(/([?&](?:pageNum|pageIndex|page)=)[^&]*/i, `$1${encodeURIComponent(page)}`));
   }
 

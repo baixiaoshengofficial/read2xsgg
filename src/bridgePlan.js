@@ -121,7 +121,8 @@ function normalizeField(rule) {
       };
     }
     const urlTemplate = String(rule.urlTemplate || "").trim().slice(0, 2_048);
-    const selector = selectorOnly(rule.selector) || (urlTemplate ? "id" : "");
+    const valueTemplate = String(rule.valueTemplate || "").trim().slice(0, 2_048);
+    const selector = selectorOnly(rule.selector) || (urlTemplate || valueTemplate ? "id" : "");
     if (!selector) return null;
     const replacements = Array.isArray(rule.replacements) ? rule.replacements.map((item) => {
       const pattern = safeRegexPattern(item?.pattern);
@@ -137,6 +138,15 @@ function normalizeField(rule) {
         hostPrefix: Boolean(rule.matchTemplate?.hostPrefix),
       };
     }
+    const valueMaps = {};
+    for (const [field, mapping] of Object.entries(rule.valueMaps || {}).slice(0, 8)) {
+      if (!/^[A-Za-z_$][\w$]*$/.test(field) || !mapping || typeof mapping !== "object" || Array.isArray(mapping)) continue;
+      const entries = Object.entries(mapping).slice(0, 24).map(([key, value]) => [
+        String(key).slice(0, 128),
+        String(value).slice(0, 512),
+      ]);
+      if (entries.length) valueMaps[field] = Object.fromEntries(entries);
+    }
     return {
       selector,
       replacements,
@@ -144,6 +154,8 @@ function normalizeField(rule) {
       matchTemplate,
       ...(String(rule.fallback || "").trim() ? { fallback: String(rule.fallback).trim().slice(0, 2048) } : {}),
       ...(urlTemplate && /^https?:\/\//i.test(urlTemplate) ? { urlTemplate } : {}),
+      ...(valueTemplate ? { valueTemplate } : {}),
+      ...(Object.keys(valueMaps).length ? { valueMaps } : {}),
     };
   }
   const source = String(rule || "").trim();
@@ -255,6 +267,20 @@ function normalizePlan(value) {
     if (!/^(?:user-agent|referer|origin|accept|accept-language|content-type|x-requested-with|x-fingerprint)$/i.test(name)) continue;
     headers[name] = String(headerValue).slice(0, 2048);
   }
+  let filter = null;
+  if (kind === "books" && value.filter && typeof value.filter === "object") {
+    const field = selectorOnly(value.filter.field);
+    const equals = String(value.filter.equals ?? "").slice(0, 512);
+    if (field && equals) filter = { field, equals };
+  }
+  let tocRequest = null;
+  if (kind === "chapters" && value.tocRequest && typeof value.tocRequest === "object") {
+    const pattern = safeRegexPattern(value.tocRequest.pattern);
+    const prefix = String(value.tocRequest.prefix || "").slice(0, 2048);
+    const suffix = String(value.tocRequest.suffix || "").slice(0, 2048);
+    const capture = Math.max(1, Math.min(8, Number(value.tocRequest.capture) || 1));
+    if (pattern && (prefix || suffix)) tocRequest = { pattern, prefix, suffix, capture };
+  }
   let latestChapter = null;
   if (kind === "detail" && value.latestChapter && typeof value.latestChapter === "object") {
     const candidate = value.latestChapter;
@@ -326,6 +352,8 @@ function normalizePlan(value) {
     preserveOrder: Boolean(value.preserveOrder),
     fields,
     headers,
+    ...(filter ? { filter } : {}),
+    ...(tocRequest ? { tocRequest } : {}),
     ...(latestChapter ? { latestChapter } : {}),
   };
 }
@@ -417,6 +445,77 @@ function multiFieldResultUrlTemplate(script) {
   return { selector: fields[0], urlTemplate };
 }
 
+function mappedResultUrlTemplate(script) {
+  const returned = String(script || "").match(/\breturn\s+([\s\S]+?)\s*;?\s*$/i);
+  if (!returned) return null;
+  let expression = returned[1].replace(/;\s*$/, "").trim();
+  const valueMaps = {};
+  expression = expression.replace(
+    /\(\s*\{([^{}]{1,4096})\}\s*\[\s*result\.([A-Za-z_$][\w$]*)\s*\]\s*\|\|\s*result\.\2\s*\)/g,
+    (whole, body, field) => {
+      const mapping = {};
+      let consumed = "";
+      const entryPattern = /\s*(["'])([^"']+)\1\s*:\s*(["'])((?:\\.|(?!\3)[\s\S])*)\3\s*(,|$)/gy;
+      let cursor = 0;
+      while (cursor < body.length) {
+        entryPattern.lastIndex = cursor;
+        const entry = entryPattern.exec(body);
+        if (!entry) return whole;
+        let value;
+        try { value = staticStringLiteral(`${entry[3]}${entry[4]}${entry[3]}`); } catch { return whole; }
+        mapping[entry[2]] = value;
+        cursor = entryPattern.lastIndex;
+        consumed += entry[0];
+      }
+      if (!Object.keys(mapping).length || consumed.trim().length !== body.trim().length) return whole;
+      valueMaps[field] = mapping;
+      return JSON.stringify(`<READ2XSGG:${field}>`);
+    },
+  );
+  // Leave ordinary prefix/suffix concatenation to the older matchTemplate
+  // compiler. This path exists specifically for object-lookup value maps.
+  if (!Object.keys(valueMaps).length) return null;
+  expression = expression
+    .replace(/String\(\s*result\.([A-Za-z_$][\w$]*)\s*\)/g, (_match, field) => (
+      JSON.stringify(`<READ2XSGG:${field}>`)
+    ))
+    .replace(/\bresult\.([A-Za-z_$][\w$]*)\b/g, (_match, field) => (
+      JSON.stringify(`<READ2XSGG:${field}>`)
+    ));
+
+  const parts = [];
+  let cursor = 0;
+  while (cursor < expression.length) {
+    const rest = expression.slice(cursor);
+    const spacing = rest.match(/^\s+/)?.[0] || "";
+    cursor += spacing.length;
+    const token = expression[cursor];
+    if (!token) break;
+    if (token === "+" || token === "(" || token === ")") {
+      cursor += 1;
+      continue;
+    }
+    const literal = expression.slice(cursor).match(/^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/);
+    if (!literal) return null;
+    let value;
+    try { value = staticStringLiteral(literal[0]); } catch { return null; }
+    parts.push(value);
+    cursor += literal[0].length;
+  }
+  const combined = parts.join("");
+  const fields = [...combined.matchAll(/<READ2XSGG:([A-Za-z_$][\w$]*)>/g)].map((match) => match[1]);
+  if (!fields.length) return null;
+  const httpTemplate = /^https?:\/\//i.test(combined);
+  const template = combined.replace(
+    /<READ2XSGG:([A-Za-z_$][\w$]*)>/g,
+    httpTemplate ? "{{$1}}" : "{{text:$1}}",
+  );
+  if (template.length > 2048) return null;
+  return httpTemplate
+    ? { selector: fields[0], urlTemplate: template, valueMaps }
+    : { selector: fields[0], valueTemplate: template, valueMaps };
+}
+
 function jsonFieldUrlTemplate(rule) {
   const source = String(rule || "").trim();
   if (!/^https?:\/\//i.test(source)) return null;
@@ -470,6 +569,8 @@ function inferredScriptField(rule, preferredNames = []) {
   }
   const multiFieldUrl = multiFieldResultUrlTemplate(source);
   if (multiFieldUrl) return multiFieldUrl;
+  const mappedUrl = mappedResultUrlTemplate(source);
+  if (mappedUrl) return mappedUrl;
   const stringLiteral = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
   const threePart = source.match(new RegExp(
     `return\\s+\\(?\\s*(${stringLiteral})\\s*\\+\\s*(?:String\\(\\s*result\\.([A-Za-z_$][\\w$]*)\\s*\\)|result\\.([A-Za-z_$][\\w$]*))\\s*\\+\\s*(${stringLiteral})\\s*\\)?\\s*;`,
@@ -545,6 +646,17 @@ function inferredScriptField(rule, preferredNames = []) {
   return "";
 }
 
+function inferredJsonEqualityFilter(rule) {
+  const source = String(rule || "");
+  const match = source.match(
+    /\bif\s*\(\s*\(*\s*(?:String\(\s*)?result\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\)*\s*={2,3}\s*(["'])((?:\\.|(?!\2)[\s\S])*)\2\s*\)*\s*\)/i,
+  );
+  if (!match) return null;
+  let equals;
+  try { equals = staticStringLiteral(`${match[2]}${match[3]}${match[2]}`); } catch { return null; }
+  return { field: match[1].replace(/\./g, "/"), equals };
+}
+
 function inferredDomScriptSelector(rule, preferredNames = []) {
   const source = String(rule || "").trim();
   if (!/^@js:/i.test(source)) return rule;
@@ -601,6 +713,7 @@ export function compileBookBridgePlan(action, headers = {}) {
     responseType: action.responseFormatType,
     charset: planCharset(action),
     list: inferredDomScriptSelector(action.list, [/book/i, /item/i, /list/i, /article/i]),
+    filter: inferredJsonEqualityFilter(action.bookName),
     fields: {
       name: inferredScriptField(action.bookName, [/^(?:book)?name$/i, /title/i, /username/i]),
       url: inferredScriptField(action.detailUrl, [/url/i, /id/i, /username/i])
@@ -640,7 +753,9 @@ export function compileDetailBridgePlan(action, headers = {}) {
   });
 }
 
-export function compileChapterBridgePlan(action, { tocSelector = "", headers = {}, reverse = false } = {}) {
+export function compileChapterBridgePlan(action, {
+  tocSelector = "", tocRequest = null, headers = {}, reverse = false,
+} = {}) {
   const urlRule = action?.url && typeof action.url === "object" && action.url.urlTemplate
     ? action.url
     : inferredScriptField(action.url, [/url/i, /id/i, /href/i]);
@@ -651,6 +766,7 @@ export function compileChapterBridgePlan(action, { tocSelector = "", headers = {
     charset: planCharset(action),
     list: inferredDomScriptSelector(action.list, [/chapter/i, /catalog/i, /directory/i, /content/i, /list/i]),
     tocSelector,
+    tocRequest,
     reverse: Boolean(reverse || action.reverseChapters || action.reverse),
     fields: {
       title: inferredScriptField(action.title, [/title/i, /name/i, /chapter/i])
@@ -1022,6 +1138,9 @@ function transformed(plan, rule, input, options = {}) {
   const field = normalizeField(rule);
   let value = select(plan, field, input, options);
   if (Array.isArray(value)) return value;
+  if (field?.valueTemplate) {
+    value = expandUrlTemplate(field.valueTemplate, input, options.baseUrl || "", value, field.valueMaps);
+  }
   for (const replacement of field?.replacements || []) {
     value = String(value).replace(new RegExp(replacement.pattern, "g"), replacement.replacement);
   }
@@ -1033,21 +1152,26 @@ function transformed(plan, rule, input, options = {}) {
   return String(value || "").trim() || field?.fallback || "";
 }
 
-function expandUrlTemplate(template, item, baseUrl, selectedValue = "") {
+function expandUrlTemplate(template, item, baseUrl, selectedValue = "", valueMaps = {}) {
   let bookId = "";
   let comicId = "";
   let entityId = "";
   try {
     const page = new URL(baseUrl);
     bookId = page.searchParams.get("bookId")
+      || page.searchParams.get("book_id")
       || page.searchParams.get("albumId")
+      || page.searchParams.get("album_id")
+      || page.searchParams.get("itemId")
+      || page.searchParams.get("item_id")
+      || page.searchParams.get("mid")
       || page.searchParams.get("id")
       || (page.pathname.match(/\/(?:book|album|comic)\/(\d+)/i)?.[1] || "")
       || (page.pathname.match(/\/(\d+)(?:\/|$)/)?.[1] || "");
     comicId = page.searchParams.get("comic_id") || page.searchParams.get("comicId") || "";
     entityId = page.searchParams.get("entityId") || page.searchParams.get("entity_id") || "";
   } catch {
-    bookId = String(baseUrl || "").match(/[?&](?:bookId|albumId|id)=(\d+)/i)?.[1] || "";
+    bookId = String(baseUrl || "").match(/[?&](?:book_?id|album_?id|item_?id|mid|id)=(\d+)/i)?.[1] || "";
     comicId = String(baseUrl || "").match(/[?&](?:comic_id|comicId)=(\d+)/i)?.[1] || "";
     entityId = String(baseUrl || "").match(/[?&](?:entityId|entity_id)=(\d+)/i)?.[1] || "";
   }
@@ -1062,13 +1186,16 @@ function expandUrlTemplate(template, item, baseUrl, selectedValue = "") {
     ...pageIds,
     ...(item && typeof item === "object" && !Array.isArray(item) ? item : {}),
   };
-  const selectedName = String(template || "").match(/\{\{(?:(?:raw):)?(?!base:)([A-Za-z_$][\w$]*)\}\}/)?.[1];
+  const selectedName = String(template || "").match(/\{\{(?:(?:raw|text):)?(?!base:)([A-Za-z_$][\w$]*)\}\}/)?.[1];
   if (selectedName && selectedValue && (values[selectedName] === undefined || values[selectedName] === null)) {
     values[selectedName] = selectedValue;
   }
-  return String(template || "").replace(/\{\{(?:(base|raw):)?([A-Za-z_$][\w$]*)\}\}/g, (_, mode, name) => {
+  return String(template || "").replace(/\{\{(?:(base|raw|text):)?([A-Za-z_$][\w$]*)\}\}/g, (_, mode, name) => {
     if (mode === "base" || name === "bookId") return encodeURIComponent(String(values.bookId || bookId || ""));
-    const value = values[name] ?? pageIds[name];
+    const rawValue = values[name] ?? pageIds[name];
+    const mapping = valueMaps?.[name];
+    const value = mapping && Object.hasOwn(mapping, String(rawValue)) ? mapping[String(rawValue)] : rawValue;
+    if (mode === "text") return String(value == null ? "" : value);
     if (mode === "raw") return String(value == null ? "" : value).split("/").map(encodeURIComponent).join("/");
     return encodeURIComponent(value == null ? "" : String(value));
   });
@@ -1244,7 +1371,9 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     for (const [name, rule] of Object.entries(plan.fields)) {
       result[name] = transformed(plan, rule, parsedInput, { content: false, baseUrl });
       const field = normalizeField(rule);
-      if (field?.urlTemplate) result[name] = expandUrlTemplate(field.urlTemplate, input, baseUrl, result[name]);
+      if (field?.urlTemplate) {
+        result[name] = expandUrlTemplate(field.urlTemplate, input, baseUrl, result[name], field.valueMaps);
+      }
     }
     if (result.cover) result.cover = absolute(result.cover, baseUrl);
     return result;
@@ -1257,15 +1386,21 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     ? undefined
     : start + Math.max(pageSize, 0) + 1;
   const scanCap = resolveBridgeScanCap(plan.kind, needValid, limits);
-  const items = plan.responseType === "json" || plan.responseType === "embedded-json"
+  let items = plan.responseType === "json" || plan.responseType === "embedded-json"
     ? (() => {
       const value = plan.responseType === "embedded-json"
         ? embeddedJsonArray(input, plan.list)
         : jsonPath(input, plan.list);
-      const list = Array.isArray(value) ? value : [];
+      // JSON catalogues commonly group rows by volume/season. A list action
+      // always consumes leaf rows, so nested arrays must be flattened before
+      // fields are evaluated against each item.
+      const list = Array.isArray(value) ? value.flat(Infinity) : [];
       return Number.isFinite(scanCap) ? list.slice(0, scanCap) : list;
     })()
     : htmlSelect(plan.list, parsedInput, { list: true, maxNodes: scanCap });
+  if (plan.filter && plan.responseType === "json") {
+    items = items.filter((item) => String(jsonPathSingle(item, plan.filter.field) ?? "") === plan.filter.equals);
+  }
   if (pageSize === 0) {
     return { data: [], hasMore: false, offset: start, pageSize };
   }
@@ -1277,7 +1412,7 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
       for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item, { baseUrl });
       const urlField = normalizeField(plan.fields.url);
       if (urlField?.urlTemplate) {
-        row.url = expandUrlTemplate(urlField.urlTemplate, item, baseUrl, row.url);
+        row.url = expandUrlTemplate(urlField.urlTemplate, item, baseUrl, row.url, urlField.valueMaps);
       } else {
         row.url = absolute(row.url, baseUrl, plan.host);
       }
@@ -1307,10 +1442,12 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item, { baseUrl });
     const urlField = normalizeField(plan.fields.url);
     row.url = urlField?.urlTemplate
-      ? expandUrlTemplate(urlField.urlTemplate, item, baseUrl, row.url)
+      ? expandUrlTemplate(urlField.urlTemplate, item, baseUrl, row.url, urlField.valueMaps)
       : absolute(row.url, baseUrl, plan.host);
     const coverField = normalizeField(plan.fields.cover);
-    if (coverField?.urlTemplate) row.cover = expandUrlTemplate(coverField.urlTemplate, item, baseUrl, row.cover);
+    if (coverField?.urlTemplate) {
+      row.cover = expandUrlTemplate(coverField.urlTemplate, item, baseUrl, row.cover, coverField.valueMaps);
+    }
     if (row.cover) row.cover = absolute(row.cover, baseUrl);
     if (!row.name || !row.url) continue;
     if (seenValid < start) {
