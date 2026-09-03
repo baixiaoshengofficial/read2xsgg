@@ -177,19 +177,34 @@ function rewriteBareRuntimeIdentifiers(value) {
 
 function rewriteImplicitRuntimeAliases(value) {
   let source = String(value || "");
+  const bookGuard = "\\b(?:var|let|const)\\s+book\\b|function(?:\\s+[A-Za-z_$][\\w$]*)?\\s*\\([^)]*\\bbook\\b";
   const aliases = [
-    ["src", "result"],
-    ["host", "config.host"],
-    [
-      "baseUrl",
-      '(params.responseUrl || (params.queryInfo && (params.queryInfo.chapterUrl || params.queryInfo.url || params.queryInfo.detailUrl)) || config.host || "")',
-    ],
+    {
+      name: "book.name",
+      replacement: '(params.queryInfo && params.queryInfo.bookName || "")',
+      guard: bookGuard,
+    },
+    {
+      name: "book.url",
+      replacement: '(params.queryInfo && (params.queryInfo.detailUrl || params.queryInfo.url) || "")',
+      guard: bookGuard,
+    },
+    { name: "src", replacement: "result", guard: null },
+    { name: "host", replacement: "config.host", guard: null },
+    {
+      name: "baseUrl",
+      replacement: '(params.responseUrl || (params.queryInfo && (params.queryInfo.chapterUrl || params.queryInfo.url || params.queryInfo.detailUrl)) || config.host || "")',
+      guard: null,
+    },
   ];
-  for (const [name, replacement] of aliases) {
+  for (const alias of aliases) {
+    const { name, replacement } = alias;
+    const guard = alias.guard ?? `\\b(?:var|let|const)\\s+${name}\\b|function(?:\\s+[A-Za-z_$][\\w$]*)?\\s*\\([^)]*\\b${name}\\b`;
+    const pattern = name.replace(/\./g, "\\.");
     let masked = maskedJavaScript(source);
-    if (new RegExp(`\\b(?:var|let|const)\\s+${name}\\b|function(?:\\s+[A-Za-z_$][\\w$]*)?\\s*\\([^)]*\\b${name}\\b`).test(masked)) continue;
+    if (new RegExp(guard).test(masked)) continue;
     const edits = [];
-    for (const match of masked.matchAll(new RegExp(`\\b${name}\\b`, "g"))) {
+    for (const match of masked.matchAll(new RegExp(`\\b${pattern}\\b`, "g"))) {
       const index = match.index;
       const text = rewrittenIdentifier(masked, index, name, replacement);
       if (text) edits.push({ index, text });

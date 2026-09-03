@@ -90,3 +90,17 @@ test("含结果模板的绝对 URL 字段仍可识别为 JSON 详情", () => {
     tocUrl: "https://api.example/items/{{$.user.name}}",
   }), "json");
 });
+
+test("阅读 book 隐式全局映射到香色 queryInfo", () => {
+  const singleChapter = rewriteLegadoJavaScript('@js:\n[{"name": book.name || "正文", "url": baseUrl}]');
+  assert.equal(hasUnsupportedLegadoRuntime(singleChapter), false);
+  assert.match(singleChapter, /params\.queryInfo\.bookName/);
+  assert.match(singleChapter, /params\.responseUrl/);
+  const detailUrl = rewriteLegadoJavaScript('@js:\nreturn book.url;');
+  assert.equal(hasUnsupportedLegadoRuntime(detailUrl), false);
+  assert.match(detailUrl, /params\.queryInfo\.detailUrl/);
+  // 局部声明的 book 变量是普通对象，不得改写；校验器会保守地标记为不可移植
+  const localBook = rewriteLegadoJavaScript('@js:\nvar book = JSON.parse(result); return book.name;');
+  assert.match(localBook, /var book = JSON\.parse\(result\); return book\.name;/);
+  assert.equal(hasUnsupportedLegadoRuntime(localBook), true);
+});
