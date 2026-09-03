@@ -241,14 +241,91 @@ test("列表自定义属性中的正则捕获会安全提取详情 URL", () => {
   assert.equal(output.data[0].url, "https://books.example/b/101.html");
 });
 
+test("HTML 条目脚本的 attr 方法按属性提取而不是误判为 JSON 字段", () => {
+  const plan = compileBookBridgePlan({
+    host: "https://books.example",
+    responseFormatType: "html",
+    list: "//main//a",
+    bookName: "//span",
+    detailUrl: "@js:\nvar href=result.attr('href'); var title=result.attr('title'); return title ? href : href;",
+  });
+  assert.equal(plan.fields.url.selector, "./@href||.//*[@href]/@href");
+  const output = executeBridgePlan([
+    '<main><a href="/book/1" title="第一本"><span>第一本</span></a></main>',
+  ].join(""), "https://books.example/category", plan);
+  assert.deepEqual(output.data, [{
+    name: "第一本",
+    url: "https://books.example/book/1",
+  }]);
+});
+
+test("需要二次请求的导航条目不会混入可直接访问的作品列表", () => {
+  const plan = compileBookBridgePlan({
+    host: "https://books.example",
+    responseFormatType: "html",
+    list: "//main//a",
+    bookName: "//span",
+    detailUrl: [
+      "@js:",
+      "var href=result.attr('href'); var title=result.attr('title');",
+      "if(!title){ var body=java.ajax(href); }",
+      "return title ? href : body;",
+    ].join("\n"),
+  });
+  assert.equal(plan.list, "(//main//a)[@title]");
+  const output = executeBridgePlan([
+    '<main><a href="/author/1"><span>作者入口</span></a>',
+    '<a href="/book/1" title="第一本"><span>第一本</span></a></main>',
+  ].join(""), "https://books.example/category", plan);
+  assert.deepEqual(output.data, [{
+    name: "第一本",
+    url: "https://books.example/book/1",
+  }]);
+});
+
+test("HTML DOM 脚本组装的 JSON 目录还原为声明式章节列表", () => {
+  const action = {
+    host: "https://books.example",
+    responseFormatType: "json",
+    list: [
+      "@js:",
+      "var doc=org.jsoup.Jsoup.parse(result);",
+      "var links=doc.select('ol.chapters li a'); var list=[];",
+      "for(var i=0;i<links.size();i++){",
+      "  list.push(JSON.stringify({title:links.get(i).text(),url:'https://books.example'+links.get(i).attr('href')}));",
+      "}",
+      "return list;",
+    ].join("\n"),
+    title: "title",
+    url: "url",
+  };
+  const plan = compileChapterBridgePlan(action);
+  assert.equal(plan.responseType, "html");
+  assert.equal(plan.fields.title.selector, ".");
+  assert.equal(plan.fields.url.selector, "./@href||.//*[@href]/@href");
+  const output = executeBridgePlan([
+    '<ol class="chapters"><li><a href="/chapter/1">第一章</a></li>',
+    '<li><a href="/chapter/2">第二章</a></li></ol>',
+  ].join(""), "https://books.example/book/1", plan);
+  assert.deepEqual(output.data.map((chapter) => chapter.title), ["第一章", "第二章"]);
+  assert.deepEqual(output.data.map((chapter) => chapter.url), [
+    "https://books.example/chapter/1",
+    "https://books.example/chapter/2",
+  ]);
+});
+
 test("GET/POST 请求模板转换", () => {
   assert.equal(
     convertRequest("/search/{{key}}/{{page}}").requestInfo,
     "/search/%@keyWord/%@pageIndex",
   );
   const post = convertRequest('/search,{"method":"post","body":"q={{key}}&offset={{page-1}}"}');
-  assert.match(post.requestInfo, /"q": params\.keyWord/);
-  assert.match(post.requestInfo, /"offset":\s*params\.pageIndex\s*-\s*1/);
+  assert.match(post.requestInfo, /"q":\s*\(+params\.keyWord\)+/);
+  assert.match(post.requestInfo, /"offset":\s*\(+params\.pageIndex\s*-\s*1\)+/);
+
+  const offsetGet = convertRequest('/search?start={{page-1}}').requestInfo;
+  const offsetRequest = new Function("config", "params", "result", offsetGet.replace(/^@js:\s*/, ""));
+  assert.equal(offsetRequest({}, { pageIndex: 3 }, "").url, "/search?start=2");
 
   const jsonPost = convertRequest('/api/cate,{"method":"POST","body":"{\\"page\\":{\\"page\\":{{page}},\\"pageSize\\":10},\\"tag\\":\\"热血\\"}"}');
   assert.match(jsonPost.requestInfo, /let hp = JSON\.parse\(/);
@@ -269,12 +346,12 @@ test("GET/POST 请求模板转换", () => {
 
   const cleanCookie = convertRequest('{{url=source.getKey();cookie.removeCookie(url);java.put("url",url)}}/search,{"method":"POST","body":"keyword={{key}}"}').requestInfo;
   assert.doesNotMatch(cleanCookie, /source\.|cookie\.|java\./);
-  assert.match(cleanCookie, /"keyword": params\.keyWord/);
+  assert.match(cleanCookie, /"keyword":\s*\(+params\.keyWord\)+/);
   assert.match(cleanCookie, /POST:true/);
 
   const jsCookiePrefix = convertRequest('@js:cookie.removeCookie(source.key);</js>/search/index.php,{"method":"POST","body":"q={{key}}","charset":"gbk"}');
   assert.doesNotMatch(jsCookiePrefix.requestInfo, /<\/js>|cookie\.|source\./);
-  assert.match(jsCookiePrefix.requestInfo, /"q": params\.keyWord/);
+  assert.match(jsCookiePrefix.requestInfo, /"q":\s*\(+params\.keyWord\)+/);
   assert.equal(jsCookiePrefix.requestParamsEncode, "2147485234");
 
   const taggedCookiePrefix = convertRequest('<js>cookie.removeCookie(source.key);</js> https://example.com/search,{"method":"POST","body":"q={{key}}"}');
@@ -629,6 +706,18 @@ test("CLI 可从标准输入读取并输出 JSON", () => {
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout)["示例书源"].sourceName, "示例书源");
+});
+
+test("无效 bookSourceUrl 从实际请求 URL 推导站点 host", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "请求地址推导";
+  source.bookSourceUrl = "仅用于说明的本地接口";
+  source.searchUrl = "https://api.example/search?q={{key}}";
+  source.exploreUrl = "";
+  const { sources, warnings } = convertLegado(source);
+  assert.equal(sources["请求地址推导"].sourceUrl, "https://api.example");
+  assert.equal(sources["请求地址推导"].searchBook.host, "https://api.example");
+  assert.ok(warnings.some((warning) => /请求规则推导站点地址/.test(warning.message)));
 });
 
 test("bookSourceType 映射为香色 sourceType，weight 不为 0", () => {

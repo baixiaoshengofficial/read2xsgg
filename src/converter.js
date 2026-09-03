@@ -36,10 +36,56 @@ function cleanBaseUrl(value) {
   if (!source) return "";
   try {
     const url = new URL(source);
-    return `${url.protocol}//${url.host}`;
+    return /^https?:$/.test(url.protocol) ? `${url.protocol}//${url.host}` : "";
   } catch {
-    return source.replace(/\/$/, "");
+    return "";
   }
+}
+
+function requestHostFromSource(source) {
+  const candidates = [
+    source.searchUrl,
+    source.exploreUrl,
+    source.loginUrl,
+    source.ruleSearch,
+    source.searchRule,
+    source.ruleExplore,
+    source.exploreRule,
+    source.ruleBookInfo,
+    source.bookInfoRule,
+    source.ruleToc,
+    source.tocRule,
+    source.ruleContent,
+    source.contentRule,
+  ];
+  const visit = (value) => {
+    if (typeof value === "string") {
+      for (const match of value.matchAll(/https?:\/\/[^\s'"`<>{},)\\]+/gi)) {
+        const host = cleanBaseUrl(match[0]);
+        if (host) return host;
+      }
+      return "";
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const host = visit(item);
+        if (host) return host;
+      }
+      return "";
+    }
+    if (value && typeof value === "object") {
+      for (const item of Object.values(value)) {
+        const host = visit(item);
+        if (host) return host;
+      }
+    }
+    return "";
+  };
+  for (const candidate of candidates) {
+    const host = visit(candidate);
+    if (host) return host;
+  }
+  return "";
 }
 
 function sourceType(source) {
@@ -446,6 +492,8 @@ function bridgeRequestInfo(requestInfo, endpoint, { pageSize = 20, serverPaging 
       'if (u && typeof u == "object") u = u.url || "";',
       'u = String(u || "").trim();',
       ...runtimeLegadoRequestOptionStrip(),
+      'if (u.indexOf("//") == 0) u = "https:" + u;',
+      'else if (u && !/^https?:\\/\\//i.test(u)) u = (config.host || "") + (u.charAt(0) == "/" ? u : "/" + u);',
       `return ${finalizeAdapterUrlExpression(pagedEndpoint)} + encodeURIComponent(u);`,
     ].join("\n");
   }
@@ -2142,7 +2190,7 @@ function convertOne(source, warnings, options = {}) {
   const sourceName = String(source.bookSourceName ?? source.name ?? "未命名书源").trim() || "未命名书源";
   const stored = resolveLegadoStoredRules(source);
   source = stored.source;
-  const host = cleanBaseUrl(source.bookSourceUrl ?? source.url);
+  const host = cleanBaseUrl(source.bookSourceUrl ?? source.url) || requestHostFromSource(source);
   const warningForSource = createWarningCollector(warnings, sourceName, "source");
   if (stored.changed) {
     warningForSource("storedRules", `${stored.changed} fields`)("已将阅读 @put/@get 状态规则编译为当前列表项或详情页的静态选择器/JSON 字段模板");
@@ -2155,7 +2203,11 @@ function convertOne(source, warnings, options = {}) {
     ...parseHeaders(source.header, warningForSource("header", source.header)),
     ...(source.httpUserAgent ? { "User-Agent": String(source.httpUserAgent) } : {}),
   }, tocRules.chapterUrl, source.searchUrl, searchRules.coverUrl, detailRules.coverUrl, exploreRulesEarly.coverUrl), host, warningForSource);
-  if (!host) warningForSource("bookSourceUrl", source.bookSourceUrl)("缺少有效的 bookSourceUrl，生成源可能无法发起请求");
+  if (!cleanBaseUrl(source.bookSourceUrl ?? source.url) && host) {
+    warningForSource("bookSourceUrl", source.bookSourceUrl)(`bookSourceUrl 不是有效 URL，已从请求规则推导站点地址 ${host}`);
+  } else if (!host) {
+    warningForSource("bookSourceUrl", source.bookSourceUrl)("缺少有效的 bookSourceUrl，且请求规则中没有可推导的绝对地址");
+  }
   const resolvedType = sourceType(source);
   if ((source.bookSourceType === 3 || source.bookSourceType === "3") && resolvedType === "text") {
     warningForSource("bookSourceType", source.bookSourceType)("阅读的文件源类型在香色中没有直接等价类型，已按普通文本源输出");

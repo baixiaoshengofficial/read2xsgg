@@ -152,7 +152,8 @@ function expressionForTemplate(template, { keyword = true, warn = () => {} } = {
     const inner = match[1].trim();
     const portable = legadoTemplateExpression(inner);
     if (portable) {
-      parts.push(!keyword && /^key$/i.test(inner) ? "params.pageIndex" : portable);
+      const expression = !keyword && /^key$/i.test(inner) ? "params.pageIndex" : portable;
+      parts.push(`(${expression})`);
     } else if (/^(?:Get|get)\s*\(/i.test(inner)) {
       const getKey = inner.match(/^[^(]+\(\s*['"]([^'"]+)['"]\s*\)$/)?.[1] || "";
       if (/^url$/i.test(getKey)) {

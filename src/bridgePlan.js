@@ -636,7 +636,11 @@ function inferredScriptField(rule, preferredNames = []) {
       return "";
     }
   }
-  const fields = [...source.matchAll(/\bresult\.([A-Za-z_$][\w$]*)/g)].map((match) => match[1]);
+  // Property reads such as result.id are JSON fields. Method calls such as
+  // result.attr('href') are DOM operations and must be handled by
+  // inferredDomScriptSelector; treating `attr` as a field drops every row.
+  const fields = [...source.matchAll(/\bresult\.([A-Za-z_$][\w$]*)\b(?!\s*\()/g)]
+    .map((match) => match[1]);
   for (const preferred of preferredNames) {
     const field = fields.find((name) => preferred.test(name));
     if (field) return field;
@@ -683,6 +687,18 @@ function inferredDomScriptSelector(rule, preferredNames = []) {
     const converted = convertRule(selector, { responseType: "html" });
     if (converted && !/^@js:/i.test(converted)) return converted;
   }
+  const attributes = [...source.matchAll(
+    /(?:\bresult|[A-Za-z_$][\w$]*)\.attr\s*\(\s*(['"])([A-Za-z_][\w:-]*)\1\s*\)/gi,
+  )].map((match) => match[2]);
+  for (const attribute of [...new Set(attributes)]) {
+    const wanted = preferredNames.some((pattern) => pattern.test(attribute));
+    if (!wanted) continue;
+    return `./@${attribute}||.//*[@${attribute}]/@${attribute}`;
+  }
+  if (preferredNames.some((pattern) => pattern.test("text") || pattern.test("title") || pattern.test("name"))
+    && /\bresult\.(?:text|ownText)\s*\(\s*\)/i.test(source)) {
+    return ".";
+  }
   // Some list fields parse the serialized item with a regex instead of using
   // Legado's DOM helpers. Preserve the referenced attribute declaratively.
   if (preferredNames.some((pattern) => pattern.test("href") || pattern.test("url"))
@@ -700,6 +716,53 @@ function inferredDomScriptSelector(rule, preferredNames = []) {
   return "";
 }
 
+function directDomAttributeGuard(rule) {
+  const source = String(rule || "");
+  if (!/^@js:/i.test(source) || !/\b(?:java\.ajax|java\.connect)\s*\(/i.test(source)) return "";
+  const variables = new Map();
+  for (const match of source.matchAll(
+    /(?:\bvar\s+|\blet\s+|\bconst\s+)?([A-Za-z_$][\w$]*)\s*=\s*result\.attr\s*\(\s*(['"])([A-Za-z_][\w:-]*)\2\s*\)/gi,
+  )) variables.set(match[1], match[3]);
+  for (const [variable, attribute] of variables) {
+    if (/^(?:href|src|url)$/i.test(attribute)) continue;
+    const escaped = variable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`\\bif\\s*\\(\\s*!\\s*${escaped}\\s*\\)`).test(source)) return attribute;
+  }
+  return "";
+}
+
+function requireListAttribute(list, attribute) {
+  const source = String(list || "").trim();
+  if (!source || !attribute || !/^[A-Za-z_][\w:-]*$/.test(attribute)) return source;
+  if (new RegExp(`@${attribute}(?:\\b|\\])`, "i").test(source)) return source;
+  return `(${source})[@${attribute}]`;
+}
+
+function domListProjection(rule, field) {
+  const source = String(rule || "");
+  if (!/^@js:/i.test(source)
+    || !/\borg\.jsoup\.Jsoup\.parse\s*\(/i.test(source)
+    || !/\.select\s*\(/i.test(source)) return "";
+  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (field === "title" && new RegExp(
+    `\\b${escapedField}\\s*:\\s*[^,}\\r\\n]*\\.(?:text|ownText)\\s*\\(`,
+    "i",
+  ).test(source)) return ".";
+  const attribute = source.match(new RegExp(
+    `\\b${escapedField}\\s*:\\s*[^,}\\r\\n]*\\.attr\\s*\\(\\s*(['"])([A-Za-z_][\\w:-]*)\\1`,
+    "i",
+  ))?.[2];
+  return attribute ? `./@${attribute}||.//*[@${attribute}]/@${attribute}` : "";
+}
+
+function isDomListProjection(rule) {
+  const source = String(rule || "");
+  return /^@js:/i.test(source)
+    && /\borg\.jsoup\.Jsoup\.parse\s*\(/i.test(source)
+    && /\.select\s*\(/i.test(source)
+    && /(?:\.push\s*\(|\.add\s*\()/i.test(source);
+}
+
 function planCharset(action) {
   if (isXiangseGbkEncode(action)) return "gbk";
   const charset = String(action?.charset || "").trim().toLowerCase();
@@ -707,12 +770,18 @@ function planCharset(action) {
 }
 
 export function compileBookBridgePlan(action, headers = {}) {
+  const guardedList = action.responseFormatType === "html"
+    ? requireListAttribute(
+      inferredDomScriptSelector(action.list, [/book/i, /item/i, /list/i, /article/i]),
+      directDomAttributeGuard(action.detailUrl),
+    )
+    : inferredDomScriptSelector(action.list, [/book/i, /item/i, /list/i, /article/i]);
   return normalizePlan({
     kind: "books",
     host: action.host,
     responseType: action.responseFormatType,
     charset: planCharset(action),
-    list: inferredDomScriptSelector(action.list, [/book/i, /item/i, /list/i, /article/i]),
+    list: guardedList,
     filter: inferredJsonEqualityFilter(action.bookName),
     fields: {
       name: inferredScriptField(action.bookName, [/^(?:book)?name$/i, /title/i, /username/i]),
@@ -756,20 +825,24 @@ export function compileDetailBridgePlan(action, headers = {}) {
 export function compileChapterBridgePlan(action, {
   tocSelector = "", tocRequest = null, headers = {}, reverse = false,
 } = {}) {
-  const urlRule = action?.url && typeof action.url === "object" && action.url.urlTemplate
+  const projectedDomList = isDomListProjection(action?.list);
+  const urlRule = projectedDomList
+    ? domListProjection(action.list, "url")
+    : action?.url && typeof action.url === "object" && action.url.urlTemplate
     ? action.url
     : inferredScriptField(action.url, [/url/i, /id/i, /href/i]);
   return normalizePlan({
     kind: "chapters",
     host: action.host,
-    responseType: action.responseFormatType,
+    responseType: projectedDomList ? "html" : action.responseFormatType,
     charset: planCharset(action),
     list: inferredDomScriptSelector(action.list, [/chapter/i, /catalog/i, /directory/i, /content/i, /list/i]),
     tocSelector,
     tocRequest,
     reverse: Boolean(reverse || action.reverseChapters || action.reverse),
     fields: {
-      title: inferredScriptField(action.title, [/title/i, /name/i, /chapter/i])
+      title: (projectedDomList ? domListProjection(action.list, "title") : "")
+        || inferredScriptField(action.title, [/title/i, /name/i, /chapter/i])
         || inferredDomScriptSelector(action.title, [/title/i, /name/i, /text/i, /alt/i])
         || (/queryInfo\.(?:bookName|name)/i.test(String(action.title || "")) ? { constant: "播放" } : ""),
       url: urlRule || inferredDomScriptSelector(action.url, [/href/i, /url/i, /src/i]),
