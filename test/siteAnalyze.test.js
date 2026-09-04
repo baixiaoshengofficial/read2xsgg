@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createServer } from "node:http";
 import iconv from "iconv-lite";
 import {
   detectKind,
@@ -54,6 +55,18 @@ import {
   stableAnchorSelectorFromLinks,
 } from "../src/siteAnalyze/domUtil.js";
 import { discoverSpaMedia } from "../src/siteAnalyze/spaMedia.js";
+import { createAppServer } from "../src/server.js";
+
+function listen(server) {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${server.address().port}`));
+  });
+}
+
+function close(server) {
+  return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+}
 
 const novelHome = `<!doctype html><html><head><title>示例小说网</title>
 <meta charset="utf-8">
@@ -4462,4 +4475,60 @@ test("抽测进度回调包含当前站点名", async () => {
   assert.ok(seen.length >= 1);
   assert.ok(seen.some((item) => String(item.current).includes("进度站")));
   assert.ok(seen.some((item) => String(item.current).includes("novel.example")));
+});
+
+test("discoverNovel 跟随 og:novel:read_url 目录页并识别卷名章节", async (context) => {
+  const home = `<!doctype html><html><head><title>轻小说站</title></head><body>
+  <a href="/gocomic" class="nav"><img src="/cover-nav.png" alt="漫画"></a>
+  <ul class="rank">
+    <li><a href="/novel/101.html">轻小说甲</a></li>
+    <li><a href="/novel/102.html">轻小说乙</a></li>
+    <li><a href="/novel/103.html">轻小说丙</a></li>
+  </ul>
+  </body></html>`;
+  const detail = `<!doctype html><html><head>
+  <meta property="og:novel:book_name" content="轻小说甲">
+  <meta property="og:novel:read_url" content="/novel/101/catalog">
+  </head><body>
+  <h1>轻小说甲</h1>
+  <a href="/novel/101/catalog">最后更新·2026-09-01 第二卷 后记</a>
+  <a href="/novel/102.html">轻小说乙</a>
+  </body></html>`;
+  const catalog = `<!doctype html><html><body><ul>
+  <li><a href="/novel/101/c1.html"><span class="idx">第一部</span></a></li>
+  <li><a href="/novel/101/c2.html"><span class="idx">第二部</span></a></li>
+  <li><a href="/novel/101/c3.html"><span class="idx">第三部</span></a></li>
+  </ul></body></html>`;
+  const chapter = `<!doctype html><html><body><div id="content">${"卷名正文。".repeat(40)}</div></body></html>`;
+  const upstream = createServer((request, response) => {
+    const path = new URL(request.url || "/", "http://upstream.example").pathname;
+    const body = path === "/novel/101/catalog" ? catalog
+      : path === "/novel/101.html" ? detail
+      : /^\/novel\/101\/c\d+\.html$/.test(path) ? chapter
+      : home;
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    response.end(body);
+  });
+  const upstreamBase = await listen(upstream);
+  context.after(() => close(upstream));
+  const bridge = createAppServer({ config: { allowPrivateNetworks: true, cacheTtlMs: 0 } });
+  const bridgeBase = await listen(bridge);
+  context.after(() => close(bridge));
+
+  const discovery = await discoverNovel(`${upstreamBase}/`, {
+    download: async (url) => Buffer.from(await (await fetch(url)).arrayBuffer()),
+    adapterBase: bridgeBase,
+  });
+  assert.ok(discovery, JSON.stringify(discovery));
+  assert.match(discovery.tocSelector, /og:novel:read_url/);
+  assert.ok(discovery.chapterCount >= 2);
+  assert.match(discovery.chapterSampleUrl, /\/novel\/101\/c\d+\.html$/);
+  assert.match(discovery.chapterRequestInfo || "", /adapter\/toc/);
+
+  const source = novelDiscoveryToXiangse(discovery, { sourceName: "轻小说站" });
+  const report = await runXbsPipeline(source, { adapterBase: bridgeBase });
+  assert.equal(report.ok, true, report.error);
+  assert.equal(report.steps.chapterList.listCount, 3);
+  assert.match(report.steps.chapterList.requestUrl, /\/novel\/101\/catalog$/);
+  assert.match(report.steps.chapterContent.requestUrl, /\/novel\/101\/c\d+\.html$/);
 });

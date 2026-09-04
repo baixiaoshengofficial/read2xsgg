@@ -102,11 +102,17 @@ export async function discoverNovel(originUrl, {
   ));
   const bookLinks = readableLinks.filter((item) => BOOK_HREF.test(item.href));
   const semanticBookLinks = bookLinks.filter((item) => !CHAPTER_TEXT.test(item.text));
-  const candidates = coveredBookLinks.length >= 2
-    ? coveredBookLinks
-    : semanticBookLinks.length >= 2 ? semanticBookLinks : bookLinks.length ? bookLinks : readableLinks;
-  const cluster = scoreLinkCluster(candidates, homeUrl)
-    .slice(0, 30);
+  // 封面卡片与 URL 语义是两个独立的列表信号：门户页可能只有两三条带封面的
+  // 导航（如「漫画」入口），而真正的书籍列表链接没有封面。比较两条聚类的
+  // 规模，跟随更强的信号，而不是无条件优先封面链接。
+  const coveredCluster = scoreLinkCluster(coveredBookLinks, homeUrl).slice(0, 30);
+  const semanticCandidates = semanticBookLinks.length >= 2
+    ? semanticBookLinks
+    : bookLinks.length ? bookLinks : readableLinks;
+  const semanticCluster = scoreLinkCluster(semanticCandidates, homeUrl).slice(0, 30);
+  const cluster = coveredCluster.length > semanticCluster.length
+    ? coveredCluster
+    : semanticCluster;
   if (cluster.length < 2) {
     diagnostics.push("list: 书籍链接不足 2 条");
     return null;
@@ -151,18 +157,50 @@ export async function discoverNovel(originUrl, {
       detailUrl,
     );
   }
-  if (chapterLinks.length < 2 && /^https?:\/\//i.test(String(adapterBase || ""))) {
-    const catalogue = detailAnchors
+  // og:novel 协议：详情页用 og:novel:read_url 直接声明目录页地址，
+  // 运行时同样可以通过 meta 选择器在详情页上还原该地址。read_url 是
+  // 站点自己声明的目录位置，比详情页上偶然的章节样链接更可信，
+  // 因此即使详情页已经凑出几条章节链接，也要优先走目录页。
+  const ogReadUrlRaw = String(
+    detailDoc.querySelector('meta[property="og:novel:read_url" i]')?.getAttribute("content") || "",
+  ).trim();
+  let ogReadUrl = "";
+  if (ogReadUrlRaw) {
+    try { ogReadUrl = new URL(ogReadUrlRaw, detailUrl).toString(); } catch { ogReadUrl = ""; }
+  }
+  if ((chapterLinks.length < 2 || (ogReadUrl && /^https?:\/\//i.test(ogReadUrl)))
+    && /^https?:\/\//i.test(String(adapterBase || ""))) {
+    const catalogCandidates = [];
+    if (ogReadUrl && /^https?:\/\//i.test(ogReadUrl)) {
+      catalogCandidates.push({
+        href: ogReadUrl,
+        tocSelector: "//meta[@property='og:novel:read_url']/@content",
+        score: 10_000,
+      });
+    }
+    catalogCandidates.push(...detailAnchors
       .map((item, order) => ({
-        ...item,
+        href: item.href,
+        tocSelector: `${xpathForElement(item.el, detailDoc)}/@href`,
         score: (/(?:章节目录|全部章节|目录列表|目录|catalog|directory|table\s+of\s+contents)/i.test(item.text) ? 1_000 : 0)
           + (/(?:catalog|chapter[-_/]?list|chapters|directory|mulu|\/i\/\d+)/i.test(item.href) ? 300 : 0)
           - (/(?:开始阅读|点击阅读|继续阅读|下一章|上一章|read\s*now)/i.test(item.text) ? 500 : 0)
           - order,
       }))
       .filter((item) => item.score > 0)
-      .sort((left, right) => right.score - left.score)[0];
-    if (catalogue) {
+      .sort((left, right) => right.score - left.score));
+    // 卷名站点（如轻小说「第一部/第二部」）的章节标题不含「章」字，
+    // 目录页里与详情 URL 同前缀的编号链接是比标题文本更强的章节信号。
+    const detailPathBookPrefix = (() => {
+      try {
+        const path = new URL(detailUrl).pathname;
+        const base = path.replace(/\/index\.[A-Za-z0-9]+$/i, "").replace(/\.html?$/i, "");
+        return base && base !== "/" && /\d/.test(base) ? base + "/" : "";
+      } catch {
+        return "";
+      }
+    })();
+    for (const catalogue of catalogCandidates) {
       try {
         const cataloguePage = await download(catalogue.href);
         const catalogueUrl = String(cataloguePage.read2xsggResponseUrl || catalogue.href);
@@ -181,11 +219,26 @@ export async function discoverNovel(originUrl, {
             catalogueUrl,
           );
         }
+        if (linked.length < 2 && detailPathBookPrefix) {
+          const sameBook = catalogueAnchors.filter((item) => {
+            try {
+              const path = new URL(item.href, catalogueUrl).pathname;
+              // 末段含数字的 .html（/novel/101/c1.html、/novel/101/333277.html），
+              // 字母前缀的编号章节地址也要覆盖。
+              return path.startsWith(detailPathBookPrefix)
+                && /\/[^/]*\d+[^/]*\.html?$/i.test(path)
+                && !/(?:\/cmt\/|\/comment)/i.test(item.href);
+            } catch {
+              return false;
+            }
+          });
+          if (sameBook.length >= 2) linked = sameBook;
+        }
         if (linked.length >= 2) {
           chapterLinks = linked;
           chapterDocument = catalogueDoc;
           chapterPageUrl = catalogueUrl;
-          tocSelector = `${xpathForElement(catalogue.el, detailDoc)}/@href`;
+          tocSelector = catalogue.tocSelector;
           const endpoint = `${String(adapterBase).replace(/\/$/, "")}/adapter/toc?selector=${encodeURIComponent(tocSelector)}&url=`;
           chapterRequestInfo = [
             "@js:",
@@ -195,9 +248,10 @@ export async function discoverNovel(originUrl, {
             'u = String(q.detailUrl || u || q.url || "");',
             `return ${JSON.stringify(endpoint)} + encodeURIComponent(u);`,
           ].join("\n");
+          break;
         }
       } catch {
-        // Continue with direct detail-page discovery diagnostics.
+        // Try the next catalog candidate.
       }
     }
   }
