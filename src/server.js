@@ -487,7 +487,11 @@ async function sourceOriginReachable(source, config) {
             current = new URL(result.location, current);
             continue;
           }
-          if (result.status > 0 && result.status < 500 && ![401, 403].includes(result.status)) return current.origin;
+          // Any HTTP status below 500 proves the origin is serving, including
+          // 401/403 deny pages from API hosts or anti-bot filters: whether a
+          // source still works is decided by verification and site analysis,
+          // not by the probe. 5xx (e.g. Cloudflare 521) stays unreachable.
+          if (result.status > 0 && result.status < 500) return current.origin;
           break;
         } catch {
           break;
