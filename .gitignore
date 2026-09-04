@@ -6,3 +6,5 @@ data/
 *.converted.json
 *.report.json
 .DS_Store
+.work/
+sources/yckceo-*.json
