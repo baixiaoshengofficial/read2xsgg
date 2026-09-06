@@ -868,7 +868,171 @@ export function compileTextBridgePlan(action, headers = {}) {
   });
 }
 
+function splitXPathUnion(expression) {
+  const parts = [];
+  let start = 0;
+  let brackets = 0;
+  let parentheses = 0;
+  let quote = "";
+  for (let index = 0; index < expression.length; index += 1) {
+    const character = expression[index];
+    if (quote) {
+      if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') quote = character;
+    else if (character === "[") brackets += 1;
+    else if (character === "]") brackets -= 1;
+    else if (character === "(") parentheses += 1;
+    else if (character === ")") parentheses -= 1;
+    else if (character === "|" && brackets === 0 && parentheses === 0) {
+      parts.push(expression.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  if (!parts.length) return [expression.trim()];
+  parts.push(expression.slice(start).trim());
+  return parts.filter(Boolean);
+}
+
+function unwrapXPathGroup(expression) {
+  const source = String(expression || "").trim();
+  if (!source.startsWith("(") || !source.endsWith(")")) return source;
+  let depth = 0;
+  let quote = "";
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') quote = character;
+    else if (character === "(") depth += 1;
+    else if (character === ")") {
+      depth -= 1;
+      if (depth === 0 && index !== source.length - 1) return source;
+    }
+  }
+  return depth === 0 ? source.slice(1, -1).trim() : source;
+}
+
+function capped(values, maxNodes) {
+  const cap = Number.isFinite(maxNodes) ? Math.max(0, Math.floor(maxNodes)) : Infinity;
+  return cap === Infinity ? values : values.slice(0, cap);
+}
+
+function terminalValues(elements, terminal, maxNodes) {
+  const values = [];
+  for (const element of elements) {
+    if (terminal === "text()") {
+      for (const child of element.childNodes || []) {
+        if (child.nodeType === 3 && String(child.nodeValue || "").trim()) values.push(child);
+      }
+    } else if (terminal?.startsWith("@")) {
+      const value = element.getAttribute?.(terminal.slice(1));
+      if (value != null) values.push(value);
+    } else {
+      values.push(element);
+    }
+    if (Number.isFinite(maxNodes) && values.length >= maxNodes) break;
+  }
+  return capped(values, maxNodes);
+}
+
+/**
+ * jsdom's XPath evaluator becomes extremely slow on large documents even for
+ * simple global attribute lookups. Converted Legado rules mostly use a small,
+ * predictable XPath subset, which native DOM traversal can evaluate linearly.
+ */
+function fastXPathValues(document, rawExpression, context, { maxNodes = Infinity } = {}) {
+  const expression = unwrapXPathGroup(rawExpression);
+  const linkedItemFilter = expression.match(/^\(([\s\S]+)\)\[self::a\[@href\] or \.\/\/a\[@href\]\]$/);
+  if (linkedItemFilter) {
+    const selected = fastXPathValues(document, linkedItemFilter[1], context, { maxNodes: Infinity });
+    if (selected === null) return null;
+    return capped(selected.filter((element) => (
+      element?.nodeType === 1
+      && ((element.localName === "a" && element.hasAttribute("href")) || element.querySelector?.("a[href]"))
+    )), maxNodes);
+  }
+  const union = splitXPathUnion(expression);
+  if (union.length > 1) {
+    const values = [];
+    for (const part of union) {
+      const selected = fastXPathValues(document, part, context, {
+        maxNodes: Number.isFinite(maxNodes) ? Math.max(0, maxNodes - values.length) : Infinity,
+      });
+      if (selected === null) return null;
+      values.push(...selected);
+      if (Number.isFinite(maxNodes) && values.length >= maxNodes) break;
+    }
+    return capped(values, maxNodes);
+  }
+
+  const scope = context?.nodeType ? context : document;
+  const exactAttribute = expression.match(
+    /^\/\/([A-Za-z][\w:-]*|\*)\[@([\w:-]+)=(['"])(.*?)\3\](?:\/(@[\w:-]+|text\(\)))?$/,
+  );
+  if (exactAttribute) {
+    const [, tag, attribute, , expected, terminal = ""] = exactAttribute;
+    const candidates = scope.querySelectorAll?.(`${tag}[${attribute}]`) || [];
+    const matched = [];
+    for (const element of candidates) {
+      if (element.getAttribute?.(attribute) === expected) matched.push(element);
+    }
+    return terminalValues(matched, terminal, maxNodes);
+  }
+
+  const classMatch = expression.match(
+    /^\/\/([A-Za-z][\w:-]*|\*)\[contains\(concat\(' ', normalize-space\(@class\), ' '\), ' ([^']+) '\)\](.*)$/,
+  );
+  if (classMatch) {
+    const [, rootTag, className, tail] = classMatch;
+    let roots = Array.from(scope.querySelectorAll?.(`${rootTag}[class]`) || [])
+      .filter((element) => element.classList?.contains(className));
+    if (!tail) return capped(roots, maxNodes);
+    const terminalMatch = tail.match(/\/(text\(\)|@[\w:-]+)$/);
+    const terminal = terminalMatch?.[1] || "";
+    const path = terminalMatch ? tail.slice(0, -terminalMatch[0].length) : tail;
+    const segments = path.split("//").filter(Boolean);
+    if (!segments.length || segments.some((segment) => !/^(?:[A-Za-z][\w:-]*|\*)(?:\[\d+\])?$/.test(segment))) {
+      return null;
+    }
+    let elements = roots;
+    for (const segment of segments) {
+      const parsed = segment.match(/^([A-Za-z][\w:-]*|\*)(?:\[(\d+)\])?$/);
+      const [, tag, rawPosition] = parsed;
+      const descendants = [];
+      for (const root of elements) {
+        const found = Array.from(root.querySelectorAll?.(tag) || []);
+        if (rawPosition) {
+          const selected = found[Number(rawPosition) - 1];
+          if (selected) descendants.push(selected);
+        } else {
+          descendants.push(...found);
+        }
+      }
+      elements = descendants;
+    }
+    return terminalValues(elements, terminal, maxNodes);
+  }
+
+  const containsText = expression.match(
+    /^\/\/([A-Za-z][\w:-]*|\*)\[contains\(normalize-space\(\.\), (['"])(.*?)\2\)\](?:\/(@[\w:-]+|text\(\)))?$/,
+  );
+  if (containsText) {
+    const [, tag, , expected, terminal = ""] = containsText;
+    const elements = Array.from(scope.querySelectorAll?.(tag) || []).filter((element) => (
+      String(element.textContent || "").replace(/\s+/g, " ").trim().includes(expected)
+    ));
+    return terminalValues(elements, terminal, maxNodes);
+  }
+  return null;
+}
+
 function xpathValues(document, expression, context = document, { maxNodes = Infinity } = {}) {
+  const fast = fastXPathValues(document, expression, context, { maxNodes });
+  if (fast !== null) return fast;
   const view = document.defaultView;
   const type = /^\s*(?:string|normalize-space)\s*\(/.test(expression)
     ? view.XPathResult.STRING_TYPE : view.XPathResult.ANY_TYPE;

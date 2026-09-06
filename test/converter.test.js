@@ -1012,6 +1012,45 @@ test("详情桥接把 HTML 元数据归一为香色 JSON 字段", () => {
   );
 });
 
+test("大页面桥接用线性 DOM 快速路径执行常用属性和类 XPath", { timeout: 10_000 }, () => {
+  const filler = Array.from({ length: 10_000 }, (_, index) => `<div class="row">${index}</div>`).join("");
+  const html = `<html><head>
+    <meta property="og:novel:author" content="作者甲">
+    <meta property="og:novel:category" content="玄幻">
+  </head><body>${filler}
+    <div class="rt"><h1>测试书</h1></div>
+    <div class="msg"><em>一</em><em>二</em><em>最新章</em></div>
+    <a href="/catalog/1">查看目录</a>
+    <ul class="mulu"><li><a href="/chapter/1">第一章</a></li></ul>
+  </body></html>`;
+  const detailPlan = compileDetailBridgePlan({
+    host: "https://book.example",
+    responseFormatType: "html",
+    bookName: "//*[contains(concat(' ', normalize-space(@class), ' '), ' rt ')]//h1",
+    author: "//*[@property='og:novel:author']/@content",
+    cat: "(//*[@property='og:novel:category']/@content | //*[contains(concat(' ', normalize-space(@class), ' '), ' msg ')]//em[3]/text())",
+    tocUrl: "//a[contains(normalize-space(.), '查看目录')]/@href",
+  });
+  assert.deepEqual(executeBridgePlan(html, "https://book.example/book/1", detailPlan), {
+    name: "测试书",
+    author: "作者甲",
+    cat: "玄幻",
+    tocUrl: "/catalog/1",
+  });
+
+  const chapterPlan = compileChapterBridgePlan({
+    host: "https://book.example",
+    responseFormatType: "html",
+    list: "(//*[contains(concat(' ', normalize-space(@class), ' '), ' mulu ')]//li//a)[self::a[@href] or .//a[@href]]",
+    title: ".",
+    url: "//@href",
+  });
+  assert.equal(
+    executeBridgePlan(html, "https://book.example/book/1", chapterPlan, { limit: 1 }).data[0]?.url,
+    "https://book.example/chapter/1",
+  );
+});
+
 test("深度预检可以限制桥接结果数量而不遍历完整大目录", () => {
   const plan = compileChapterBridgePlan({
     host: "https://example.com",
