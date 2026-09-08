@@ -147,6 +147,12 @@ function normalizeField(rule) {
       ]);
       if (entries.length) valueMaps[field] = Object.fromEntries(entries);
     }
+    const templateFields = {};
+    for (const [name, fieldSelector] of Object.entries(rule.templateFields || {}).slice(0, 8)) {
+      if (!/^[A-Za-z_$][\w$]*$/.test(name)) continue;
+      const normalized = selectorOnly(fieldSelector);
+      if (normalized) templateFields[name] = normalized;
+    }
     return {
       selector,
       replacements,
@@ -156,6 +162,7 @@ function normalizeField(rule) {
       ...(urlTemplate && /^https?:\/\//i.test(urlTemplate) ? { urlTemplate } : {}),
       ...(valueTemplate ? { valueTemplate } : {}),
       ...(Object.keys(valueMaps).length ? { valueMaps } : {}),
+      ...(Object.keys(templateFields).length ? { templateFields } : {}),
     };
   }
   const source = String(rule || "").trim();
@@ -445,6 +452,69 @@ function multiFieldResultUrlTemplate(script) {
   return { selector: fields[0], urlTemplate };
 }
 
+function domScriptUrlTemplate(script) {
+  const source = String(script || "").trim();
+  if (!/^@js:/i.test(source) || !/\bresult\.(?:attr|select)\s*\(/i.test(source)) return null;
+  const templateFields = {};
+  const declarationPrefix = String.raw`\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:String\s*\(\s*)?`;
+  const declarationSuffix = String.raw`\s*\)?\s*;`;
+  for (const match of source.matchAll(new RegExp(
+    declarationPrefix + String.raw`result\.attr\(\s*["']([A-Za-z_][\w:-]*)["']\s*\)` + declarationSuffix,
+    "g",
+  ))) {
+    templateFields[match[1]] = `./@${match[2]}`;
+  }
+  for (const match of source.matchAll(new RegExp(
+    declarationPrefix + String.raw`result\.select\(\s*["']([^'"\\\r\n]+)["']\s*\)(?:\.first\(\))?\.(text|ownText)\(\s*\)` + declarationSuffix,
+    "g",
+  ))) {
+    const selector = convertRule(match[2], { responseType: "html" });
+    if (selector && !/^@js:/i.test(selector)) templateFields[match[1]] = selector;
+  }
+  for (const match of source.matchAll(new RegExp(
+    declarationPrefix + String.raw`result\.select\(\s*["']([^'"\\\r\n]+)["']\s*\)(?:\.first\(\))?\.attr\(\s*["']([A-Za-z_][\w:-]*)["']\s*\)` + declarationSuffix,
+    "g",
+  ))) {
+    const selector = convertRule(`${match[2]}@${match[3]}`, { responseType: "html" });
+    if (selector && !/^@js:/i.test(selector)) templateFields[match[1]] = selector;
+  }
+  const names = Object.keys(templateFields);
+  if (!names.length) return null;
+
+  const returned = source.match(/\breturn\s+([\s\S]+?)\s*;?\s*$/i);
+  if (!returned) return null;
+  let expression = returned[1].trim().replace(/;\s*$/, "");
+  while (expression.startsWith("(") && expression.endsWith(")")) {
+    expression = expression.slice(1, -1).trim();
+  }
+  const parts = [];
+  let cursor = 0;
+  while (cursor < expression.length) {
+    const spacing = expression.slice(cursor).match(/^\s+/)?.[0] || "";
+    cursor += spacing.length;
+    const token = expression[cursor];
+    if (!token) break;
+    if (token === "+" || token === "(" || token === ")") {
+      cursor += 1;
+      continue;
+    }
+    const literal = expression.slice(cursor).match(/^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/);
+    if (literal) {
+      try { parts.push(staticStringLiteral(literal[0])); } catch { return null; }
+      cursor += literal[0].length;
+      continue;
+    }
+    const call = expression.slice(cursor).match(/^(?:encodeURIComponent|encodeURI|String)\s*\(\s*([A-Za-z_$][\w$]*)\s*\)/);
+    const variable = call?.[1] || expression.slice(cursor).match(/^([A-Za-z_$][\w$]*)/)?.[1];
+    if (!variable || !Object.hasOwn(templateFields, variable)) return null;
+    parts.push(`{{${variable}}}`);
+    cursor += call ? call[0].length : variable.length;
+  }
+  const urlTemplate = parts.join("");
+  if (!/^https?:\/\//i.test(urlTemplate) || urlTemplate.length > 2_048 || !/\{\{/.test(urlTemplate)) return null;
+  return { selector: templateFields[names[0]], urlTemplate, templateFields };
+}
+
 function mappedResultUrlTemplate(script) {
   const returned = String(script || "").match(/\breturn\s+([\s\S]+?)\s*;?\s*$/i);
   if (!returned) return null;
@@ -569,6 +639,8 @@ function inferredScriptField(rule, preferredNames = []) {
   }
   const multiFieldUrl = multiFieldResultUrlTemplate(source);
   if (multiFieldUrl) return multiFieldUrl;
+  const domUrl = domScriptUrlTemplate(source);
+  if (domUrl) return domUrl;
   const mappedUrl = mappedResultUrlTemplate(source);
   if (mappedUrl) return mappedUrl;
   const stringLiteral = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
@@ -1376,7 +1448,14 @@ function transformed(plan, rule, input, options = {}) {
   let value = select(plan, field, input, options);
   if (Array.isArray(value)) return value;
   if (field?.valueTemplate) {
-    value = expandUrlTemplate(field.valueTemplate, input, options.baseUrl || "", value, field.valueMaps);
+    value = expandUrlTemplate(
+      field.valueTemplate,
+      input,
+      options.baseUrl || "",
+      value,
+      field.valueMaps,
+      field.templateFields,
+    );
   }
   for (const replacement of field?.replacements || []) {
     value = String(value).replace(new RegExp(replacement.pattern, "g"), replacement.replacement);
@@ -1389,7 +1468,7 @@ function transformed(plan, rule, input, options = {}) {
   return String(value || "").trim() || field?.fallback || "";
 }
 
-function expandUrlTemplate(template, item, baseUrl, selectedValue = "", valueMaps = {}) {
+function expandUrlTemplate(template, item, baseUrl, selectedValue = "", valueMaps = {}, templateFields = {}) {
   let bookId = "";
   let comicId = "";
   let entityId = "";
@@ -1423,6 +1502,11 @@ function expandUrlTemplate(template, item, baseUrl, selectedValue = "", valueMap
     ...pageIds,
     ...(item && typeof item === "object" && !Array.isArray(item) ? item : {}),
   };
+  if (item?.nodeType) {
+    for (const [name, selector] of Object.entries(templateFields || {})) {
+      values[name] = htmlSelect(selector, item);
+    }
+  }
   const selectedName = String(template || "").match(/\{\{(?:(?:raw|text):)?(?!base:)([A-Za-z_$][\w$]*)\}\}/)?.[1];
   if (selectedName && selectedValue && (values[selectedName] === undefined || values[selectedName] === null)) {
     values[selectedName] = selectedValue;
@@ -1609,7 +1693,14 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
       result[name] = transformed(plan, rule, parsedInput, { content: false, baseUrl });
       const field = normalizeField(rule);
       if (field?.urlTemplate) {
-        result[name] = expandUrlTemplate(field.urlTemplate, input, baseUrl, result[name], field.valueMaps);
+        result[name] = expandUrlTemplate(
+          field.urlTemplate,
+          input,
+          baseUrl,
+          result[name],
+          field.valueMaps,
+          field.templateFields,
+        );
       }
     }
     if (result.cover) result.cover = absolute(result.cover, baseUrl);
@@ -1649,7 +1740,14 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
       for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item, { baseUrl });
       const urlField = normalizeField(plan.fields.url);
       if (urlField?.urlTemplate) {
-        row.url = expandUrlTemplate(urlField.urlTemplate, item, baseUrl, row.url, urlField.valueMaps);
+        row.url = expandUrlTemplate(
+          urlField.urlTemplate,
+          item,
+          baseUrl,
+          row.url,
+          urlField.valueMaps,
+          urlField.templateFields,
+        );
       } else {
         row.url = absolute(row.url, baseUrl, plan.host);
       }
@@ -1679,11 +1777,25 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item, { baseUrl });
     const urlField = normalizeField(plan.fields.url);
     row.url = urlField?.urlTemplate
-      ? expandUrlTemplate(urlField.urlTemplate, item, baseUrl, row.url, urlField.valueMaps)
+      ? expandUrlTemplate(
+        urlField.urlTemplate,
+        item,
+        baseUrl,
+        row.url,
+        urlField.valueMaps,
+        urlField.templateFields,
+      )
       : absolute(row.url, baseUrl, plan.host);
     const coverField = normalizeField(plan.fields.cover);
     if (coverField?.urlTemplate) {
-      row.cover = expandUrlTemplate(coverField.urlTemplate, item, baseUrl, row.cover, coverField.valueMaps);
+      row.cover = expandUrlTemplate(
+        coverField.urlTemplate,
+        item,
+        baseUrl,
+        row.cover,
+        coverField.valueMaps,
+        coverField.templateFields,
+      );
     }
     if (row.cover) row.cover = absolute(row.cover, baseUrl);
     if (!row.name || !row.url) continue;

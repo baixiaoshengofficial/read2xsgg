@@ -107,6 +107,74 @@ test("香色动作链执行器验证分类、详情、章节和正文", async (c
   assert.equal(fallbackReport.attemptedWorlds, 2);
 });
 
+test("JSON 动作链会展开分组数组中的书籍列表", async (context) => {
+  const upstream = createServer((request, response) => {
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    if (request.url === "/books") {
+      response.end(JSON.stringify({ data: { groups: [
+        { books: [{ name: "分组作品一", url: "/detail/1" }] },
+        { books: [{ name: "分组作品二", url: "/detail/2" }] },
+      ] } }));
+    } else if (request.url === "/detail/1") {
+      response.end(JSON.stringify({ name: "分组作品一", chapters: [
+        { title: "第一章", url: "/chapter/1" },
+      ] }));
+    } else if (request.url === "/chapter/1") {
+      response.setHeader("Content-Type", "text/plain; charset=utf-8");
+      response.end("分组数组作品的正文内容。");
+    } else {
+      response.statusCode = 404;
+      response.end(JSON.stringify({ error: "not found" }));
+    }
+  });
+  const base = await listen(upstream);
+  context.after(() => close(upstream));
+  const source = {
+    sourceName: "分组 JSON 运行时测试",
+    sourceUrl: base,
+    sourceType: "text",
+    bookWorld: {
+      分类: {
+        actionID: "bookWorld",
+        host: base,
+        requestInfo: "/books",
+        responseFormatType: "json",
+        list: "data/groups/books",
+        bookName: "name",
+        detailUrl: "url",
+      },
+    },
+    bookDetail: {
+      actionID: "bookDetail",
+      host: base,
+      requestInfo: "%@result",
+      responseFormatType: "json",
+      bookName: "name",
+    },
+    chapterList: {
+      actionID: "chapterList",
+      host: base,
+      requestInfo: "%@result",
+      responseFormatType: "json",
+      list: "chapters",
+      title: "title",
+      url: "url",
+    },
+    chapterContent: {
+      actionID: "chapterContent",
+      host: base,
+      requestInfo: "%@result",
+      content: "@js:\nreturn result;",
+    },
+  };
+
+  const report = await runXbsPipeline(source, { fetchMedia: false });
+  assert.equal(report.ok, true, report.error);
+  assert.equal(report.steps.bookWorld.listCount, 2);
+  assert.equal(report.steps.bookWorld.bookName, "分组作品一");
+  assert.equal(report.steps.chapterList.listCount, 1);
+});
+
 test("纯脚本正文规则接收纯文本章节的原始响应", async (context) => {
   const upstream = createServer((request, response) => {
     if (request.url === "/books") {

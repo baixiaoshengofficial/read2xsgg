@@ -2803,6 +2803,22 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
       if (semantic || mediaLike) add(name, part, mediaLike);
     }
   }
+  // Some player pages keep a complete media URL in a static Base64 string and
+  // decode it in browser JavaScript. Decode only bounded string literals and
+  // accept the result only when it is an HTTP(S) URL of the requested media
+  // kind; this preserves portability without evaluating page scripts.
+  for (const match of text.matchAll(/(["'])([A-Za-z0-9+/_-]{32,4096}={0,2})\1/g)) {
+    const encoded = match[2];
+    if (encoded.length % 4 === 1) continue;
+    let decoded = "";
+    try {
+      decoded = Buffer.from(encoded.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8").trim();
+    } catch {
+      continue;
+    }
+    if (!/^https?:\/\/[^\s<>"']+$/i.test(decoded) || !mediaExtensionPattern(kind).test(decoded)) continue;
+    add("media", decoded, true);
+  }
   for (const match of text.replace(/\\\//g, "/").matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
     // sourceRegex-derived extension hints (e.g. ".mp3") promote matching URLs
     // even when they sit outside semantic JSON keys. Skip bare page links: the

@@ -136,6 +136,19 @@ function stripLeadingLegadoSideEffectTemplates(request, warn) {
   return value;
 }
 
+function normalizeWrappedSimpleTemplates(request, warn) {
+  let changed = false;
+  const normalized = String(request || "").replace(
+    /<\s*(\{\{\s*(?:key|page(?:\s*[+-]\s*\d+)?)\s*\}\})\s*>/gi,
+    (_match, template) => {
+      changed = true;
+      return template;
+    },
+  );
+  if (changed) warn("阅读请求把单个 key/page 模板包在尖括号中，已去掉会导致 URL 编码错误的尖括号");
+  return normalized;
+}
+
 /**
  * 把阅读 URL/正文里的 Mustache 片段转成可拼进香色 @js 的表达式。
  * - {{key}} / {{page}} / {{page±n}} → params.*
@@ -397,7 +410,10 @@ function compilePortableJsonPost(script, headers, warn) {
 export function convertRequest(request, { headers = {}, warn = () => {}, fallback = "%@result" } = {}) {
   if (!request || request === "-") return { requestInfo: fallback };
   if (typeof request !== "string") return { requestInfo: fallback };
-  const source = stripLeadingLegadoSideEffectTemplates(request, warn);
+  const source = normalizeWrappedSimpleTemplates(
+    stripLeadingLegadoSideEffectTemplates(request, warn),
+    warn,
+  );
 
   if (/^@js:/i.test(source) || /^<js>/i.test(source)) {
     const normalized = source.replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");

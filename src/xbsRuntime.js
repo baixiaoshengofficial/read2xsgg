@@ -130,7 +130,17 @@ function jsonPathValue(input, path) {
     .replace(/\[\*\]/g, "")
     .replace(/\[(\d+)\]/g, "/$1")
     .replace(/\./g, "/");
-  for (const key of normalized.split("/").filter(Boolean)) value = value?.[key];
+  for (const key of normalized.split("/").filter(Boolean)) {
+    if (Array.isArray(value) && !/^\d+$/.test(key)) {
+      value = value.flatMap((item) => {
+        const child = item?.[key];
+        if (child === undefined || child === null) return [];
+        return Array.isArray(child) ? child : [child];
+      });
+    } else {
+      value = value?.[key];
+    }
+  }
   return value;
 }
 

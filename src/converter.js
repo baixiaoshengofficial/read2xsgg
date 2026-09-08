@@ -699,7 +699,9 @@ function tocLinkHint(rule) {
  * JavaScript string concatenation: `result.cover + ',{"headers":{"Referer":"..."}}'`.
  */
 function splitLegadoUrlOptions(rule) {
-  const source = String(rule || "").trim();
+  // Some collections prefix URL-producing JSON rules with `@JSON:` just as
+  // they do selectors. It is a parser marker, never part of the request URL.
+  const source = String(rule || "").trim().replace(/^@json:\s*/i, "");
   if (!source) return { url: "", options: {} };
 
   const trailing = source.match(/^(.*?)(,\s*\{[\s\S]*\})\s*$/);
@@ -829,13 +831,13 @@ function compileHtmlCaptureTocRequest(tocUrl) {
     .replace(/^\s*(?:@js:|<js>)\s*/i, "")
     .replace(/<\/js>\s*$/i, "");
   const capture = source.match(
-    /\b(?:var|let|const)?\s*([A-Za-z_$][\w$]*)\s*=\s*result\.match\(\s*\/((?:\\.|[^/\r\n])+)\/[dgimsuvy]*\s*\)/,
+    /\b(?:var|let|const)?\s*([A-Za-z_$][\w$]*)\s*=\s*(?:String\(\s*)?result\s*\)?\.match\(\s*\/((?:\\.|[^/\r\n])+)\/[dgimsuvy]*\s*\)/,
   );
   if (!capture) return null;
   const variable = capture[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const literal = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
   const request = source.match(new RegExp(
-    `(?:^|[;{}\\n])\\s*[A-Za-z_$][\\w$]*\\s*=\\s*(${literal})\\s*\\+\\s*${variable}\\s*\\[\\s*(\\d)\\s*\\]\\s*\\+\\s*(${literal})`,
+    `(?:^|[;{}\\n])\\s*(?:[A-Za-z_$][\\w$]*\\s*=\\s*)?(${literal})\\s*\\+\\s*${variable}\\s*\\[\\s*(\\d)\\s*\\]\\s*\\+\\s*(${literal})`,
   ));
   if (!request) return null;
   const prefix = staticJavaScriptString(request[1]);
@@ -851,7 +853,7 @@ function compileStoredIdChapterUrl(chapterUrl, convertedRule) {
   const source = String(chapterUrl || "");
   const template = source.match(/`(https?:\/\/(?:\\.|[^`])+)`/)?.[1];
   if (!template || !/\$\{\s*java\.get\s*\(/i.test(template) || !/\$\{\s*result\s*\}/i.test(template)) {
-    return null;
+    return compileStoredIdConcatenation(source);
   }
   const selector = String(convertedRule || "").split(/\|\|\s*@js:/i, 1)[0].trim();
   if (!selector || /^@js:/i.test(selector)) return null;
@@ -877,6 +879,36 @@ function staticJavaScriptString(value) {
   } catch {
     return null;
   }
+}
+
+function compileStoredIdConcatenation(source) {
+  const stored = String(source || "").match(
+    /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*java\.get\s*\(\s*['"][^'"]+['"]\s*\)/i,
+  )?.[1];
+  if (!stored) return null;
+  const concatenated = String(source).match(
+    /(["'])(https?:\/\/(?:\\.|(?!\1)[\s\S])*?)\1\s*\+\s*([A-Za-z_$][\w$]*)\s*\+\s*(["'])((?:\\.|(?!\4)[\s\S])*?)\4\s*\+\s*([A-Za-z_$][\w$]*)/,
+  );
+  if (!concatenated || concatenated[3] !== stored) return null;
+  const target = concatenated[6].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const item = String(source).match(new RegExp(
+    `\\b(?:var|let|const)\\s+${target}\\s*=\\s*([A-Za-z_$][\\w$]*)\\.([A-Za-z_$][\\w$]*)(\\s*\\|\\|\\s*\\1\\.[A-Za-z_$][\\w$]*)*`,
+    "i",
+  ));
+  if (!item) return null;
+  const prefix = staticJavaScriptString(concatenated[1] + concatenated[2] + concatenated[1]);
+  const middle = staticJavaScriptString(concatenated[4] + concatenated[5] + concatenated[4]);
+  if (prefix === null || middle === null) return null;
+  const assignment = item[0].slice(item[0].indexOf("=") + 1);
+  const object = item[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const fields = [...assignment.matchAll(new RegExp(object + "\\.([A-Za-z_$][\\w$]*)", "g"))]
+    .map((match) => match[1]);
+  if (!fields.length) return null;
+  const uniqueFields = [...new Set(fields)];
+  return {
+    selector: uniqueFields.join("||"),
+    urlTemplate: prefix + "{{base:bookId}}" + middle + "{{raw:" + uniqueFields[0] + "}}",
+  };
 }
 
 /**
@@ -1612,7 +1644,45 @@ function mapTocRules(rules, responseType, warningFor) {
   return result;
 }
 
+function normalizeParsedJsonItemTocRules(rules = {}) {
+  const normalized = { ...rules };
+  const listScript = String(rules.chapterList || "");
+  const parsedList = listScript.match(
+    /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*JSON\.parse\s*\(\s*(?:result|src)\s*\)/,
+  );
+  if (parsedList) {
+    for (const assignment of listScript.matchAll(
+      /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;]{1,2048});/g,
+    )) {
+      if (!new RegExp("\\b" + assignment[1] + "\\.map\\s*\\(").test(listScript)) continue;
+      const paths = [...assignment[2].matchAll(
+        new RegExp("\\b" + parsedList[1] + "\\.([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)", "g"),
+      )].map((match) => match[1]);
+      if (paths.length) {
+        normalized.chapterList = [...new Set(paths)].map((path) => "$." + path).join("||");
+        break;
+      }
+    }
+  }
+
+  const titleScript = String(rules.chapterName || "");
+  const parsedTitle = titleScript.match(
+    /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*JSON\.parse\s*\(\s*(?:result|src)\s*\)/,
+  );
+  if (parsedTitle) {
+    const paths = [...titleScript.matchAll(
+      new RegExp("\\b" + parsedTitle[1] + "\\.([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)", "g"),
+    )].map((match) => match[1]);
+    const leaves = [...new Set(paths)].filter((path) => (
+      !paths.some((candidate) => candidate !== path && candidate.startsWith(path + "."))
+    ));
+    if (leaves.length) normalized.chapterName = leaves.map((path) => "$." + path).join("||");
+  }
+  return normalized;
+}
+
 function normalizeMappedJsonTocRules(rules = {}) {
+  rules = normalizeParsedJsonItemTocRules(rules);
   const script = String(rules.chapterList || "");
   const embedded = script.match(/result\.match\(\/([A-Za-z_$][\w$]*)\\s\*=/);
   if (embedded) return { ...rules, chapterList: `@embedded-json-array:${embedded[1]}` };
@@ -2023,6 +2093,10 @@ function compactCategoryTemplate(value, host) {
   // actions so convertRequest() can emit the correct conditional URL.
   if (/<[^<>]*,[^<>]*>/.test(template)) return "";
   template = template
+    // A single template wrapped as `<{{page}}>` is not Legado's
+    // `<first,following>` branch; the brackets otherwise reach upstream as
+    // `%3C1%3E` and commonly make JSON category APIs reject the request.
+    .replace(/<\s*(\{\{\s*(?:key|page(?:\s*[+-]\s*\d+)?)\s*\}\})\s*>/gi, "$1")
     .replace(/^\{\{\s*(?:Get|get)\(\s*["']url["']\s*\)\s*\}\}/i, "")
     .replace(/^\{\{\s*(?:baseUrl|bookSourceUrl)\s*\}\}/i, "");
   if (host && template.startsWith(host)) template = template.slice(host.length) || "/";
@@ -2255,6 +2329,10 @@ function convertOne(source, warnings, options = {}) {
   const stateBackedSingleMedia = (resolvedType === "audio" || resolvedType === "video")
     && /\bjava\.get\s*\(/i.test(String(tocRules.chapterList || ""))
     && /^[A-Za-z_$][\w$]*$/.test(String(tocRules.chapterUrl || "").trim());
+  const syntheticSingleMedia = (resolvedType === "audio" || resolvedType === "video")
+    && /^\s*(?:@js:|<js>)/i.test(String(tocRules.chapterList || ""))
+    && /\burl\s*:\s*baseUrl\b/i.test(String(tocRules.chapterList || ""))
+    && !/\b(?:java\.(?:ajax|connect)|JSON\.parse\s*\(\s*(?:result|src))\b/i.test(String(tocRules.chapterList || ""));
   const effectiveSearchRules = stateBackedSingleMedia
     ? {
       ...searchRules,
@@ -2415,7 +2493,7 @@ function convertOne(source, warnings, options = {}) {
       requestInfo: chapterListRequestInfo,
       ...(() => {
         const mapped = mapTocRules(tocRules, tocResponseType, tocWarningFor);
-        const capturedTocRequest = tocResponseType === "html"
+        const capturedTocRequest = detailResponseType === "html"
           ? compileHtmlCaptureTocRequest(detailRules.tocUrl)
           : null;
         if (capturedTocRequest) {
@@ -2504,6 +2582,18 @@ function convertOne(source, warnings, options = {}) {
     converted.chapterList = singleMediaChapterList(host, options.imageProxyBase) || converted.chapterList;
     tocWarningFor("chapterList", tocRules.chapterList)(
       "目录依赖阅读状态缓存，已将搜索项媒体字段转换为通用单章节动作",
+    );
+  }
+  if (syntheticSingleMedia) {
+    converted.chapterList = singleMediaChapterList(host, options.imageProxyBase) || {
+      ...converted.chapterList,
+      list: ".",
+      title: "@js:\nreturn String((params.queryInfo && params.queryInfo.bookName) || \"播放\");",
+      url: "@js:\nreturn String((params.queryInfo && (params.queryInfo.detailUrl || params.queryInfo.url)) || result || \"\");",
+      moreKeys: { pageSize: 1, maxPage: 1 },
+    };
+    tocWarningFor("chapterList", tocRules.chapterList)(
+      "媒体目录脚本仅用当前详情 URL 合成单章，已转换为通用单章节动作",
     );
   }
   if ((resolvedType === "audio" || resolvedType === "video")

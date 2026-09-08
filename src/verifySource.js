@@ -185,9 +185,10 @@ function portableUrlExpression(expression, {
   }
 }
 
-function portableDataExpression(expression, {
+function portableValueExpression(expression, {
   keyWord = "",
   pageIndex = 1,
+  variables = {},
 } = {}) {
   const source = String(expression || "").trim();
   if (!source || source.length > 10_000
@@ -200,17 +201,23 @@ function portableDataExpression(expression, {
   const allowed = new Set([
     "params", "keyWord", "pageIndex", "filter", "filters", "category",
     "JSON", "parse", "String", "encodeURIComponent", "encodeURI",
+    "Math", "floor", "ceil", "round", "max", "min", "abs",
     "true", "false", "null", "undefined",
+    ...Object.keys(variables),
   ]);
   const identifiers = masked.match(/[A-Za-z_$][\w$]*/g) || [];
   if (identifiers.some((identifier) => !allowed.has(identifier))) return null;
   try {
+    const variableNames = Object.keys(variables)
+      .filter((name) => /^[A-Za-z_$][\w$]*$/.test(name) && !["params", "JSON", "String", "Math"].includes(name));
     const evaluate = new Function(
       "params",
       "JSON",
       "String",
       "encodeURIComponent",
       "encodeURI",
+      "Math",
+      ...variableNames,
       `"use strict"; return (${source});`,
     );
     const value = evaluate(
@@ -219,7 +226,24 @@ function portableDataExpression(expression, {
       String,
       encodeURIComponent,
       encodeURI,
+      Math,
+      ...variableNames.map((name) => variables[name]),
     );
+    if (typeof value === "function" || typeof value === "symbol" || typeof value === "bigint") return null;
+    if (value && typeof value === "object") {
+      const serialized = JSON.stringify(value);
+      if (!serialized || serialized.length > 100_000) return null;
+      return JSON.parse(serialized);
+    }
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function portableDataExpression(expression, options = {}) {
+  const value = portableValueExpression(expression, options);
+  try {
     if (!value || typeof value !== "object" || Array.isArray(value)) return null;
     const output = {};
     for (const [key, item] of Object.entries(value).slice(0, 100)) {
@@ -231,6 +255,19 @@ function portableDataExpression(expression, {
   } catch {
     return null;
   }
+}
+
+function portableRequestVariables(script, options = {}) {
+  const variables = {};
+  const declarations = String(script || "").matchAll(/\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=/g);
+  for (const declaration of declarations) {
+    const name = declaration[1];
+    if (Object.hasOwn(variables, name) || ["params", "JSON", "String", "Math"].includes(name)) continue;
+    const expression = assignedExpression(String(script).slice(declaration.index), name);
+    const value = portableValueExpression(expression, { ...options, variables });
+    if (value !== null && value !== undefined) variables[name] = value;
+  }
+  return variables;
 }
 
 function returnedPropertyExpression(script, name) {
@@ -270,19 +307,25 @@ function generatedRequestOptions(requestInfo, { keyWord = "小说", pageIndex = 
   const script = String(requestInfo || "");
   if (!/^@js:/i.test(script)) return null;
   if (!assignedExpression(script, "url")) return null;
+  const variables = portableRequestVariables(script, { keyWord, pageIndex });
   const method = /\bPOST\s*:\s*true\b/.test(script) ? "POST" : "GET";
-  const paramsExpression = assignedExpression(script, "hp");
-  const params = paramsExpression
-    ? portableDataExpression(paramsExpression, { keyWord, pageIndex })
-    : null;
+  let paramsExpression = returnedPropertyExpression(script, "httpParams");
+  if (!paramsExpression) paramsExpression = assignedExpression(script, "hp");
+  const params = /^[A-Za-z_$][\w$]*$/.test(paramsExpression)
+    ? variables[paramsExpression] || null
+    : portableDataExpression(paramsExpression, { keyWord, pageIndex, variables });
   let headerExpression = returnedPropertyExpression(script, "httpHeaders");
   if (headerExpression && /^[A-Za-z_$][\w$]*$/.test(headerExpression)) {
+    const value = variables[headerExpression];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return { method, params, headers: value, url: variables.url || "" };
+    }
     headerExpression = assignedExpression(script, headerExpression);
   }
   const headers = headerExpression
-    ? portableDataExpression(headerExpression, { keyWord, pageIndex }) || {}
+    ? portableDataExpression(headerExpression, { keyWord, pageIndex, variables }) || {}
     : {};
-  return { method, params, headers };
+  return { method, params, headers, url: variables.url || "" };
 }
 
 /**
@@ -302,7 +345,7 @@ export function resolveBookTargetUrl(action, bridge, {
     const generatedRequest = generatedRequestOptions(requestInfo, { keyWord, pageIndex });
     if (generatedRequest) {
       const expression = assignedExpression(requestInfo, "url");
-      const target = portableUrlExpression(expression, { host, keyWord, pageIndex });
+      const target = generatedRequest.url || portableUrlExpression(expression, { host, keyWord, pageIndex });
       if (!target) return "";
       try { return new URL(target, host).toString(); } catch { return ""; }
     }

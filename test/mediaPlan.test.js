@@ -80,6 +80,14 @@ test("通用媒体提取支持 JSON、HTML 标签和脚本 URL", () => {
   ]);
 });
 
+test("通用媒体提取解码脚本中的静态 Base64 播放地址", () => {
+  const audioUrl = "https://cdn.example/audio/track.mp3?token=abc";
+  const encoded = Buffer.from(audioUrl, "utf8").toString("base64");
+  const html = `<script>let code = "${encoded}"; player.src = atob(code);</script>`;
+  assert.deepEqual(pageMediaUrls(html, "https://audio.example/player/1", { kind: "audio" }), [audioUrl]);
+  assert.deepEqual(pageMediaUrls(html, "https://audio.example/player/1", { kind: "video" }), []);
+});
+
 test("通用媒体提取解析 data 属性中的分隔播放列表并压过普通接口", () => {
   const html = [
     '<script>var player={"url":"https://audio.example/admin-ajax.php"}</script>',

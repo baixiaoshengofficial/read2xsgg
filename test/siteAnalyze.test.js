@@ -1483,6 +1483,41 @@ test("resolveBookTargetRequest 安全解析转换器生成的 POST 表单", () =
   assert.equal(target.headers["Content-Type"], "application/x-www-form-urlencoded");
 });
 
+test("resolveBookTargetRequest 解析局部变量组成的内联 JSON POST 参数", () => {
+  const requestInfo = [
+    "@js:",
+    "var query = params.keyWord;",
+    "var offset = (params.pageIndex - 1) * 20;",
+    "var limit = 20;",
+    "var tab_type = 2;",
+    'var url = "https://api.example/search";',
+    'return {url:url,POST:true,httpParams:{query:query,offset:offset,limit:limit,tab_type:tab_type},httpHeaders:{"Content-Type":"application/json; charset=utf-8"}};',
+  ].join("\n");
+  const action = {
+    host: "https://api.example",
+    requestInfo,
+    responseFormatType: "json",
+    list: "data/groups/books",
+    bookName: "name",
+    detailUrl: "url",
+  };
+  const target = resolveBookTargetRequest(
+    { sourceUrl: "https://api.example" },
+    action,
+    { plan: { host: "https://api.example" }, requestInfo },
+    { keyWord: "测试", pageIndex: 3 },
+  );
+  assert.equal(target.url, "https://api.example/search");
+  assert.equal(target.options.method, "POST");
+  assert.deepEqual(JSON.parse(target.options.body), {
+    query: "测试",
+    offset: 40,
+    limit: 20,
+    tab_type: 2,
+  });
+  assert.equal(target.headers["Content-Type"], "application/json; charset=utf-8");
+});
+
 test("resolveBookTargetRequest 按香色 GBK 标记编码 POST 表单", () => {
   const requestInfo = [
     "@js:",
