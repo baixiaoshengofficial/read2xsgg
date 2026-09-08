@@ -814,7 +814,7 @@ test("通用详情桥接器从 HTML 独立目录末项补全最新章节", async
   const upstream = createServer((request, response) => {
     response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     if (request.url === "/book/7") {
-      response.end('<h1>测试书</h1><a class="catalog" href="/book/7/chapters">章节目录</a><a href="#top">返回顶部↑</a>');
+      response.end('<h1>测试书</h1><span class="cat">第3章 终章</span><a class="catalog" href="/book/7/chapters">章节目录</a><a href="#top">返回顶部↑</a>');
       return;
     }
     response.end([
@@ -839,7 +839,10 @@ test("通用详情桥接器从 HTML 独立目录末项补全最新章节", async
     kind: "detail",
     host: upstreamBase,
     responseType: "html",
-    fields: { name: "//h1" },
+    fields: {
+      name: "//h1",
+      cat: { selector: "//span[@class='cat']", fallback: "小说" },
+    },
     latestChapter: {
       responseType: "html",
       tocSelector: "//a[contains(normalize-space(.), '章节目录')]/@href",
@@ -853,7 +856,7 @@ test("通用详情桥接器从 HTML 独立目录末项补全最新章节", async
     `${appBase}/adapter/detail?plan=${plan}&url=${encodeURIComponent(`${upstreamBase}/book/7`)}`,
   );
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { name: "测试书", lastChapterTitle: "第3章 终章" });
+  assert.deepEqual(await response.json(), { name: "测试书", cat: "小说", lastChapterTitle: "第3章 终章" });
 });
 
 test("通用详情桥接器跟随目录页声明的动态 HTML 补全最新章节", async (context) => {

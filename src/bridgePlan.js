@@ -1055,6 +1055,29 @@ function fastXPathValues(document, rawExpression, context, { maxNodes = Infinity
     return terminalValues(matched, terminal, maxNodes);
   }
 
+  const anchorConditions = expression.match(/^\/\/a\[([\s\S]+)\]$/i);
+  if (anchorConditions) {
+    const hrefParts = [...anchorConditions[1].matchAll(
+      /contains\(\s*@href\s*,\s*(['"])(.*?)\1\s*\)/gi,
+    )].map((match) => match[2]);
+    const requiresText = /normalize-space\(\.\)\s*!=\s*(['"])\1/i.test(anchorConditions[1]);
+    const remainder = anchorConditions[1]
+      .replace(/contains\(\s*@href\s*,\s*(['"])(.*?)\1\s*\)/gi, "")
+      .replace(/normalize-space\(\.\)\s*!=\s*(['"])\1/gi, "")
+      .replace(/\band\b|[()\s]/gi, "");
+    if (hrefParts.length && !remainder) {
+      const matched = [];
+      for (const anchor of scope.querySelectorAll?.("a[href]") || []) {
+        const href = String(anchor.getAttribute("href") || "");
+        if (!hrefParts.every((part) => href.includes(part))) continue;
+        if (requiresText && !String(anchor.textContent || "").trim()) continue;
+        matched.push(anchor);
+        if (Number.isFinite(maxNodes) && matched.length >= maxNodes) break;
+      }
+      return matched;
+    }
+  }
+
   const classMatch = expression.match(
     /^\/\/([A-Za-z][\w:-]*|\*)\[contains\(concat\(' ', normalize-space\(@class\), ' '\), ' ([^']+) '\)\](.*)$/,
   );
@@ -1468,6 +1491,22 @@ function transformed(plan, rule, input, options = {}) {
   return String(value || "").trim() || field?.fallback || "";
 }
 
+export function applyDetailSemanticFallbacks(result, fields) {
+  const comparable = (value) => String(value || "")
+    .replace(/[\s·・|｜:：,，/\\_-]+/g, "")
+    .toLocaleLowerCase();
+  const category = comparable(result.cat);
+  const categoryFallback = normalizeField(fields?.cat)?.fallback;
+  if (category && categoryFallback && [result.name, result.author, result.lastChapterTitle]
+    .some((value) => category === comparable(value))) {
+    result.cat = categoryFallback;
+  }
+  const author = comparable(result.author);
+  const authorFallback = normalizeField(fields?.author)?.fallback;
+  if (author && authorFallback && author === comparable(result.name)) result.author = authorFallback;
+  return result;
+}
+
 function expandUrlTemplate(template, item, baseUrl, selectedValue = "", valueMaps = {}, templateFields = {}) {
   let bookId = "";
   let comicId = "";
@@ -1704,7 +1743,7 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
       }
     }
     if (result.cover) result.cover = absolute(result.cover, baseUrl);
-    return result;
+    return applyDetailSemanticFallbacks(result, plan.fields);
   }
   const pageSize = resolvePageSize(plan.kind, limit, limits);
   const start = Math.max(0, Math.floor(Number(offset)) || 0);

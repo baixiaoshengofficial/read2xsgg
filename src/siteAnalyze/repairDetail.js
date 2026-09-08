@@ -621,15 +621,26 @@ export async function repairDetailFromBook(source, bookUrl, missingFields = [], 
   let semanticAuthor = "";
   if (detailJson) {
     for (const field of ["cover", "author", "cat", "lastChapterTitle"]) {
-      fields[field] = jsonDetailFieldSelector(detailJson, field);
+      if (missing.has(field)) fields[field] = jsonDetailFieldSelector(detailJson, field);
     }
   } else {
-    fields.cover = detailCoverSelector(document);
-    semanticAuthor = authorSelector(document);
-    structuredAuthor = structuredDataAuthorRule(detailBody);
-    fields.author = semanticAuthor || structuredAuthor;
-    fields.cat = categorySelector(document);
-    fields.lastChapterTitle = latestChapterSelector(document);
+    if (missing.has("cover")) fields.cover = detailCoverSelector(document);
+    if (missing.has("author") || missing.has("cat")) {
+      semanticAuthor = authorSelector(document);
+      structuredAuthor = structuredDataAuthorRule(detailBody);
+      fields.author = semanticAuthor || structuredAuthor;
+    }
+    if (missing.has("cat")) fields.cat = categorySelector(document);
+    if (missing.has("lastChapterTitle")) {
+      const canDeriveLatestFromToc = /^https?:\/\//i.test(String(adapterBase || ""))
+        && source?.chapterList;
+      const shouldInspectDetailLatest = !canDeriveLatestFromToc
+        || document.querySelectorAll("a[href]").length <= 500;
+      const latestSelector = shouldInspectDetailLatest ? latestChapterSelector(document) : "";
+      if (!canDeriveLatestFromToc || String(latestSelector || "").length <= 2_048) {
+        fields.lastChapterTitle = latestSelector;
+      }
+    }
   }
   const selectorFields = Object.fromEntries(Object.entries(fields).filter(([, value]) => Boolean(value)));
   if (Object.keys(selectorFields).length) {
@@ -670,18 +681,10 @@ export async function repairDetailFromBook(source, bookUrl, missingFields = [], 
   }
   const previousPlan = existingDetailPlan(source);
   if (previousPlan) {
-    try {
-      const sampled = executeBridgePlan(detailBody, responseUrl, previousPlan);
-      for (const field of ["cover", "author", "cat", "lastChapterTitle"]) {
-        if (!previousPlan.fields?.[field]) continue;
-        if (usableRepairedField(field, sampled?.[field])) {
-          if (!fields[field] || !missing.has(field)) fields[field] = previousPlan.fields[field];
-          if (!missing.has(field)) preservedFields.add(field);
-          sampledValues[field] = String(sampled[field]).replace(/\s+/g, " ").trim();
-        }
-      }
-    } catch {
-      // Invalid historical plans are replaced by newly discovered fields below.
+    for (const field of ["cover", "author", "cat", "lastChapterTitle"]) {
+      if (!previousPlan.fields?.[field] || missing.has(field)) continue;
+      fields[field] = previousPlan.fields[field];
+      preservedFields.add(field);
     }
   }
   if (document && sampledValues.author) {

@@ -8,6 +8,17 @@ function commonAction(actionID, host, responseFormatType = "html") {
   };
 }
 
+function categoryRequestInfo(host) {
+  return [
+    "@js:",
+    "var filters = (params && params.filters) || {};",
+    'var url = filters.category || (params && params.filter) || "";',
+    "if (!url) { for (var key in filters) { if (filters[key]) { url = filters[key]; break; } } }",
+    `url = String(url || ${JSON.stringify(host)});`,
+    'return url.replace(/%@pageIndex/g, String((params && params.pageIndex) || 1));',
+  ].join("\n");
+}
+
 const KIND_LABEL = {
   text: "小说",
   comic: "漫画",
@@ -68,6 +79,27 @@ function baseSource(discovery, { sourceName = "", miniAppVersion = "2.56.1", sou
     ...(listCover ? { cover: listCover } : {}),
   };
   const listPageSize = Math.max(1, Math.min(200, Number(discovery.listPageSize) || 20));
+  const categoryFilters = String(discovery.categoryFilters || "").trim();
+  const bookWorld = {
+    站点首页: {
+      ...commonAction("bookWorld", host, "html"),
+      requestInfo: discovery.listRequestInfo || discovery.listUrl || host,
+      ...listFields,
+      ...encode,
+      moreKeys: { pageSize: listPageSize },
+      _sIndex: 0,
+    },
+  };
+  if (categoryFilters) {
+    bookWorld.分类 = {
+      ...commonAction("bookWorld", host, "html"),
+      requestInfo: categoryRequestInfo(host),
+      ...listFields,
+      ...encode,
+      moreKeys: { pageSize: listPageSize, requestFilters: categoryFilters },
+      _sIndex: 1,
+    };
+  }
   return {
     sourceName: name,
     sourceUrl: host,
@@ -76,16 +108,7 @@ function baseSource(discovery, { sourceName = "", miniAppVersion = "2.56.1", sou
     miniAppVersion,
     authorId: "",
     sourceType,
-    bookWorld: {
-      站点首页: {
-        ...commonAction("bookWorld", host, "html"),
-        requestInfo: discovery.listRequestInfo || discovery.listUrl || host,
-        ...listFields,
-        ...encode,
-        moreKeys: { pageSize: listPageSize },
-        _sIndex: 0,
-      },
-    },
+    bookWorld,
     searchBook: {
       ...commonAction("searchBook", host, "html"),
       // Never reuse the homepage URL as "search" — without %@keyWord / params.keyWord

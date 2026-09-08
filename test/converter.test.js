@@ -1110,6 +1110,30 @@ test("详情桥接把 HTML 元数据归一为香色 JSON 字段", () => {
   );
 });
 
+test("详情桥接对误取为书名或章节名的推荐字段使用通用回退", () => {
+  const plan = compileDetailBridgePlan({
+    host: "https://book.example",
+    responseFormatType: "html",
+    bookName: "//h1",
+    author: { selector: "//span[@class='author']", fallback: "原站未标注" },
+    cat: { selector: "//span[@class='cat']", fallback: "小说" },
+    lastChapterTitle: "//span[@class='latest']",
+  });
+  const output = executeBridgePlan([
+    "<h1>测试书</h1>",
+    '<span class="author">测试书</span>',
+    '<span class="cat">第10章 完结</span>',
+    '<span class="latest">第10章 完结</span>',
+  ].join(""), "https://book.example/detail/1", plan);
+
+  assert.deepEqual(output, {
+    name: "测试书",
+    author: "原站未标注",
+    cat: "小说",
+    lastChapterTitle: "第10章 完结",
+  });
+});
+
 test("大页面桥接用线性 DOM 快速路径执行常用属性和类 XPath", { timeout: 10_000 }, () => {
   const filler = Array.from({ length: 10_000 }, (_, index) => `<div class="row">${index}</div>`).join("");
   const html = `<html><head>
@@ -1147,6 +1171,23 @@ test("大页面桥接用线性 DOM 快速路径执行常用属性和类 XPath", 
     executeBridgePlan(html, "https://book.example/book/1", chapterPlan, { limit: 1 }).data[0]?.url,
     "https://book.example/chapter/1",
   );
+});
+
+test("大目录桥接用线性路径执行多个 href 包含条件", { timeout: 2_000 }, () => {
+  const html = Array.from({ length: 5_000 }, (_, index) => (
+    `<a href="/chapter/${index}.html">第${index + 1}章</a>`
+  )).join("");
+  const plan = compileChapterBridgePlan({
+    host: "https://book.example",
+    responseFormatType: "html",
+    list: "//a[contains(@href, '/chapter/') and contains(@href, '.html') and normalize-space(.) != '']",
+    title: ".",
+    url: "./@href",
+  });
+  const output = executeBridgePlan(html, "https://book.example/book/1", plan, { limit: 200 });
+
+  assert.equal(output.data.length, 200);
+  assert.equal(output.data[0].url, "https://book.example/chapter/0.html");
 });
 
 test("深度预检可以限制桥接结果数量而不遍历完整大目录", () => {

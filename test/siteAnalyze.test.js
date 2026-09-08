@@ -438,6 +438,7 @@ test("discoverMedia 排除媒体作者归档并选择带封面的作品详情", 
 test("discoverMedia 通用识别重复内容卡、单节目媒体和列表分页", async () => {
   const home = (page) => `<!doctype html><html><head><title>有声站</title></head><body>
     <p>听书 有声 音频</p>
+    <nav><a href="/category/history">历史</a><a href="/category/fantasy">玄幻</a></nav>
     <article class="post post-list"><h2><a rel="bookmark" href="/work/${page}1">作品${page}1</a></h2></article>
     <article class="post post-list"><h2><a rel="bookmark" href="/work/${page}2">作品${page}2</a></h2></article>
     ${page === 1 ? '<a rel="next" href="/page/2/">下一页</a>' : ""}
@@ -455,10 +456,13 @@ test("discoverMedia 通用识别重复内容卡、单节目媒体和列表分页
   assert.ok(discovery);
   assert.match(discovery.listSelector, /article/);
   assert.match(discovery.listRequestInfo, /page\/%@pageIndex/);
+  assert.match(discovery.categoryFilters, /历史::https:\/\/card-audio\.example\/category\/history\/page\/%@pageIndex/);
   assert.match(discovery.chapterRequestInfo, /adapter\/single-chapter/);
   assert.equal(discovery.chapterListSelector, "$.data");
   assert.match(discovery.contentRequestInfo, /adapter\/media/);
   const source = mediaDiscoveryToXiangse(discovery, { sourceName: "单节目音频" });
+  assert.match(source.bookWorld.分类.moreKeys.requestFilters, /玄幻::/);
+  assert.match(source.bookWorld.分类.requestInfo, /params\.pageIndex/);
   const detailValues = executeBridgePlan(
     detail,
     "https://card-audio.example/work/11",
@@ -3762,6 +3766,36 @@ test("详情元素修复排除作者重复分类和最新更新占位文字", as
   assert.equal(plan.fields.cat.constant, "小说");
   assert.equal(plan.latestChapter.mode, "html-toc");
   assert.equal(plan.fields.lastChapterTitle, undefined);
+});
+
+test("详情元素修复在超大目录页直接复用目录计划推导末章", async () => {
+  const host = "https://large-detail.example";
+  const source = {
+    sourceUrl: host,
+    sourceType: "text",
+    bookDetail: {
+      actionID: "bookDetail", host, responseFormatType: "html", parserID: "DOM", requestInfo: "%@result",
+      bookName: "//h1",
+    },
+    chapterList: {
+      actionID: "chapterList", host, responseFormatType: "html", parserID: "DOM", requestInfo: "%@result",
+      list: "//*[@id='chapters']/a", title: ".", url: "./@href",
+    },
+  };
+  const chapters = Array.from({ length: 600 }, (_, index) => (
+    `<a href="/read/${index + 1}">第${index + 1}章</a>`
+  )).join("");
+  const html = `<h1>大目录测试</h1><div id="chapters">${chapters}</div>`;
+  const repaired = await repairDetailFromBook(source, `${host}/book/1`, ["lastChapterTitle"], {
+    adapterBase: "https://converter.example",
+    download: async () => Buffer.from(html),
+  });
+  const token = repaired.bookDetail.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)?.[1];
+  const plan = decodeBridgePlan(token);
+
+  assert.equal(plan.fields.lastChapterTitle, undefined);
+  assert.equal(plan.latestChapter.mode, "html-toc");
+  assert.equal(plan.latestChapter.list, source.chapterList.list);
 });
 
 test("详情元素修复只更新缺失字段并拒绝把书名当作作者", async () => {

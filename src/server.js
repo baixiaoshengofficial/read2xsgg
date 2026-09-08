@@ -46,6 +46,7 @@ import { decodeSignedRequestPlan, signedRequestTarget } from "./requestPlan.js";
 import { resolveChapterListUrls } from "./verifySource.js";
 import { isDateOnlyMetadata } from "./elementValidation.js";
 import {
+  applyDetailSemanticFallbacks,
   bridgeTocUrl,
   compileBookBridgePlan,
   compileChapterBridgePlan,
@@ -3347,6 +3348,7 @@ export function createAppServer(options = {}) {
                 adapterTarget.bridgePlan,
                 config,
               );
+              output = applyDetailSemanticFallbacks(output, adapterTarget.bridgePlan.fields);
             }
             const planHasUserAgent = Object.keys(adapterTarget.bridgePlan.headers || {})
               .some((name) => name.toLowerCase() === "user-agent");

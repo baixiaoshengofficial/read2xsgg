@@ -20,6 +20,7 @@ const AUDIO_HREF = /\/(?:audio|ting|sound|music|radio|mp3|book)\/|(?:听书|有�
 const VIDEO_HREF = /\/(?:video|vod|movie|play|film|drama|tv)\/|(?:影视|电影|剧集)/i;
 const MEDIA_FILE = /\.(?:mp3|m4a|aac|ogg|wav|flac|mp4|m3u8|webm)(?:\?|$)/i;
 const NON_CONTENT_PATH = /\/(?:about|agreement|privacy|policy|terms|help|support|contact|login|register|download|authors?|actors?|models?|stars?|directors?|categories|category|tags?|genres?|series)(?:\/|$)/i;
+const CATEGORY_PATH = /\/(?:category|categories|genres?|types?|classes?|sort|list|link)\//i;
 
 function mediaHrefPattern(kind) {
   return kind === "video" ? VIDEO_HREF : AUDIO_HREF;
@@ -102,6 +103,50 @@ function sharedClassToken(elements) {
   const first = String(elements[0].className || "").split(/\s+/).filter(Boolean);
   return first.find((token) => token.length >= 3
     && elements.every((element) => element.classList?.contains(token))) || "";
+}
+
+function categoryPageUrl(categoryUrl, listPageUrl) {
+  let category;
+  let pagination;
+  try {
+    category = new URL(categoryUrl);
+    pagination = new URL(listPageUrl);
+  } catch {
+    return "";
+  }
+  for (const [key, value] of pagination.searchParams) {
+    if (!String(value).includes("%@pageIndex")) continue;
+    category.searchParams.set(key, "%@pageIndex");
+    return category.toString();
+  }
+  const suffix = pagination.pathname.match(/(\/(?:page|list)\/%@pageIndex(?:\/|\.[a-z]+)?)$/i)?.[1] || "";
+  if (!suffix) return category.toString();
+  category.pathname = `${category.pathname.replace(/\/+$/, "")}${suffix}`;
+  return category.toString();
+}
+
+function mediaCategoryFilters(document, pageUrl, listPageUrl) {
+  const rows = [];
+  const seenUrls = new Set();
+  const seenLabels = new Set();
+  let origin;
+  try { origin = new URL(pageUrl).origin; } catch { return ""; }
+  for (const anchor of document.querySelectorAll("a[href]")) {
+    const label = visibleText(anchor).replace(/\s+/g, " ").trim();
+    if (!label || label.length > 24
+      || /^(?:首页|首頁|全部|更多|下一页|下一頁|上一页|上一頁|登录|登錄|注册|註冊)$/i.test(label)) continue;
+    let target;
+    try { target = new URL(anchor.getAttribute("href"), pageUrl); } catch { continue; }
+    if (target.origin !== origin || !CATEGORY_PATH.test(target.pathname)
+      || seenUrls.has(target.toString()) || seenLabels.has(label)) continue;
+    const value = categoryPageUrl(target.toString(), listPageUrl);
+    if (!value) continue;
+    seenUrls.add(target.toString());
+    seenLabels.add(label);
+    rows.push(`${label}::${value}`);
+    if (rows.length >= 40) break;
+  }
+  return rows.length >= 2 ? `_category\n${rows.join("\n")}` : "";
 }
 
 function repeatedContentCards(document, baseUrl, origin) {
@@ -388,6 +433,7 @@ export async function discoverMedia(originUrl, kind, {
     listSelector,
     download,
   });
+  const categoryFilters = mediaCategoryFilters(document, homeUrl, pagedListUrl);
   const contentDirect = [
     "@js:",
     'var q = (typeof params !== "undefined" && params.queryInfo) || {};',
@@ -439,6 +485,7 @@ export async function discoverMedia(originUrl, kind, {
     homeUrl,
     listUrl: homeUrl,
     listRequestInfo: pagedListUrl || homeRequestInfo,
+    categoryFilters,
     listSelector,
     bookNameSelector: cards?.bookNameSelector || (stableListSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : ".//a||normalize-space(/html/body/*)"),
     detailUrlSelector: cards?.detailUrlSelector || (stableListSelector ? "./@href||//@href" : ".//a/@href||//@href"),
