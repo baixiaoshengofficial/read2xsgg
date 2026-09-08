@@ -5,7 +5,8 @@ services:
     container_name: read2xsgg
     restart: unless-stopped
     init: true
-    # Resource guard: keep AgentFlow-driven workloads from exhausting the VM.
+    # Resource guard: scripts/deploy-local.sh additionally clamps overrides to
+    # at most RESOURCE_LIMIT_PERCENT (maximum 90%) of the current host.
     mem_reservation: ${CONTAINER_MEMORY_RESERVATION:-1g}
     mem_limit: ${CONTAINER_MEMORY_LIMIT:-4g}
     memswap_limit: ${CONTAINER_MEMORY_SWAP_LIMIT:-5g}

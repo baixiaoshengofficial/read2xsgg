@@ -46,7 +46,7 @@ cp .env.example .env
 
 ```bash
 docker compose pull
-docker compose up -d
+npm run deploy:local -- --pull always
 ```
 
 镜像地址：`knighttools/read2xsgg:latest`。

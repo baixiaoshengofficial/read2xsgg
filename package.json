@@ -20,6 +20,7 @@
     "convert": "node ./bin/read2xsgg.js",
     "publish:library": "node ./bin/publish-library.js",
     "rebase:library": "node ./bin/rebase-library.js",
+    "deploy:local": "./scripts/deploy-local.sh",
     "start": "node ./bin/server.js",
     "docker:push": "./scripts/docker-push.sh"
   },
