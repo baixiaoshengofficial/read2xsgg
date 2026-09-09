@@ -700,10 +700,19 @@ export function usableComicPageUrl(value, cover = "") {
 }
 
 export function usableComicContentReport(report, cover = "") {
-  if (!report?.firstUrl || !usableComicPageUrl(report.firstUrl, cover)) return false;
+  if (!report?.firstUrl) return false;
+  let firstUrl = report.firstUrl;
+  if (!/^https?:\/\//i.test(String(firstUrl))) {
+    try {
+      firstUrl = new URL(String(firstUrl), String(report.requestUrl || "")).toString();
+    } catch {
+      return false;
+    }
+  }
+  if (!usableComicPageUrl(firstUrl, cover)) return false;
   return !(Number(report.itemCount) <= 1
     && /(?:^|[\/_-])(?:thumb(?:nail)?|small)(?:[\/_\-.]|$)/i.test(
-      underlyingAdapterUrl(report.firstUrl),
+      underlyingAdapterUrl(firstUrl),
     ));
 }
 

@@ -87,4 +87,4 @@ export {
   verifyConvertedSources,
 } from "./verifySource.js";
 export { downloadAsFetch, filterValidXiangseSources, repairXiangseEntrypoints, ruleUsesForbiddenSinglePipeJs, validateXiangseSource } from "./xiangseValidate.js";
-export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadMedia, downloadSource, filterReachableSources, HttpError, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaPlaylist, pageMediaUrls, pageText, pageTocUrl, serverConfig, sourceUrlCandidates, startServer } from "./server.js";
+export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadMedia, downloadSource, filterReachableSources, HttpError, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaPlaylist, pageMediaUrls, pageText, pageTocUrl, preferredResolvedAddress, serverConfig, sourceUrlCandidates, startServer } from "./server.js";

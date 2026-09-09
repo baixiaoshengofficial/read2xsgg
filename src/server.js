@@ -188,6 +188,11 @@ function isDnsProxyIpv4(address) {
   return first === 198 && (second === 18 || second === 19);
 }
 
+export function preferredResolvedAddress(addresses) {
+  if (!Array.isArray(addresses) || addresses.length === 0) return null;
+  return addresses.find(({ family }) => Number(family) === 4) || addresses[0];
+}
+
 async function resolveTarget(url, config) {
   if (!/^https?:$/.test(url.protocol)) throw new HttpError(400, "阅读源地址只支持 http:// 或 https://");
   if (!url.hostname) throw new HttpError(400, "阅读源地址缺少主机名");
@@ -207,7 +212,7 @@ async function resolveTarget(url, config) {
   if (!config.allowPrivateNetworks && blockedAddresses.length && !dnsProxyException) {
     throw new HttpError(403, "出于安全考虑，默认禁止访问本机或内网地址；可信环境可设置 ALLOW_PRIVATE_NETWORKS=true");
   }
-  return addresses[0];
+  return preferredResolvedAddress(addresses);
 }
 
 function requestBuffer(url, resolved, config, {

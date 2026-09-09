@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
-import { chapterPageCandidates, compileBookBridgePlan, createAppServer, decodeBridgePlan, decodeXbs, downloadSource, encodeBridgePlan, filterReachableSources, normalizeEmbeddedSourceUrl, pageImageUrls, pageTocUrl, serverConfig, skippedBuckets, sourceUrlCandidates } from "../src/index.js";
+import { chapterPageCandidates, compileBookBridgePlan, createAppServer, decodeBridgePlan, decodeXbs, downloadSource, encodeBridgePlan, filterReachableSources, normalizeEmbeddedSourceUrl, pageImageUrls, pageTocUrl, preferredResolvedAddress, serverConfig, skippedBuckets, sourceUrlCandidates } from "../src/index.js";
 import { encodeSsrEpisodePlan } from "../src/siteAnalyze/ssrEpisodes.js";
 
 const source = {
@@ -83,6 +83,14 @@ test("深度预检为 JSON API 详情尝试同源 HTML 章节页", () => {
   assert.deepEqual(chapterPageCandidates("https://comic.example/comic/123"), [
     "https://comic.example/comic/123",
   ]);
+});
+
+test("DNS 同时返回 IPv6 和 IPv4 时优先使用 IPv4", () => {
+  const ipv6 = { address: "2001:4860:4860::8888", family: 6 };
+  const ipv4 = { address: "8.8.8.8", family: 4 };
+  assert.deepEqual(preferredResolvedAddress([ipv6, ipv4]), ipv4);
+  assert.deepEqual(preferredResolvedAddress([ipv6]), ipv6);
+  assert.equal(preferredResolvedAddress([]), null);
 });
 
 test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (context) => {

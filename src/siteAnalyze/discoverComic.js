@@ -17,7 +17,7 @@ import { dynamicHtmlRequestUrl } from "./dynamicHtml.js";
 import { unpackDeanEdwards } from "../mediaPlan.js";
 
 const COMIC_HREF = /\/(?:comic|comics|manga|manhua|mh|cartoon|chapter)\/|(?:漫画)/i;
-const CHAPTER_HREF = /\/(?:comic|comics|manga|manhua|mh|chapter|view)\/|\/\d+(?:-\d+)?\.html?$/i;
+const CHAPTER_HREF = /\/(?:comic|comics|manga|manhua|mh|chapter|view)\/|\/\d+(?:-\d+)?\.html?$|[?&](?:chapter|chapter_?slot|episode|episode_?slot|section_?slot)=/i;
 const CHAPTER_TEXT = /(?:第\s*.{0,12}[話话章回卷集]|\d+\s*[話话章回卷集]|全[一1][話话]|番外|序章)/i;
 
 function likelyComicChapter(item, detailUrl) {
@@ -35,7 +35,9 @@ function likelyComicChapter(item, detailUrl) {
   if (!targetPath || targetPath === detailPath) return false;
   const childPath = targetPath.startsWith(`${detailPath}/`) || targetPath.startsWith(`${detailStem}/`);
   const explicitRoute = /\/(?:chapter|chapters|read|view)(?:[-_/]|$)/i.test(targetPath);
-  return childPath || (explicitRoute && CHAPTER_TEXT.test(item.text));
+  const semanticQuery = [...target.searchParams.keys()]
+    .some((key) => /^(?:chapter|chapter_?slot|episode|episode_?slot|section_?slot)$/i.test(key));
+  return childPath || ((explicitRoute || semanticQuery) && CHAPTER_TEXT.test(item.text));
 }
 
 function imageCount(document) {

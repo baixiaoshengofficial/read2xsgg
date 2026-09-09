@@ -12,6 +12,26 @@ import { dynamicComicApiImages } from "./dynamicComic.js";
 const SEMANTIC_TOKEN = /(?:content|chapter|article|read|正文|内容)/i;
 const NOISE_TOKEN = /(?:nav|menu|footer|header|comment|recommend|related|广告|推荐|目录)/i;
 
+export function reusableComicDecoderContent(source) {
+  if (source?.sourceType !== "comic") return "";
+  const content = String(source?.chapterContent?.content || "");
+  const explicitDecoder = /\/image\/(?:aes-cbc-(?:prefix-iv|fixed-iv)-|id-md5-reverse-tiles-|md5-reverse-tiles-)[A-Za-z0-9_-]+\?url=/i;
+  return explicitDecoder.test(content) ? content : "";
+}
+
+export function carryReusableComicDecoder(candidate, original) {
+  if (candidate?.sourceType !== "comic") return candidate;
+  const content = reusableComicDecoderContent(original);
+  if (!content) return candidate;
+  return {
+    ...candidate,
+    chapterContent: {
+      ...(candidate.chapterContent || {}),
+      content,
+    },
+  };
+}
+
 function stableContentSelector(element, document) {
   const id = String(element.id || "").trim();
   if (id && !/["']/.test(id)

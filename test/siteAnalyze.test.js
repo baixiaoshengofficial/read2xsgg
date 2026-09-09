@@ -285,6 +285,30 @@ test("discoverComic 从 HTML fixture 发现漫画结构", async () => {
   assert.match(discovery.contentSelector, /urls/);
 });
 
+test("discoverComic 识别查询参数声明的章节跳转链接", async () => {
+  const host = "https://comic-query.example";
+  const pages = new Map([
+    [`${host}/`, [
+      '<a href="/comic/alpha"><img src="/alpha.jpg">甲漫画</a>',
+      '<a href="/comic/beta"><img src="/beta.jpg">乙漫画</a>',
+    ].join("")],
+    [`${host}/comic/alpha`, [
+      '<h1>甲漫画</h1>',
+      '<a href="/user/page_direct?comic_id=alpha&section_slot=0&chapter_slot=0">第1话</a>',
+      '<a href="/user/page_direct?comic_id=alpha&section_slot=0&chapter_slot=1">第2话</a>',
+    ].join("")],
+    [`${host}/user/page_direct?comic_id=alpha&section_slot=0&chapter_slot=1`,
+      '<img src="/pages/1.jpg"><img src="/pages/2.jpg">'],
+  ]);
+  const download = async (url) => Buffer.from(pages.get(String(url)) || "");
+
+  const discovery = await discoverComic(`${host}/`, { download });
+
+  assert.ok(discovery);
+  assert.equal(discovery.chapterCount, 2);
+  assert.match(discovery.chapterSampleUrl, /chapter_slot=1/);
+});
+
 test("discoverNovel 识别并验证分类列表下一页模板", async () => {
   const page1 = `<!doctype html><html><head><title>分页小说</title></head><body>
   <ul class="list">
@@ -1031,6 +1055,49 @@ test("analyzeSite 对漫画 fixture 生成漫画源", async () => {
   const comic = Object.values(result.sources).find((item) => item.sourceType === "comic");
   assert.ok(comic);
   assert.match(comic.chapterContent.content, /urls/);
+});
+
+test("analyzeSite 漫画正文只命中页面图标时通用修复并重新验证", async () => {
+  const host = "https://comic-ui.example";
+  const home = `<p>漫画 comic manga 阅读</p><ul>${[1, 2, 3, 4].map((id) => (
+    `<li><img src="/cover/${id}.jpg"><a href="/comic/${id}.html">漫画${id}</a></li>`
+  )).join("")}</ul>`;
+  const detail = `<h1>漫画1</h1>
+    <a href="/comic/1/1.html">第1话</a><a href="/comic/1/2.html">第2话</a>`;
+  const chapter = `<img src="/static/home_icon_his.png">
+    <img class="page" src="/pages/1.jpg"><img class="page" src="/pages/2.jpg">`;
+  const download = async (url) => {
+    const pathname = new URL(String(url)).pathname;
+    if (/\.(?:jpg|png)$/.test(pathname)) return Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    if (pathname === "/") return Buffer.from(home);
+    if (/^\/comic\/\d+\.html$/.test(pathname)) return Buffer.from(detail);
+    if (/^\/comic\/\d+\/\d+\.html$/.test(pathname)) return Buffer.from(chapter);
+    throw new Error(`fixture missing: ${url}`);
+  };
+  let repairs = 0;
+  const result = await analyzeSite(`${host}/`, {
+    download,
+    sourceName: "页面图标漫画",
+    contentRepair: async (source) => {
+      repairs += 1;
+      return {
+        ...source,
+        chapterContent: {
+          ...source.chapterContent,
+          requestInfo: "%@result",
+          content: "//img[contains(concat(' ', normalize-space(@class), ' '), ' page ')]/@src||@js:return JSON.stringify({urls:result,httpHeaders:{}});",
+        },
+      };
+    },
+  });
+
+  assert.equal(result.ok, true, JSON.stringify(result.skippedKinds));
+  assert.equal(repairs, 1);
+  assert.match(result.source.chapterContent.content, /normalize-space\(@class\)/);
+  assert.equal(result.runtimeReports["页面图标漫画"].steps.chapterContent.firstUrl, "/pages/1.jpg");
+  assert.equal(usableComicContentReport(
+    result.runtimeReports["页面图标漫画"].steps.chapterContent,
+  ), true);
 });
 
 test("discoverNovel 接受只有一个真实章节的新书", async () => {
@@ -2439,6 +2506,9 @@ test("pipeline 对识站后正文为空的漫画继续通用修复并重新验�
         requestInfo: `${host}/missing`, list: "//*[@id='missing']", bookName: ".", detailUrl: "./@href",
       },
     },
+    chapterContent: {
+      content: "$.urls||@js:return 'https://converter.example/image/aes-cbc-prefix-iv-MDEyMzQ1Njc4OWFiY2RlZg?url=';",
+    },
   };
   const download = async (url) => {
     const target = String(url);
@@ -2480,6 +2550,7 @@ test("pipeline 对识站后正文为空的漫画继续通用修复并重新验�
       analyze: async () => ({ ok: true, sources: { 识站漫画: analyzed } }),
       repairContent: async (source) => {
         contentRepairs += 1;
+        assert.equal(source.chapterContent.content, broken.chapterContent.content);
         return {
           ...source,
           chapterContent: {

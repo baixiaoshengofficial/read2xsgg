@@ -1,6 +1,6 @@
 import { analyzeSite } from "./siteAnalyze/index.js";
 import { repairChapterFromBook } from "./siteAnalyze/repairChapter.js";
-import { repairContentFromChapter } from "./siteAnalyze/repairContent.js";
+import { carryReusableComicDecoder, repairContentFromChapter } from "./siteAnalyze/repairContent.js";
 import { repairDetailFromBook } from "./siteAnalyze/repairDetail.js";
 import { repairBooksFromRequests, repairChaptersFromBookJson } from "./siteAnalyze/repairBooks.js";
 import {
@@ -668,7 +668,7 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
         let pickedVerified = null;
         const repairFailures = [];
         for (const [candidateName, candidate] of candidates) {
-          let repaired = { ...candidate, sourceName: name };
+          let repaired = carryReusableComicDecoder({ ...candidate, sourceName: name }, source);
           let structural = validateXiangseSource(repaired);
           if (!structural.ok) {
             repairFailures.push(`结构校验失败：${structural.errors.slice(0, 3).join("；")}`);

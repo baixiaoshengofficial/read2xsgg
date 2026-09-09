@@ -7,6 +7,8 @@ import { loadDocument, visibleText } from "./domUtil.js";
 import { runXbsPipeline } from "../xbsRuntime.js";
 import { downloadAsFetch, validateXiangseSource } from "../xiangseValidate.js";
 import { decodeTextBuffer } from "../charset.js";
+import { usableComicContentReport } from "../verifySource.js";
+import { carryReusableComicDecoder, repairContentFromChapter } from "./repairContent.js";
 
 const CONTENT_NAV_TEXT = /(?:小说|书库|阅读|漫画|动漫|听书|有声|音频|广播剧|视频|影视|轻小说|novel|books?|comic|manga|audio|podcast|video)/i;
 const TRANSIENT_NETWORK_ERROR = /(?:abort|timed?\s*out|超时|timeout|socket|network|fetch failed|connection|连接|econnreset|econnrefused|ehostunreach|enetunreach|eai_again|enotfound|tls|ssl|http\s*(?:408|425|429|5\d\d)\b)/i;
@@ -127,6 +129,7 @@ export async function analyzeSite(siteUrl, {
   seedRequests = [],
   adapterBase = "",
   repairSource = null,
+  contentRepair = repairContentFromChapter,
   maxPageBytes = 2 * 1024 * 1024,
 } = {}) {
   if (typeof download !== "function") {
@@ -346,13 +349,14 @@ export async function analyzeSite(siteUrl, {
     const attempt = (attemptsByKind.get(item.kind) || 0) + 1;
     attemptsByKind.set(item.kind, attempt);
     const candidateName = attempt === 1 ? name : `${name}#候选${attempt}`;
-    const source = discoveryToXiangse(item.discovery, { sourceName: name });
+    let source = discoveryToXiangse(item.discovery, { sourceName: name });
     if (!source) {
       skippedKinds.push({ kind: item.kind, reason: "无法导出香色源" });
       continue;
     }
+    source = carryReusableComicDecoder(source, repairSource);
 
-    const structural = validateXiangseSource(source);
+    let structural = validateXiangseSource(source);
     if (!structural.ok) {
       skippedKinds.push({
         kind: item.kind,
@@ -362,12 +366,50 @@ export async function analyzeSite(siteUrl, {
     }
 
     if (validateRuntime) {
-      const report = await runXbsPipeline(source, {
+      const runCandidate = (candidate, maxCandidates) => runXbsPipeline(candidate, {
         fetchImpl,
         timeoutMs,
         fetchMedia: item.kind === "comic" || item.kind === "audio" || item.kind === "video",
-        maxCandidates: 3,
+        maxCandidates,
       });
+      let report = await runCandidate(source, item.kind === "comic" ? 1 : 3);
+      const contentReport = report.steps?.chapterContent;
+      const chapterUrl = report.steps?.chapterList?.chapterUrl || item.discovery.chapterSampleUrl;
+      const comicContentInvalid = item.kind === "comic"
+        && !usableComicContentReport(contentReport, report.steps?.bookDetail?.cover);
+      let comicRepairAccepted = false;
+      if (comicContentInvalid && chapterUrl && typeof contentRepair === "function") {
+        try {
+          const repaired = await contentRepair(source, chapterUrl, {
+            download: timedDownload,
+            adapterBase,
+          });
+          if (repaired) {
+            const repairedStructural = validateXiangseSource(repaired);
+            if (repairedStructural.ok) {
+              const repairedReport = await runCandidate(repaired, 3);
+              if (repairedReport.ok && usableComicContentReport(
+                repairedReport.steps?.chapterContent,
+                repairedReport.steps?.bookDetail?.cover,
+              )) {
+                source = repaired;
+                structural = repairedStructural;
+                report = repairedReport;
+                comicRepairAccepted = true;
+              }
+            }
+          }
+        } catch {
+          // The report below preserves the concrete failure from the original candidate.
+        }
+      }
+      if (item.kind === "comic" && !comicRepairAccepted
+        && (!report.ok || !usableComicContentReport(
+          report.steps?.chapterContent,
+          report.steps?.bookDetail?.cover,
+        ))) {
+        report = await runCandidate(source, 3);
+      }
       runtimeReports[candidateName] = report;
       if (!report.ok) {
         repairCandidates[candidateName] = source;
@@ -380,7 +422,11 @@ export async function analyzeSite(siteUrl, {
       const steps = report.steps || {};
       if (!(steps.bookWorld?.listCount >= 1)
         || !(steps.chapterList?.listCount >= 1)
-        || !(steps.chapterContent?.itemCount > 0)) {
+        || !(steps.chapterContent?.itemCount > 0)
+        || (item.kind === "comic" && !usableComicContentReport(
+          steps.chapterContent,
+          steps.bookDetail?.cover,
+        ))) {
         repairCandidates[candidateName] = source;
         skippedKinds.push({
           kind: item.kind,
@@ -449,7 +495,8 @@ export { discoverComic } from "./discoverComic.js";
 export { discoverMedia } from "./discoverMedia.js";
 export { repairChapterFromBook } from "./repairChapter.js";
 export { repairDetailFromBook } from "./repairDetail.js";
-export { discoverContentRule, repairContentFromChapter } from "./repairContent.js";
+export { discoverContentRule } from "./repairContent.js";
+export { repairContentFromChapter };
 export { repairBooksFromRequests, repairChaptersFromBookJson } from "./repairBooks.js";
 export {
   novelDiscoveryToXiangse,
