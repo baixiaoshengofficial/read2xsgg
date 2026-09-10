@@ -214,6 +214,7 @@ export function downloadAsFetch(download) {
         ok: true,
         status: 200,
         url: responseUrl,
+        read2xsggDecodedText: Boolean(buffer.read2xsggDecodedText),
         headers: {
           get(name) {
             const key = String(name || "").toLowerCase();

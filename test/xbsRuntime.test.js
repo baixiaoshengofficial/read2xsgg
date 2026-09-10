@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { gzipSync } from "node:zlib";
 import test from "node:test";
+import iconv from "iconv-lite";
 import {
   convertLegado,
   createAppServer,
+  downloadAsFetch,
   isPlayableMediaResponse,
   runXbsPipeline,
 } from "../src/index.js";
@@ -20,6 +22,72 @@ function close(server) {
   return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
 
+test("原生 GBK 动作按响应编码解码，UTF-8 JSON 桥接不继承请求编码", async () => {
+  const host = "https://charset.example";
+  for (const encodingSource of ["action", "header", "meta", "decoded"]) {
+    const responseFields = ["action", "decoded"].includes(encodingSource) ? { responseEncode: "2147485234" } : {};
+    const htmlAction = { host, responseFormatType: "html", ...responseFields };
+    const source = {
+      sourceName: "中文编码回归",
+      sourceUrl: host,
+      sourceType: "text",
+      bookWorld: {
+        分类: {
+          ...htmlAction, actionID: "bookWorld", requestInfo: "/books",
+          list: "//a[contains(., '作品')]", bookName: ".", detailUrl: "./@href",
+        },
+      },
+      bookDetail: {
+        host, actionID: "bookDetail", responseFormatType: "json",
+        requestInfo: "/detail", bookName: "name", author: "author",
+        requestParamsEncode: "2147485234",
+      },
+      chapterList: {
+        ...htmlAction, actionID: "chapterList", requestInfo: "%@result",
+        list: "//a[contains(., '第一章')]", title: ".", url: "./@href",
+      },
+      chapterContent: {
+        ...htmlAction, actionID: "chapterContent", requestInfo: "%@result",
+        content: "//article",
+      },
+    };
+    const pages = {
+      "/books": '<a href="/book/1">中文作品</a>',
+      "/book/1": '<a href="/chapter/1">第一章 启程</a>',
+      "/chapter/1": "<article>这是正确解码的中文正文。</article>",
+    };
+    const fetchImpl = async (url) => {
+      const pathname = new URL(url).pathname;
+      assert.ok(pathname === "/detail" || pages[pathname], pathname);
+      const json = pathname === "/detail";
+      const body = json
+        ? Buffer.from(JSON.stringify({ name: "中文作品", author: "测试作者" }))
+        : iconv.encode((["meta", "decoded"].includes(encodingSource) ? '<meta charset="gb2312">' : "")
+          + pages[pathname], encodingSource === "decoded" ? "utf8" : "gbk");
+      if (encodingSource === "decoded") {
+        Object.defineProperty(body, "read2xsggDecodedText", { value: true });
+        Object.defineProperty(body, "httpHeaders", {
+          value: { "content-type": json ? "application/json; charset=utf-8" : "text/html; charset=gbk" },
+        });
+        return downloadAsFetch(async () => body)(url);
+      }
+      const response = new Response(body, {
+        headers: { "Content-Type": json ? "application/json; charset=utf-8"
+          : encodingSource === "header" ? "text/html; charset=gbk" : "text/html" },
+      });
+      Object.defineProperty(response, "url", { value: url });
+      return response;
+    };
+    const report = await runXbsPipeline(source, { fetchImpl, bookIndex: 0, chapterIndex: 0 });
+    assert.equal(report.ok, true, `${encodingSource}: ${report.error}`);
+    assert.equal(report.steps.bookWorld.bookName, "中文作品");
+    assert.equal(report.steps.bookDetail.name, "中文作品");
+    assert.equal(report.steps.bookDetail.author, "测试作者");
+    assert.equal(report.steps.chapterList.chapterTitle, "第一章 启程");
+    assert.equal(report.steps.chapterContent.itemCount, "这是正确解码的中文正文。".length);
+  }
+});
+
 test("媒体响应校验拒绝伪装成播放地址的 HTML 页面", () => {
   const response = (contentType, url = "https://example.test/play") => ({
     ok: true,
@@ -31,6 +99,48 @@ test("媒体响应校验拒绝伪装成播放地址的 HTML 页面", () => {
   assert.equal(isPlayableMediaResponse(response("audio/mpeg")), true);
   assert.equal(isPlayableMediaResponse(response("application/octet-stream", "https://cdn.test/1.mp3")), true);
   assert.equal(isPlayableMediaResponse(response("text/html", "https://cdn.test/1.mp3")), false);
+});
+
+test("整源取消后不再重试其它分类、书籍或章节", async () => {
+  const host = "https://cancel.example";
+  const controller = new AbortController();
+  const world = {
+    actionID: "bookWorld", host, requestInfo: "/books",
+    list: "//a", bookName: ".", detailUrl: "./@href",
+  };
+  const source = {
+    sourceName: "取消回归", sourceUrl: host, sourceType: "text",
+    bookWorld: { 首选: world, 备用: { ...world, requestInfo: "/other-books" } },
+    searchBook: { ...world, requestInfo: "/search" },
+    bookDetail: { actionID: "bookDetail", host, requestInfo: "%@result" },
+    chapterList: {
+      actionID: "chapterList", host, requestInfo: "%@result",
+      list: "//a", title: ".", url: "./@href",
+    },
+    chapterContent: { actionID: "chapterContent", host, requestInfo: "%@result", content: "//article" },
+  };
+  const requested = [];
+  const fetchImpl = async (url) => {
+    requested.push(new URL(url).pathname);
+    if (url.endsWith("/chapter/1")) {
+      controller.abort(new Error("单源预算耗尽"));
+      throw controller.signal.reason;
+    }
+    const response = new Response(url.endsWith("/books")
+      ? '<a href="/book/1">作品一</a><a href="/book/2">作品二</a>'
+      : '<a href="/chapter/1">第一章</a><a href="/chapter/2">第二章</a>');
+    Object.defineProperty(response, "url", { value: url });
+    return response;
+  };
+  const report = await runXbsPipeline(source, { fetchImpl, signal: controller.signal });
+  assert.equal(report.ok, false);
+  assert.match(report.error, /单源预算耗尽/);
+  assert.deepEqual(requested, ["/books", "/book/1", "/book/1", "/chapter/1"]);
+  requested.length = 0;
+  const cancelled = await runXbsPipeline(source, { fetchImpl, signal: controller.signal });
+  assert.equal(cancelled.ok, false);
+  assert.match(cancelled.error, /单源预算耗尽/);
+  assert.deepEqual(requested, []);
 });
 
 test("香色动作链执行器验证分类、详情、章节和正文", async (context) => {

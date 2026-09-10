@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { JSDOM } from "jsdom";
 import { decodeXbs } from "./xbs.js";
-import { encodeFormBody } from "./charset.js";
+import { decodeTextBuffer, encodeFormBody, XIANGSE_GBK_ENCODE } from "./charset.js";
 import { orderChaptersAscending } from "./bridgePlan.js";
 
 function splitPostScript(rule) {
@@ -229,6 +229,7 @@ function absoluteUrl(value, base) {
 }
 
 async function requestAction(source, action, context, fetchImpl) {
+  context.signal?.throwIfAborted();
   const config = actionConfig(source, action);
   const params = {
     pageIndex: context.pageIndex || 1,
@@ -272,7 +273,14 @@ async function requestAction(source, action, context, fetchImpl) {
     }
   }
   const response = await fetchImpl(url, init);
-  const body = await response.text();
+  const body = !response.read2xsggDecodedText && typeof response.arrayBuffer === "function"
+    ? decodeTextBuffer(Buffer.from(await response.arrayBuffer()), {
+      headers: { "content-type": response.headers?.get?.("content-type") || "" },
+      charsetHint: String(action.responseEncode || "") === XIANGSE_GBK_ENCODE
+        ? "gbk"
+        : action.charset || "",
+    })
+    : await response.text();
   if (!response.ok) throw new Error(`${action.actionID} 请求失败：HTTP ${response.status} ${response.url}`);
   let parsed = body;
   if (action.responseFormatType === "json") {
@@ -605,6 +613,7 @@ export async function runXbsPipeline(source, options = {}) {
     report.ok = true;
   } catch (error) {
     report.error = error.message;
+    if (options.signal?.aborted) return report;
     if (!options.world && !options.useSearch && !options._worldFallback) {
       const maxWorldCandidates = Math.max(1, Math.min(12, options.maxWorldCandidates || 8));
       const alternatives = Object.keys(source.bookWorld || {}).slice(1, maxWorldCandidates);
@@ -614,6 +623,7 @@ export async function runXbsPipeline(source, options = {}) {
           world,
           _worldFallback: true,
         });
+        if (options.signal?.aborted) return candidate;
         if (candidate.ok) {
           candidate.attemptedWorlds = alternatives.indexOf(world) + 2;
           return candidate;
@@ -625,6 +635,7 @@ export async function runXbsPipeline(source, options = {}) {
           useSearch: true,
           _worldFallback: true,
         });
+        if (options.signal?.aborted) return candidate;
         if (candidate.ok) {
           candidate.attemptedWorlds = alternatives.length + 1;
           return candidate;
@@ -637,6 +648,7 @@ export async function runXbsPipeline(source, options = {}) {
         options.maxChapterCandidates || options.maxCandidates || 5));
       for (let index = 1; index < maxCandidates; index += 1) {
         const candidate = await runXbsPipeline(source, { ...options, chapterIndex: index });
+        if (options.signal?.aborted) return candidate;
         if (candidate.ok) {
           candidate.attemptedChapterCandidates = index + 1;
           return candidate;
@@ -651,6 +663,7 @@ export async function runXbsPipeline(source, options = {}) {
         options.maxBookCandidates || options.maxCandidates || 5));
       for (let index = 1; index < maxCandidates; index += 1) {
         const candidate = await runXbsPipeline(source, { ...options, bookIndex: index });
+        if (options.signal?.aborted) return candidate;
         if (candidate.ok) {
           candidate.attemptedCandidates = index + 1;
           return candidate;
