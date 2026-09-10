@@ -1,4 +1,4 @@
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ ENV NODE_ENV=production \
 
 COPY package.json package-lock.json LICENSE README.md ./
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends imagemagick webp gosu ca-certificates curl \
+    && apt-get install -y --no-install-recommends imagemagick webp gosu ca-certificates curl openssl \
     && npm ci --omit=dev \
     && mkdir -p /data \
     && chown node:node /data
