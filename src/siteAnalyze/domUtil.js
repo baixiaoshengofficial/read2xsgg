@@ -81,9 +81,12 @@ export function scoreLinkCluster(links, baseUrl) {
     const first = parts[0] || "";
     const extension = first.match(/(\.[A-Za-z0-9]{1,8})$/)?.[1]?.toLowerCase() || "";
     const dynamicFirst = /^\d+$|\d{3,}|^[a-f0-9]{8,}(?:\.[A-Za-z0-9]+)?$/i.test(first);
+    const numberedSlug = parts.length === 1 && !extension && /^(?:[a-z0-9]+-)+\d+$/i.test(first)
+      ? first.replace(/\d+$/, ":id")
+      : "";
     const key = parts.length <= 1 && extension
       ? `/:file${extension}`
-      : (dynamicFirst ? "/:id" : (first || "/"));
+      : (dynamicFirst ? "/:id" : (numberedSlug || first || "/"));
     const bucket = samePathPrefix.get(key) || [];
     bucket.push(link);
     samePathPrefix.set(key, bucket);

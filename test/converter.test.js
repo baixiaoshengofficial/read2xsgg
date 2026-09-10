@@ -525,8 +525,33 @@ JSON.stringify(books)
   assert.ok(converted);
   assert.equal(converted.searchBook.list, "data/groups/items");
   assert.equal(typeof converted.searchBook.detailUrl, "string");
-  assert.match(converted.searchBook.detailUrl, /result\.book_id/);
+  assert.match(converted.searchBook.detailUrl, /^book_id\|\|@js:/);
   assert.deepEqual(validateXiangseSource(converted), { ok: true, errors: [] });
+});
+
+test("JSON POST 搜索的嵌套详情字段先取标量再拼接 URL", () => {
+  const source = {
+    bookSourceName: "POST 嵌套详情字段",
+    bookSourceUrl: "https://api.example",
+    bookSourceType: 2,
+    searchUrl: '/search,{"method":"POST","body":"keyword={{key}}&page={{page}}"}',
+    ruleSearch: {
+      bookList: "$.data[*]",
+      name: "$.attributes.title",
+      bookUrl: "https://api.example/worksinfos/{$.attributes.wid}?include=chapters",
+    },
+    ruleBookInfo: {},
+    ruleToc: { chapterList: "$.included[*]", chapterName: "$.title", chapterUrl: "$.url" },
+    ruleContent: { content: "$.urls[*]" },
+  };
+  const converted = convertLegado(source).sources["POST 嵌套详情字段"];
+  const plan = compileBookBridgePlan(converted.searchBook);
+  const output = executeBridgePlan(JSON.stringify({
+    data: [{ attributes: { title: "作品", wid: 366490031 } }],
+  }), "https://api.example/search", plan, { limit: 2 });
+
+  assert.match(converted.searchBook.detailUrl, /^attributes\/wid\|\|@js:/);
+  assert.equal(output.data[0].url, "https://api.example/worksinfos/366490031?include=chapters");
 });
 
 test("章节脚本的多字段静态拼接编译为完整 URL 模板", () => {
@@ -643,7 +668,7 @@ eval(String(source.bookSourceComment));
 });
 
 test("单花括号 JSON 字段 URL 和安全的 @put/@get 选择器会被统一编译", () => {
-  assert.match(convertRule("https://api.example/book/{$.id}"), /result\.id/);
+  assert.match(convertRule("https://api.example/book/{$.id}"), /^id\|\|@js:/);
   const source = structuredClone(sampleSource);
   source.bookSourceName = "状态规则测试";
   source.ruleSearch.name = "a@text@put:{u:\"a@href\"}";
@@ -3482,7 +3507,7 @@ test("JSON API 字段与 {$.id} URL 模板不再被误判成 HTML XPath", () => 
   };
   assert.equal(inferResponseType(rules), "json");
   assert.equal(convertRule(rules.bookList, { responseType: "json" }), "data||data/items");
-  assert.match(convertRule(rules.bookUrl, { responseType: "json" }), /result\.bookId/);
+  assert.match(convertRule(rules.bookUrl, { responseType: "json" }), /^bookId\|\|@js:/);
   assert.equal(convertRule(rules.name, { responseType: "json" }), "bookName");
 });
 

@@ -277,6 +277,40 @@ test("discoverNovel 从 HTML fixture 发现列表/目录/正文", async () => {
   assert.ok(discovery.chapterCount >= 2);
 });
 
+test("discoverNovel 优先把无扩展名作品 slug 作为详情而非章节 HTML", async () => {
+  const home = `<html><head><title>作品全集</title></head><body>
+    <nav>
+      <a href="/series-volume-1">作品卷一</a>
+      <a href="/series-volume-2">作品卷二</a>
+      <a href="/series-volume-3">作品卷三</a>
+    </nav>
+    <main>
+      <a href="/series-chapter-01.html">第一章 开始</a>
+      <a href="/series-chapter-02.html">第二章 继续</a>
+      <a href="/series-chapter-03.html">第三章 尾声</a>
+      <a href="/series-chapter-04.html">第四章 番外</a>
+    </main>
+  </body></html>`;
+  const detail = `<html><body><h1>作品第一卷</h1><div class="chapters">
+    <a href="/series-chapter-01.html">第一章 开始</a>
+    <a href="/series-chapter-02.html">第二章 继续</a>
+    <a href="/series-chapter-03.html">第三章 尾声</a>
+  </div></body></html>`;
+  const download = async (url) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/") return Buffer.from(home);
+    if (/^\/series-volume-\d+$/.test(path)) return Buffer.from(detail);
+    return Buffer.from(`<article>${"有效正文。".repeat(50)}</article>`);
+  };
+
+  const diagnostics = [];
+  const discovery = await discoverNovel("https://slug-novel.example/", { download, diagnostics });
+
+  assert.ok(discovery, diagnostics.join("; "));
+  assert.equal(discovery.detailSampleUrl, "https://slug-novel.example/series-volume-1");
+  assert.equal(discovery.chapterCount, 3);
+});
+
 test("discoverComic 从 HTML fixture 发现漫画结构", async () => {
   const discovery = await discoverComic("https://comic.example/", { download: fixtureDownload });
   assert.ok(discovery);

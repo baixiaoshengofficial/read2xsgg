@@ -722,6 +722,30 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
         cleanupReplacement = replacement;
       }
     }
+    // A scalar selector followed by a postprocessor matches Xiangse's field
+    // evaluation model and remains declarative for bridge verification. Pure
+    // JS receives different result shapes across list runtimes and can turn a
+    // nested object into `[object Object]` instead of reading its leaf value.
+    if (!scriptBody && !cleanupPattern) {
+      const placeholder = /\{\{\s*\$\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*)\s*\}\}|\{\s*\$\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*)\s*\}/g;
+      const matches = [...template.matchAll(placeholder)];
+      const paths = [...new Set(matches.map((match) => match[1] || match[2]))];
+      if (matches.length && paths.length === 1) {
+        const marker = "__READ2XSGG_FIELD__";
+        const literal = template.replace(placeholder, marker);
+        if (!/\{\{|\{\s*\$\./.test(literal)) {
+          const selector = paths[0].replace(/\[(\d+)\]/g, "/$1").replace(/\./g, "/");
+          const parts = literal.split(marker).map((part) => JSON.stringify(part));
+          const expression = parts
+            .flatMap((part, index) => index < parts.length - 1
+              ? [part, 'String(result || "")']
+              : [part])
+            .join(" + ");
+          warn("已将阅读 JSON 字段 URL 模板转换为香色声明式字段后处理");
+          return `${selector}||@js:\nreturn ${expression};`;
+        }
+      }
+    }
     let expression = rewriteLegadoJavaScript(`@js:\nreturn ${JSON.stringify(template)};`)
       .replace(/^@js:\s*return\s+/i, "")
       .replace(/;\s*$/, "");

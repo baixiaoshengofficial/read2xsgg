@@ -16,7 +16,7 @@ import {
   xpathForElement,
 } from "./domUtil.js";
 
-const BOOK_HREF = /(?:\/(?:book|novel|info|xiaoshuo|story|article)\/|\/\d{3,}\.html?$|\/read\/\d+)/i;
+const BOOK_HREF = /(?:\/(?:book|novel|info|xiaoshuo|story|article)\/|\/[a-z0-9]+(?:-[a-z0-9]+){1,}-?\d*\/?(?:[?#].*)?$|\/\d{3,}\.html?$|\/read\/\d+)/i;
 const CHAPTER_HREF = /(?:\/(?:chapter|chapters|read|book|view)\/|\/\d+\.html?$)/i;
 const STRONG_CHAPTER_HREF = /\/view\/\d+(?:_\d+)?\.html?(?:$|[?#])/i;
 const CHAPTER_TEXT = /(?:第.{0,24}[章节回话集卷]|^\s*\d+[.、\s]|序章|楔子|正文)/;

@@ -619,12 +619,12 @@ function inferredScriptField(rule, preferredNames = []) {
     return { currentUrl: true };
   }
   const hostTemplate = source.match(
-    /return\s+\(?\s*String\(\s*config\.host\s*\)\s*\+\s*("(?:\\.|[^"\\])*")\s*\+\s*String\(result\.([A-Za-z_$][\w$]*)\)(?:\s*\+\s*("(?:\\.|[^"\\])*"))?\s*\)?\s*;/i,
+    /return\s+\(?\s*String\(\s*config\.host\s*\)\s*\+\s*("(?:\\.|[^"\\])*")\s*\+\s*String\(result\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*)\)(?:\s*\+\s*("(?:\\.|[^"\\])*"))?\s*\)?\s*;/i,
   );
   if (hostTemplate) {
     try {
       return {
-        selector: hostTemplate[2],
+        selector: hostTemplate[2].replace(/\[(\d+)\]/g, "/$1").replace(/\./g, "/"),
         hostPrefix: true,
         matchTemplate: {
           pattern: "^([\\s\\S]+)$",
@@ -645,7 +645,7 @@ function inferredScriptField(rule, preferredNames = []) {
   if (mappedUrl) return mappedUrl;
   const stringLiteral = `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`;
   const threePart = source.match(new RegExp(
-    `return\\s+\\(?\\s*(${stringLiteral})\\s*\\+\\s*(?:String\\(\\s*result\\.([A-Za-z_$][\\w$]*)\\s*\\)|result\\.([A-Za-z_$][\\w$]*))\\s*\\+\\s*(${stringLiteral})\\s*\\)?\\s*;`,
+    `return\\s+\\(?\\s*(${stringLiteral})\\s*\\+\\s*(?:String\\(\\s*result\\.([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*|\\[\\d+\\])*)\\s*\\)|result\\.([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*|\\[\\d+\\])*))\\s*\\+\\s*(${stringLiteral})\\s*\\)?\\s*;`,
     "i",
   ));
   if (threePart) {
@@ -654,7 +654,7 @@ function inferredScriptField(rule, preferredNames = []) {
       const suffix = staticStringLiteral(threePart[4]);
       const hostPrefix = /^(?:\/|\.{1,2}\/)/.test(prefix);
       return {
-        selector: threePart[2] || threePart[3],
+        selector: (threePart[2] || threePart[3]).replace(/\[(\d+)\]/g, "/$1").replace(/\./g, "/"),
         hostPrefix,
         matchTemplate: {
           pattern: "^([\\s\\S]+)$",
@@ -668,14 +668,14 @@ function inferredScriptField(rule, preferredNames = []) {
     }
   }
   const prefixOnly = source.match(
-    /return\s+\(?\s*("(?:\\.|[^"\\])*")\s*\+\s*String\(result\.([A-Za-z_$][\w$]*)\)\s*\)?\s*;/i,
+    /return\s+\(?\s*("(?:\\.|[^"\\])*")\s*\+\s*String\(result\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*)\)\s*\)?\s*;/i,
   );
   if (prefixOnly) {
     try {
       const prefix = JSON.parse(prefixOnly[1]);
       const hostPrefix = /^(?:\/|\.{1,2}\/)/.test(prefix);
       return {
-        selector: prefixOnly[2],
+        selector: prefixOnly[2].replace(/\[(\d+)\]/g, "/$1").replace(/\./g, "/"),
         hostPrefix,
         matchTemplate: {
           pattern: "^([\\s\\S]+)$",
@@ -689,13 +689,13 @@ function inferredScriptField(rule, preferredNames = []) {
     }
   }
   const suffixOnly = source.match(
-    /return\s+\(?\s*String\(result\.([A-Za-z_$][\w$]*)\)\s*\+\s*("(?:\\.|[^"\\])*")\s*\)?\s*;/i,
+    /return\s+\(?\s*String\(result\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*)\)\s*\+\s*("(?:\\.|[^"\\])*")\s*\)?\s*;/i,
   );
   if (suffixOnly) {
     try {
       const suffix = JSON.parse(suffixOnly[2]);
       return {
-        selector: suffixOnly[1],
+        selector: suffixOnly[1].replace(/\[(\d+)\]/g, "/$1").replace(/\./g, "/"),
         hostPrefix: false,
         matchTemplate: {
           pattern: "^([\\s\\S]+)$",
@@ -711,8 +711,8 @@ function inferredScriptField(rule, preferredNames = []) {
   // Property reads such as result.id are JSON fields. Method calls such as
   // result.attr('href') are DOM operations and must be handled by
   // inferredDomScriptSelector; treating `attr` as a field drops every row.
-  const fields = [...source.matchAll(/\bresult\.([A-Za-z_$][\w$]*)\b(?!\s*\()/g)]
-    .map((match) => match[1]);
+  const fields = [...source.matchAll(/\bresult\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*)\b(?!\s*\()/g)]
+    .map((match) => match[1].replace(/\[(\d+)\]/g, "/$1").replace(/\./g, "/"));
   for (const preferred of preferredNames) {
     const field = fields.find((name) => preferred.test(name));
     if (field) return field;
