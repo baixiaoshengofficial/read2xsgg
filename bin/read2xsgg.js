@@ -101,10 +101,28 @@ function defaultOutput(input, analyzeUrl) {
 
 async function writeOutputs(options, sources, { warnings = [], skipped = [], fallbackCount = 0 } = {}) {
   const count = Object.keys(sources).length;
-  if (!count) throw new Error("没有可输出的香色源");
   const spacing = options.compact ? 0 : 2;
   const json = `${JSON.stringify(sources, null, spacing)}\n`;
 
+  // 全部被跳过时也要把报告写出来，便于排查；只有既无输出又无报告时才报错。
+  if (!count && !options.report) {
+    throw new Error(`没有可输出的香色源${skipped.length ? `（${skipped.length} 个源全部被过滤，使用 --report 查看原因）` : ""}`);
+  }
+  if (options.report) {
+    const reportPath = resolve(options.report);
+    await writeFile(reportPath, `${JSON.stringify({
+      converted: count,
+      fallbackCount,
+      skipped,
+      warningCount: warnings.length,
+      warnings,
+    }, null, 2)}\n`, "utf8");
+    process.stderr.write(`✓ 已生成兼容性报告：${reportPath}\n`);
+  }
+  if (!count) {
+    process.stderr.write(`⚠ 没有可输出的香色源，已把 ${skipped.length} 个被过滤源的原因写入报告\n`);
+    return;
+  }
   if (options.jsonOnly && !options.json) {
     process.stdout.write(json);
   } else {
@@ -118,18 +136,6 @@ async function writeOutputs(options, sources, { warnings = [], skipped = [], fal
       await writeFile(jsonPath, json, "utf8");
       process.stderr.write(`✓ 已生成可审阅 JSON：${jsonPath}\n`);
     }
-  }
-
-  if (options.report) {
-    const reportPath = resolve(options.report);
-    await writeFile(reportPath, `${JSON.stringify({
-      converted: count,
-      fallbackCount,
-      skipped,
-      warningCount: warnings.length,
-      warnings,
-    }, null, 2)}\n`, "utf8");
-    process.stderr.write(`✓ 已生成兼容性报告：${reportPath}\n`);
   }
   if (fallbackCount) process.stderr.write(`ℹ 其中 ${fallbackCount} 个由自动识站修复生成\n`);
   if (skipped.length) process.stderr.write(`⚠ 跳过 ${skipped.length} 个源\n`);
