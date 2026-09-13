@@ -1,4 +1,5 @@
-import { hasUnsupportedLegadoRuntime, legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
+import { hasUnsupportedLegadoRuntime, legadoTemplateExpression, rewriteLegadoJavaScript, rewriteLegadoJavaScriptRaw } from "./legadoJs.js";
+import { injectRuntimeHelpers } from "./legadoRuntime.js";
 
 function quoteXPath(value) {
   if (!value.includes("'")) return `'${value}'`;
@@ -392,7 +393,7 @@ function jsonPathToXsgg(path, warn) {
     .replace(/^\/+|\/+$/g, "");
   if (!jsSuffix) return converted || (rootArray || /^\$$/.test(source.trim()) ? "." : "");
   return converted
-    ? `${converted}||${jsSuffix}`
+    ? chainJsPostprocess(converted, jsSuffix)
     : jsSuffix;
 }
 
@@ -448,6 +449,40 @@ function stripLegadoRegexOptions(replacement, warn) {
   return value;
 }
 
+/**
+ * 给规则追加一段 `@js:` 后处理。规则已有 `||@js:` 或本身就是脚本时，把已有
+ * 脚本包进 IIFE、让新脚本接续处理其返回值——直接再拼一个 `||@js:` 会产生
+ * 两个 @js: 段，香色无法执行。
+ */
+function chainJsPostprocess(rule, processorBody) {
+  const source = String(rule || "").trim();
+  const body = String(processorBody || "").replace(/^\s*@js:\s*/i, "").trim();
+  if (!body) return source;
+  const segments = [];
+  let selector = "";
+  const splitMatch = source.match(/^([\s\S]*?)\|\|\s*@js:([\s\S]*)$/i);
+  const pureScript = !splitMatch && /^@js:/i.test(source);
+  if (splitMatch) {
+    selector = splitMatch[1].trim();
+    segments.push(splitMatch[2].trim());
+  } else if (pureScript) {
+    segments.push(source.replace(/^@js:\s*/i, "").trim());
+  } else {
+    selector = source;
+  }
+  segments.push(body);
+  const lines = ["@js:"];
+  segments.forEach((segment, index) => {
+    const isLast = index === segments.length - 1;
+    const seed = index === 0 ? "result" : `__r${index - 1}`;
+    lines.push(`${isLast ? "return " : "var __r" + index + " = "}(function (result) {`);
+    lines.push(segment);
+    lines.push(`})(${seed});`);
+  });
+  const composed = lines.join("\n");
+  return selector ? `${selector}||${composed}` : composed;
+}
+
 function appendRegexReplacement(converted, suffix, warn) {
   const [pattern = "", replacement = ""] = suffix.split("##");
   if (!pattern) return converted;
@@ -462,7 +497,7 @@ function appendRegexReplacement(converted, suffix, warn) {
       return converted;
     }
     if (!safeReplacement) return converted;
-    return `${converted}||@js:\nreturn String(result || "") + ${JSON.stringify(safeReplacement)};`;
+    return chainJsPostprocess(converted, `return String(result || "") + ${JSON.stringify(safeReplacement)};`);
   }
 
   if (/\{\{\s*(?:Get|get)\s*\(/i.test(safeReplacement)) {
@@ -473,7 +508,7 @@ function appendRegexReplacement(converted, suffix, warn) {
     } catch {
       warn("清理正则无法解析，已原样写入转换结果");
     }
-    return `${converted}||@js:\nreturn String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(cleaned)});`;
+    return chainJsPostprocess(converted, `return String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(cleaned)});`);
   }
 
   try {
@@ -482,7 +517,7 @@ function appendRegexReplacement(converted, suffix, warn) {
   } catch {
     warn("清理正则无法解析，已原样写入转换结果");
   }
-  return `${converted}||@js:\nreturn String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(safeReplacement)});`;
+  return chainJsPostprocess(converted, `return String(result).replace(new RegExp(${JSON.stringify(pattern)}, "g"), ${JSON.stringify(safeReplacement)});`);
 }
 
 /**
@@ -491,8 +526,72 @@ function appendRegexReplacement(converted, suffix, warn) {
  * - 多行 Mustache → || 备选
  * - 末尾 @js / <js> 仍接到后续 convertRule 处理
  */
-function expandMustacheRule(rule, warn) {
-  const trimmed = rule.trim();
+/**
+ * 把 `字面量{{表达式}}字面量` 形式的字段模板（desc/title 等）编译为一条
+ * `@js:` 拼接脚本。没有该处理时，这类混合规则会落入 JSONPath/XPath 分支，
+ * 整串做点号→斜杠转换产生不可执行的规则。
+ */
+function composeTemplateRule(rule, warn) {
+  const matches = [...String(rule).matchAll(/\{\{\s*([\s\S]*?)\s*\}\}/g)];
+  if (!matches.length) return "";
+  const parts = [];
+  let lastIndex = 0;
+  let sawRuntimeExpression = false;
+  for (const match of matches) {
+    if (match.index > lastIndex) parts.push(JSON.stringify(rule.slice(lastIndex, match.index)));
+    const inner = match[1].trim();
+    const expression = compileTemplateInner(inner, warn);
+    if (!expression) return "";
+    if (expression.iife) sawRuntimeExpression = true;
+    parts.push(expression.code);
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < rule.length) parts.push(JSON.stringify(rule.slice(lastIndex)));
+  const composed = `@js:\nreturn (${parts.join(" + ") || '""'});`;
+  return sawRuntimeExpression ? injectRuntimeHelpers(composed) : composed;
+}
+
+function compileTemplateInner(inner, warn) {
+  // {{'字面量'}} / {{"字面量"}}
+  const literalOnly = inner.match(/^(['"])([\s\S]*)\1$/);
+  if (literalOnly) {
+    const decoded = literalOnly[2]
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
+      .replace(/\\t/g, "\t")
+      .replace(/\\(['"\\])/g, "$1");
+    return { code: JSON.stringify(decoded) };
+  }
+  const direct = legadoTemplateExpression(inner);
+  if (direct) return { code: `String(${direct})` };
+  // 支持 `表达式##正则##替换` 的清理后缀。
+  let body = inner;
+  let cleanup = "";
+  const hashSplit = body.match(/^([\s\S]*?)##([\s\S]*)$/);
+  if (hashSplit && legadoTemplateExpression(hashSplit[1].trim())) {
+    const [pattern = "", replacement = ""] = hashSplit[2].split("##");
+    body = hashSplit[1].trim();
+    cleanup = { pattern, replacement };
+  }
+  const directBody = legadoTemplateExpression(body);
+  if (directBody) {
+    if (!cleanup) return { code: `String(${directBody})` };
+    return {
+      code: `String(String(${directBody}).replace(new RegExp(${JSON.stringify(cleanup.pattern)}, "g"), ${JSON.stringify(cleanup.replacement)}))`,
+    };
+  }
+  // 复杂 JS 模板：作为内联 IIFE 编译；运行时助手统一在整条规则上注入一次。
+  const script = rewriteLegadoJavaScriptRaw(`@js:\n${body}`);
+  if (script.includes("{{") || hasUnsupportedLegadoRuntime(script)) return null;
+  const body2 = script.replace(/^@js:\s*/i, "").trim();
+  let code = `(function () {\n${body2}\n})()`;
+  if (cleanup) {
+    code = `String(${code}.replace(new RegExp(${JSON.stringify(cleanup.pattern)}, "g"), ${JSON.stringify(cleanup.replacement)}))`;
+  }
+  return { code, iife: true };
+}
+
+function expandMustacheRule(rule, warn) {  const trimmed = rule.trim();
   if (!/\{\{/.test(trimmed)) return trimmed;
 
   const mustacheOnly = /^\s*(?:\{\{[\s\S]*?\}\}\s*)+(?:(?:@js:|<js>)[\s\S]*)?$/i.test(trimmed);
@@ -663,6 +762,39 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
 
   if (/^(?:@js:|<js>)/i.test(trimmed)) {
     const normalized = trimmed.replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "");
+    // 整条脚本只是一次元素/规则求值（java.getElements / getString('css@attr') /
+    // getString('$.json')）时，直接降级为声明式规则，避免为单次调用内嵌运行时助手。
+    const scriptBody = normalized.replace(/^@js:\s*/i, "");
+    const soleCall = scriptBody.match(
+      /^\s*(?:return\s+)?java\.(?:getElements?|getString(?:List)?)\s*\(\s*(['"])((?:\\.|(?!\1)[^\\])*)\1\s*\)\s*;?\s*$/i,
+    );
+    if (soleCall) {
+      const soleRule = soleCall[2].trim();
+      if (soleRule && !soleRule.includes("{{") && !soleRule.includes("${")
+        && !/^https?:\/\//i.test(soleRule)) {
+        const converted = convertRule(soleRule, { responseType, warn });
+        if (converted && !/^(?:@js:|<js>)/i.test(converted)) {
+          warn("阅读 JS 单次规则求值已降级为等价声明式规则");
+          return converted;
+        }
+      }
+    }
+    // 列表/字段脚本若只是用 java.getElements('选择器') 取元素列表，可把首个
+    // 选择器降级为声明式规则，香色无需执行脚本即可得到同一批节点。
+    const elementSelectors = [...normalized.matchAll(
+      /\bjava\.getElements?\s*\(\s*(['"])((?:\\.|(?!\1)[^\\])*)\1\s*\)/gi,
+    )].map((match) => match[2].trim()).filter((selector) => (
+      selector && !selector.includes("{{") && !selector.includes("${")
+    ));
+    if (elementSelectors.length) {
+      for (const selector of elementSelectors) {
+        const converted = convertRule(selector, { responseType, warn });
+        if (converted && !/^(?:@js:|<js>)/i.test(converted)) {
+          warn("阅读 JS 列表已降级为其调用的元素选择器（java.getElements 不可执行）");
+          return converted;
+        }
+      }
+    }
     const rewritten = rewriteLegadoJavaScript(normalized);
     warn(rewritten === normalized
       ? "阅读与香色的 JavaScript 运行环境不同，JS 规则已保留但需要人工检查"
@@ -685,7 +817,7 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
       }
       return `@js:\n${body};\nreturn String(result || "") + ${JSON.stringify(suffix)};`;
     }
-    if (head) return `${head}||@js:\nreturn String(result || "") + ${JSON.stringify(suffix)};`;
+    if (head) return chainJsPostprocess(head, `return String(result || "") + ${JSON.stringify(suffix)};`);
     return `@js:\nreturn ${JSON.stringify(suffix)};`;
   }
 
@@ -742,7 +874,7 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
               : [part])
             .join(" + ");
           warn("已将阅读 JSON 字段 URL 模板转换为香色声明式字段后处理");
-          return `${selector}||@js:\nreturn ${expression};`;
+          return chainJsPostprocess(selector, `return ${expression};`);
         }
       }
     }
@@ -750,7 +882,12 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
       .replace(/^@js:\s*return\s+/i, "")
       .replace(/;\s*$/, "");
     if (scriptBody) {
-      expression = `(function(result){ return (${scriptBody}); })(${expression})`;
+      // scriptBody 可能是多语句脚本（var/if/else），包进 IIFE 后用
+      // ensureJavaScriptReturn 语义补 return，而不是非法的 `return (多语句)`。
+      const chained = rewriteLegadoJavaScriptRaw(`@js:\n${scriptBody}`)
+        .replace(/^@js:\s*/i, "")
+        .trim();
+      expression = `(function(result){ ${chained} })(${expression})`;
     }
     if (cleanupPattern) {
       expression = `String(${expression}).replace(new RegExp(${JSON.stringify(cleanupPattern)}, "g"), ${JSON.stringify(cleanupReplacement)})`;
@@ -758,13 +895,13 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
     const composed = `@js:\nreturn ${expression};`;
     if (!composed.includes("{{") && !/\{(\$\.)/.test(composed)) {
       if (!hasUnsupportedLegadoRuntime(composed)) warn("已将阅读 JSON 字段模板转换为香色运行时表达式");
-      return composed;
+      return injectRuntimeHelpers(composed);
     }
   }
 
   if (trimmed.includes("{{") && !/\{\{\s*@/.test(trimmed)) {
-    const composed = rewriteLegadoJavaScript(`@js:\nreturn ${JSON.stringify(trimmed)};`);
-    if (!composed.includes("{{")) return composed;
+    const composed = composeTemplateRule(trimmed, warn);
+    if (composed) return composed;
   }
 
   if (/\{\{/.test(trimmed)) {
@@ -797,7 +934,7 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
     // 2.56.1 的公开可用源与独立模拟器统一使用 `selector||@js:`。
     // 单管道虽然出现在部分旧文档中，但真实客户端上会出现只执行选择器、
     // 不把结果交给 JS 的兼容差异，因此发布产物固定使用双管道。
-    return `${head}||${script}`;
+    return chainJsPostprocess(head, script);
   }
 
   // Apply ## cleanup to the whole rule (including && combinations) before splitting.
@@ -879,7 +1016,12 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
 }
 
 export function inferResponseType(rules = {}) {
-  const values = Object.values(rules).filter((value) => typeof value === "string" && value.trim());
+  // imageStyle/imageDecode 等是阅读的样式/解码指令，不是解析规则；
+  // 裸词值（如 imageStyle: "FULL"）会被误判成 JSON 字段导致整源误标 json。
+  const DIRECTIVE_FIELDS = new Set(["imageStyle", "imageDecode", "enabledCookieJar"]);
+  const values = Object.entries(rules)
+    .filter(([field, value]) => typeof value === "string" && value.trim() && !DIRECTIVE_FIELDS.has(field))
+    .map(([, value]) => value);
   if (!values.length) return "html";
   if (values.some((value) => /\bJSON\.parse\s*\(\s*(?:src|result)\s*\)/.test(value))) return "json";
 

@@ -12,7 +12,8 @@ import {
   MEDIA_PORTABILITY_WARNING,
 } from "./mediaPlan.js";
 import { encodeCatalogPlan, normalizeCatalogPlan } from "./catalogPlan.js";
-import { hasUnsupportedLegadoRuntime } from "./legadoJs.js";
+import { hasUnsupportedLegadoRuntime, rewriteLegadoJavaScriptRaw } from "./legadoJs.js";
+import { injectRuntimeHelpers } from "./legadoRuntime.js";
 import { compileSignedRequestPlan, encodeSignedRequestPlan } from "./requestPlan.js";
 import {
   compileBookBridgePlan,
@@ -105,6 +106,11 @@ function sourceType(source) {
   if (/(?:漫画|图片|图集|写真)/i.test(group)
     || ((type === 3 || type === "3") && /(?:\bimg\b|image|page-chapter|cp_img|data-original|imageStyle)/i.test(contentRule))) {
     return "comic";
+  }
+  // 正文规则里出现 m3u8/播放页解析（如 player_aaaa）的源实际是影视源，
+  // 即使 bookSourceType 仍是旧的 0 也应按 video 转换。
+  if (/(?:\.m3u8\b|\.mp4\b|player_aaaa|play_from|vodplayinfo)/i.test(contentRule)) {
+    return "video";
   }
   // True file/download sources have no direct 香色 equivalent and remain text.
   if (type === 3 || type === "3") return "text";
@@ -252,25 +258,64 @@ function portableEmbeddedBase64ContentRule(rule, warn) {
 
 /** 漫画正文：若规则取出的是图片 URL 列表，包成 <img> 供香色 comic 渲染。 */
 function wrapComicImageContent(contentRule) {
-  if (!contentRule || /<img\s/i.test(contentRule)) return contentRule;
-  if (!/@(?:src|data-original|data-src)\b/i.test(contentRule) && !/\/@(?:src|data-original|data-src)\b/i.test(contentRule)) {
-    return contentRule;
-  }
-  if (/\|\|?\s*@js:/i.test(contentRule)) return contentRule;
-  const wrapJs = [
-    "@js:",
-    "var text = String(result || \"\").trim();",
-    "if (!text) return text;",
-    "if (/<img\\s/i.test(text)) return text;",
-    "return text.split(/\\r?\\n+/).map(function (line) {",
-    "  line = line.trim();",
-    "  if (!line) return \"\";",
-    "  if (/^https?:\\/\\//i.test(line) || line.charAt(0) === \"/\") {",
-    "    return \"<img src=\\\"\" + line + \"\\\">\";",
+  if (!contentRule || /\{urls:/.test(contentRule)) return contentRule;
+  const raw = String(contentRule);
+  const isJsonPathRule = /^\s*(?:@?json:|\$[.[])/.test(raw);
+  // 漫画源正文一律按图片列表契约包装：选择器选中的可能是 img 节点、
+  // 属性或图片容器，运行时统一抽取 <img src>/URL 行；找不到图片会显式
+  // 报错而不是静默产出客户端无法使用的 <img> HTML。
+  if (isJsonPathRule) return contentRule;
+  // 香色 comic 正文要求 URL 列表（或含 urls 的 JSON），不能返回 <img> HTML。
+  const convertLines = [
+    "var text = String(__xsComicRaw == null ? \"\" : __xsComicRaw).trim();",
+    "if (!text || /^[\\[{]/.test(text)) return text;",
+    "var base = String((params && (params.responseUrl || (params.queryInfo && (params.queryInfo.chapterUrl || params.queryInfo.url)))) || config.host || \"\");",
+    "var origin = (base.match(/^https?:\\/\\/[^/]+/) || [String(config.host || \"\").replace(/\\/$/, \"\")])[0];",
+    "var resolve = function (url) {",
+    "  url = String(url || \"\").trim();",
+    "  url = url.replace(/,\\s*\\{[\\s\\S]*$/, \"\");",
+    "  if (!url) return \"\";",
+    "  if (url.indexOf(\"//\") === 0) return \"https:\" + url;",
+    "  if (/^https?:\\/\\//i.test(url)) return url;",
+    "  if (url.charAt(0) === \"/\") return origin + url;",
+    "  return url;",
+    "};",
+    "var urls = [];",
+    "var imgPattern = /<img\\b[^>]*\\bsrc=[\"']([^\"']+)[\"']/gi;",
+    "var match;",
+    "while ((match = imgPattern.exec(text))) {",
+    "  var u = resolve(match[1]);",
+    "  if (u) urls[urls.length] = u;",
+    "}",
+    "if (!urls.length) {",
+    "  var lines = text.split(/\\r?\\n+/);",
+    "  for (var i = 0; i < lines.length; i++) {",
+    "    var line = lines[i].trim();",
+    "    if (/^(?:https?:\\/\\/|\\/\\/)/.test(line)) { var u2 = resolve(line); if (u2) urls[urls.length] = u2; }",
     "  }",
-    "  return line;",
-    "}).filter(Boolean).join(\"\\n\");",
-  ].join("\n");
+    "}",
+    "return JSON.stringify({urls: urls, httpHeaders: {}});",
+  ];
+  // 纯 @js: 或 `selector||@js:` 规则：把原脚本包进 IIFE，在同一个脚本内把
+  // <img> HTML / URL 行转换为 urls JSON。直接再拼一个 `||@js:` 会产生两个
+  // @js: 段，香色无法执行。
+  const scriptSplit = contentRule.match(/^([\s\S]*?)\|\|\s*@js:([\s\S]*)$/i)
+    || (/^(?:@js:|<js>)/i.test(contentRule.trim()) ? ["", "", contentRule] : null);
+  if (scriptSplit) {
+    const [, selector = "", rawScript = ""] = scriptSplit;
+    const scriptBody = rewriteLegadoJavaScriptRaw(
+      String(rawScript).trim().replace(/^<js>/i, "@js:\n").replace(/<\/js>$/i, "").replace(/^@js:\s*/i, ""),
+    ).replace(/^@js:\s*/i, "").trim();
+    const composed = [
+      "@js:",
+      "var __xsComicRaw = (function () {",
+      scriptBody,
+      "})();",
+      ...convertLines,
+    ].join("\n");
+    return selector.trim() ? `${selector.trim()}||${composed}` : composed;
+  }
+  const wrapJs = ["@js:", "var __xsComicRaw = result;", ...convertLines].join("\n");
   return `${contentRule}||${wrapJs}`;
 }
 
@@ -293,6 +338,12 @@ function wrapMediaContent(contentRule, imageProxyBase = "") {
     "  || url.match(/https?:\\/\\/[^\\s\"'<>]+/i)",
     "  || (url.charAt(0) === \"/\" ? [null, url] : null);",
     "if (m) url = m[1] || m[0];",
+    // 相对媒体地址按章节页 origin 补全，避免请求 http://3726702 这类残缺 URL。
+    "var base = String((params && (params.responseUrl || (params.queryInfo && (params.queryInfo.chapterUrl || params.queryInfo.url)))) || config.host || \"\");",
+    "var origin = (base.match(/^https?:\\/\\/[^/]+/) || [String(config.host || \"\").replace(/\\/$/, \"\")])[0];",
+    "if (url.indexOf(\"//\") === 0) url = \"https:\" + url;",
+    "else if (url.charAt(0) === \"/\") url = origin + url;",
+    "else if (!/^https?:\\/\\//i.test(url)) url = origin + \"/\" + url;",
     "try { url = encodeURI(decodeURI(url)); } catch (e) { url = encodeURI(url); }",
     "return JSON.stringify({",
     "  url: url,",
@@ -958,12 +1009,19 @@ function buildJsonApiTocRequestInfo(tocUrl) {
   const { url: raw } = splitLegadoUrlOptions(tocUrl);
   if (!/^https?:\/\//i.test(raw)) return "";
   const fieldPath = "[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*";
-  if (!new RegExp(`\\{\\{\\s*\\$.${fieldPath}\\s*\\}\\}|\\{(?:\\$\\.)?${fieldPath}\\}`).test(raw)) return "";
+  const recursiveFieldPath = "\\.\\.(?:[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)";
+  if (!new RegExp(`\\{\\{\\s*\\$(?:${recursiveFieldPath}|\\.${fieldPath})\\s*\\}\\}|\\{(?:\\$\\.)?${fieldPath}\\}`).test(raw)) return "";
 
   let template = raw
     .replace(/\{\{\s*page\s*\}\}/gi, "__PAGE__")
     .replace(/([?&](?:pageNum|pageIndex|page)=)(?:1|\{\{\s*page\s*\}\})/gi, "$1__PAGE__");
 
+  // `{{$..field}}` 引用详情响应里的递归字段，运行时从 params.lastResponse 求值。
+  const recursiveFields = [];
+  template = template.replace(/\{\{\s*\$\.\.((?:[A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*)\s*\}\}/g, (_, field) => {
+    if (!recursiveFields.includes(field)) recursiveFields.push(field);
+    return "__ID__";
+  });
   const idFields = [];
   template = template.replace(/\{\{\s*\$\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\}\}/g, (_, field) => {
     if (!idFields.includes(field)) idFields.push(field);
@@ -974,8 +1032,31 @@ function buildJsonApiTocRequestInfo(tocUrl) {
     return "__ID__";
   });
   if (!template.includes("__ID__")) return "";
+  const recursiveLines = recursiveFields.length ? [
+    "var __detailResponse = (params && params.lastResponse);",
+    "var __findByPath = function (root, path) {",
+    "  var segs = String(path || \"\").split(\".\");",
+    '  var found = "";',
+    "  var walk = function (node) {",
+    '    if (found !== "" || node == null || typeof node !== "object") return;',
+    "    var cur = node;",
+    "    var ok = true;",
+    "    for (var i = 0; i < segs.length; i++) {",
+    '      if (cur == null || typeof cur !== "object" || cur[segs[i]] === undefined) { ok = false; break; }',
+    "      cur = cur[segs[i]];",
+    "    }",
+    '    if (ok && cur != null && cur !== "") { found = String(cur); return; }',
+    "    for (var k in node) walk(node[k]);",
+    "  };",
+    "  walk(root);",
+    "  return found;",
+    "};",
+    ...recursiveFields.map((field) => (
+      `if (!id) id = __findByPath((typeof __detailResponse === "object" && __detailResponse) || (typeof result === "object" && result) || {}, ${JSON.stringify(field)}).trim();`
+    )),
+  ] : [];
 
-  return [
+  const scriptLines = [
     "@js:",
     "var q = (typeof params !== \"undefined\" && params.queryInfo) || {};",
     "var u = String(q.detailUrl || q.url || q.chapterUrl || \"\");",
@@ -996,6 +1077,7 @@ function buildJsonApiTocRequestInfo(tocUrl) {
     "    if (pathIds.length) id = pathIds[pathIds.length - 1].slice(1);",
     "  }",
     "}",
+    ...recursiveLines,
     "if (!id) return \"\";",
     `var url = ${JSON.stringify(template)};`,
     "url = url.split(\"__ID__\").join(encodeURIComponent(id));",
@@ -1005,6 +1087,7 @@ function buildJsonApiTocRequestInfo(tocUrl) {
     ] : []),
     "return url;",
   ].join("\n");
+  return scriptLines;
 }
 
 function buildJsonApiTocNextPageUrl(tocUrl) {
@@ -1529,6 +1612,31 @@ function convertCoverRule(rule, responseType, warningFor) {
   );
 }
 
+
+/**
+ * 剥离规则尾部形如 `,{...}` 的阅读请求选项串。只有当花括号内容能按宽松
+ * JSON 解析且含已知的请求选项键时才剥离，避免误伤含逗号的真实 URL。
+ */
+function stripLegadoUrlOptionSuffix(rule) {
+  const source = String(rule || "");
+  const match = source.match(/,\s*(\{[\s\S]*\})\s*$/);
+  if (!match) return source;
+  const head = source.slice(0, match.index);
+  if (!head.trim() || /@js:/i.test(head)) return source;
+  try {
+    const options = JSON.parse(match[1].replace(/\b(\w+)\s*:/g, '"$1":').replace(/'/g, '"'));
+    if (options && typeof options === "object" && !Array.isArray(options)) {
+      const keys = Object.keys(options);
+      if (keys.length && keys.every((key) => /^(?:method|headers?|webView|charset|body|type|retry)$/i.test(key))) {
+        return head.trim();
+      }
+    }
+  } catch {
+    // 宽松解析失败则保留原样。
+  }
+  return source;
+}
+
 function mapBookRules(rules, responseType, warningFor, { initPath = "", listContext = false } = {}) {
   const mapping = {
     bookList: "list",
@@ -1563,6 +1671,16 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
         rules[from],
         convertRule(rules[from], { responseType, warn: warningFor(from, rules[from]) }),
       );
+      // URL 字段后缀的 `,{...}` 是阅读请求选项（webView/method 等），不是地址
+      // 的一部分；拼进 URL 会产生 `https://x/1,{"webView":true}` 这类畸形链接。
+      if (to === "detailUrl") {
+        const cleaned = stripLegadoUrlOptionSuffix(convertedRule);
+        if (cleaned !== convertedRule) {
+          warningFor(from, rules[from])("bookUrl 携带的请求选项已从详情地址剥离（webView 等需在香色请求配置中手工处理）");
+        }
+        result[to] = cleaned;
+        continue;
+      }
       // 阅读 ruleBookInfo.init 会将后续 JSONPath 的根切换到该节点。
       // 香色没有 init 字段，因此对无歧义的简单 JSONPath 显式补回前缀。
       const rulePath = initPath && responseType === "json" ? simpleJsonPath(rules[from]) : "";
@@ -1602,6 +1720,9 @@ function mapTocRules(rules, responseType, warningFor) {
       reverseChapters = true;
       chapterListRule = stripped[1].trim();
     }
+    // Legado 的 `+` 前缀表示目录正序排列；香色目录默认按页面顺序，直接剥离。
+    const ascending = chapterListRule.match(/^\s*\+(?=[@.#/:*\[$a-zA-Z])([\s\S]*)$/);
+    if (ascending) chapterListRule = ascending[1].trim();
     // Legado accepts a descending result slice from the last item to index 0.
     // XPath 1.0 cannot express reversed node order; select the complete set and
     // let the chapter bridge apply the existing reverse flag before paging.
@@ -1611,22 +1732,44 @@ function mapTocRules(rules, responseType, warningFor) {
       warningFor("chapterList", rules.chapterList)("目录倒序切片 [-1:0] 已转换为完整列表并在桥接器中倒序");
     }
   }
+  let postChapterPlan = null;
   for (const [from, to] of Object.entries(mapping)) {
     const raw = from === "chapterList" ? chapterListRule : rules[from];
     if (raw !== undefined && raw !== "") {
+      if (from === "chapterUrl") {
+        // 章节 URL 也可能是「POST 接口 + body 引用字段」的复合规则；此时
+        // 章节地址改为占位字段本身，POST 语义编译进 chapterContent.requestInfo。
+        postChapterPlan = compilePostChapterUrlRule(raw);
+        if (postChapterPlan) {
+          // 章节地址改为「endpoint?表单参数」形态：字段占位由列表项编译填充，
+          // chapterContent.requestInfo 再把它拆回 POST 接口 + 表单体。
+          result[to] = convertRule(
+            `${postChapterPlan.endpoint}?${postChapterPlan.body}`,
+            { responseType, warn: warningFor(from, raw) },
+          );
+          warningFor(from, raw)("chapterUrl 为 POST 接口复合规则：章节地址改写为参数化链接，POST 语义已编译进 chapterContent");
+          continue;
+        }
+      }
       result[to] = compatibleTextRule(
         raw,
         convertRule(raw, { responseType, warn: warningFor(from, raw) }),
       );
     }
   }
+  if (postChapterPlan) result._postChapterPlan = postChapterPlan;
   // Legado silently ignores chapter group/header rows whose URL field is empty.
   // 香色 may keep such rows and then fail on the first title. Filter HTML list
   // nodes to entries that actually contain a link whenever chapterUrl is href.
-  if (responseType === "html" && result.list && /(?:^|@)href(?:$|##)/i.test(String(rules.chapterUrl || ""))) {
+  // `@js:` 列表是脚本而非 XPath，套上投影后缀只会产生无法执行的规则。
+  if (responseType === "html" && result.list
+    && !/^(?:@js:|<js>|\()/.test(String(result.list))
+    && !/@js:/i.test(String(result.list))
+    && /(?:^|@)href(?:$|##)/i.test(String(rules.chapterUrl || ""))) {
     result.list = `(${result.list})[self::a[@href] or .//a[@href]]`;
   }
-  if (result.list && result.title && !result.url && (rules.chapterUrl === undefined || rules.chapterUrl === "")) {
+  if (responseType === "html" && result.list && result.title && !result.url
+    && (rules.chapterUrl === undefined || rules.chapterUrl === "" || /^\s*-\s*$/.test(String(rules.chapterUrl)))) {
     const anchorItems = responseType === "html" && /(?:^|@|\s)a(?:\s*$|\[|[.#:@])/i.test(String(chapterListRule || ""));
     if (anchorItems) {
       result.url = "./@href";
@@ -1906,6 +2049,12 @@ function buildBookAction({ actionID, host, request, rules, headers, warnings, so
   if (rules.bookList && !action.moreKeys) {
     action.moreKeys = { pageSize: listPageSizeForRequest(action.requestInfo || request, null) };
   }
+  // 搜索列表是 `<a>`/含链接节点而源未声明 bookUrl 时，条目自身就是链接，
+  // 用条目 href 兜底，避免整个源因缺必填字段被过滤。
+  if (!action.detailUrl && responseType === "html" && action.list) {
+    action.detailUrl = ".//a/@href||./@href";
+    warningFor("bookUrl", rules.bookUrl)("阅读源未声明 bookUrl，已用条目内的链接地址兜底详情页地址");
+  }
   const verifyKeyWord = String(rules.checkKeyWord || "").split(/[|,，\n]/)[0].trim();
   if (verifyKeyWord) action._verifyKeyWord = verifyKeyWord.slice(0, 200);
   return action;
@@ -1937,7 +2086,8 @@ function extractTitleUrlLinesFromText(text) {
       return null;
     }
     const title = value.slice(0, separator).trim();
-    const url = value.slice(separator + 2).trim();
+    // 行尾悬空的 `&&` 分隔符是 Legado 的宽松写法，原样拼接会导致 404。
+    let url = value.slice(separator + 2).trim().replace(/&&+$/, "").trim();
     if (!title || !url) return null;
     if (!/^(?:\/|https?:\/\/)/i.test(url) && !/\{\{\s*page\s*\}\}|%@pageIndex/i.test(url)) return null;
     return { title, url, group };
@@ -2258,6 +2408,112 @@ function buildBookWorld(source, context) {
   return result;
 }
 
+
+/**
+ * 阅读 bookUrl 还可以是「POST 接口 + 请求选项」复合规则：
+ * `https://api/book,{\"method\":\"POST\",\"body\":\"bookId={$.bookId}\"}`。
+ * 此时详情地址应是 body 占位引用的字段（如 `$.bookId`），而 bookDetail 的
+ * 请求改写为对该接口的 POST，body 用条目详情地址填充。
+ */
+function compilePostChapterUrlRule(rule) {
+  const source = String(rule || "").trim();
+  const match = source.match(/^(https?:\/\/[^,\s]+)\s*,\s*(\{[\s\S]+\})\s*$/);
+  if (!match) return null;
+  let options;
+  try {
+    options = JSON.parse(match[2]);
+  } catch {
+    try {
+      options = JSON.parse(match[2].replace(/([{,]\s*)(\w+)\s*:/g, '$1"$2":').replace(/'/g, '"'));
+    } catch {
+      return null;
+    }
+  }
+  if (!options || String(options.method || "").toUpperCase() !== "POST" || typeof options.body !== "string") {
+    return null;
+  }
+  const placeholders = [...options.body.matchAll(/\{\s*\$\.((?:[A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*)\s*\}/g)];
+  if (!placeholders.length) return null;
+  return {
+    endpoint: match[1],
+    body: options.body,
+    headers: options.headers || {},
+  };
+}
+
+function compilePostDetailBookUrl(rule) {
+  const source = String(rule || "").trim();
+  const match = source.match(/^(https?:\/\/[^,\s]+)\s*,\s*(\{[\s\S]+\})\s*$/);
+  if (!match) return null;
+  let options;
+  try {
+    options = JSON.parse(match[2]);
+  } catch {
+    try {
+      options = JSON.parse(match[2].replace(/([{,]\s*)(\w+)\s*:/g, '$1"$2":').replace(/'/g, '"'));
+    } catch {
+      return null;
+    }
+  }
+  if (!options || String(options.method || "").toUpperCase() !== "POST" || typeof options.body !== "string") {
+    return null;
+  }
+  const placeholders = [...options.body.matchAll(/\{\s*\$\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\}/g)];
+  if (!placeholders.length) return null;
+  const fields = [...new Set(placeholders.map((item) => item[1]))];
+  if (fields.length !== 1) return null;
+  return {
+    endpoint: match[1],
+    field: fields[0],
+    body: options.body,
+    headers: options.headers || {},
+  };
+}
+
+
+/**
+ * 把「endpoint?表单参数」形态的章节地址在正文阶段还原为 POST 请求：
+ * 查串原样作为表单体，endpoint 作为请求地址。
+ */
+function postChapterRequestInfo(plan, headers) {
+  const headerLines = [];
+  const merged = { ...plan.headers, "Content-Type": "application/x-www-form-urlencoded" };
+  for (const [key, value] of Object.entries(merged)) {
+    headerLines.push(`httpHeaders[${JSON.stringify(key)}] = ${JSON.stringify(value)};`);
+  }
+  return [
+    "@js:",
+    "var u = String((typeof result === \"string\" && result) || (params && params.queryInfo && (params.queryInfo.chapterUrl || params.queryInfo.url)) || \"\");",
+    "if (/^[{[]/.test(u.trim())) { try { var prev = JSON.parse(u); u = String(prev.url || \"\"); } catch (e) {} }",
+    "var qPos = u.indexOf(\"?\");",
+    "var endpoint = qPos < 0 ? u : u.slice(0, qPos);",
+    "var form = qPos < 0 ? \"\" : u.slice(qPos + 1);",
+    "var httpHeaders = {};",
+    ...headerLines,
+    "if (!endpoint) return \"\";",
+    "return {url: endpoint, POST: true, httpParams: form, httpHeaders: httpHeaders};",
+  ].join("\n");
+}
+
+function postDetailRequestInfo(plan, headers) {
+  const bodyLines = [];
+  for (const [key, value] of Object.entries({ ...plan.headers, "Content-Type": "application/x-www-form-urlencoded" })) {
+    bodyLines.push(`httpHeaders[${JSON.stringify(key)}] = ${JSON.stringify(value)};`);
+  }
+  return [
+    "@js:",
+    'var q = (params && params.queryInfo) || {};',
+    'var ref = String(q.url || q.detailUrl || (typeof result === "string" ? result : "") || "");',
+    // 香色会把条目地址绝对化；占位字段（如 bookId）取末段即可还原原始值。
+    'ref = ref.split(/[?#]/)[0].replace(/\\/\\.$/, "").replace(/^.*\\//, "");',
+    `var endpoint = ${JSON.stringify(plan.endpoint)};`,
+    `var body = ${JSON.stringify(plan.body)}.replace(/\\{\\s*\\$\\.[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*\\s*\\}/g, encodeURIComponent(ref));`,
+    "var httpHeaders = {};",
+    ...bodyLines,
+    "return {url: endpoint, POST: true, httpParams: body, httpHeaders: httpHeaders};",
+  ].join("\n");
+}
+
 function convertOne(source, warnings, options = {}) {
   const sourceName = String(source.bookSourceName ?? source.name ?? "未命名书源").trim() || "未命名书源";
   const stored = resolveLegadoStoredRules(source);
@@ -2363,9 +2619,15 @@ function convertOne(source, warnings, options = {}) {
       || (contentResponseType === "html" && Boolean(tocRules.chapterList)));
   const contentWarningFor = createWarningCollector(warnings, sourceName, "chapterContent");
 
+  const postDetailPlan = compilePostDetailBookUrl(effectiveSearchRules.bookUrl);
+  const postChapterPlanForContent = tocRules.chapterUrl
+    ? compilePostChapterUrlRule(tocRules.chapterUrl)
+    : null;
   const bookDetail = {
-    ...commonAction("bookDetail", host, detailResponseType),
-    requestInfo: runtimeResultRequestInfo(),
+    ...commonAction("bookDetail", host, postDetailPlan ? "json" : detailResponseType),
+    requestInfo: postDetailPlan
+      ? postDetailRequestInfo(postDetailPlan, headers)
+      : runtimeResultRequestInfo(),
     ...mapDetailRules(detailRules, detailResponseType, detailWarningFor),
   };
 
@@ -2489,8 +2751,10 @@ function convertOne(source, warnings, options = {}) {
     }),
     bookDetail,
     chapterList: {
-      ...commonAction("chapterList", host, tocResponseType),
-      requestInfo: chapterListRequestInfo,
+      ...commonAction("chapterList", host, postDetailPlan ? "json" : tocResponseType),
+      requestInfo: postDetailPlan
+        ? postDetailRequestInfo(postDetailPlan, headers)
+        : chapterListRequestInfo,
       ...(() => {
         const mapped = mapTocRules(tocRules, tocResponseType, tocWarningFor);
         const capturedTocRequest = detailResponseType === "html"
@@ -2533,8 +2797,10 @@ function convertOne(source, warnings, options = {}) {
       })(),
     },
     chapterContent: {
-      ...commonAction("chapterContent", host, contentResponseType),
-      requestInfo: runtimeResultRequestInfo(),
+      ...commonAction("chapterContent", host, postChapterPlanForContent ? "json" : contentResponseType),
+      requestInfo: postChapterPlanForContent
+        ? postChapterRequestInfo(postChapterPlanForContent, headers)
+        : runtimeResultRequestInfo(),
       ...(content !== undefined ? { content } : {}),
       ...((contentRules.nextContentUrl || contentRules.nextUrl) ? {
         nextPageUrl: convertRule(contentRules.nextContentUrl || contentRules.nextUrl, {
@@ -2709,6 +2975,15 @@ function convertOne(source, warnings, options = {}) {
     converted.bookWorld = Object.fromEntries(Object.entries(converted.bookWorld || {}).map(([title, action]) => (
       [title, { ...action, ...encoding }]
     )));
+  }
+
+  if (postDetailPlan) {
+    // 复合 POST bookUrl：条目详情地址改为占位字段本身，请求语义在 bookDetail.requestInfo。
+    converted.searchBook = {
+      ...converted.searchBook,
+      detailUrl: `$.${postDetailPlan.field}`,
+    };
+    detailWarningFor("bookUrl", effectiveSearchRules.bookUrl)("bookUrl 为 POST 接口复合规则：详情地址改为条目字段，请求体已编译进 bookDetail");
   }
 
   if (options.imageProxyBase) {

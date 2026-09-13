@@ -195,8 +195,48 @@ export function replaceSimpleTemplates(value) {
     .replace(/\{\{\s*page\s*\}\}/gi, "%@pageIndex");
 }
 
-function objectLiteralFromBody(body, warn) {
+const KEYWORD_FORM_KEYS = new Set([
+  "s", "searchkey", "searchtype", "keyword", "keywords", "q", "kw", "wd", "key",
+  "searchword", "search", "name", "bookname", "searchname", "so", "query",
+]);
+
+/**
+ * 表单 body 里没有 {{key}} 模板、但含常见关键词键（s=/searchkey=/kw=…）且值是
+ * 非空字面量时，该值几乎都是源作者留下的示例关键词（如 `s=你好`）。替换为
+ * 运行时关键词，否则搜索永远只会搜样例词。
+ */
+function substituteFormKeyword(body, warn) {
   const source = String(body ?? "").trim();
+  if (!source || /\{\{/.test(source) || /^[[{]/.test(source)) return source;
+  const pairs = source.split("&").map((pair) => {
+    const separator = pair.indexOf("=");
+    return separator >= 0 ? [pair.slice(0, separator), pair.slice(separator + 1)] : [pair, undefined];
+  });
+  let replaced = false;
+  let sawKeywordCandidate = false;
+  const next = pairs.map(([key, value]) => {
+    const decodedKey = decodeURIComponent(key).toLowerCase();
+    if (replaced || value === undefined || value === "" || !KEYWORD_FORM_KEYS.has(decodedKey)) {
+      return [key, value];
+    }
+    sawKeywordCandidate = true;
+    const literal = decodeURIComponent(value);
+    if (!/[\u4e00-\u9fff]/.test(literal) || /^\d+$/.test(literal)) return [key, value];
+    replaced = true;
+    return [key, "{{key}}"];
+  });
+  if (replaced) {
+    warn(`表单 body 缺少 {{key}} 模板，已把样例关键词字段替换为搜索关键词（原文 ${pairs.map(([k, v]) => `${k}=${v}`).join("&").slice(0, 80)}）`);
+    return next.map(([key, value]) => (value === undefined ? key : `${key}=${value}`)).join("&");
+  }
+  if (sawKeywordCandidate) {
+    // 有关键词键但值不像样例（数字/空），仍保持原样。
+  }
+  return source;
+}
+
+function objectLiteralFromBody(body, warn) {
+  const source = substituteFormKeyword(body, warn).trim();
   // 阅读的 POST body 既可能是表单，也可能是 JSON。把 JSON 拆成
   // key=value 会生成一个错误的单字段对象（例如 {"{\"page\"...": ""}）。
   // 先将模板拼为 JSON 文本，再在香色运行时解析，数值型 {{page}} 也能保持数值。

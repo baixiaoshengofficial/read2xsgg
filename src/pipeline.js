@@ -151,7 +151,7 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
   download,
   concurrency = 4,
   timeoutMs = 3_000,
-  sourceTimeoutMs = Math.max(12_000, timeoutMs * 4),
+  sourceTimeoutMs = Math.max(15_000, timeoutMs * 5),
   analyzeTimeoutMs = 8_000,
   enabled = true,
   analyzeFallback = true,
@@ -212,9 +212,11 @@ export async function applyVerifyAndAnalyzeFallback(sources, {
   const initialVerifySource = (source) => verifyConvertedSource(source, {
     download,
     timeoutMs,
+    // 初始验源是门槛而非精测：预算过短会把慢站（每请求 3~4s）误判为
+    // rules-stale/empty-list 直接过滤。给到与完整验源同级的下限（15s）。
     sourceTimeoutMs: Math.min(
       sourceTimeoutMs,
-      Math.max(timeoutMs * 2, Math.min(20_000, Math.floor(sourceTimeoutMs / 3))),
+      Math.max(15_000, timeoutMs * 5),
     ),
   });
   const improveBookElements = async (source, verified) => {

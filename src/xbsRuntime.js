@@ -22,8 +22,40 @@ function splitPostScript(rule) {
 }
 
 function runJavaScript(script, config, params, result) {
-  if (!String(script || "").trim()) return result;
-  return new Function("config", "params", "result", String(script))(config, params, result);
+  const source = String(script || "");
+  if (!source.trim()) return result;
+  // 阅读 JS 列表脚本常用 java.getElements/getElement。香色运行时没有该桥，
+  // 这里用 JSDOM 提供等价实现，使此类规则在本运行时可验证。
+  if (/\bjava\.(?:getElements?|getString(?:List)?)\s*\(/.test(source)) {
+    const document = typeof result === "string" ? htmlDocument(result) : null;
+    const domGetElements = (selector) => {
+      if (!document) return [];
+      const nodes = [];
+      try {
+        const found = document.querySelectorAll(String(selector));
+        for (const node of found) nodes.push(node);
+      } catch { return []; }
+      nodes.size = () => nodes.length;
+      nodes.getFirst = () => nodes[0] || null;
+      return nodes;
+    };
+    const java = {
+      getElements: domGetElements,
+      getElement: (selector) => domGetElements(selector)[0] || null,
+      getString: (rule) => {
+        const [selector, attribute = "text"] = String(rule || "").split("@");
+        const element = domGetElements(selector)[0];
+        if (!element) return "";
+        if (attribute === "text") return element.textContent.trim();
+        if (attribute === "html") return element.innerHTML;
+        return element.getAttribute(attribute) || "";
+      },
+      log: () => {},
+      toast: () => {},
+    };
+    return new Function("config", "params", "result", "java", source)(config, params, result, java);
+  }
+  return new Function("config", "params", "result", source)(config, params, result);
 }
 
 function xpathValues(document, expression, context = document) {
@@ -75,6 +107,17 @@ function htmlSelect(rule, input, {
       ? input
       : nodeValue(input, { content });
     return runJavaScript(script, config, params, result);
+  }
+  if (!selector && script && list) {
+    // 纯 @js: 列表规则：执行脚本并把返回值（元素数组/字符串数组）作为列表项。
+    const seed = typeof input === "string"
+      ? input
+      : nodeValue(input, { content });
+    const value = runJavaScript(script, config, params, seed);
+    const items = Array.isArray(value) ? value : (value == null ? [] : [value]);
+    return items.filter((item) => item?.nodeType === 1
+      || (typeof item === "string" && item.trim())
+      || (item && typeof item === "object" && !item.nodeType));
   }
   let selected = [];
   if (selector) {
@@ -141,11 +184,72 @@ function jsonPathValue(input, path) {
       value = value?.[key];
     }
   }
+  // 阅读 `a[*].b[*]` 的多重展开语义是拍平成单一列表；香色运行时同样处理，
+  // 否则分卷目录会产生「数组的数组」导致章节解析为 0。
+  let guard = 0;
+  while (Array.isArray(value) && value.length && value.every((item) => Array.isArray(item)) && guard < 4) {
+    value = value.flat();
+    guard += 1;
+  }
   return value;
+}
+
+// `@json-recursive:field[:values]`：在整个 JSON 树里递归收集字段值。
+// 与服务端桥接适配器（bridgePlan）语义一致，使 CLI 转换源无需代理即可执行。
+function jsonRecursiveValue(input, rule) {
+  const recursive = String(rule || "").trim().match(/^@json-recursive:([^:]+)(?::(values))?$/);
+  if (!recursive) return undefined;
+  let selector = recursive[1];
+  try { selector = decodeURIComponent(selector); } catch { /* keep raw */ }
+  const [first, ...rest] = selector.split(/[/.]/).filter(Boolean);
+  if (!first) return undefined;
+  const found = [];
+  const visit = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    if (Object.hasOwn(value, first)) {
+      const raw = typeof value[first] === "number" && !Number.isSafeInteger(value[first])
+        && typeof value[`${first}Str`] === "string"
+        ? value[`${first}Str`]
+        : value[first];
+      let selected = raw;
+      if (rest.length) selected = jsonPathValue(raw, rest.join("/"));
+      if (selected !== undefined && selected !== null) found.push(selected);
+    }
+    for (const child of Object.values(value)) visit(child);
+  };
+  visit(input);
+  if (!recursive[2]) {
+    return found.flatMap((value) => (Array.isArray(value) ? value : [value]));
+  }
+  return found.flatMap((value) => {
+    if (Array.isArray(value)) return value;
+    if (value && typeof value === "object") return Object.values(value);
+    return value === undefined || value === null ? [] : [value];
+  });
 }
 
 function jsonSelect(rule, input, { list = false, config, params } = {}) {
   const { selector, script } = splitPostScript(rule);
+  if (selector && /@json-recursive:/i.test(selector)) {
+    // 允许 `@json-recursive:x||path` 的联合：按顺序取首个非空备选。
+    let collected;
+    for (const alternative of selector.split(/\s*\|\|\s*/).filter(Boolean)) {
+      const value = /^@json-recursive:/i.test(alternative.trim())
+        ? jsonRecursiveValue(input, alternative.trim())
+        : jsonPathValue(input, alternative);
+      if (value !== undefined && value !== null
+        && (!Array.isArray(value) || value.length)) {
+        collected = value;
+        break;
+      }
+    }
+    const value = list ? (Array.isArray(collected) ? collected : []) : collected;
+    return script ? runJavaScript(script, config, params, value) : value;
+  }
   let result = input;
   if (selector) {
     result = undefined;
@@ -225,7 +329,13 @@ function substituteRequest(template, values) {
 function absoluteUrl(value, base) {
   const url = String(value || "").trim();
   if (!url) return "";
-  return new URL(url, base).href;
+  // 条目字段（如 `$.id` → "7"）不是地址：没有 base 可拼时原样返回，
+  // 由后续的请求脚本（如 POST 复合详情）自行解释。
+  try {
+    return new URL(url, base).href;
+  } catch {
+    return url;
+  }
 }
 
 async function requestAction(source, action, context, fetchImpl) {
@@ -266,10 +376,30 @@ async function requestAction(source, action, context, fetchImpl) {
     url = parsed.href;
   } else if (request.httpParams && method === "POST") {
     const contentType = Object.entries(headers).find(([key]) => key.toLowerCase() === "content-type")?.[1] || "";
-    if (/json/i.test(String(contentType))) init.body = JSON.stringify(request.httpParams);
+    if (typeof request.httpParams === "string") {
+      // @js 请求对象允许直接给出已编码的表单串，原样作为 body。
+      init.body = request.httpParams;
+      if (!contentType) headers["Content-Type"] = "application/x-www-form-urlencoded";
+    } else if (/json/i.test(String(contentType))) init.body = JSON.stringify(request.httpParams);
     else {
       init.body = encodeFormBody(request.httpParams, action);
       if (!contentType) headers["Content-Type"] = "application/x-www-form-urlencoded";
+    }
+  }
+  // 媒体直链探测：content 阶段请求的是音频/视频文件本身时，用 Range 只取
+  // 文件头即可确认可播性，避免整段 MP3/MP4 下载烧尽验证预算。
+  if (context.mediaProbe && method === "GET" && MEDIA_EXTENSION.test(String(url).split("?")[0])) {
+    headers.Range = "bytes=0-4095";
+    const probe = await fetchImpl(url, { ...init, headers });
+    if (probe.ok && isPlayableMediaResponse(probe, url)) {
+      await probe.body?.cancel?.().catch?.(() => {});
+      return {
+        response: probe,
+        body: "",
+        parsed: "",
+        params,
+        config,
+      };
     }
   }
   const response = await fetchImpl(url, init);
@@ -526,6 +656,7 @@ export async function runXbsPipeline(source, options = {}) {
       result: detailUrl,
       queryInfo,
       responseUrl: detailResponse.response.url,
+      lastResponse: detailResponse.parsed,
       timeoutMs,
       signal: options.signal,
     }, fetchImpl);
@@ -578,6 +709,7 @@ export async function runXbsPipeline(source, options = {}) {
       responseUrl: tocResponse.response.url,
       timeoutMs,
       signal: options.signal,
+      mediaProbe: ["audio", "video"].includes(source.sourceType || "text"),
     }, fetchImpl);
     const contentParams = { ...contentResponse.params, responseUrl: contentResponse.response.url };
     const contentValue = select(content, content.content, contentResponse.parsed, {

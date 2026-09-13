@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { bridgeTocUrl, compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, compileMediaResolutionFromRule, compileTextBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan, filterValidXiangseSources, hasUnsupportedLegadoRuntime, htmlToPlainText, inferResponseType, validateXiangseSource } from "../src/index.js";
+import { runXbsPipeline } from "../src/xbsRuntime.js";
+import { verifyConvertedSource } from "../src/verifySource.js";
 
 const sampleSource = {
   bookSourceName: "示例书源",
@@ -1668,7 +1670,9 @@ test("漫画源保留 comic 类型，图片 URL 包成 img，并告警 imageDeco
   assert.equal(converted.bookDetail.tocUrl, undefined);
   assert.match(converted.searchBook.requestInfo, /config\.host/);
   assert.match(converted.chapterContent.content, /data-original/);
-  assert.match(converted.chapterContent.content, /<img src=/);
+  // 香色 comic 正文契约是 URL 列表/urls JSON，不能是 <img> HTML。
+  assert.match(converted.chapterContent.content, /\{urls:/);
+  assert.doesNotMatch(converted.chapterContent.content, /<img src=/);
   assert.match(converted.chapterList.url, /shunt=/);
   assert.doesNotMatch(converted.chapterList.url, /\{\{Get/);
   assert.ok(warnings.some((w) => w.field === "imageDecode"));
@@ -2198,9 +2202,9 @@ test("在线质量门槛只删除 Android 专用可选字段而保留可执行�
   const converted = sources["可选字段含 Java"];
   assert.ok(converted);
   assert.deepEqual(skipped, []);
-  assert.equal(converted.searchBook.author, undefined);
-  assert.equal(converted.bookWorld["玄幻"].author, undefined);
-  assert.ok(warnings.some((warning) => warning.message.includes("已删除字段并保留可执行的核心动作")));
+  // getString('css@attr') 现在可编译为等价声明式选择器，字段不再是 Android 专用。
+  assert.equal(converted.searchBook.author, "//*[contains(concat(' ', normalize-space(@class), ' '), ' author ')]");
+  assert.equal(converted.bookWorld["玄幻"].author, "//*[contains(concat(' ', normalize-space(@class), ' '), ' author ')]");
 });
 
 test("列表项字段保持香色支持的双斜线 XPath", () => {
@@ -2242,9 +2246,9 @@ test("列表项的阅读专用后处理回退为基础选择器", () => {
   const { sources, warnings } = convertLegado(source);
   const world = sources["列表 JS 回退测试"].bookWorld["分类"];
   assert.equal(world.bookName, "//*[contains(concat(' ', normalize-space(@class), ' '), ' name ')]");
-  assert.equal(world.cat, undefined);
+  // java.getString('css@attr') 是纯 JS 可执行的规则求值，直接降级为等价声明式规则。
+  assert.equal(world.cat, "//*[contains(concat(' ', normalize-space(@class), ' '), ' kind ')]/text()");
   assert.ok(warnings.some((warning) => warning.message.includes("保留基础选择器")));
-  assert.ok(warnings.some((warning) => warning.message.includes("避免香色丢弃整个列表")));
 });
 
 test("有声源保留 audio 类型，正文包装为播放 JSON", () => {
@@ -3710,7 +3714,7 @@ test("公开合集常见语法：相对 XPath、~= 交替、##$## 追加、@js �
   assert.match(convertRule("href##$##?page=1"), /\+ "\?page=1"/);
   assert.equal(
     convertRule('img@src##(.*)##$1,{"headers":{"Referer":"$1"}}###'),
-    '//img/@src||@js:\nreturn String(result).replace(new RegExp("(.*)", "g"), "$1");',
+    '//img/@src||@js:\nreturn (function (result) {\nreturn String(result).replace(new RegExp("(.*)", "g"), "$1");\n})(result);',
   );
 
   const source = {
@@ -3757,4 +3761,58 @@ test("公开合集常见语法：相对 XPath、~= 交替、##$## 追加、@js �
   assert.doesNotMatch(converted.chapterContent.content, /\{\{\s*book\.durChapterTitle/);
   assert.doesNotMatch(converted.chapterContent.content, /new RegExp\("##/);
   assert.ok(!warnings.some((warning) => /请求配置不是有效 JSON/.test(warning.message)));
+});
+
+
+test("POST 复合 bookUrl 编译为条目字段 + 详情 POST 请求", () => {
+  const source = {
+    bookSourceName: "POST 复合详情",
+    bookSourceUrl: "https://api.example",
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: "$.list[*]", name: "$.name", bookUrl: 'https://api.example/book/chapters,{"method":"POST","body":"bookId={$.bookId}"}' },
+    ruleBookInfo: { name: "$.name" },
+    ruleToc: { chapterList: "$.list[*]", chapterName: "$.name", chapterUrl: 'https://api.example/chapter/info,{"method":"POST","body":"chapterId={$.id}&bookId={$.bookId}"}' },
+    ruleContent: { content: "$.data.content" },
+  };
+  const { sources } = convertLegado([source], {});
+  const converted = sources["POST 复合详情"];
+  assert.equal(converted.searchBook.detailUrl, "$.bookId");
+  assert.match(converted.bookDetail.requestInfo, /POST:\s*true/);
+  assert.match(converted.bookDetail.requestInfo, /book\/chapters/);
+  // 章节地址参数化，正文请求拆回 POST
+  assert.match(converted.chapterList.url, /chapter\/info\?chapterId=/);
+  assert.match(converted.chapterContent.requestInfo, /POST:\s*true/);
+  assert.equal(validateXiangseSource(converted).ok, true);
+});
+
+test("运行时支持字符串 httpParams、@json-recursive 与联合回退", async () => {
+  const legadoSource = {
+    bookSourceName: "递归与POST运行时",
+    bookSourceUrl: "https://rt.example",
+    searchUrl: "https://rt.example/lib",
+    ruleSearch: { bookList: "$..pageList[*]", name: "$.name", bookUrl: 'https://rt.example/detail,{"method":"POST","body":"id={$.id}"}' },
+    ruleBookInfo: { name: "$.name" },
+    ruleToc: { chapterList: "$.list[*]", chapterName: "$.name", chapterUrl: "$.url" },
+    ruleContent: { content: "//article" },
+  };
+  const { sources } = convertLegado([legadoSource], {});
+  const converted = sources["递归与POST运行时"];
+  assert.ok(converted, "转换应成功");
+  assert.equal(converted.searchBook.detailUrl, "$.id");
+  const result = await runXbsPipeline(converted, {
+    fetchImpl: async (url, init = {}) => {
+      if (String(url).includes("/lib")) {
+        return new Response(JSON.stringify({ data: { pageList: [{ name: "递归书", id: "7" }] } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (String(url).includes("/detail")) {
+        assert.equal(init.body, "id=7", "字符串 httpParams 应原样作为 POST 体");
+        return new Response(JSON.stringify({ list: [{ name: "第一章", url: "https://rt.example/c/1" }] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("<article>正文内容</article>", { status: 200, headers: { "content-type": "text/html" } });
+    },
+    timeoutMs: 5_000,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result).slice(0, 300));
+  assert.equal(result.steps.chapterList.listCount, 1);
+  assert.ok(result.steps.chapterContent.itemCount > 0);
 });

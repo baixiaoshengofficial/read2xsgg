@@ -1,3 +1,5 @@
+import { injectRuntimeHelpers } from "./legadoRuntime.js";
+
 function propertyExpression(root, path) {
   const value = String(path || "").trim();
   if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*$/.test(value)) return "";
@@ -5,6 +7,87 @@ function propertyExpression(root, path) {
 }
 
 const PORTABLE_STRING_METHODS = "length|substring|substr|slice|indexOf|charAt|charCodeAt|trim|toLowerCase|toUpperCase|startsWith|endsWith|includes|replace|concat|padStart|padEnd";
+
+/**
+ * 香色把脚本包装成 function(config, params, result)，脚本体内再声明同名变量
+ * 会触发 "Identifier has already been declared"。统一改名本地声明，保持脚本
+ * 语义不变（改名是一致替换）。
+ */
+function rewriteShadowedRuntimeNames(value) {
+  let source = String(value || "");
+  let masked = maskedJavaScript(source);
+  const renames = [];
+  for (const name of ["config", "params", "result"]) {
+    if (new RegExp(`\\b(?:var|let|const)\\s+${name}\\b`).test(masked)) {
+      renames.push([name, `__xsLocal${name.charAt(0).toUpperCase()}${name.slice(1)}`]);
+    }
+  }
+  if (!renames.length) return source;
+  for (const [name, replacement] of renames) {
+    masked = maskedJavaScript(source);
+    const edits = [];
+    for (const match of masked.matchAll(new RegExp(`\\b${name}\\b`, "g"))) {
+      const index = match.index;
+      const text = rewrittenIdentifier(masked, index, name, replacement);
+      if (text) edits.push({ index, text });
+    }
+    for (const edit of edits.reverse()) {
+      source = `${source.slice(0, edit.index)}${edit.text}${source.slice(edit.index + name.length)}`;
+    }
+  }
+  return source;
+}
+
+function rewriteJavaRuntimeApis(value) {
+  let source = String(value || "");
+  // 纯 JS 可实现的编码/加密/时间 API（助手按需内嵌）。
+  const apiRenames = [
+    [/java\.base64DecodeToByteArray\s*\(/g, "__xsBase64Bytes("],
+    [/java\.base64Decode\s*\(/g, "__xsBase64Decode("],
+    [/java\.base64Encode\s*\(/g, "__xsBase64Encode("],
+    [/java\.hexDecodeToString\s*\(/g, "__xsHexDecode("],
+    [/java\.hexDecodeToByteArray\s*\(/g, "__xsHexBytes("],
+    [/java\.strToBytes\s*\(/g, "__xsStrToBytes("],
+    [/java\.bytesToStr\s*\(/g, "__xsBytesToStr("],
+    [/java\.md5Encode\s*\(/g, "__xsMd5("],
+    [/java\.timeFormatUTC\s*\(/g, "__xsTimeFormatUTC("],
+    [/java\.timeFormat\s*\(/g, "__xsTimeFormat("],
+    // htmlFormat 在阅读里做 HTML 标准化；转换后正则按原文匹配即可，恒等映射。
+    [/java\.htmlFormat\s*\(/g, "String("],
+  ];
+  for (const [pattern, replacement] of apiRenames) {
+    source = source.replace(pattern, replacement);
+  }
+  // jsoup（Java DOM）改为内嵌迷你 DOM。
+  source = source
+    .replace(/(?:Packages\.)?org\.jsoup\.Jsoup\s*\.\s*parse\s*\(/gi, "__xsJsoup.parse(")
+    .replace(/(?<![A-Za-z_$][\w$]*\.)\bJsoup\s*\.\s*parse\s*\(/g, "__xsJsoup.parse(");
+  // getString 的规则求值形态（JSONPath / CSS@属性）可移植；URL 形态是 HTTP 请求，保留。
+  source = source
+    .replace(/java\.getString(?:List)?\s*\(\s*(['"])(\$[^'"]*)\1\s*\)/gi,
+      (_match, _quote, path) => `__xsJsonPath(result, ${JSON.stringify(path)})`)
+    .replace(/java\.getString\s*\(\s*(['"])([^'"]*@[^'"]*)\1\s*\)/gi,
+      (_match, _quote, rule) => `__xsRuleString(result, ${JSON.stringify(rule)})`);
+  // 正文后处理里常见的「再取一次当前响应」可直接用 result。
+  source = source
+    .replace(/java\.ajax\s*\(\s*result\s*\)/gi, "String(result)")
+    .replace(/java\.getString\s*\(\s*result\s*\)/gi, "String(result)");
+  // 状态读写：香色无跨字段变量，按脚本内局部状态编译（跨脚本场景由告警提示）。
+  source = source.replace(
+    /^(\s*)java\.put\s*\(\s*(['"])([^'"]+)\2\s*,\s*([\s\S]+?)\s*\)\s*;?$/gim,
+    (_match, indent, _quote, key, expression) => `${indent}__xsState[${JSON.stringify(key)}] = (${expression});`,
+  );
+  source = source.replace(
+    /java\.get\s*\(\s*(['"])([^'"]+)\1\s*\)/g,
+    (match, quote, key) => (/^[^:/]*:\/\//.test(key) ? match : `(__xsState[${JSON.stringify(key)}] || "")`),
+  );
+  // 无副作用的 UI/日志调用整句移除。
+  source = source
+    .replace(/^\s*java\.(?:log|toast|longToast)\s*\([^;\r\n]*\)\s*;?\s*$/gim, "")
+    .replace(/^\s*java\.refresh(?:Explore|Book)\s*\(\s*\)\s*;?\s*$/gim, "")
+    .replace(/try\s*\{\s*java\.(?:log|toast|longToast)\s*\([^;{}]*\)\s*;?\s*\}\s*catch\s*\([^)]*\)\s*\{\s*\}/gi, "");
+  return source;
+}
 
 function rewriteKeyPageIdentifiers(expression) {
   return String(expression || "")
@@ -53,7 +136,12 @@ export function legadoTemplateExpression(value) {
   if (/^String\(\s*source\.getVariable\(\s*\)\s*!==?\s*['"]['"]\s*\?\s*source\.getVariable\(\s*\)\s*:\s*source\.getKey\(\s*\)\s*\)\.replace\(\s*\/\\\/\$\/\s*,\s*['"]['"]\s*\)$/i.test(expression)) {
     return 'String(config.host || "").replace(/\\\/$/, "")';
   }
-  if (/^(?:host|(?:getCurrentUrl|Url)\s*\(\s*\))$/i.test(expression)) return "config.host";
+  if (/^(?:host(?:\s*\.\s*(?:call|apply)\s*\(\s*(?:this|[^)]*)\s*\))?|(?:getCurrentUrl|Url)\s*\(\s*\))$/i.test(expression)) return "config.host";
+  // 镜像/登录分流 jsLib（eval(source.loginUrl)、GetUL() 等）在香色无宿主等价物，
+  // 站点主域回退 config.host，保持请求可达而不是丢弃整条规则。
+  if (/^(?:eval\s*\(\s*String\s*\(\s*source\.loginUrl\s*\)\s*\)\s*;?\s*)?(?:get(?:ul|url|host)|get\s*\(\s*['"](?:ul|url|host)['"]?\s*\))\s*\(\s*\)\s*;?$/i.test(expression)) {
+    return "config.host";
+  }
   if (/^java\.connect\(\s*source\.getKey\(\s*\)\s*\)\.raw\(\s*\)\.request\(\s*\)\.url\(\s*\)$/i.test(expression)) {
     return "config.host";
   }
@@ -121,14 +209,87 @@ function compileTemplateString(value) {
 }
 
 function maskedJavaScript(value) {
-  return String(value || "")
-    .replace(/(['"`])(?:\\.|(?!\1)[\s\S])*?\1/g, (match) => " ".repeat(match.length))
-    .replace(/\/\*[\s\S]*?\*\//g, (match) => " ".repeat(match.length))
-    .replace(/\/\/[^\r\n]*/g, (match) => " ".repeat(match.length))
-    // Runtime names inside `/.../` are regex text, not JavaScript globals.
-    // Require an expression-leading token so arithmetic division is retained.
-    .replace(/(^|[=(:,!&|?;{}\[\]\n]\s*)\/(?![/*])(?:\\.|\[(?:\\.|[^\]\\\r\n])*\]|[^/\\\r\n])+\/[dgimsuvy]*/gm,
-      (match, prefix) => `${prefix}${" ".repeat(match.length - prefix.length)}`);
+  // 单遍扫描：按 JS 词法上下文把字符串、模板串、注释和正则字面量整体抹成
+  // 空格。旧的「先字符串后正则」两段式在正则含引号（如 /x="a"/）时会把
+  // 正则里的引号误当字符串边界，导致后续语句边界判断错位。
+  const source = String(value || "");
+  const out = new Array(source.length);
+  let index = 0;
+  // 表达式位置判定：`/` 出现在这些字符之后才是正则字面量，否则是除号。
+  const regexPrefix = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", ";", "{", "}", "+", "-", "*", "%", "~", "<", ">", "^", "\n", "\r", ""]);
+  const lastMeaningful = () => {
+    for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+      if (!/\s/.test(source[cursor])) return source[cursor];
+    }
+    return "";
+  };
+  const blank = (start, end) => {
+    for (let cursor = start; cursor < end && cursor < source.length; cursor += 1) {
+      out[cursor] = source[cursor] === "\n" ? "\n" : " ";
+    }
+  };
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (char === "/" && next === "/") {
+      const end = source.indexOf("\n", index);
+      const stop = end < 0 ? source.length : end;
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      const end = source.indexOf("*/", index + 2);
+      const stop = end < 0 ? source.length : end + 2;
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      let cursor = index + 1;
+      while (cursor < source.length) {
+        if (source[cursor] === "\\") { cursor += 2; continue; }
+        if (source[cursor] === char) { cursor += 1; break; }
+        cursor += 1;
+      }
+      blank(index, cursor);
+      index = cursor;
+      continue;
+    }
+    if (char === "/" && regexPrefix.has(lastMeaningful())) {
+      let cursor = index + 1;
+      let inClass = false;
+      let closed = false;
+      while (cursor < source.length) {
+        const current = source[cursor];
+        if (current === "\\") { cursor += 2; continue; }
+        if (current === "\n") break;
+        if (inClass) {
+          if (current === "]") inClass = false;
+        } else if (current === "[") {
+          inClass = true;
+        } else if (current === "/") {
+          closed = true;
+          cursor += 1;
+          while (cursor < source.length && /[dgimsuvy]/.test(source[cursor])) cursor += 1;
+          break;
+        }
+        cursor += 1;
+      }
+      if (closed) {
+        blank(index, cursor);
+        index = cursor;
+        continue;
+      }
+      // 未闭合（可能是除号或被截断的 URL），按普通字符保留。
+      out[index] = char;
+      index += 1;
+      continue;
+    }
+    out[index] = char;
+    index += 1;
+  }
+  return out.join("");
 }
 
 function insideObjectLiteral(masked, index) {
@@ -295,7 +456,62 @@ function ensureJavaScriptReturn(value) {
       // Keep the original script when the final statement is not an expression.
     }
   }
+  // Legado 脚本常以给 result 赋值收尾（隐式返回 result），补上显式返回。
+  const assignCandidate = `${statementBody};\nreturn result;`;
+  if (/\bresult\s*=(?!=)/.test(masked)) {
+    try {
+      new Function("config", "params", "result", assignCandidate);
+      return `${prefix}\n${assignCandidate}`;
+    } catch {
+      // Fall through and keep the original script.
+    }
+  }
+  // 列表规则脚本还有 `list = ...` 的魔法赋值约定，同样补返回。
+  const listCandidate = `${statementBody};\nreturn typeof list === "undefined" ? result : list;`;
+  if (/\blist\s*=(?!=)/.test(masked)) {
+    try {
+      new Function("config", "params", "result", listCandidate);
+      return `${prefix}\n${listCandidate}`;
+    } catch {
+      // Fall through and keep the original script.
+    }
+  }
   return source;
+}
+
+
+/**
+ * 阅读源常用 `typeof Packages!='undefined'?jsoup路径:回退` 守卫。香色没有
+ * Packages，运行时恒走回退分支；编译期直接裁掉不可达的真分支，规则才
+ * 不会因残留的 Packages 字样被结构校验拒收。
+ */
+function stripGuardedPackagesBranches(source) {
+  let out = String(source || "");
+  const marker = /typeof\s+Packages\s*(?:!==?|==?)\s*(['"])undefined\1\s*\?/gi;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const match = marker.exec(out);
+    if (!match) break;
+    marker.lastIndex = 0;
+    const start = match.index;
+    const question = start + match[0].length - 1;
+    // 找到与该 `?` 配对的同级 `:`（括号/嵌套三元感知）。
+    let depth = 0;
+    let ternary = 1;
+    let colon = -1;
+    for (let cursor = question + 1; cursor < out.length; cursor += 1) {
+      const ch = out[cursor];
+      if (ch === "(" || ch === "[" || ch === "{") depth += 1;
+      else if (ch === ")" || ch === "]" || ch === "}") depth = Math.max(0, depth - 1);
+      else if (ch === "?" && depth === 0) ternary += 1;
+      else if (ch === ":" && depth === 0) {
+        ternary -= 1;
+        if (ternary === 0) { colon = cursor; break; }
+      }
+    }
+    if (colon < 0) break;
+    out = `${out.slice(0, start).trimEnd()}${out.slice(colon + 1).trimStart()}`;
+  }
+  return out;
 }
 
 /**
@@ -303,13 +519,14 @@ function ensureJavaScriptReturn(value) {
  * runtime. This never evaluates source code; it only rewrites recognised
  * placeholders inside JavaScript string literals and standalone templates.
  */
-export function rewriteLegadoJavaScript(value) {
+export function rewriteLegadoJavaScriptRaw(value) {
   let source = String(value || "")
     .replace(/<\/js>/gi, "")
     // Older Legado collections also use `{$.id}` (one brace) in JSON URL
     // templates. Normalise only this narrow field form; ordinary JS objects
     // are deliberately untouched.
     .replace(/(?<!\{)\{(\$\.[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*(?:\s*\|\|\s*\$\.[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*)*)\}(?!\})/g, "{{$1}}");
+  source = stripGuardedPackagesBranches(source);
   source = source
     // Xiangse has no Legado source-variable UI. Empty is the exact initial
     // value on Legado and therefore selects a script's declared default path.
@@ -336,14 +553,19 @@ export function rewriteLegadoJavaScript(value) {
     legadoTemplateExpression(expression) || template
   ));
   source = source.replace(/\bjava\.encodeURI\s*\(/g, "encodeURIComponent(");
+  source = rewriteJavaRuntimeApis(source);
   source = source
     .replace(/\bsource\.getKey\s*\(\s*\)/gi, "config.host")
     .replace(/\bsource\.(?:key|bookSourceUrl)\b/gi, "config.host")
-    .replace(/^\s*(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie)\s*\([^;\n]*\)\s*;?\s*$/gim, "")
-    .replace(/^\s*java\.put\s*\(\s*['"][^'"]+['"]\s*,\s*[^;\n]+\)\s*;?\s*$/gim, "");
+    .replace(/^\s*(?:cookie\s*\.\s*)?(?:removeCookie|clearCookie)\s*\([^;\n]*\)\s*;?\s*$/gim, "");
+  source = rewriteShadowedRuntimeNames(source);
   source = rewriteBareRuntimeIdentifiers(source);
   source = rewriteImplicitRuntimeAliases(source);
   return ensureJavaScriptReturn(source);
+}
+
+export function rewriteLegadoJavaScript(value) {
+  return injectRuntimeHelpers(rewriteLegadoJavaScriptRaw(value));
 }
 
 export function hasUnsupportedLegadoRuntime(value) {

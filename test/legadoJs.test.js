@@ -2,6 +2,49 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { convertRequest, convertRule, hasUnsupportedLegadoRuntime, inferResponseType, rewriteLegadoJavaScript } from "../src/index.js";
 
+function evaluateRewrittenScript(script, result = "") {
+  const rewritten = rewriteLegadoJavaScript(`@js:\n${script}`);
+  const body = rewritten.replace(/^@js:\s*/i, "");
+  return {
+    rewritten,
+    value: new Function("config", "params", "result", body)(
+      { host: "https://example.test" },
+      { keyWord: "你好", pageIndex: 2, responseUrl: "https://example.test/chapter" },
+      result,
+    ),
+  };
+}
+
+test("常用阅读 Java 编解码和时间 API 可在香色脚本中执行", () => {
+  const cases = [
+    ["java.md5Encode(\"abc\")", "900150983cd24fb0d6963f7d28e17f72"],
+    ["java.base64Encode(\"你好\")", "5L2g5aW9"],
+    ["java.base64Decode(\"5L2g5aW9\")", "你好"],
+    ["java.hexDecodeToString(\"e4bda0e5a5bd\")", "你好"],
+    ["java.timeFormatUTC(1704067200000, \"yyyy-MM-dd HH:mm\")", "2024-01-01 00:00"],
+  ];
+  for (const [expression, expected] of cases) {
+    const { value, rewritten } = evaluateRewrittenScript(`return ${expression};`);
+    assert.equal(value, expected, rewritten);
+  }
+});
+
+test("内嵌 jsoup、规则取值和脚本状态可执行", () => {
+  const html = '<div class="card"><a href="/a">一</a></div><div class="card"><a href="/b">二</a></div>';
+  const jsoup = evaluateRewrittenScript(
+    'var doc = org.jsoup.Jsoup.parse(result); return doc.select(".card a").first().attr("href");',
+    html,
+  );
+  assert.equal(jsoup.value, "/a", jsoup.rewritten);
+
+  assert.equal(evaluateRewrittenScript('return java.getString(".card@text");', html).value, "一");
+  assert.equal(
+    evaluateRewrittenScript('return java.getString("$.data.name");', JSON.stringify({ data: { name: "ok" } })).value,
+    "ok",
+  );
+  assert.equal(evaluateRewrittenScript('java.put("state", "ok"); return java.get("state");').value, "ok");
+});
+
 test("阅读 JavaScript 字符串模板转换为香色 params/result 表达式", () => {
   const rewritten = rewriteLegadoJavaScript(`
     let url = "/api/models?offset={{(page-1)*60}}";

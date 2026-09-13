@@ -813,7 +813,7 @@ function requireListAttribute(list, attribute) {
 function domListProjection(rule, field) {
   const source = String(rule || "");
   if (!/^@js:/i.test(source)
-    || !/\borg\.jsoup\.Jsoup\.parse\s*\(/i.test(source)
+    || !/(?:\b(?:Packages\.)?org\.jsoup\.Jsoup|__xsJsoup)\.parse\s*\(/i.test(source)
     || !/\.select\s*\(/i.test(source)) return "";
   const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   if (field === "title" && new RegExp(
@@ -830,7 +830,7 @@ function domListProjection(rule, field) {
 function isDomListProjection(rule) {
   const source = String(rule || "");
   return /^@js:/i.test(source)
-    && /\borg\.jsoup\.Jsoup\.parse\s*\(/i.test(source)
+    && /(?:\b(?:Packages\.)?org\.jsoup\.Jsoup|__xsJsoup)\.parse\s*\(/i.test(source)
     && /\.select\s*\(/i.test(source)
     && /(?:\.push\s*\(|\.add\s*\()/i.test(source);
 }
