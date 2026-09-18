@@ -165,27 +165,57 @@ function normalizeLegadoReplaceRegex(pattern) {
 }
 
 function compileReplaceRegexStatement(pattern, warn) {
-  const { source, replacement } = normalizeLegadoReplaceRegex(pattern);
-  if (!source) return "";
-  if (/\{\{\s*book\.durChapterTitle\s*\}\}/i.test(source)) {
+  let source = String(pattern ?? "").trim();
+  // 阅读的 replaceRegex 还有三种脚本形态：
+  // 1) `@js:<表达式>`：对正文求值的 JS 清理脚本；
+  // 2) `<js>##pattern##replacement</js>`：标签包裹的 ## 替换；
+  // 3) 数组已在上层展开。这些都不能当普通正则编译，否则 `@js:` 字样会
+  //    残留在正文规则里被结构校验拒收。
+  const tagged = source.match(/^(?:@js:|<js>)([\s\S]*)$/i);
+  if (tagged) {
+    let body = tagged[1].replace(/<\/js>$/i, "").trim();
+    // `<js>##pattern##replacement</js>`：剥离标签后按 ## 替换处理。
+    if (body.startsWith("##")) {
+      return compileReplaceRegexStatement(body, warn);
+    }
+    const innerJs = body.match(/<js>([\s\S]*?)<\/js>/gi);
+    if (innerJs) {
+      const statements = innerJs
+        .map((piece) => compileReplaceRegexStatement(piece.replace(/^<js>|<\/js>$/gi, ""), warn))
+        .filter(Boolean);
+      if (statements.length) return statements.join("\n");
+      return "";
+    }
+    const rewritten = rewriteLegadoJavaScriptRaw(`@js:\n${body}`);
+    if (hasUnsupportedLegadoRuntime(rewritten)) {
+      warn("正文 replaceRegex 的 JS 清理脚本依赖阅读运行时，已忽略该清理规则");
+      return "";
+    }
+    warn("正文 replaceRegex 为 JS 清理脚本，已编译为正文后处理");
+    return rewritten.replace(/^@js:\s*/i, "").trim();
+  }
+  const { source: rawPattern, replacement } = normalizeLegadoReplaceRegex(source);
+  const src = rawPattern;
+  if (!src) return "";
+  if (/\{\{\s*book\.durChapterTitle\s*\}\}/i.test(src)) {
     warn("正文 replaceRegex 含章节标题模板，已改为香色 queryInfo.chapterTitle 运行时替换");
-    const template = source.replace(/\{\{\s*book\.durChapterTitle\s*\}\}/gi, "__READ2XSGG_CHAPTER_TITLE__");
+    const template = src.replace(/\{\{\s*book\.durChapterTitle\s*\}\}/gi, "__READ2XSGG_CHAPTER_TITLE__");
     return [
       'var __chapterTitle = String((params.queryInfo && (params.queryInfo.chapterTitle || params.queryInfo.chapterName || params.queryInfo.title)) || "");',
       `var __replacePat = ${JSON.stringify(template)}.replace(/__READ2XSGG_CHAPTER_TITLE__/g, __chapterTitle.replace(/[.*+?^$\{}()|[\\]\\\\]/g, "\\\\$&"));`,
       `result = String(result).replace(new RegExp(__replacePat, "g"), ${JSON.stringify(replacement)});`,
     ].join("\n");
   }
-  if (/\{\{/.test(source)) {
+  if (/\{\{/.test(src)) {
     warn("正文 replaceRegex 含无法移植的阅读模板，已忽略该清理规则");
     return "";
   }
   try {
-    new RegExp(source);
+    new RegExp(src);
   } catch {
     warn("正文 replaceRegex 无法解析，已原样写入转换结果");
   }
-  return `result = String(result).replace(new RegExp(${JSON.stringify(source)}, "g"), ${JSON.stringify(replacement)});`;
+  return `result = String(result).replace(new RegExp(${JSON.stringify(src)}, "g"), ${JSON.stringify(replacement)});`;
 }
 
 function appendRulePostprocessor(rule, processor) {
@@ -937,6 +967,7 @@ function compileStoredIdConcatenation(source) {
     /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*java\.get\s*\(\s*['"][^'"]+['"]\s*\)/i,
   )?.[1];
   if (!stored) return null;
+  // 用 O(n) 字符串扫描代替二义交替正则（长反斜杠 span 上会指数回溯）。
   const concatenated = String(source).match(
     /(["'])(https?:\/\/(?:\\.|(?!\1)[\s\S])*?)\1\s*\+\s*([A-Za-z_$][\w$]*)\s*\+\s*(["'])((?:\\.|(?!\4)[\s\S])*?)\4\s*\+\s*([A-Za-z_$][\w$]*)/,
   );
@@ -1768,6 +1799,7 @@ function mapTocRules(rules, responseType, warningFor) {
     && /(?:^|@)href(?:$|##)/i.test(String(rules.chapterUrl || ""))) {
     result.list = `(${result.list})[self::a[@href] or .//a[@href]]`;
   }
+  // 目录选中 `<a>`/`li a` 而源未声明 chapterName 时，用链接文本作章节标题。
   if (responseType === "html" && result.list && result.title && !result.url
     && (rules.chapterUrl === undefined || rules.chapterUrl === "" || /^\s*-\s*$/.test(String(rules.chapterUrl)))) {
     const anchorItems = responseType === "html" && /(?:^|@|\s)a(?:\s*$|\[|[.#:@])/i.test(String(chapterListRule || ""));
