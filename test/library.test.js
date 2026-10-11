@@ -252,12 +252,16 @@ test("serverConfig 暴露 dataDir / adminToken / jobConcurrency", () => {
   assert.equal(serverConfig({}).dataDir, "./data");
   assert.equal(serverConfig({}).adminToken, "");
   assert.equal(serverConfig({}).jobConcurrency, 1);
+  assert.equal(serverConfig({}).jobIsolation, true);
   assert.equal(serverConfig({}).jobVerifyBudgetMs, 0);
+  assert.equal(serverConfig({}).jobVerifySourceBudgetMs, 30_000);
   assert.equal(serverConfig({ ADMIN_TOKEN: "x", DATA_DIR: "/data", JOB_CONCURRENCY: "2" }).adminToken, "x");
   assert.equal(serverConfig({ ADMIN_TOKEN: "x", DATA_DIR: "/data", JOB_CONCURRENCY: "2" }).dataDir, "/data");
   assert.equal(serverConfig({ ADMIN_TOKEN: "x", DATA_DIR: "/data", JOB_CONCURRENCY: "2" }).jobConcurrency, 2);
+  assert.equal(serverConfig({ JOB_ISOLATION: "false" }).jobIsolation, false);
   assert.equal(serverConfig({ JOB_VERIFY_BUDGET_MS: "120000" }).jobVerifyBudgetMs, 120_000);
   assert.equal(serverConfig({ JOB_VERIFY_BUDGET_MS: "0" }).jobVerifyBudgetMs, 0);
+  assert.equal(serverConfig({ JOB_VERIFY_SOURCE_BUDGET_MS: "7000" }).jobVerifySourceBudgetMs, 7000);
 });
 
 test("删除运行中任务会释放队列槽位并启动下一个", async () => {
@@ -331,6 +335,45 @@ test("并发进度更新不会损坏 job JSON", async () => {
     const listed = await store.listJobs();
     assert.equal(listed[0].id, job.id);
     assert.equal(listed[0].status, "running");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("任务阶段切换会清除上一阶段和恢复前的陈旧进度", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-progress-phase-"));
+  try {
+    const store = createLibraryStore(dir);
+    const job = await store.createJob({ url: "https://example.com/a.json" });
+    await store.updateJob(job.id, {
+      status: "running",
+      phase: "verify",
+      progress: {
+        done: 40,
+        total: 80,
+        kept: 4,
+        skipped: 36,
+        unverified: 0,
+        fallback: 4,
+        failed: 40,
+        step: "repair-books",
+        current: "old source",
+        active: ["old source"],
+      },
+    });
+
+    const next = await store.updateJob(job.id, {
+      phase: "preflight",
+      progress: { phase: "preflight", done: 1, total: 2, kept: 1, skipped: 0 },
+    });
+
+    assert.equal(next.progress.done, 1);
+    assert.equal(next.progress.total, 2);
+    assert.equal(next.progress.failed, 0);
+    assert.equal(next.progress.fallback, 0);
+    assert.equal(next.progress.step, "");
+    assert.equal(next.progress.current, "");
+    assert.deepEqual(next.progress.active, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -492,11 +535,14 @@ test("retry 优先使用已发布 source payload，不回落缺 mediaResolution 
       return {
         sources: JSON.parse(json.toString("utf8")),
         warnings: [],
-        skipped: [],
+        skipped: [
+          { source: "list-stale", reason: "rules-stale: empty-list" },
+          { source: "preflight", reason: "上游站点不可访问，或核心分类/章节链路没有数据" },
+        ],
         count: 1,
         fallbackCount: 0,
         unverifiedCount: 0,
-        skippedBuckets: {},
+        skippedBuckets: { "rules-stale": 1, "preflight-inconclusive": 1 },
         json,
         xbs: encodeXbs(json),
       };
@@ -522,6 +568,19 @@ test("retry 优先使用已发布 source payload，不回落缺 mediaResolution 
       await new Promise((resolve) => setTimeout(resolve, 40));
     }
     assert.equal(next.status, "done", next.error || next.status);
+    assert.deepEqual(next.skippedReasons, {
+      "rules-stale: empty-list": 1,
+      "preflight-inconclusive": 1,
+    });
+    assert.deepEqual(next.skippedSources, [
+      { source: "list-stale", reason: "rules-stale: empty-list" },
+      { source: "preflight", reason: "上游站点不可访问，或核心分类/章节链路没有数据" },
+    ]);
+    assert.deepEqual((await store.listJobs())[0].skippedSources.map((item) => item.source), [
+      "list-stale",
+      "preflight",
+    ]);
+    assert.equal(next.progress.skipped, 2);
     assert.equal(remoteConverts, 0);
     assert.equal(payloadConverts, 1);
     const xbs = await store.readArtifact(job.id, "xbs");

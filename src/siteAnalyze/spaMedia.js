@@ -436,7 +436,7 @@ export async function discoverSpaMedia(originUrl, kind, {
       const source = {
         sourceName: repairSource?.sourceName || new URL(originUrl).hostname,
         sourceUrl: originalOrigin,
-        weight: 0,
+        weight: "100",
         enable: 1,
         miniAppVersion: "2.56.1",
         authorId: "",

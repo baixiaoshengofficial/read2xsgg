@@ -16,6 +16,21 @@ const BOOK_PATH = /(?:\/(?:book|novel|info|detail|story|read|comic|manga|vod|vid
 const NAV_TEXT = /^(?:全部|[首頁页]|主[頁页]|分[類类]|排行|排行榜|登[錄录]|註冊|注册|充值|書架|书架|歷史|历史|更多|下一[頁页]|上一[頁页]|下[頁页]|上[頁页]|末[頁页]|尾[頁页]|男生|女生|小說|小说|漫畫|漫画|聽書|听书|視頻|视频|影視|影视)$/i;
 const PURE_CHAPTER_TEXT = /^(?:(?:第\s*)?\d+(?:\.\d+)?\s*(?:[章節节回話话集卷]|p)(?:\s*(?:完|終|终|end|[（(][^)）]{1,20}[)）]))?|\d+\s*[~～-]\s*\d+\s*p|(?:開始|开始|立即|點擊|点击)閱讀)$/i;
 
+function abortError(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  return new Error(String(signal?.reason || "操作已取消"));
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+async function yieldToEventLoop(signal) {
+  throwIfAborted(signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  throwIfAborted(signal);
+}
+
 function likelyBookPath(value) {
   let parsed;
   try { parsed = new URL(value); } catch { return false; }
@@ -286,7 +301,7 @@ function htmlBookCluster(page, requestedUrl) {
   return {
     list,
     bookName: bookNameSelector(),
-    detailUrl: stable ? "./@href||//@href" : ".//a/@href||./@href||//@href",
+    detailUrl: stable ? "//@href" : "//a/@href||//@href",
     cover: listCoverSelectorFromLinks(links),
   };
 }
@@ -305,13 +320,16 @@ function legacyUnicodeRequestInfo(requestInfo, page) {
   ].join("\n");
 }
 
-async function repairHtmlBooks(source, request, action, download) {
+async function repairHtmlBooks(source, request, action, download, signal) {
+  throwIfAborted(signal);
   let page;
   try {
     page = await download(request.url, request.headers || {}, request.options || {});
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return null;
   }
+  await yieldToEventLoop(signal);
   const rewritten = legacyUnicodeRequestInfo(action.requestInfo, page);
   if (rewritten) {
     const clone = structuredClone(source);
@@ -339,6 +357,7 @@ async function repairHtmlBooks(source, request, action, download) {
   repaired.detailUrl = fields.detailUrl;
   if (fields.cover) repaired.cover = fields.cover;
   try {
+    await yieldToEventLoop(signal);
     const output = executeBridgePlan(
       decodedPageText(page),
       responseUrl,
@@ -356,29 +375,40 @@ async function repairHtmlBooks(source, request, action, download) {
       && likelyBookPath(String(item.url))
     ));
     if (usable.length < 2) return null;
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return null;
   }
   return clone;
 }
 
 /** Repair stale HTML/JSON list fields without changing site-specific behavior. */
-export async function repairBooksFromRequests(source, { download } = {}) {
+export async function repairBooksFromRequests(source, {
+  download,
+  signal = null,
+  limit = 3,
+} = {}) {
   if (typeof download !== "function") return null;
-  for (const request of resolveBookTargetRequests(source, { limit: 8 })) {
-    const action = request.action || actionAt(source, request);
+  const requestLimit = Math.max(1, Number(limit) || 3);
+  let repairedSource = null;
+  for (const request of resolveBookTargetRequests(source, { limit: requestLimit })) {
+    await yieldToEventLoop(signal);
+    const baseSource = repairedSource || source;
+    const action = actionAt(baseSource, request) || request.action;
     if (!action) continue;
     if (String(action.responseFormatType || "html").toLowerCase() !== "json") {
-      const repaired = await repairHtmlBooks(source, request, action, download);
-      if (repaired) return repaired;
+      const repaired = await repairHtmlBooks(baseSource, request, action, download, signal);
+      if (repaired) repairedSource = repaired;
       continue;
     }
     let page;
     try {
       page = await download(request.url, request.headers || {}, request.options || {});
-    } catch {
+    } catch (error) {
+      if (signal?.aborted) throw error;
       continue;
     }
+    await yieldToEventLoop(signal);
     let payload;
     try {
       payload = JSON.parse(decodedPageText(page));
@@ -386,8 +416,19 @@ export async function repairBooksFromRequests(source, { download } = {}) {
       continue;
     }
     const bridge = adapterPlan(action);
-    const previousFields = bridge?.plan?.fields || {};
+    let previousFields = bridge?.plan?.fields || {};
+    if (!bridge) {
+      try {
+        previousFields = compileBookBridgePlan(action, {
+          ...(baseSource?.httpHeaders || {}),
+          ...(action.httpHeaders || {}),
+        }).fields || {};
+      } catch {
+        previousFields = {};
+      }
+    }
     for (const candidate of objectArrays(payload).sort((a, b) => b.rows.length - a.rows.length)) {
+      throwIfAborted(signal);
       const fields = inferredFields(candidate.rows, previousFields);
       if (!fields) continue;
       if (bridge) {
@@ -395,44 +436,53 @@ export async function repairBooksFromRequests(source, { download } = {}) {
         let output;
         try {
           output = executeBridgePlan(decodedPageText(page), request.url, plan, { limit: 3 });
-        } catch {
+        } catch (error) {
+          if (signal?.aborted) throw error;
           continue;
         }
         if (!(output.data || []).some((item) => item?.name && item?.url)) continue;
-        const clone = structuredClone(source);
+        const clone = structuredClone(baseSource);
         const repaired = actionAt(clone, request);
         if (!repaired) continue;
         repaired.requestInfo = String(repaired.requestInfo).split(bridge.token).join(encodeBridgePlan(plan));
-        return clone;
+        repairedSource = clone;
+        break;
       }
-      const clone = structuredClone(source);
+      const clone = structuredClone(baseSource);
       const repaired = actionAt(clone, request);
       if (!repaired) continue;
       repaired.list = candidate.path;
-      repaired.bookName = fields.name.selector;
-      repaired.detailUrl = fields.url.selector;
+      if (!/(?:@js:|<js>)/i.test(String(action.bookName || ""))) {
+        repaired.bookName = fields.name.selector;
+      }
+      if (!/(?:@js:|<js>)/i.test(String(action.detailUrl || ""))) {
+        repaired.detailUrl = fields.url.selector;
+      }
       if (fields.cover?.selector) repaired.cover = fields.cover.selector;
       if (fields.author?.selector) repaired.author = fields.author.selector;
       if (fields.cat?.selector) repaired.cat = fields.cat.selector;
       if (fields.lastChapterTitle?.selector) repaired.lastChapterTitle = fields.lastChapterTitle.selector;
-      return clone;
+      repairedSource = clone;
+      break;
     }
   }
-  const sourceUrl = String(source?.sourceUrl || source?.host || "").trim();
+  if (repairedSource) return repairedSource;
+  const baseSource = repairedSource || source;
+  const sourceUrl = String(baseSource?.sourceUrl || baseSource?.host || "").trim();
   if (/^https?:\/\//i.test(sourceUrl)) {
-    const firstWorld = Object.entries(source?.bookWorld || {})[0];
+    const firstWorld = Object.entries(baseSource?.bookWorld || {})[0];
     const section = firstWorld ? "bookWorld" : "searchBook";
     const actionName = firstWorld?.[0] || "";
-    const action = firstWorld?.[1] || source?.searchBook;
+    const action = firstWorld?.[1] || baseSource?.searchBook;
     if (action) {
-      const repaired = await repairHtmlBooks(source, {
+      const repaired = await repairHtmlBooks(baseSource, {
         url: sourceUrl,
-        headers: { ...(source?.httpHeaders || {}), ...(action.httpHeaders || {}) },
+        headers: { ...(baseSource?.httpHeaders || {}), ...(action.httpHeaders || {}) },
         options: {},
         section,
         actionName,
         rootFallback: true,
-      }, action, download);
+      }, action, download, signal);
       if (repaired) return repaired;
     }
   }
@@ -440,7 +490,7 @@ export async function repairBooksFromRequests(source, { download } = {}) {
 }
 
 /** Repair a stale JSON catalogue plan using its live detail/menu response. */
-export async function repairChaptersFromBookJson(source, bookUrl, { download } = {}) {
+export async function repairChaptersFromBookJson(source, bookUrl, { download, signal = null } = {}) {
   if (typeof download !== "function") return null;
   const action = source?.chapterList;
   if (!action) return null;
@@ -448,12 +498,15 @@ export async function repairChaptersFromBookJson(source, bookUrl, { download } =
   const headers = { ...(source?.httpHeaders || {}), ...(action?.httpHeaders || {}) };
   const urls = resolveChapterListUrls(action.requestInfo, bookUrl, { pageIndex: 1 });
   for (const url of urls) {
+    await yieldToEventLoop(signal);
     let page;
     try {
       page = await download(url, headers);
-    } catch {
+    } catch (error) {
+      if (signal?.aborted) throw error;
       continue;
     }
+    await yieldToEventLoop(signal);
     let payload;
     try {
       payload = JSON.parse(decodedPageText(page));
@@ -461,6 +514,7 @@ export async function repairChaptersFromBookJson(source, bookUrl, { download } =
       continue;
     }
     for (const candidate of objectArrays(payload).sort((a, b) => b.rows.length - a.rows.length)) {
+      throwIfAborted(signal);
       const fields = inferredChapterFields(candidate.rows, bridge?.plan?.fields || {});
       if (!fields) continue;
       if (bridge) {
@@ -468,7 +522,8 @@ export async function repairChaptersFromBookJson(source, bookUrl, { download } =
         let output;
         try {
           output = executeBridgePlan(decodedPageText(page), url, plan, { limit: 3 });
-        } catch {
+        } catch (error) {
+          if (signal?.aborted) throw error;
           continue;
         }
         if (!(output.data || []).some((item) => item?.title && item?.url)) continue;

@@ -1225,7 +1225,7 @@ async function verifyConvertedSourceWithin(source, options) {
     if (retried.ok) return { ...retried, retryRecovered: true };
     if (retried.detail) primary = retried;
   }
-  if (primary.ok || !["rules-stale: empty-toc", "rules-stale: empty-content"].includes(primary.reason)) {
+  if (primary.ok || !["rules-stale: empty-list", "rules-stale: empty-toc", "rules-stale: empty-content"].includes(primary.reason)) {
     return primary;
   }
   const timeoutMs = options.timeoutMs || 3_000;
@@ -1241,7 +1241,11 @@ async function verifyConvertedSourceWithin(source, options) {
       Number(report.attemptedCandidates) || 0,
       Number(report.attemptedChapterCandidates) || 0,
     );
-    if (!report.ok || attempted <= 1) return primary;
+    // A successful XBS run has already exercised the complete list → detail →
+    // chapter → content chain. Do not reject that evidence merely because the
+    // source exposed only one candidate (or its native bridge could not count
+    // candidates before the runtime fallback).
+    if (!report.ok) return primary;
     if (!requiredElementPresent("name", report.steps?.bookWorld?.bookName)
       || !requiredElementPresent("url", report.steps?.bookWorld?.detailUrl)) return primary;
     const fallbackChapter = {

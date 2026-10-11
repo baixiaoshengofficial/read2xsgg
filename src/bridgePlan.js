@@ -1,6 +1,7 @@
 import { JSDOM } from "jsdom";
 import { isXiangseGbkEncode } from "./charset.js";
 import { convertRule } from "./selectors.js";
+import { normalizeXiangseItemRule } from "./xiangseRules.js";
 
 const MAX_PLAN_BYTES = 24 * 1024;
 const FIELD_NAMES = new Set([
@@ -122,7 +123,8 @@ function normalizeField(rule) {
     }
     const urlTemplate = String(rule.urlTemplate || "").trim().slice(0, 2_048);
     const valueTemplate = String(rule.valueTemplate || "").trim().slice(0, 2_048);
-    const selector = selectorOnly(rule.selector) || (urlTemplate || valueTemplate ? "id" : "");
+    const selector = selectorOnly(normalizeXiangseItemRule(rule.selector))
+      || (urlTemplate || valueTemplate ? "id" : "");
     if (!selector) return null;
     const replacements = Array.isArray(rule.replacements) ? rule.replacements.map((item) => {
       const pattern = safeRegexPattern(item?.pattern);
@@ -150,7 +152,7 @@ function normalizeField(rule) {
     const templateFields = {};
     for (const [name, fieldSelector] of Object.entries(rule.templateFields || {}).slice(0, 8)) {
       if (!/^[A-Za-z_$][\w$]*$/.test(name)) continue;
-      const normalized = selectorOnly(fieldSelector);
+      const normalized = selectorOnly(normalizeXiangseItemRule(fieldSelector));
       if (normalized) templateFields[name] = normalized;
     }
     return {
@@ -765,7 +767,7 @@ function inferredDomScriptSelector(rule, preferredNames = []) {
   for (const attribute of [...new Set(attributes)]) {
     const wanted = preferredNames.some((pattern) => pattern.test(attribute));
     if (!wanted) continue;
-    return `./@${attribute}||.//*[@${attribute}]/@${attribute}`;
+    return "//@" + attribute;
   }
   if (preferredNames.some((pattern) => pattern.test("text") || pattern.test("title") || pattern.test("name"))
     && /\bresult\.(?:text|ownText)\s*\(\s*\)/i.test(source)) {
@@ -775,15 +777,15 @@ function inferredDomScriptSelector(rule, preferredNames = []) {
   // Legado's DOM helpers. Preserve the referenced attribute declaratively.
   if (preferredNames.some((pattern) => pattern.test("href") || pattern.test("url"))
     && /(?:getAttribute\s*\(\s*['"]href['"]|\bhref\\?=[\\]?['"])/i.test(source)) {
-    return ".//a[@href]/@href";
+    return "//a[@href]/@href";
   }
   if (preferredNames.some((pattern) => pattern.test("src") || pattern.test("img") || pattern.test("cover"))
     && /(?:getAttribute\s*\(\s*['"](?:src|data-src|data-original)['"]|\b(?:src|data-src|data-original)\\?=[\\]?['"])/i.test(source)) {
-    return ".//img/@src||.//img/@data-src||.//img/@data-original";
+    return "//img/@src||//img/@data-src||//img/@data-original";
   }
   if (preferredNames.some((pattern) => pattern.test("title") || pattern.test("name"))
     && /(?:getAttribute\s*\(\s*['"]title['"]|\btitle\\?=[\\]?['"])/i.test(source)) {
-    return "./@title";
+    return "//@title";
   }
   return "";
 }
@@ -824,7 +826,7 @@ function domListProjection(rule, field) {
     `\\b${escapedField}\\s*:\\s*[^,}\\r\\n]*\\.attr\\s*\\(\\s*(['"])([A-Za-z_][\\w:-]*)\\1`,
     "i",
   ))?.[2];
-  return attribute ? `./@${attribute}||.//*[@${attribute}]/@${attribute}` : "";
+  return attribute ? "//@" + attribute : "";
 }
 
 function isDomListProjection(rule) {
@@ -842,10 +844,19 @@ function planCharset(action) {
 }
 
 export function compileBookBridgePlan(action, headers = {}) {
+  const bookName = normalizeXiangseItemRule(action.bookName);
+  const detailUrl = normalizeXiangseItemRule(action.detailUrl);
+  const author = normalizeXiangseItemRule(action.author);
+  const desc = normalizeXiangseItemRule(action.desc);
+  const cat = normalizeXiangseItemRule(action.cat);
+  const lastChapterTitle = normalizeXiangseItemRule(action.lastChapterTitle);
+  const cover = normalizeXiangseItemRule(action.cover);
+  const status = normalizeXiangseItemRule(action.status);
+  const wordCount = normalizeXiangseItemRule(action.wordCount);
   const guardedList = action.responseFormatType === "html"
     ? requireListAttribute(
       inferredDomScriptSelector(action.list, [/book/i, /item/i, /list/i, /article/i]),
-      directDomAttributeGuard(action.detailUrl),
+      directDomAttributeGuard(detailUrl),
     )
     : inferredDomScriptSelector(action.list, [/book/i, /item/i, /list/i, /article/i]);
   return normalizePlan({
@@ -854,20 +865,20 @@ export function compileBookBridgePlan(action, headers = {}) {
     responseType: action.responseFormatType,
     charset: planCharset(action),
     list: guardedList,
-    filter: inferredJsonEqualityFilter(action.bookName),
+    filter: inferredJsonEqualityFilter(bookName),
     fields: {
-      name: inferredScriptField(action.bookName, [/^(?:book)?name$/i, /title/i, /username/i]),
-      url: inferredScriptField(action.detailUrl, [/url/i, /id/i, /username/i])
-        || inferredDomScriptSelector(action.detailUrl, [/url/i, /href/i, /id/i]),
-      author: action.author,
-      desc: action.desc,
-      cat: action.cat,
-      lastChapterTitle: action.lastChapterTitle,
-      cover: inferredScriptField(action.cover, [/cover/i, /pic/i, /img/i, /icon/i])
-        || inferredDomScriptSelector(action.cover, [/cover/i, /pic/i, /img/i, /src/i])
-        || action.cover,
-      status: action.status,
-      wordCount: action.wordCount,
+      name: inferredScriptField(bookName, [/^(?:book)?name$/i, /title/i, /username/i]),
+      url: inferredScriptField(detailUrl, [/url/i, /id/i, /username/i])
+        || normalizeXiangseItemRule(inferredDomScriptSelector(detailUrl, [/url/i, /href/i, /id/i])),
+      author,
+      desc,
+      cat,
+      lastChapterTitle,
+      cover: inferredScriptField(cover, [/cover/i, /pic/i, /img/i, /icon/i])
+        || normalizeXiangseItemRule(inferredDomScriptSelector(cover, [/cover/i, /pic/i, /img/i, /src/i]))
+        || cover,
+      status,
+      wordCount,
     },
     headers,
   });
@@ -897,12 +908,15 @@ export function compileDetailBridgePlan(action, headers = {}) {
 export function compileChapterBridgePlan(action, {
   tocSelector = "", tocRequest = null, headers = {}, reverse = false,
 } = {}) {
+  const title = normalizeXiangseItemRule(action?.title);
+  const url = normalizeXiangseItemRule(action?.url);
+  const updateTime = normalizeXiangseItemRule(action?.updateTime);
   const projectedDomList = isDomListProjection(action?.list);
   const urlRule = projectedDomList
     ? domListProjection(action.list, "url")
-    : action?.url && typeof action.url === "object" && action.url.urlTemplate
-    ? action.url
-    : inferredScriptField(action.url, [/url/i, /id/i, /href/i]);
+    : url && typeof url === "object" && url.urlTemplate
+    ? url
+    : inferredScriptField(url, [/url/i, /id/i, /href/i]);
   return normalizePlan({
     kind: "chapters",
     host: action.host,
@@ -914,11 +928,11 @@ export function compileChapterBridgePlan(action, {
     reverse: Boolean(reverse || action.reverseChapters || action.reverse),
     fields: {
       title: (projectedDomList ? domListProjection(action.list, "title") : "")
-        || inferredScriptField(action.title, [/title/i, /name/i, /chapter/i])
-        || inferredDomScriptSelector(action.title, [/title/i, /name/i, /text/i, /alt/i])
-        || (/queryInfo\.(?:bookName|name)/i.test(String(action.title || "")) ? { constant: "播放" } : ""),
-      url: urlRule || inferredDomScriptSelector(action.url, [/href/i, /url/i, /src/i]),
-      updateTime: action.updateTime,
+        || inferredScriptField(title, [/title/i, /name/i, /chapter/i])
+        || normalizeXiangseItemRule(inferredDomScriptSelector(title, [/title/i, /name/i, /text/i, /alt/i]))
+        || (/queryInfo\.(?:bookName|name)/i.test(String(title || "")) ? { constant: "播放" } : ""),
+      url: urlRule || normalizeXiangseItemRule(inferredDomScriptSelector(url, [/href/i, /url/i, /src/i])),
+      updateTime,
     },
     headers,
   });

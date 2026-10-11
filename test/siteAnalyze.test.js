@@ -205,6 +205,11 @@ test("detectKind 从视频作品路径和文字识别视频站", () => {
   assert.equal(detectKind(html, "https://media.example/").kind, "video");
 });
 
+test("detectKind 将单个明确播放器归入对应媒体类型", () => {
+  assert.equal(detectKind('<audio src="/play"></audio>').kind, "audio");
+  assert.equal(detectKind('<video src="/play"></video>').kind, "video");
+});
+
 test("detectKinds 混合站可同时命中多种类型", () => {
   const kinds = detectKinds(mixedHome, "https://mixed.example/");
   const set = new Set(kinds.map((item) => item.kind));
@@ -913,7 +918,7 @@ test("小说列表节点本身为链接时详情规则读取当前节点 href", 
   const discovery = await discoverNovel("https://self-link.example/", { download, maxPages: 2 });
 
   assert.ok(discovery);
-  assert.match(discovery.detailUrlSelector, /\.\/@href/);
+  assert.equal(discovery.detailUrlSelector, "//@href");
   assert.match(discovery.bookNameSelector, /normalize-space\(\.\)/);
 });
 
@@ -2385,6 +2390,60 @@ test("抽测失败后 pipeline 可回退识站", async () => {
   assert.match(gated.sources["过时源"].chapterContent.content, /content/);
 });
 
+test("后续章节仍失败时保留已验证结构的书籍列表修复", async () => {
+  const host = "https://partial-repair.example";
+  const listAction = {
+    actionID: "bookWorld",
+    host,
+    responseFormatType: "html",
+    requestInfo: `${host}/list`,
+    list: "//*[@id='stale-list']/li",
+    bookName: ".//a",
+    detailUrl: ".//a/@href",
+  };
+  const source = {
+    sourceName: "部分修复保留",
+    sourceUrl: host,
+    miniAppVersion: "1.0.0",
+    sourceType: "text",
+    bookWorld: { 分类: listAction },
+    searchBook: { ...listAction, actionID: "searchBook" },
+    bookDetail: {
+      actionID: "bookDetail", host, responseFormatType: "html", requestInfo: "%@result", bookName: "//h1",
+    },
+    chapterList: {
+      actionID: "chapterList", host, responseFormatType: "html", requestInfo: "%@result",
+      list: "//*[@id='stale-toc']/a", title: ".", url: "//@href",
+    },
+    chapterContent: {
+      actionID: "chapterContent", host, responseFormatType: "html", requestInfo: "%@result",
+      content: "//article",
+    },
+  };
+  const download = async (url) => {
+    if (String(url).endsWith("/list")) return Buffer.from('<ul><li><a href="/book/1">测试书</a></li></ul>');
+    if (String(url).endsWith("/book/1")) return Buffer.from("<h1>测试书</h1>");
+    return Buffer.from("");
+  };
+  const gated = await applyVerifyAndAnalyzeFallback({ 部分修复保留: source }, {
+    download,
+    retainUnverified: true,
+    repairBooks: async (current) => {
+      const repaired = structuredClone(current);
+      repaired.bookWorld.分类.list = "//li";
+      repaired.searchBook.list = "//li";
+      return repaired;
+    },
+    repairChapter: async () => null,
+    analyze: async () => ({ ok: false, reason: "no stable page" }),
+  });
+
+  assert.ok(gated.sources["部分修复保留"]);
+  assert.equal(gated.sources["部分修复保留"].bookWorld.分类.list, "//li");
+  assert.equal(gated.unverifiedCount, 1);
+  assert.equal(gated.skipped.length, 0);
+});
+
 test("pipeline 不把已检测但修复失败的漫画降级成文本源", async () => {
   const textSource = novelDiscoveryToXiangse(
     await discoverNovel("https://novel.example/", { download: fixtureDownload }),
@@ -2877,6 +2936,49 @@ test("局部 JSON 列表识别重写声明式桥接字段", async () => {
   assert.equal(output.data[0].name, "第一本书");
   assert.equal(output.data[0].url, "https://json-books.example/book/1");
   assert.equal(output.data[0].cover, "https://json-books.example/cover/1.jpg");
+});
+
+test("JSON 列表修复保留源声明的动态详情地址并修复多个分类", async () => {
+  const host = "https://json-articles.example";
+  const detailRule = '@js:\nreturn "https://detail.example/item/" + String(result.id);';
+  const makeAction = (path) => ({
+    actionID: "bookWorld",
+    host,
+    responseFormatType: "json",
+    parserID: "JSONPath",
+    requestInfo: `${host}${path}`,
+    list: "$.missing",
+    bookName: "$.title",
+    detailUrl: detailRule,
+  });
+  const source = {
+    sourceName: "JSON 文章分类修复",
+    sourceUrl: host,
+    sourceType: "text",
+    bookWorld: {
+      分类甲: makeAction("/api/a"),
+      分类乙: makeAction("/api/b"),
+    },
+  };
+  const repaired = await repairBooksFromRequests(source, {
+    download: async (url) => Buffer.from(JSON.stringify({
+      response: { items: [{ id: url.endsWith("/api/a") ? 101 : 202, title: "文章标题" }] },
+    })),
+  });
+
+  assert.ok(repaired);
+  for (const [name, expectedUrl] of [["分类甲", 101], ["分类乙", 202]]) {
+    const action = repaired.bookWorld[name];
+    assert.equal(action.list, "$.response.items");
+    assert.equal(action.detailUrl, detailRule);
+    const output = executeBridgePlan(
+      JSON.stringify({ response: { items: [{ id: expectedUrl, title: "文章标题" }] } }),
+      `${host}/api/${name === "分类甲" ? "a" : "b"}`,
+      compileBookBridgePlan(action),
+      { limit: 2 },
+    );
+    assert.equal(output.data[0].url, `https://detail.example/item/${expectedUrl}`);
+  }
 });
 
 test("局部 HTML 列表失效时按详情链接聚类重建书籍元素", async () => {
@@ -4494,6 +4596,40 @@ test("verify budget 到期后保留未抽测源，已确认失败的源会跳过
   assert.equal(Object.keys(gated.sources).length, gated.unverifiedCount);
   assert.equal(Object.keys(gated.sources).length + gated.skipped.length, 6);
   assert.ok(gated.skipped.length >= 1 || gated.unverifiedCount === 6);
+});
+
+test("单源验链超时会取消回退下载并快速结算", async () => {
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel("https://novel.example/", { download: fixtureDownload }),
+    { sourceName: "单源超时" },
+  );
+  const firstWorld = Object.keys(source.bookWorld)[0];
+  source.bookWorld[firstWorld].requestInfo = "https://novel.example/slow-list";
+  delete source.searchBook;
+  let aborted = false;
+  const download = async (url, headers, options = {}) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(Buffer.from("<html><body>empty</body></html>")), 200);
+    options.signal?.addEventListener("abort", () => {
+      aborted = true;
+      clearTimeout(timer);
+      reject(options.signal.reason || new Error("aborted"));
+    }, { once: true });
+  });
+  const started = Date.now();
+  const gated = await applyVerifyAndAnalyzeFallback({ 单源超时: source }, {
+    download,
+    concurrency: 1,
+    timeoutMs: 200,
+    sourceTimeoutMs: 500,
+    sourceBudgetMs: 30,
+    analyzeFallback: true,
+    analyze: async () => ({ ok: false, reason: "should not run" }),
+  });
+  assert.ok(Date.now() - started < 180, `source took too long: ${Date.now() - started}ms`);
+  assert.equal(aborted, true);
+  assert.equal(gated.sources["单源超时"], undefined);
+  assert.equal(gated.skipped.length, 1);
+  assert.match(gated.skipped[0].reason, /source-timeout/);
 });
 
 test("识站失败时过滤原源", async () => {

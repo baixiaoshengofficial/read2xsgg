@@ -135,12 +135,43 @@ test("整源取消后不再重试其它分类、书籍或章节", async () => {
   const report = await runXbsPipeline(source, { fetchImpl, signal: controller.signal });
   assert.equal(report.ok, false);
   assert.match(report.error, /单源预算耗尽/);
-  assert.deepEqual(requested, ["/books", "/book/1", "/book/1", "/chapter/1"]);
+  // bookDetail and chapterList share the exact same request; the runtime's
+  // per-pipeline cache should fetch that page once and still stop at abort.
+  assert.deepEqual(requested, ["/books", "/book/1", "/chapter/1"]);
   requested.length = 0;
   const cancelled = await runXbsPipeline(source, { fetchImpl, signal: controller.signal });
   assert.equal(cancelled.ok, false);
   assert.match(cancelled.error, /单源预算耗尽/);
   assert.deepEqual(requested, []);
+});
+
+test("动作链校验不共享不同香色 JS 规则之间的 java.put/get 状态", async () => {
+  const host = "https://isolated-state.example";
+  const source = {
+    sourceName: "规则状态隔离",
+    sourceUrl: host,
+    sourceType: "text",
+    bookWorld: {
+      分类: {
+        actionID: "bookWorld",
+        host,
+        responseFormatType: "html",
+        requestInfo: `${host}/books`,
+        list: '@js:\nvar __xsState = {}; __xsState["book"] = {name: "状态书"}; return [__xsState["book"]];',
+        bookName: '@js:\nvar __xsState = {}; return __xsState["book"] && __xsState["book"].name;',
+        detailUrl: `${host}/book/1`,
+      },
+    },
+    bookDetail: { actionID: "bookDetail", host, responseFormatType: "html", requestInfo: "%@result" },
+    chapterList: { actionID: "chapterList", host, responseFormatType: "html", requestInfo: "%@result" },
+    chapterContent: { actionID: "chapterContent", host, responseFormatType: "html", requestInfo: "%@result" },
+  };
+  const report = await runXbsPipeline(source, {
+    fetchImpl: async (url) => new Response("<main>分类</main>", { status: 200 }),
+  });
+
+  assert.equal(report.ok, false);
+  assert.match(report.error, /bookWorld\.bookName 解析为空/);
 });
 
 test("香色动作链执行器验证分类、详情、章节和正文", async (context) => {

@@ -106,6 +106,8 @@ docker login
 IMAGE=knighttools/read2xsgg TAG=0.2.0 PLATFORM=linux/amd64 ./scripts/docker-push.sh
 ```
 
+构建机需要代理或镜像源时，可通过 `BASE_IMAGE`、`BUILD_NETWORK`、`BUILDER` 覆盖构建参数；脚本会把已设置的 `http_proxy` / `https_proxy` 传给 BuildKit。
+
 服务器部署时直接拉取：
 
 ```bash
@@ -119,9 +121,9 @@ docker compose up -d
 
 ### 0. WebUI 异步源管理（推荐大聚合源）
 
-大合集（几十上百个源）同步 `/source/` 会受抽测预算限制；WebUI 在后台做**完整抽测 + 识站回退**（默认不设时间上限），并实时显示进度与当前站点；完成后给出稳定订阅地址。
+大合集（几十上百个源）同步 `/source/` 会受抽测预算限制；WebUI 在后台做**完整抽测 + 识站回退**（默认不设任务总时间上限，但每源有独立验链预算），并实时显示进度与当前站点；完成后给出稳定订阅地址。
 
-上千源的超大组合包可以完整抽测，耗时可能很长；可用 `JOB_VERIFY_BUDGET_MS`（毫秒，`0` 表示不限）在需要时加墙钟上限。
+上千源的超大组合包可以完整抽测；每个源默认有 30 秒的完整验链预算，超出后取消该源的遗留请求并继续下一个源。可用 `JOB_VERIFY_SOURCE_BUDGET_MS` 调整单源预算，另可用 `JOB_VERIFY_BUDGET_MS` 设置整个任务的墙钟上限（两者为 `0` 时分别表示不限制）。
 
 1. 复制环境变量并填写管理口令：
 
@@ -148,6 +150,27 @@ docker compose up -d
 - `POST /api/jobs/:id/publish` — 用显式声明式阅读源 JSON 覆盖同一 `id` 的 `/library/{id}.xbs`（`{ "source": <legado>, "verify?" }`，或直接提交 Legado 对象）；会持久化 payload，后续 retry 不再回落到缺字段的远程源
 - `POST /api/jobs/:id/rebase` — 将制品内旧公开桥接 origin 替换为新 origin（`{ "oldOrigin"|"from", "newOrigin"|"to", "dryRun?" }`）；保留任务 id / 订阅路径 / source payload，只改属于旧 origin 的 URL；响应仅为摘要，不含制品正文
 - `DELETE /api/jobs/:id`
+
+AI 识站与 MCP 爬取可在 WebUI 的“AI 识站与 MCP 爬取”面板配置，也可经管理员 API 设置：
+
+- `GET /api/settings/ai` — 只返回 AI/MCP 配置状态，不回显密钥
+- `PUT /api/settings/ai` — 保存 `enabled`、`provider`（`api`、`local-http` 或 `cli`）、模型连接参数、`cliClient`、`mcpEndpoint`、`mcpToken` 和预算参数；密钥留空表示保留旧值，显式清除用 `clearApiKey` / `clearMcpToken`
+- `POST /api/settings/ai/test`、`POST /api/settings/mcp/test` — 分别测试模型 API 和 MCP 工具发现
+
+AI 可选三种接入：`api` 使用 OpenAI Chat Completions 兼容接口与 API Key；`local-http` 使用可从容器访问的本地 OpenAI 兼容 HTTP 服务，无需 API Key，在管理页填写 `localBaseUrl` 和 `localModel`；`cli` 通过宿主机桥接运行已登录的 Codex CLI。Compose 已解析 `host.docker.internal` 到宿主机网关；HTTP 服务仍需监听容器可访问的地址。三种模式互不转发已保存的云端 API Key。当前 CLI 白名单仅支持 `codex`，其他 CLI 需要增加适配器，而不是由网页输入任意命令。
+
+CLI 模式需要在运行转换器的宿主机上以已登录 Codex 的用户启动桥接进程，且桥接进程与 Docker 的 `./data` 指向相同目录：
+
+```sh
+codex login status
+npm run agent:bridge
+```
+
+桥接进程监听 `DATA_DIR/private-settings/agent.sock`（默认 `./data/private-settings/agent.sock`），仅允许目录所有者访问；容器使用已有的 `./data:/data` 卷连接 Socket，不挂载 Codex 登录文件。若在其他目录部署，启动桥接时设置与 Compose 卷一致的 `DATA_DIR`。若桥接由 root 启动，Socket 所有权自动匹配目录所有者。将桥接进程作为宿主机守护服务运行，并在管理页保存 `cli` 后点击“测试当前 AI 接入”。CLI 调用会限制输入/输出大小、并发和时长；客户端断开时会终止子进程。Codex 使用一次性会话、只读沙箱、独立临时工作目录和固定输出 schema；生成的规则仍要通过相同的安全校验和完整站点动作链实测。CLI 可能消耗账户额度；不可信网站内容即使脱敏也会发送给所选客户端，建议使用专用的低权限宿主机账户运行桥接进程。
+
+MCP 使用 Streamable HTTP。MCP 地址可接浏览器/页面读取服务，未配置 MCP 时 AI 仅使用转换器抓取并脱敏后的页面证据。应用内置版本化的通用 `site-to-xiangse` 技能，按文本、漫画、音频、影视分别识别；不生成站点专属代码或 `@js`，并且只有香色 2.56.1 的列表/分类→详情→章节→正文完整动作链通过后才会收录 AI 候选规则。AI 默认关闭；触发模型调用会把受限大小、已脱敏的上游网页证据发送到所配置的 AI 服务，可能产生服务商费用。任务页分别显示实测通过、AI 修复、未验证保留、跳过数；仅实测通过数计入转换成功率。
+
+API Key 与 MCP Token 保存在 `DATA_DIR/private-settings/ai.json`，目录/文件权限分别为 `0700` / `0600`，不会写入 `.env`、任务记录或 API 响应。AI 并发、单次预算、修正轮数和 MCP 只读工具调用数均可在 WebUI 调整；实际 MCP 服务器需自行提供可从容器访问的 Streamable HTTP 地址。
 
 离线/运维也可：
 
@@ -252,31 +275,47 @@ node ./bin/server.js
 
 ### 大型混合源验证
 
-在线转换管线现在是：**探活 → 按阅读规则转换 → 抽测列表/目录 → 失败则自动识站修复 → 仍失败则跳过（不把坏源写入 XBS）**。站点可达时，抽测/识站失败视为转换器问题：必须用识站通用解析修成可用香色源，否则丢弃。
+在线转换管线现在是：**探活 → 按阅读规则转换 → 识别类型 → 列表/分类 → 详情 → 章节 → 正文 → 写入 XBS**；任一动作失败都会继续通用识站修复并重走链路。失败本身不等于站点不可访问：只要源结构仍能生成合法 XBS，就保留为“未验证源”，供香色继续使用；只有探活确认不可访问，或最终无法生成合法 XBS，才跳过。
 
 ```mermaid
 flowchart LR
   legado[阅读源] --> probe[探活]
   probe -->|死站| skip1[跳过]
-  probe --> convert[规则转换]
-  convert --> verify[抽测列表和目录]
-  verify -->|通过| xbs[写入 XBS]
-  verify -->|失败| analyze[自动识站修复]
-  analyze -->|成功| xbs
-  analyze -->|失败| skip2[跳过坏源]
+  probe --> convert[通用规则转换]
+  convert --> kind[识别文本/图片/音频/影视能力]
+  kind --> list[列表/分类]
+  list --> detail[详情]
+  detail --> toc[章节]
+  toc --> content[正文内容]
+  content -->|完整链路通过| xbs[写入 XBS]
+  list -->|失败| analyze[通用识站修复]
+  detail -->|失败| analyze
+  toc -->|失败| analyze
+  content -->|失败| analyze
+  analyze -->|成功并重走链路| xbs
+  analyze -->|暂时无法复现但结构合法| unverified[保留未验证源]
+  unverified --> xbs
+  analyze -->|不可访问或结构不可转换| skip2[跳过]
   siteUrl[网站 URL] --> analyzeDirect["/url/ 直接识站"]
   analyzeDirect --> xbs
 ```
 
-Compose **默认同步路径**开启 origin 探活、抽测与识站修复；仅当抽测墙钟预算用尽时，未抽测的源才会暂时保留：
+Compose **默认同步路径**开启 origin 探活、完整抽测与通用识站修复。站点可达时，转换器仍会执行“列表/分类 → 详情 → 章节 → 正文”的动作链；原规则失败就继续通用修复。若本次请求被限流、超时或返回临时空结果，但转换结果结构合法，则保留并标记为未验证，避免把阅读中可用的源误删。部署默认不设置同步抽测墙钟或源数量上限：
+
+`PREFLIGHT_TIMEOUT_MS` 仅控制快速站点探活；完整列表、详情、章节与正文链路使用 `FETCH_TIMEOUT_MS`，不能用快速探活时限误判慢站。
 
 - `PREFLIGHT_SOURCES=true`
 - `VERIFY_CONVERTED_SOURCES=true`
 - `ANALYZE_FALLBACK=true`（同步 `/source` 与 WebUI 任务都会识站修复）
-- `VERIFY_BUDGET_MS=20000` / `VERIFY_MAX_SOURCES=50`（仅同步 `/source`；超限跳过抽测直接保留）
+- `RETAIN_UNVERIFIED_SOURCES=true`（结构合法但本次完整链路暂未复现时保留源；已确认不可访问或结构非法的源仍跳过）
+- `VERIFY_BUDGET_MS=0` / `VERIFY_MAX_SOURCES=0`（仅同步 `/source`；`0` 表示完整执行，不因抽测预算主动截断）
 - `JOB_VERIFY_BUDGET_MS=0`（WebUI 异步任务抽测墙钟预算；`0` 为完整抽测不限时）
-- `PREFLIGHT_CONCURRENCY=8`（探活与抽测共用并发；同源识站结果会复用）
+- `VERIFY_SOURCE_BUDGET_MS=30000` / `JOB_VERIFY_SOURCE_BUDGET_MS=30000`（单源从原规则验链到列表、详情、章节、正文修复的墙钟预算；超时取消当前验链，结构合法的源保留为未验证并继续任务，`0` 明确表示不限）
+- `JOB_VERIFY_WORKERS`（CPU 密集的规则解析/识站线程；显式值会限制在容器可用 CPU 并行数内、最高 16。网络探活并发独立由 `PREFLIGHT_CONCURRENCY` 控制）
+- `JOB_ISOLATION=true`（WebUI 转换任务放入 Worker Thread，避免大聚合转换阻塞 3000 端口的健康检查和 API；仅调试注入假转换器时关闭）
+- `PREFLIGHT_CONCURRENCY=8`（网络探活并发；完整验链由 `JOB_VERIFY_WORKERS` / `VERIFY_WORKERS` 按 CPU 拆分，同源识站结果仍会复用）
 - `PREFLIGHT_RETRIES=3`（单个站点探活的总尝试次数；超时、TLS 断开或限流后会跳过该站点并继续任务）
+- `PREFLIGHT_SOURCE_BUDGET_MS=30000`（单源探活总墙钟上限；限制多入口站点逐个超时造成的长尾）
 - `ADMIN_TOKEN`（写在 `.env`，WebUI / `/api/jobs` 必需）
 - `DATA_DIR=/data`
 - `CACHE_TTL_SECONDS=300`（同步转换结果的内存与磁盘缓存有效期）
@@ -303,7 +342,7 @@ npm run convert -- legado.json --verify --analyze-fallback -o sources.xbs --repo
 识站会对首页做多类型信号检测；**每种能发现可用列表/目录/正文结构的类型各出一条源**（命名如 `站点·小说` / `站点·漫画` / `站点·听书` / `站点·影视`）。导出前会做两道校验：
 
 1. **结构校验**：`sourceUrl` / `sourceType` / `miniAppVersion`、分类/搜索/详情/章节/正文必填字段、禁止单竖线 `|@js:`
-2. **动作链实测**：用与香色相同的选择器执行器跑通 分类列表 → 详情 → 章节 → 正文（漫画/音视频还会拉一条媒体 URL）
+2. **动作链实测**：按香色 2.56.1 的字段、`requestInfo`、列表项和正文请求语义跑通 分类列表 → 详情 → 章节 → 正文（漫画/音视频还会拉一条媒体 URL）。列表项标量字段及桥接模板字段统一使用香色可稳定执行的绝对后代 XPath（例如 `//@href`），避免仅在本地相对上下文模拟器中通过、导入香色后列表为空。
 
 任一关失败则丢弃该类型，并在 JSON 的 `skippedKinds` 中说明原因。登录墙、强 JS 渲染站仍无法保证。
 
@@ -335,9 +374,19 @@ Compose 支持通过环境变量调整：
 | `PREFLIGHT_TIMEOUT_MS` | `3000` | 单个上游站点预检/抽测超时时间 |
 | `PREFLIGHT_CONFIRM_TIMEOUT_MS` | `10000` | 快速预检失败后，使用实际入口再次确认不可达的超时时间 |
 | `PREFLIGHT_CONCURRENCY` | `8` | 上游站点并发预检/抽测数量；不建议在小内存容器中调高 |
-| `VERIFY_CONVERTED_SOURCES` | `true` | 转换后抽测分类列表与目录是否非空；失败进入识站修复，再失败则跳过 |
-| `ANALYZE_FALLBACK` | `true` | 抽测失败时用启发式识站生成可用香色源；仍失败则跳过坏源 |
+| `VERIFY_CONVERTED_SOURCES` | `true` | 转换后完整抽测分类/搜索 → 详情 → 目录 → 正文；失败进入通用识站修复，结构合法但本次未复现的源保留 |
+| `RETAIN_UNVERIFIED_SOURCES` | `true` | 完整动作链暂未复现时保留结构合法源；不可访问或结构非法的源仍跳过 |
+| `ANALYZE_FALLBACK` | `true` | 抽测失败时用通用识站生成可用香色源；失败后按 `RETAIN_UNVERIFIED_SOURCES` 决定保留或过滤 |
 | `ANALYZE_TIMEOUT_MS` | `8000` | 自动识站单次页面下载超时 |
+| `VERIFY_WORKERS` | CPU 并行数（最多 8） | 同步路径 CPU 密集验链/识站的 Worker Thread 数；网络探活仍由 `PREFLIGHT_CONCURRENCY` 控制 |
+| `VERIFY_SOURCE_BUDGET_MS` | `30000` | 同步路径单个源的完整验链/修复墙钟预算；超时取消当前验链，结构合法源保留为未验证，`0` 不限 |
+| `VERIFY_BUDGET_MS` | `0` | 同步抽测墙钟上限（毫秒）；`0` 不限时，正数是显式的性能取舍，可能保留未抽测尾部 |
+| `VERIFY_MAX_SOURCES` | `0` | 同步抽测源数量上限；`0` 不限，正数超过后跳过同步抽测 |
+| `JOB_CONCURRENCY` | `1` | WebUI 异步转换并发任务数；每个任务独立 Worker Thread |
+| `JOB_ISOLATION` | `true` | 是否把异步转换放到 Worker Thread，保护 HTTP 事件循环；生产环境保持开启 |
+| `JOB_VERIFY_BUDGET_MS` | `0` | WebUI 异步抽测墙钟上限；`0` 不限时，正数是显式的性能取舍 |
+| `JOB_VERIFY_SOURCE_BUDGET_MS` | `30000` | WebUI 单个源的完整验链/修复墙钟预算；超时取消该源并继续任务，`0` 不限 |
+| `JOB_VERIFY_WORKERS` | 默认按 CPU 并行数，最多 8 | WebUI 验链/识站线程；显式值最多 16 且不会超过容器可用 CPU，网络探活并发另由 `PREFLIGHT_CONCURRENCY` 控制 |
 | `MAX_COMIC_PAGES` | `50` | 单章 JSON 漫画接口最多聚合的分页数（含第一页） |
 | `MAX_COMIC_IMAGES` | `2000` | 单章最多返回的图片数 |
 | `COMIC_PAGE_CONCURRENCY` | `4` | 单章后续图片分页的并发请求数 |

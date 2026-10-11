@@ -1,4 +1,6 @@
 export { convertLegado, portableConvertedSource, skippedBuckets } from "./converter.js";
+export { SOURCE_KINDS, inferSourceKind } from "./contentKind.js";
+export { isLegadoSource, normalizeLegadoSources } from "./sourceInput.js";
 export {
   detectLegadoCharset,
   decodeTextBuffer,
@@ -87,4 +89,5 @@ export {
   verifyConvertedSources,
 } from "./verifySource.js";
 export { downloadAsFetch, filterValidXiangseSources, repairXiangseEntrypoints, ruleUsesForbiddenSinglePipeJs, validateXiangseSource } from "./xiangseValidate.js";
+export { normalizeXiangseItemRule, normalizeXiangseSource } from "./xiangseRules.js";
 export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadMedia, downloadSource, filterReachableSources, HttpError, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaPlaylist, pageMediaUrls, pageText, pageTocUrl, preferredResolvedAddress, serverConfig, sourceUrlCandidates, startServer } from "./server.js";
