@@ -133,11 +133,6 @@ body {
   width: 100%;
 }
 
-#app[hidden],
-#login[hidden] {
-  display: none !important;
-}
-
 .hint {
   margin: -0.25rem 0 0.9rem;
   color: var(--muted);
@@ -148,6 +143,69 @@ body {
 .stack {
   display: grid;
   gap: 0.75rem;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
+  gap: 0.75rem;
+}
+
+.settings-actions {
+  flex-wrap: wrap;
+}
+
+.ai-flow {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  gap: 0.75rem;
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0;
+}
+
+.ai-flow li {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+}
+
+.ai-flow span {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.ai-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.ai-toggle input {
+  flex: 0 0 auto;
+  width: 1.15rem;
+  height: 1.15rem;
+  min-height: 1.15rem;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.ai-advanced {
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  padding: 0.75rem;
+}
+
+.ai-advanced summary {
+  cursor: pointer;
+  min-height: var(--touch-min);
+  align-content: center;
+}
+
+.ai-advanced > .stack {
+  margin-top: 0.75rem;
 }
 
 .row {
@@ -306,6 +364,7 @@ select:focus-visible {
 
 .badge.done { color: var(--ok); border-color: rgba(124, 184, 138, 0.45); }
 .badge.running, .badge.queued { color: var(--warn); border-color: rgba(212, 161, 92, 0.45); }
+.badge.paused { color: var(--muted); border-color: var(--line); }
 .badge.failed { color: var(--bad); border-color: rgba(210, 122, 106, 0.45); }
 
 .progress {
@@ -503,4 +562,8 @@ code {
     transition: none !important;
     animation: none !important;
   }
+}
+
+[hidden] {
+  display: none !important;
 }

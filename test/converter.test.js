@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { bridgeTocUrl, compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, compileMediaResolutionFromRule, compileTextBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeXbs, encodeXbs, executeBridgePlan, filterValidXiangseSources, hasUnsupportedLegadoRuntime, htmlToPlainText, inferResponseType, validateXiangseSource } from "../src/index.js";
+import { bridgeTocUrl, compileBookBridgePlan, compileChapterBridgePlan, compileDomBookProjection, compileDomDetailProjection, compileDetailBridgePlan, compileMediaResolutionFromRule, compileTextBridgePlan, convertLegado, convertRequest, convertRule, decodeBridgePlan, decodeComicExtractionPlan, decodeSearchPlan, decodeXbs, encodeXbs, executeBridgePlan, filterValidXiangseSources, hasUnsupportedLegadoRuntime, htmlToPlainText, inferResponseType, inferSourceKind, normalizeXiangseItemRule, normalizeXiangseSource, validateXiangseSource } from "../src/index.js";
 import { runXbsPipeline } from "../src/xbsRuntime.js";
 import { verifyConvertedSource } from "../src/verifySource.js";
 
@@ -60,7 +60,7 @@ test("转换一个完整的 HTML 阅读源", () => {
   assert.equal(converted.searchBook.list, "//*[@id='sitembox']//dl");
   assert.equal(
     converted.searchBook.author,
-    "(.//*[contains(concat(' ', normalize-space(@class), ' '), ' book_other ')])[1]//span[1]",
+    "(//*[contains(concat(' ', normalize-space(@class), ' '), ' book_other ')])[1]//span[1]",
   );
   assert.equal(converted.chapterList.list, "(//*[contains(concat(' ', normalize-space(@class), ' '), ' box_con ')]//dd)[self::a[@href] or .//a[@href]]");
   assert.match(converted.chapterContent.content, /new RegExp\("广告\.\*"/);
@@ -68,6 +68,47 @@ test("转换一个完整的 HTML 阅读源", () => {
   assert.deepEqual(Object.keys(converted.bookWorld), ["玄幻", "都市"]);
   assert.doesNotMatch(JSON.stringify(converted), /(^|[^|])\|@js:/);
   assert.equal(warnings.length, 0);
+});
+
+test("文本源缺少正文规则时沿用完整章节响应作为正文", () => {
+  const source = {
+    bookSourceName: "章节响应文本源",
+    bookSourceUrl: "https://example.com",
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".book", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapters a", chapterName: "a@text", chapterUrl: "a@href" },
+    ruleContent: {},
+  };
+  const converted = convertLegado(source, { imageProxyBase: "http://bridge.example" }).sources["章节响应文本源"];
+  assert.equal(converted.chapterContent.content, "$.content");
+  assert.match(converted.chapterContent.requestInfo, /adapter\/text\?plan=/);
+  const plan = decodeBridgePlan(converted.chapterContent.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)?.[1]);
+  assert.equal(plan.kind, "text");
+  assert.equal(executeBridgePlan("第一段<br>第二段", "https://example.com/chapter/1", plan).content, "第一段第二段");
+});
+
+test("正文分页优先跟随香色 lastResponse.nextPageUrl", () => {
+  const source = {
+    ...structuredClone(sampleSource),
+    bookSourceName: "正文分页源",
+    ruleContent: {
+      content: "#content@html",
+      nextContentUrl: "a.next@href",
+    },
+  };
+  const converted = convertLegado(source).sources["正文分页源"];
+  const script = String(converted.chapterContent.requestInfo).replace(/^@js:\s*/i, "");
+  const request = new Function("config", "params", "result", script)(
+    { host: "https://example.com" },
+    {
+      queryInfo: { chapterUrl: "https://example.com/read/1" },
+      responseUrl: "https://example.com/read/1",
+      lastResponse: { nextPageUrl: "/read/2" },
+    },
+    "https://example.com/read/1",
+  );
+  assert.equal(request, "https://example.com/read/2");
 });
 
 test("相同规则更换站名和域名不会改变转换策略", () => {
@@ -111,6 +152,33 @@ test("转换 JSONPath 规则和 JSON 响应", () => {
   assert.equal(convertRule("title", { responseType: "json" }), "title");
   assert.equal(convertRule("content", { responseType: "json" }), "content");
   assert.equal(convertRule("a@href", { responseType: "json" }), "//a/@href");
+});
+
+test("只展开 jsLib 中声明的静态 URL 常量，不执行其余脚本", () => {
+  const source = {
+    bookSourceName: "jsLib 静态地址",
+    bookSourceUrl: "https://source.example",
+    jsLib: "const ho = 'https://library.example'; const token = 'private-token';",
+    searchUrl: "{{ho}}/search?q={{key}}",
+    ruleSearch: {
+      bookList: ".book",
+      name: "a@text",
+      bookUrl: "{{ho}}/book/{{$.id}}",
+    },
+    ruleToc: {
+      chapterList: ".chapter",
+      chapterName: "a@text",
+      chapterUrl: "a@href",
+    },
+    ruleContent: { content: ".content@text" },
+  };
+
+  const { sources, warnings } = convertLegado(source);
+  const converted = sources["jsLib 静态地址"];
+  assert.equal(converted.searchBook.requestInfo, "https://library.example/search?q=%@keyWord");
+  assert.match(converted.searchBook.detailUrl, /https:\/\/library\.example\/book\//);
+  assert.doesNotMatch(JSON.stringify(converted), /private-token|\{\{ho\}\}/);
+  assert.equal(warnings.filter((warning) => warning.field === "jsLib").length, 1);
 });
 
 test("JSON 字段拼接 URL 不会把字符串中的 book 子域误判为阅读变量", () => {
@@ -181,6 +249,26 @@ test("CSS、阅读链式选择器和分页选择器转换为 XPath", () => {
   assert.equal(convertRule("a.1@href"), "(.//a)[2]/@href");
   assert.equal(convertRule("a[1]@href"), "(.//a)[2]/@href");
   assert.equal(convertRule("tag.a.0:1:2@text"), "(.//a)[position() = 1 or position() = 2 or position() = 3]/text()");
+
+  const plan = compileBookBridgePlan({
+    host: "https://comic.example",
+    responseFormatType: "html",
+    list: convertRule(".rankList@li"),
+    bookName: convertRule("p.0@text"),
+    detailUrl: convertRule("a@href"),
+    author: convertRule("p.2@text"),
+    cover: convertRule("img.0@src"),
+  });
+  const output = executeBridgePlan(`
+    <ul class="rankList">
+      <li><a href="/comic/1"><img src="/cover/1.jpg"></a><p>第一本</p><p>第一话</p><p>作者甲</p></li>
+      <li><a href="/comic/2"><img src="/cover/2.jpg"></a><p>第二本</p><p>第二话</p><p>作者乙</p></li>
+    </ul>
+  `, "https://comic.example/search", plan, { limit: 10 });
+  assert.deepEqual(output.data.map((item) => [item.name, item.author, item.cover]), [
+    ["第一本", "作者甲", "https://comic.example/cover/1.jpg"],
+    ["第二本", "作者乙", "https://comic.example/cover/2.jpg"],
+  ]);
 });
 
 test("相对属性 text/href 与 CSS 目录规则不会被误判为 JSON", () => {
@@ -251,7 +339,7 @@ test("HTML 条目脚本的 attr 方法按属性提取而不是误判为 JSON 字
     bookName: "//span",
     detailUrl: "@js:\nvar href=result.attr('href'); var title=result.attr('title'); return title ? href : href;",
   });
-  assert.equal(plan.fields.url.selector, "./@href||.//*[@href]/@href");
+  assert.equal(plan.fields.url.selector, "//@href");
   const output = executeBridgePlan([
     '<main><a href="/book/1" title="第一本"><span>第一本</span></a></main>',
   ].join(""), "https://books.example/category", plan);
@@ -259,6 +347,31 @@ test("HTML 条目脚本的 attr 方法按属性提取而不是误判为 JSON 字
     name: "第一本",
     url: "https://books.example/book/1",
   }]);
+});
+
+test("HTML 条目脚本的子元素书名和链接统一降级为声明式字段", () => {
+  const plan = compileBookBridgePlan({
+    host: "https://books.example",
+    responseFormatType: "html",
+    list: "//*[contains(@class,'book')]",
+    bookName: [
+      "@js:",
+      "return ((function(){try{return String(result.select('h4.bookTitle a').first().text());}catch(e){return '';}})());",
+    ].join("\n"),
+    detailUrl: [
+      "@js:",
+      "return ((function(){try{return String(result.select('h4.bookTitle a').first().attr('href'));}catch(e){return '';}})());",
+    ].join("\n"),
+  });
+  assert.ok(plan.fields.name?.selector);
+  assert.equal(plan.fields.url.selector, "//@href");
+  const output = executeBridgePlan(
+    '<div class="book"><h4 class="bookTitle"><a href="/book/1">测试书</a></h4></div>',
+    "https://books.example/search",
+    plan,
+  );
+  assert.equal(output.data[0].name, "测试书");
+  assert.equal(output.data[0].url, "https://books.example/book/1");
 });
 
 test("HTML 条目脚本用属性和子元素文本拼接详情 URL", () => {
@@ -277,7 +390,7 @@ test("HTML 条目脚本用属性和子元素文本拼接详情 URL", () => {
   });
   assert.equal(plan.fields.url.urlTemplate, "https://audio.example/player/{{rid}}/?name={{nm}}&artist={{ar}}");
   assert.deepEqual(plan.fields.url.templateFields, {
-    rid: "./@data-rid",
+    rid: "//@data-rid",
     nm: "//*[contains(concat(' ', normalize-space(@class), ' '), ' result-title ')]",
     ar: "//*[contains(concat(' ', normalize-space(@class), ' '), ' result-artist ')]",
   });
@@ -335,7 +448,7 @@ test("HTML DOM 脚本组装的 JSON 目录还原为声明式章节列表", () =>
   const plan = compileChapterBridgePlan(action);
   assert.equal(plan.responseType, "html");
   assert.equal(plan.fields.title.selector, ".");
-  assert.equal(plan.fields.url.selector, "./@href||.//*[@href]/@href");
+  assert.equal(plan.fields.url.selector, "//@href");
   const output = executeBridgePlan([
     '<ol class="chapters"><li><a href="/chapter/1">第一章</a></li>',
     '<li><a href="/chapter/2">第二章</a></li></ol>',
@@ -345,6 +458,163 @@ test("HTML DOM 脚本组装的 JSON 目录还原为声明式章节列表", () =>
     "https://books.example/chapter/1",
     "https://books.example/chapter/2",
   ]);
+});
+
+test("嵌套 JSON 循环目录提取根字段并生成章节 URL", () => {
+  const action = {
+    host: "https://manhua.example",
+    responseFormatType: "json",
+    list: [
+      "@js:",
+      "var d = (typeof result === 'string') ? JSON.parse(result) : result;",
+      "var ci = d.data.comicInfo; var cid = ci.id;",
+      "var vols = ci.chapterList || []; var arr = [];",
+      "for (var i=0;i<vols.length;i++){ var chs = vols[i].data || [];",
+      "for (var j=0;j<chs.length;j++){ var ch = chs[j];",
+      "var u = 'https://api.example/chapter?comic_id=' + cid + '&chapter_id=' + ch.chapter_id;",
+      "arr.push({name: ch.chapter_title, url: u}); }}",
+      "return arr.map(function(item){ return JSON.stringify(item); });",
+    ].join("\n"),
+    title: "name",
+    url: "url",
+  };
+  const plan = compileChapterBridgePlan(action);
+  assert.equal(plan.responseType, "json");
+  assert.equal(plan.list, "data/comicInfo/chapterList/data");
+  assert.equal(plan.fields.title.selector, "chapter_title");
+  assert.equal(plan.fields.url.rootTemplateFields.cid, "data/comicInfo/id");
+  const output = executeBridgePlan(JSON.stringify({
+    data: { comicInfo: {
+      id: "77",
+      chapterList: [{ data: [
+        { chapter_title: "第一章", chapter_id: "9" },
+        { chapter_title: "第二章", chapter_id: "10" },
+      ] }],
+    } },
+  }), "https://api.example/comic/77", plan, { limit: 10 });
+  assert.deepEqual(output.data.map((chapter) => chapter.url), [
+    "https://api.example/chapter?comic_id=77&chapter_id=9",
+    "https://api.example/chapter?comic_id=77&chapter_id=10",
+  ]);
+});
+
+test("JSON 播放线路按线路、集数和裸链通用展开", () => {
+  const plan = compileChapterBridgePlan({
+    host: "https://vod.example",
+    responseFormatType: "json",
+    list: [
+      "@js:",
+      "var d = (typeof result === 'string') ? JSON.parse(result) : result;",
+      "if (String(params.responseUrl || '').indexOf('/art/') !== -1) return [{name:'正文浏览',url:params.responseUrl}];",
+      "var vod = (d && d.list) ? d.list[0] : {}; var playFrom = (vod.vod_play_from || '').split('$$$');",
+      "var playUrl = (vod.vod_play_url || '').split('$$$'); var list = [];",
+      "for (var i=0;i<playUrl.length;i++){ var episodes = playUrl[i].split('#');",
+      "for (var j=0;j<episodes.length;j++){ var parts = episodes[j].split('$');",
+      "list.push({name: (playFrom[i] || '线路' + (i+1)) + ' - ' + (parts[0] || ('第' + (j+1) + '集')), url: parts[1] || parts[0]}); }}",
+      "return list;",
+    ].join("\n"),
+    title: "name",
+    url: "url",
+  });
+  assert.match(plan.list, /^@split-json-chapters:/);
+  assert.equal(plan.responseType, "json");
+  assert.deepEqual(
+    executeBridgePlan(JSON.stringify({
+      list: [{
+        vod_play_from: "线路A",
+        vod_play_url: "第一集$https://cdn.example/1#第二集$https://cdn.example/2",
+      }],
+    }), "https://vod.example/detail/1", plan).data,
+    [
+      { title: "线路A - 第一集", url: "https://cdn.example/1" },
+      { title: "线路A - 第二集", url: "https://cdn.example/2" },
+    ],
+  );
+  assert.deepEqual(
+    executeBridgePlan("<html>正文页</html>", "https://vod.example/art/1", plan).data,
+    [{ title: "正文浏览", url: "https://vod.example/art/1" }],
+  );
+});
+
+test("SSR hydration 数组引用目录可通用还原为章节", () => {
+  const plan = compileChapterBridgePlan({
+    host: "https://audio.example",
+    responseFormatType: "json",
+    list: [
+      "@js:",
+      "return ((function(){var s=String(result);var m=s.match(/__NUXT_DATA__[^>]*>([\\s\\S]*?)<\\/script>/);",
+      "if(!m)return [];var arr=[];try{arr=JSON.parse(m[1])}catch(e){return [];}var ci=-1;",
+      "for(var i=0;i<arr.length;i++){var o=arr[i];if(o&&typeof o==='object'&&!(o instanceof Array)&&o.chapters!==undefined){ci=i;break;}}",
+      "if(ci<0)return [];var crefs=arr[ci].chapters;var cr=(typeof crefs==='number')?arr[crefs]:crefs;",
+      "if(!cr||!cr.length)return [];var out=[];var bm=String((params.responseUrl || config.host || '')).match(/albums\\/(\\d+)/);",
+      "var bid=bm?bm[1]:'';for(var j=0;j<cr.length;j++){var co=arr[cr[j]];",
+      "if(co&&typeof co==='object'){out.push({name:String(arr[co.title]),url:'https://audio.example/audios/'+bid+'/'+String(arr[co.index])});}}",
+      "return out;})());",
+    ].join(""),
+    title: "name",
+    url: "url",
+  });
+  assert.match(plan.list, /^@hydration-chapters:/);
+  assert.equal(plan.responseType, "html");
+  const body = '<script id="__NUXT_DATA__" type="application/json">'
+    + '[null,{"chapters":2},[3,4],{"title":5,"index":9},{"title":6,"index":12},'
+    + '"第一集","第二集",null,null,1,null,101,102]</script>';
+  assert.deepEqual(
+    executeBridgePlan(body, "https://audio.example/albums/99", plan).data,
+    [
+      { title: "第一集", url: "https://audio.example/audios/99/1" },
+      { title: "第二集", url: "https://audio.example/audios/99/102" },
+    ],
+  );
+});
+
+test("SSR hydration 数组引用目录可通用还原为书籍列表", () => {
+  const rule = [
+    "@js:",
+    "return (function(){var s=String(result);var m=s.match(/__NUXT_DATA__[^>]*>([\\s\\S]*?)<\\/script>/);",
+    "if(!m)return [];var arr=JSON.parse(m[1]);var list=null;",
+    "for(var i=0;i<arr.length;i++){var o=arr[i];if(o&&typeof o==='object'&&!(o instanceof Array)&&o.searchResults!==undefined){",
+    "var sr=o.searchResults;var so=(typeof sr==='number')?arr[sr]:sr;if(so){var lk=so.list;list=(typeof lk==='number')?arr[lk]:lk;}break;}}",
+    "if(!list||!list.length)return [];var out=[];for(var j=0;j<list.length;j++){var ref=list[j];",
+    "var co=(typeof ref==='number')?arr[ref]:ref;if(co&&typeof co==='object'){var id=arr[co.id];",
+    "var t=arr[co.title];var c=arr[co.cover];out.push({name:String(t),cover:String(c),url:'https://audio.example/albums/'+id});}}",
+    "return out;})()",
+  ].join("");
+  const plan = compileBookBridgePlan({
+    host: "https://audio.example",
+    responseFormatType: "html",
+    list: rule,
+    bookName: "name",
+    detailUrl: "url",
+    cover: "cover",
+  });
+  assert.match(plan.list, /^@hydration-books:/);
+  const body = '<script id="__NUXT_DATA__" type="application/json">'
+    + JSON.stringify([
+      null, { searchResults: 2 }, { list: 3 }, [4, 5],
+      { id: 6, title: 7, cover: 8 }, { id: 9, title: 10, cover: 11 },
+      101, "甲", "/cover-a.jpg", 102, "乙", "/cover-b.jpg",
+    ])
+    + "</script>";
+  assert.deepEqual(
+    executeBridgePlan(body, "https://audio.example/search", plan).data.map((row) => ({
+      name: row.name,
+      url: row.url,
+      cover: row.cover,
+    })),
+    [
+      {
+        name: "甲",
+        url: "https://audio.example/albums/101",
+        cover: "https://audio.example/cover-a.jpg",
+      },
+      {
+        name: "乙",
+        url: "https://audio.example/albums/102",
+        cover: "https://audio.example/cover-b.jpg",
+      },
+    ],
+  );
 });
 
 test("GET/POST 请求模板转换", () => {
@@ -365,6 +635,25 @@ test("GET/POST 请求模板转换", () => {
   assert.match(jsonPost.requestInfo, /params\.pageIndex/);
   assert.match(jsonPost.requestInfo, /POST:true/);
   assert.match(jsonPost.requestInfo, /"Content-Type":\s*"application\/json"/);
+
+  const objectBody = convertRequest("/api/object,{}", { warn: () => {} });
+  // Exercise the same object-valued request option shape produced by source
+  // collections before it is accidentally coerced to `[object Object]`.
+  const objectRequest = convertRequest('/api/object,{"method":"POST","body":{"page":"{{page}}","query":"{{key}}","nested":{"enabled":true}}}');
+  const objectValue = new Function("config", "params", "result", objectRequest.requestInfo.replace(/^@js:\s*/, ""))(
+    {},
+    { keyWord: "测试", pageIndex: 3 },
+    "",
+  );
+  assert.equal(objectBody.requestInfo, "/api/object");
+  assert.deepEqual(objectValue, {
+    url: "/api/object",
+    POST: true,
+    httpParams: { page: 3, query: "测试", nested: { enabled: true } },
+    httpHeaders: { "Content-Type": "application/json" },
+  });
+  const brokenObjectBody = convertRequest('/api/object,{"method":"POST","body":"[object Object]"}');
+  assert.doesNotMatch(brokenObjectBody.requestInfo, /JSON\.parse\("\[object Object\]"\)/);
 
   const branch = convertRequest("/tuijian<,/page/{{page}}>").requestInfo;
   const branchRequest = new Function("config", "params", branch.replace(/^@js:\s*/, ""));
@@ -642,6 +931,67 @@ test("阅读请求 JavaScript 的裸 page/key 与末尾表达式会编译为香�
   assert.equal(hasUnsupportedLegadoRuntime(sideEffect), false);
 });
 
+test("java.put 包装的静态模板 URL 可转为关键词分页请求", () => {
+  const request = convertRequest('{{java.put("su",`https://api.example/search?page=${page}&keyword=${key}`)}}').requestInfo;
+  assert.equal(hasUnsupportedLegadoRuntime(request), false);
+  const evaluated = new Function("config", "params", "result", request.replace(/^@js:\s*/, ""))(
+    { host: "https://source.example" },
+    { keyWord: "测试", pageIndex: 3 },
+    "",
+  );
+  assert.equal(evaluated.url, "https://api.example/search?page=3&keyword=测试");
+  assert.equal(evaluated.POST, false);
+});
+
+test("混合 Android 前置请求可安全恢复依赖 host/key/page 的 URL", () => {
+  const warnings = [];
+  const request = convertRequest(`@js:
+var u = source.bookSourceUrl;
+var ticket = java.ajax(u + "/guard");
+var q = page == 1 ? u + "/search?q=" + encodeURIComponent(key) : u + "/search/" + encodeURIComponent(key) + "_" + page + ".html";
+q + ',{"headers":{"Cookie":"ticket=' + ticket + '"},"webView":false}'`, {
+    warn: (message) => warnings.push(message),
+  }).requestInfo;
+  assert.equal(hasUnsupportedLegadoRuntime(request), false);
+  assert.doesNotMatch(request, /source\.|java\.|ticket/);
+  assert.equal(new Function("config", "params", "result", request.replace(/^@js:\s*/, ""))(
+    { host: "https://example.com" },
+    { keyWord: "测试", pageIndex: 2 },
+    "",
+  ), "https://example.com/search/%E6%B5%8B%E8%AF%95_2.html");
+  assert.ok(warnings.some((message) => /安全提取可移植 URL/.test(message)));
+});
+
+test("混合请求含 POST/body 时不丢失请求语义", () => {
+  const request = convertRequest(`@js:
+var u = source.bookSourceUrl;
+var body = "q=" + key;
+u + "/search,{\\"method\\":\\"POST\\",\\"body\\":\\"" + body + "\\"}"`).requestInfo;
+  assert.match(request, /java|source\.|body|POST/i);
+});
+
+test("POST 跳转脚本只保留可移植 URL、body 并移除 cookie 副作用", () => {
+  const warnings = [];
+  const request = convertRequest(`@js:
+java.webView(null, source.bookSourceUrl, null)
+u = source.bookSourceUrl + "/search/"
+bd = \`searchkey=\${encodeURIComponent(key, 'utf-8')}&t=1\`
+hd = {"Referer": source.bookSourceUrl, "Cookie": cookie.getCookie(source.bookSourceUrl)}
+lo = String(java.post(u, bd, hd).headers("Location"))
+url = source.bookSourceUrl + lo`, { warn: (message) => warnings.push(message) }).requestInfo;
+  assert.equal(hasUnsupportedLegadoRuntime(request), false);
+  const evaluated = new Function("config", "params", "result", request.replace(/^@js:\s*/, ""))(
+    { host: "https://example.com" },
+    { keyWord: "测试", pageIndex: 1 },
+    "",
+  );
+  assert.equal(evaluated.url, "https://example.com/search/");
+  assert.equal(evaluated.POST, true);
+  assert.equal(evaluated.httpParams, "searchkey=%E6%B5%8B%E8%AF%95&t=1");
+  assert.doesNotMatch(request, /cookie\.|java\.|source\./);
+  assert.ok(warnings.some((message) => /安全提取可移植 URL、body/.test(message)));
+});
+
 test("源变量默认分支、私有辅助库和末尾注释不会阻断静态请求", () => {
   const mirror = convertRequest(`@js:
 var options = {};
@@ -804,6 +1154,15 @@ test("bookSourceType 映射为香色 sourceType，weight 不为 0", () => {
   }
 });
 
+test("已转换的香色 sourceType 用于后续媒体分类验收", () => {
+  for (const sourceType of ["text", "comic", "audio", "video"]) {
+    const result = inferSourceKind({ sourceType });
+    assert.equal(result.kind, sourceType);
+    assert.equal(result.explicit, true);
+  }
+  assert.equal(inferSourceKind({ sourceType: "video", bookSourceType: 2 }).kind, "comic");
+});
+
 test("旧类型号可按分组和正文能力自动识别图片源", () => {
   const source = {
     ...structuredClone(sampleSource),
@@ -818,6 +1177,128 @@ test("旧类型号可按分组和正文能力自动识别图片源", () => {
   assert.match(converted.chapterContent.requestInfo, /\/adapter\/images/);
   assert.ok(warnings.some((warning) => warning.message.includes("自动识别为 comic")));
   assert.ok(!warnings.some((warning) => warning.message.includes("文件源类型")));
+});
+
+test("文本源的 imageStyle 兼容占位值不会误判为漫画", () => {
+  const source = {
+    ...structuredClone(sampleSource),
+    bookSourceName: "文本兼容样式占位",
+    bookSourceType: 0,
+    ruleContent: { content: "$.chapter.htmlContent", imageStyle: "0" },
+  };
+  const { sources } = convertLegado(source);
+  assert.equal(sources["文本兼容样式占位"].sourceType, "text");
+});
+
+test("小说正文的 imageStyle 与 HTML 插图标记不构成漫画分类证据", () => {
+  const source = {
+    ...structuredClone(sampleSource),
+    bookSourceName: "小说正文带插图",
+    bookSourceType: 0,
+    ruleContent: {
+      content: "id.content@html",
+      imageStyle: "FULL",
+    },
+  };
+  const { sources } = convertLegado(source);
+  assert.equal(sources["小说正文带插图"].sourceType, "text");
+});
+
+test("空的漫画兼容字段不会误判下载文本源", () => {
+  const source = {
+    ...structuredClone(sampleSource),
+    bookSourceName: "空图片能力文本",
+    bookSourceType: 3,
+    bookSourceGroup: "下载书源",
+    ruleContent: {
+      content: "",
+      imageDecode: "",
+      imageStyle: "",
+      sourceRegex: "",
+    },
+  };
+  const { sources } = convertLegado(source);
+  assert.equal(sources["空图片能力文本"].sourceType, "text");
+});
+
+test("旧类型号按正文能力区分音频、影视和图片，不依赖站点名称", () => {
+  const audio = structuredClone(sampleSource);
+  audio.bookSourceName = "旧媒体源 A";
+  audio.bookSourceType = 0;
+  audio.ruleContent = { content: "$.stream.url", sourceRegex: "\\.(?:mp3|m4a)(?:\\?|$)" };
+  audio.ruleToc = { chapterList: "$.tracks[*]", chapterName: "$.name", chapterUrl: "$.stream.url" };
+
+  const video = structuredClone(sampleSource);
+  video.bookSourceName = "旧媒体源 B";
+  video.bookSourceType = 0;
+  video.ruleContent = { content: "$.play.m3u8" };
+  video.ruleToc = { chapterList: "$.episodes[*]", chapterName: "$.title", chapterUrl: "$.play.m3u8" };
+
+  const comic = structuredClone(sampleSource);
+  comic.bookSourceName = "旧媒体源 C";
+  comic.bookSourceType = 0;
+  comic.ruleContent = { content: ".reader img@src" };
+
+  const { sources } = convertLegado([audio, video, comic], { imageProxyBase: "https://convert.example" });
+  assert.equal(sources["旧媒体源 A"].sourceType, "audio");
+  assert.equal(sources["旧媒体源 B"].sourceType, "video");
+  assert.equal(sources["旧媒体源 C"].sourceType, "comic");
+});
+
+test("旧文本类型的媒体字段文本回退规则不会误分类成音频", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "媒体文本混合正文";
+  source.bookSourceType = 0;
+  source.ruleContent = {
+    content: "@js:var item=JSON.parse(result);var media=item.audioUrl||item.playUrl||item.m4aUrl;if(media&&/\\.(?:mp3|m4a)(?:[?#]|$)/i.test(media))return media;return item.chapterBody||item.content||item.text||item.body;",
+  };
+
+  const inference = inferSourceKind(source);
+  const converted = convertLegado(source).sources["媒体文本混合正文"];
+  assert.equal(inference.kind, "text");
+  assert.ok(inference.evidence.includes("正文规则同时提供媒体与文本回退，按阅读默认文本类型处理"));
+  assert.equal(converted.sourceType, "text");
+});
+
+test("文本段落流中的插图块不会把文本源误判为漫画", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "段落插图文本源";
+  source.bookSourceType = 0;
+  source.ruleContent = {
+    content: [
+      "@js:",
+      "let raw = JSON.parse(result);",
+      "let paragraphs = raw.Content.split(\"\\\\r\\\\n\");",
+      "for (let block of raw.Blocks) {",
+      "  if (block.Type == \"image\") result += \"<img src=\\\"\" + block.Url + \"\\\">\";",
+      "}",
+      "paragraphs.join(\"\\\\n\");",
+    ].join("\n"),
+    imageStyle: "FULL",
+  };
+  const { sources } = convertLegado(source);
+  assert.equal(sources["段落插图文本源"].sourceType, "text");
+});
+
+test("聚合源中单个转换异常不会中断其余源", () => {
+  const broken = structuredClone(sampleSource);
+  broken.bookSourceName = "故障源";
+  broken.ruleContent = { content: { toString() { throw new Error("规则对象损坏"); } } };
+  const good = structuredClone(sampleSource);
+  good.bookSourceName = "正常源";
+  const { sources, skipped, warnings } = convertLegado([broken, good]);
+  assert.ok(sources["正常源"]);
+  assert.equal(sources["故障源"], undefined);
+  assert.equal(skipped[0].source, "故障源");
+  assert.match(skipped[0].reason, /convert-failed/);
+  assert.ok(warnings.some((warning) => warning.source === "故障源" && warning.field === "conversion"));
+});
+
+test("转换器和在线预检共享嵌套源集合规范化", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "嵌套集合源";
+  const { sources } = convertLegado({ data: { sources: [source] } });
+  assert.ok(sources["嵌套集合源"]);
 });
 
 test("默认不抬高香色最低版本，输入显式版本则保留", () => {
@@ -1404,7 +1885,7 @@ test("目录倒序切片和缺省锚点 URL 转换为可分页章节", () => {
   const plan = decodeBridgePlan(token);
   assert.equal(plan.reverse, true);
   assert.doesNotMatch(plan.list, /position\(\).*last\(\).*position\(\)/);
-  assert.equal(plan.fields.url.selector, "./@href");
+  assert.equal(plan.fields.url.selector, "//@href");
   assert.match(converted.chapterContent.requestInfo, /\/adapter\/images\?/);
   assert.equal(validateXiangseSource(converted).ok, true);
 });
@@ -1730,6 +2211,32 @@ test("通用提取 jsLib 声明的 AES 图片解密参数", () => {
   );
 });
 
+test("正文脚本内声明的 CryptoJS 漫画解密规则进入通用图片桥接计划", () => {
+  const source = {
+    bookSourceName: "正文脚本 AES 漫画",
+    bookSourceUrl: "https://script-content-comic.example/",
+    bookSourceType: 2,
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: ".item", name: "a@text", bookUrl: "a@href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: ".chapter", chapterName: "text", chapterUrl: "href" },
+    ruleContent: {
+      content: `<js>
+        var encrypted = CryptoJS.enc.Base64.parse(result);
+        var iv = CryptoJS.lib.WordArray.create(encrypted.words.slice(0, 4));
+        var body = CryptoJS.lib.WordArray.create(encrypted.words.slice(4));
+        var key = CryptoJS.enc.Utf8.parse("0123456789abcdef");
+        CryptoJS.AES.decrypt({ciphertext: body}, key, {iv: iv});
+      </js>`,
+    },
+  };
+  const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example.com" });
+  const converted = sources["正文脚本 AES 漫画"];
+  const plan = decodeComicExtractionPlan(converted.chapterContent.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)[1]);
+  assert.equal(plan.decoder, "aes-cbc-prefix-iv-MDEyMzQ1Njc4OWFiY2RlZg");
+  assert.match(converted.chapterContent.content, /\/image\/aes-cbc-prefix-iv-MDEyMzQ1Njc4OWFiY2RlZg\?url=/);
+});
+
 test("参数完整的 ID 分块图片规则转换为参数化图片代理", () => {
   const source = {
     bookSourceName: "ID 分块漫画",
@@ -1940,18 +2447,62 @@ test("宽松 JSON 分类支持单引号、裸键、尾逗号和控制字符", ()
   assert.equal(world["玄幻"].requestInfo, "/fantasy?page=%@pageIndex");
 });
 
-test("动态发现配置无法编译时不会把发现选择器错误套到站点首页", () => {
+test("动态发现配置无法编译时用完整规则生成首页候选，但空列表不能通过验链", async () => {
   const source = structuredClone(sampleSource);
   source.bookSourceName = "动态分类拒绝首页兜底";
   source.exploreUrl = "@js:return java.ajax('/categories');";
   source.ruleSearch.checkKeyWord = "";
   const { sources, warnings } = convertLegado(source, { omitNonPortable: true });
   const converted = sources["动态分类拒绝首页兜底"];
-  // 无可用分类时保留搜索链路，不再用发现选择器硬套站点首页。
+  assert.ok(converted);
+  assert.deepEqual(Object.keys(converted.bookWorld || {}), ["站点首页"]);
+  assert.ok(converted.searchBook?.list);
+  assert.match(converted.bookWorld["站点首页"].requestInfo, /^https:\/\/example\.com\/?$/);
+  assert.ok(warnings.some((warning) => /发现页依赖阅读 Android JavaScript|缺少可移植发现分类/.test(warning.message)));
+  assert.ok(warnings.some((warning) => warning.message.includes("必须通过完整列表链验收")));
+
+  const verification = await verifyConvertedSource(converted, {
+    download: async () => Buffer.from("<html><body><nav><a href='/'>首页</a></nav></body></html>"),
+    timeoutMs: 1_000,
+    requireBookWorld: true,
+  });
+  assert.equal(verification.ok, false, "首页没有真实书籍列表时不能作为可用分类保留");
+});
+
+test("JSON 发现规则不会被错误套用到 HTML 站点首页", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "JSON 发现规则不套首页";
+  source.exploreUrl = "@js:return java.ajax('/categories');";
+  source.ruleSearch.checkKeyWord = "";
+  source.ruleExplore = {
+    bookList: "$.data.books[*]",
+    name: "$.name",
+    bookUrl: "$.url",
+  };
+  const { sources } = convertLegado(source, { omitNonPortable: true });
+  const converted = sources[source.bookSourceName];
   assert.ok(converted);
   assert.deepEqual(Object.keys(converted.bookWorld || {}), []);
   assert.ok(converted.searchBook?.list);
-  assert.ok(warnings.some((warning) => /发现页依赖阅读 Android JavaScript|缺少可移植发现分类/.test(warning.message)));
+});
+
+test("AI 识站可选保留限长的原始发现线索，默认转换结果不携带内部提示", () => {
+  const source = structuredClone(sampleSource);
+  source.bookSourceName = "AI 发现线索边界";
+  source.exploreUrl = "@js: var api='https://api.example.test/v1/catalog'; JSON.stringify([]);";
+  source.ruleExplore = {
+    bookList: "$.data.items[*]",
+    name: "$.title",
+    bookUrl: "$.url",
+  };
+
+  const regular = convertLegado(source).sources[source.bookSourceName];
+  assert.equal(regular.__read2xsggAiHints, undefined);
+
+  const withHints = convertLegado(source, { includeAiRecognitionHints: true }).sources[source.bookSourceName];
+  assert.equal(withHints.__read2xsggAiHints.exploreUrl, source.exploreUrl);
+  assert.equal(withHints.__read2xsggAiHints.ruleExplore.bookList, "$.data.items[*]");
+  assert.deepEqual(withHints.__read2xsggAiHints.declaredUrls, ["https://api.example.test/v1/catalog"]);
 });
 
 test("从 @js 模板字符串中静态提取 title::url 发现分类", () => {
@@ -2073,6 +2624,8 @@ test("缺少发现页时使用搜索规则生成可选择的分类入口", () =>
   assert.ok(entry);
   assert.match(entry.requestInfo, /%E6%B5%8B%E8%AF%95%E4%B9%A6%E5%90%8D/);
   assert.equal(sources["仅搜索源"].searchBook._verifyKeyWord, "测试书名");
+  const bridged = convertLegado(source, { imageProxyBase: "http://127.0.0.1:3000" }).sources["仅搜索源"];
+  assert.equal(bridged.searchBook._verifyKeyWord, "测试书名");
   assert.equal(entry.list, "//*[contains(concat(' ', normalize-space(@class), ' '), ' result ')]");
   assert.ok(warnings.some((warning) => warning.message.includes("生成分类入口")));
 });
@@ -2229,6 +2782,31 @@ test("列表项字段保持香色支持的双斜线 XPath", () => {
   assert.equal(converted.chapterList.title, "//a");
   assert.equal(converted.chapterList.url, "//a/@href");
   assert.equal(converted.chapterList.list, "(//li)[self::a[@href] or .//a[@href]]");
+});
+
+test("香色列表项规则统一移除易失效的相对上下文并修复零权重", () => {
+  assert.equal(
+    normalizeXiangseItemRule(".//a/@href||./@href||//@href||@js:\nreturn result;"),
+    "//a/@href||//@href||@js:\nreturn result;",
+  );
+  const normalized = normalizeXiangseSource({
+    weight: 0,
+    bookWorld: {
+      分类: {
+        bookName: ".//a",
+        detailUrl: "./@href",
+      },
+    },
+    chapterList: {
+      title: "normalize-space(.//a)",
+      url: "./@href",
+    },
+  });
+  assert.equal(normalized.weight, "100");
+  assert.equal(normalized.bookWorld.分类.bookName, "//a");
+  assert.equal(normalized.bookWorld.分类.detailUrl, "//@href");
+  assert.equal(normalized.chapterList.title, "normalize-space(//a)");
+  assert.equal(normalized.chapterList.url, "//@href");
 });
 
 test("列表项的阅读专用后处理回退为基础选择器", () => {
@@ -2672,6 +3250,43 @@ test("状态缓存单曲源转换为搜索项直链与单章节动作", () => {
   assert.match(converted.chapterContent.requestInfo, /adapter\/direct-media/);
 });
 
+test("隐藏媒体目录不覆盖 API 的绝对详情 URL 模板", () => {
+  const source = {
+    bookSourceName: "API 静态音频",
+    bookSourceUrl: "https://audio.example",
+    bookSourceType: 1,
+    searchUrl: "/api/search?q={{key}}",
+    ruleSearch: {
+      bookList: "$.result.songs",
+      name: "name",
+      bookUrl: "https://audio.example/song?id={{$.id}}",
+      author: "artists/name",
+    },
+    ruleToc: {
+      chapterList: "id.song-list-pre-cache@class.f-hide@tag.a||class.tit",
+      chapterName: "text",
+      chapterUrl: "href",
+    },
+    ruleContent: {
+      content: "@js:'https://cdn.example/track?id='+baseUrl.match(/id=(\\d+)/)[1]+'.mp3'",
+    },
+  };
+  const converted = convertLegado(source, { imageProxyBase: "https://convert.example" }).sources[source.bookSourceName];
+  const encoded = String(converted.searchBook.requestInfo).match(/plan=([^&]+)/)?.[1];
+  const plan = decodeBridgePlan(encoded);
+  assert.equal(plan.fields.url.urlTemplate, "https://audio.example/song?id={{id}}");
+  const output = executeBridgePlan(JSON.stringify({ result: {
+    songs: [{ id: 42, name: "歌曲", artists: [{ name: "歌手" }] }],
+  } }), "https://audio.example/api/search", plan, { limit: 1 });
+  assert.deepEqual(output.data[0], {
+    name: "歌曲",
+    url: "https://audio.example/song?id=42",
+    author: "歌手",
+  });
+  assert.match(converted.chapterList.requestInfo, /adapter\/single-chapter/);
+  assert.match(converted.chapterContent.content, /new RegExp\("id=/);
+});
+
 test("媒体目录缺少章节 URL 时使用详情页单章节入口", () => {
   const source = {
     bookSourceName: "详情单曲",
@@ -3005,7 +3620,7 @@ test("HTML 列表项 href 正则脚本回退为声明式链接字段", () => {
       return m?m[1]:'';
     })()`),
   });
-  assert.equal(plan.fields.url.selector, ".//a[@href]/@href");
+  assert.equal(plan.fields.url.selector, "//a[@href]/@href");
   const output = executeBridgePlan(`
     <article class="card"><h3>短剧一</h3><a href="/series/details/1">播放</a></article>
   `, "https://video.example/", plan, { limit: 10 });
@@ -3274,6 +3889,18 @@ JSON.parse(java.ajax(url+JSON.stringify(options))).url`,
   assert.match(leftover, /url=https%3A%2F%2Faudio\.example\.com%2Fbook%2F42-7$/);
   assert.doesNotMatch(leftover, /url=https%3A%2F%2Faudio\.example\.com%2Fbook%2F42$/);
 
+  const signedUrl = build(
+    { host: "https://audio.example.com", httpHeaders: null },
+    { queryInfo: { detailUrl: detail, url: detail }, pageIndex: 1 },
+    `${chapter},${JSON.stringify({ headers: { ss: "signature", tt: "timestamp" } })}`,
+  );
+  const signedRequest = new URL(signedUrl);
+  assert.equal(signedRequest.searchParams.get("url"), chapter);
+  assert.deepEqual(
+    JSON.parse(signedRequest.searchParams.get("requestHeaders")),
+    { ss: "signature", tt: "timestamp" },
+  );
+
   const contentRule = String(converted.chapterContent.content);
   const { script } = (() => {
     const match = contentRule.match(/\|\|\s*@js:/i);
@@ -3369,6 +3996,27 @@ test("显式 forceWebViewMedia 时注入源声明的 webViewMediaJs", () => {
   assert.match(converted.chapterContent.requestInfo, /webView:\s*""/);
   assert.match(converted.chapterContent.requestInfo, /webViewJs:/);
   assert.match(converted.chapterContent.requestInfo, /document\.title/);
+});
+
+test("浏览器媒体规则自动切换为通用 WebView 动作", () => {
+  const source = {
+    bookSourceName: "自动 WebView 媒体",
+    bookSourceUrl: "https://audio.example/",
+    bookSourceType: 1,
+    searchUrl: "/search/{{key}}",
+    ruleSearch: { bookList: "a", name: "text", bookUrl: "href" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: "a", chapterName: "text", chapterUrl: "href" },
+    ruleContent: {
+      content: "@webjs:(function(){var a=document.querySelector('audio');if(a&&a.src)return a.src;document.querySelector('.play').click();})()",
+    },
+  };
+  const { sources } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const converted = sources["自动 WebView 媒体"];
+  assert.match(converted.chapterContent.requestInfo, /webView:\s*""/);
+  assert.match(converted.chapterContent.requestInfo, /webViewJs:/);
+  assert.match(converted.chapterContent.requestInfo, /querySelector\('audio'\)/);
+  assert.doesNotMatch(converted.chapterContent.requestInfo, /adapter\/media/);
 });
 
 test("forceWebViewMedia 播放 JSON 带上章节 Referer", () => {
@@ -3513,6 +4161,205 @@ test("JSON API 字段与 {$.id} URL 模板不再被误判成 HTML XPath", () => 
   assert.equal(convertRule(rules.bookList, { responseType: "json" }), "data||data/items");
   assert.match(convertRule(rules.bookUrl, { responseType: "json" }), /^bookId\|\|@js:/);
   assert.equal(convertRule(rules.name, { responseType: "json" }), "bookName");
+});
+
+test("HTML DOM 列表脚本返回 JSON 行时仍按 HTML 响应解析", () => {
+  const rules = {
+    bookList: [
+      "@js:",
+      "var doc = Packages.org.jsoup.Jsoup.parse(String(result));",
+      "return Array.from(doc.select('tr')).map(function (row) {",
+      "  return JSON.stringify({name: row.select('a').text(), bookUrl: row.select('a').attr('href')});",
+      "});",
+    ].join("\n"),
+    name: "$.name",
+    bookUrl: "$.bookUrl",
+  };
+  assert.equal(inferResponseType(rules), "html");
+});
+
+test("Jsoup 列表脚本的字段链会编译为通用相对 XPath", () => {
+  const listRule = [
+    "@js:",
+    "var Jsoup = Packages.org.jsoup.Jsoup;",
+    "var doc = Jsoup.parse(String(result));",
+    "var out = [];",
+    "var rows = doc.select('tr');",
+    "for (var i = 0; i < rows.size(); i++) {",
+    "  var td = rows.get(i).select('td');",
+    "  var a = td.get(1).select('a');",
+    "  if (a.size() == 0) continue;",
+    "  var name = String(a.get(0).text());",
+    "  var url = String(a.get(0).attr('href'));",
+    "  var authorCell = td.get(2).select('span');",
+    "  var author = authorCell.size() > 0 ? String(authorCell.get(0).text()) : String(td.get(2).text());",
+    "  out.push(String(JSON.stringify({name: name, bookUrl: url, author: author})));",
+    "}",
+    "out;",
+  ].join("\n");
+  const chapterRule = [
+    "@js:",
+    "var Jsoup = Packages.org.jsoup.Jsoup;",
+    "var doc = Jsoup.parse(String(result));",
+    "var out = [];",
+    "var items = doc.select('ul.chapters li');",
+    "for (var i = 0; i < items.size(); i++) {",
+    "  var row = items.get(i);",
+    "  var a = row.select('a');",
+    "  if (a.size() == 0) continue;",
+    "  out.push(String(JSON.stringify({name: String(a.get(0).text()), url: String(a.get(0).attr('href'))})));",
+    "}",
+    "out;",
+  ].join("\n");
+  const source = {
+    bookSourceName: "Jsoup 行投影源",
+    bookSourceUrl: "https://projection.example",
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: listRule, name: "$.name", bookUrl: "$.bookUrl", author: "$.author" },
+    ruleBookInfo: { name: "h1@text" },
+    ruleToc: { chapterList: chapterRule, chapterName: "$.name", chapterUrl: "$.url" },
+    ruleContent: { content: "#content@text" },
+  };
+  const converted = convertLegado(source, { imageProxyBase: "https://convert.example" }).sources["Jsoup 行投影源"];
+  const token = converted.searchBook.requestInfo.match(/\/adapter\/books\?plan=([^&]+)/)?.[1];
+  assert.ok(token);
+  const plan = decodeBridgePlan(token);
+  assert.equal(plan.responseType, "html");
+  assert.equal(plan.list, "//tr");
+  assert.equal(plan.fields.url.selector, "//td[2]//a[1]/@href");
+  const output = executeBridgePlan(
+    "<table><tr><th>类型</th><th>标题</th><th>作者</th></tr><tr><td>玄幻</td><td><a href='/book/1'>书名</a></td><td><span>作者</span></td></tr></table>",
+    "https://projection.example/search",
+    plan,
+  );
+  assert.deepEqual(output.data[0], {
+    name: "书名",
+    url: "https://projection.example/book/1",
+    author: "作者",
+  });
+  const chapterToken = converted.chapterList.requestInfo.match(/\/adapter\/chapters\?plan=([^&]+)/)?.[1];
+  assert.ok(chapterToken);
+  const chapterPlan = decodeBridgePlan(chapterToken);
+  assert.equal(chapterPlan.responseType, "html");
+  assert.equal(chapterPlan.fields.title.selector, "//a[1]");
+  assert.deepEqual(
+    executeBridgePlan(
+      "<ul class='chapters'><li><a href='/chapter/1'>第一章</a></li><li><a href='/chapter/2'>第二章</a></li></ul>",
+      "https://projection.example/book/1",
+      chapterPlan,
+    ).data,
+    [
+      { title: "第一章", url: "https://projection.example/chapter/1" },
+      { title: "第二章", url: "https://projection.example/chapter/2" },
+    ],
+  );
+});
+
+test("DOM 投影支持逗号声明、分支列表和通用文本包装", () => {
+  const rule = [
+    "@js:",
+    "var d = Packages.org.jsoup.Jsoup.parse(String(result));",
+    "function t(x){ return String(java.t2s(String(x))); }",
+    "var rows = d.select('.item');",
+    "var out = [];",
+    "if (rows.size() > 0) {",
+    "  for (var i = 0; i < rows.size(); i++) {",
+    "    var row = rows.get(i), a = row.select('dl dt a[href^=/book/]');",
+    "    if (a.size() > 0) out.push({name: t(a.text()), bookUrl: String(a.attr('href'))});",
+    "  }",
+    "}",
+    "out;",
+  ].join("\n");
+  assert.deepEqual(compileDomBookProjection(rule), {
+    list: "//*[contains(concat(' ', normalize-space(@class), ' '), ' item ')]",
+    fields: {
+      name: ".//dl//dt//a[starts-with(@href, '/book/')]",
+      bookUrl: ".//dl//dt//a[starts-with(@href, '/book/')]/@href",
+    },
+  });
+});
+
+test("Jsoup 详情 init 对象会编译为 HTML 字段桥接", () => {
+  const init = [
+    "@js:",
+    "var d = Packages.org.jsoup.Jsoup.parse(String(result));",
+    "function t(s){ return String(java.t2s(String(d.select(s).text()))); }",
+    "JSON.stringify({n:t('h1.title'), a:t('.author'), c:String(d.select('.cover img').attr('src'))});",
+  ].join("\n");
+  const projection = compileDomDetailProjection(init);
+  assert.deepEqual(projection, {
+    fields: {
+      name: "//h1[contains(concat(' ', normalize-space(@class), ' '), ' title ')]",
+      author: "//*[contains(concat(' ', normalize-space(@class), ' '), ' author ')]",
+      coverUrl: "//*[contains(concat(' ', normalize-space(@class), ' '), ' cover ')]//img/@src",
+    },
+  });
+  const source = {
+    bookSourceName: "Jsoup 详情对象源",
+    bookSourceUrl: "https://detail-projection.example",
+    searchUrl: "/search?q={{key}}",
+    ruleSearch: { bookList: "$.books[*]", name: "$.name", bookUrl: "$.url" },
+    ruleBookInfo: { init, name: "$.n", author: "$.a", coverUrl: "$.c" },
+    ruleToc: { chapterList: "$.chapters[*]", chapterName: "$.name", chapterUrl: "$.url" },
+    ruleContent: { content: "#content@text" },
+  };
+  const converted = convertLegado(source, { imageProxyBase: "https://convert.example" }).sources["Jsoup 详情对象源"];
+  const token = converted.bookDetail.requestInfo.match(/\/adapter\/detail\?plan=([^&]+)/)?.[1];
+  assert.ok(token);
+  const plan = decodeBridgePlan(token);
+  assert.equal(plan.responseType, "html");
+  assert.deepEqual(
+    executeBridgePlan(
+      "<h1 class=\"title\">详情书</h1><span class=\"author\">作者甲</span><div class=\"cover\"><img src=\"/cover.jpg\"></div>",
+      "https://detail-projection.example/book/1",
+      plan,
+    ),
+    {
+      name: "详情书",
+      author: "作者甲",
+      cover: "https://detail-projection.example/cover.jpg",
+    },
+  );
+});
+
+test("QD 签名详情 init 转成通用签名 API 动作并映射 Data 字段", () => {
+  const source = {
+    bookSourceName: "签名详情源",
+    bookSourceUrl: "https://source.example",
+    searchUrl: "/search?q={{key}}",
+    jsLib: [
+      "const encryptKeys = { headers: {",
+      "  QDSign: { key: \"123456789012345678901234\", iv: \"01234567\" },",
+      "  QDInfo: { key: \"abcdefghijklmnopqrstuvwx\", iv: String.fromCharCode(0,0,0,0,0,0,0,0) }",
+      "} };",
+      "let url = \"https://api.example/argus/api/\" + path;",
+    ].join("\n"),
+    ruleSearch: { bookList: "$.Items[*]", name: "$.BookName", bookUrl: "/book/{{$.BookId}}" },
+    ruleBookInfo: {
+      init: '@js: java.ajax(QDSign("v2/bookdetail/get", ["bookId=" + bookId])); $.Data',
+      name: "$.BookName",
+      author: "$.Author",
+      intro: "$.Description",
+    },
+    ruleToc: { chapterList: "$.Items[*]", chapterName: "$.Name", chapterUrl: "$.Url" },
+    ruleContent: { content: "$.Content" },
+  };
+  const { sources, warnings } = convertLegado(source, { imageProxyBase: "https://convert.example" });
+  const converted = sources["签名详情源"];
+  assert.equal(converted.bookDetail.responseFormatType, "json");
+  assert.match(converted.bookDetail.requestInfo, /\/adapter\/search\?plan=/);
+  assert.doesNotMatch(converted.bookDetail.requestInfo, /\/adapter\/detail\?plan=/);
+  const token = converted.bookDetail.requestInfo.match(/\/adapter\/search\?plan=([A-Za-z0-9_-]+)&value=/)?.[1];
+  assert.ok(token);
+  const plan = decodeSearchPlan(token);
+  assert.equal(plan.kind, "qd-sign-json");
+  assert.equal(plan.qd.path, "v2/bookdetail/get");
+  assert.equal(plan.qd.valueMode, "bookId");
+  assert.equal(plan.qd.resultPath, "Data");
+  assert.equal(converted.bookDetail.bookName, "BookName");
+  assert.equal(converted.bookDetail.author, "Author");
+  assert.equal(converted.bookDetail.desc, "Description");
+  assert.equal(warnings.some((warning) => /详情页 init 规则.*已忽略/.test(warning.message)), false);
 });
 
 test("桥接分类 URL 会替换 %@pageIndex，避免适配器把占位符当成坏编码", () => {
@@ -3749,8 +4596,8 @@ test("公开合集常见语法：相对 XPath、~= 交替、##$## 追加、@js �
   assert.equal(converted.httpHeaders["User-Agent"], "Mozilla/5.0");
   assert.equal(converted.httpHeaders.Referer, "https://www.gutenberg.org/");
   assert.equal(converted.searchBook.list, "//li[@class='booklink']");
-  assert.match(converted.searchBook.bookName, /\.\/\/span\[@class='title'\]/);
-  assert.equal(converted.searchBook.detailUrl, ".//a/@href");
+  assert.match(converted.searchBook.bookName, /\/\/span\[@class='title'\]/);
+  assert.equal(converted.searchBook.detailUrl, "//a/@href");
   assert.match(converted.searchBook.cat, /contains\(@property, 'category'\) or contains\(@property, 'status'\)/);
   assert.match(converted.bookDetail.bookName, /book_name/);
   assert.match(converted.chapterList.title, /text\(\)/);

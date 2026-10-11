@@ -12,6 +12,21 @@ import { dynamicComicApiImages } from "./dynamicComic.js";
 const SEMANTIC_TOKEN = /(?:content|chapter|article|read|正文|内容)/i;
 const NOISE_TOKEN = /(?:nav|menu|footer|header|comment|recommend|related|广告|推荐|目录)/i;
 
+function abortError(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  return new Error(String(signal?.reason || "操作已取消"));
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+async function yieldToEventLoop(signal) {
+  throwIfAborted(signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  throwIfAborted(signal);
+}
+
 export function reusableComicDecoderContent(source) {
   if (source?.sourceType !== "comic") return "";
   const content = String(source?.chapterContent?.content || "");
@@ -268,7 +283,7 @@ function probableImageResponse(response) {
     || bytes.subarray(0, 4).toString("ascii") === "RIFF";
 }
 
-async function discoverComicApiTemplate(html, pageUrl, download, headers) {
+async function discoverComicApiTemplate(html, pageUrl, download, headers, responseHeaders = {}) {
   const documents = [{ body: String(html || ""), url: pageUrl }];
   for (const scriptUrl of linkedScriptUrls(html, pageUrl)) {
     try {
@@ -310,6 +325,7 @@ async function discoverComicApiTemplate(html, pageUrl, download, headers) {
   const dynamic = await dynamicComicApiImages(html, pageUrl, {
     download,
     headers,
+    responseHeaders,
     probeOnly: true,
   });
   if (dynamic.urls.length >= 2) return { mode: "post-form" };
@@ -368,8 +384,13 @@ function repairedComicContent(source, host, adapterBase, apiTemplate = null) {
   };
 }
 
-export async function repairContentFromChapter(source, chapterUrl, { download, adapterBase = "" } = {}) {
+export async function repairContentFromChapter(source, chapterUrl, {
+  download,
+  adapterBase = "",
+  signal = null,
+} = {}) {
   if (!["text", "comic"].includes(source?.sourceType) || typeof download !== "function") return null;
+  throwIfAborted(signal);
   let host;
   try {
     host = new URL(chapterUrl).origin;
@@ -382,9 +403,11 @@ export async function repairContentFromChapter(source, chapterUrl, { download, a
       ...(source?.httpHeaders || {}),
       ...(source?.chapterContent?.httpHeaders || {}),
     });
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return null;
   }
+  await yieldToEventLoop(signal);
   const responseUrl = String(page.read2xsggResponseUrl || chapterUrl);
   if (source.sourceType === "comic") {
     const headers = {
@@ -396,9 +419,12 @@ export async function repairContentFromChapter(source, chapterUrl, { download, a
       responseUrl,
       download,
       headers,
+      page.httpHeaders || {},
     );
+    throwIfAborted(signal);
     return repairedComicContent(source, new URL(responseUrl).origin, adapterBase, apiTemplate);
   }
+  throwIfAborted(signal);
   const selector = discoverContentRule(
     decodeTextBuffer(page, { headers: page.httpHeaders || {} }),
     responseUrl,

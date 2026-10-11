@@ -16,10 +16,10 @@ import {
   xpathForElement,
 } from "./domUtil.js";
 
-const BOOK_HREF = /(?:\/(?:book|novel|info|xiaoshuo|story|article)\/|\/[a-z0-9]+(?:-[a-z0-9]+){1,}-?\d*\/?(?:[?#].*)?$|\/\d{3,}\.html?$|\/read\/\d+)/i;
-const CHAPTER_HREF = /(?:\/(?:chapter|chapters|read|book|view)\/|\/\d+\.html?$)/i;
+const BOOK_HREF = /(?:\/(?:book|novel|info|xiaoshuo|story|article)\/|\/[a-z0-9]+(?:-[a-z0-9]+){1,}-?\d*\/?(?:[?#].*)?$|\/\d{3,}\.html?$|\/(?:[^/?#]+\/){2}[^/?#]+\.html?(?:[?#].*)?$|\/read\/\d+)/i;
+const CHAPTER_HREF = /(?:\/(?:chapter|chapters|read|book|view)\/|\/\d+\.html?$|\/[^/?#]+[_-]\d+\.html?(?:[?#].*)?$)/i;
 const STRONG_CHAPTER_HREF = /\/view\/\d+(?:_\d+)?\.html?(?:$|[?#])/i;
-const CHAPTER_TEXT = /(?:第.{0,24}[章节回话集卷]|^\s*\d+[.、\s]|序章|楔子|正文)/;
+const CHAPTER_TEXT = /(?:第.{0,24}[章节回话集卷]|第\s*\d+\s*页|^\s*\d+[.、\s]|序章|楔子|正文)/;
 const CONTENT_SELECTORS = [
   "#content",
   "#chaptercontent",
@@ -60,6 +60,15 @@ function findContentSelector(document) {
   const className = String(best.className || "").trim().split(/\s+/).find(Boolean);
   if (className) return classContainsXPath(className);
   return xpathForElement(best, document);
+}
+
+function pagedRequestInfo(template, firstPageUrl) {
+  return [
+    "@js:",
+    "var page = Number((params && params.pageIndex) || 1);",
+    `if (page === 1) return ${JSON.stringify(String(firstPageUrl || ""))};`,
+    `return ${JSON.stringify(String(template || ""))}.replace(/%@pageIndex/g, String(page));`,
+  ].join("\n");
 }
 
 /**
@@ -110,10 +119,27 @@ export async function discoverNovel(originUrl, {
     ? semanticBookLinks
     : bookLinks.length ? bookLinks : readableLinks;
   const semanticCluster = scoreLinkCluster(semanticCandidates, homeUrl).slice(0, 30);
-  const cluster = coveredCluster.length > semanticCluster.length
-    ? coveredCluster
+  // Some catalogues use one-segment book URLs (`/slug`) with no shared path
+  // prefix. URL-only clustering then overfits a couple of duplicate navigation
+  // links and drops the real cover-backed list. When several independent cover
+  // links are present but path clustering explains less than half of them,
+  // retain the structural list candidates; the strict runtime walk still has
+  // to prove each generated action is usable before publication.
+  const coveredListFallback = coveredBookLinks.length >= 4
+    && coveredCluster.length * 2 < coveredBookLinks.length
+    ? coveredBookLinks.slice(0, 30)
+    : coveredCluster;
+  const cluster = coveredListFallback.length > semanticCluster.length
+    ? coveredListFallback
     : semanticCluster;
-  if (cluster.length < 2) {
+  // Repeated links are strong list evidence, but some accessible catalogues
+  // expose only one work on the current page. A single result is a candidate
+  // only when its URL has book semantics or it is paired with its own cover;
+  // the pipeline still requires the full list → detail → chapter → content
+  // runtime chain before it can be retained.
+  const singleStrongBook = cluster.length === 1
+    && (coveredBookLinks.includes(cluster[0]) || BOOK_HREF.test(cluster[0].href));
+  if (cluster.length < 2 && !singleStrongBook) {
     diagnostics.push("list: 书籍链接不足 2 条");
     return null;
   }
@@ -127,6 +153,10 @@ export async function discoverNovel(originUrl, {
     listSelector,
     download,
   });
+  const pagedListRequestInfo = pagedListUrl
+    && pagedListUrl.replace(/%@pageIndex/g, "1") !== homeUrl
+    ? pagedRequestInfo(pagedListUrl, homeUrl)
+    : "";
   let detailUrl = cluster.find((item) => BOOK_HREF.test(item.href))?.href || cluster[0].href;
   if (!detailUrl) {
     diagnostics.push("detail: 未取得详情 URL");
@@ -282,11 +312,11 @@ export async function discoverNovel(originUrl, {
     title,
     homeUrl,
     listUrl: pagedListUrl || homeUrl,
-    listRequestInfo: pagedListUrl ? "" : homeRequestInfo,
+    listRequestInfo: pagedListRequestInfo || (pagedListUrl ? "" : homeRequestInfo),
     listPageSize: pagedListUrl ? cluster.length : 20,
     listSelector,
     bookNameSelector: bookNameSelector(),
-    detailUrlSelector: stableListSelector ? "./@href||//@href" : ".//a/@href||./@href||//@href",
+    detailUrlSelector: stableListSelector ? "//@href" : "//a/@href||//@href",
     listCoverSelector,
     detailCoverSelector: detailCover,
     searchRequestInfo: search?.requestInfo || "",
@@ -298,8 +328,8 @@ export async function discoverNovel(originUrl, {
     tocSelector,
     chapterRequestInfo,
     chapterListSelector,
-    chapterTitleSelector: stableChapterSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : "normalize-space(.//a)||normalize-space(/html/body/*)",
-    chapterUrlSelector: stableChapterSelector ? "./@href||//@href" : ".//a/@href||./@href||//@href",
+    chapterTitleSelector: stableChapterSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : "normalize-space(//a)||normalize-space(/html/body/*)",
+    chapterUrlSelector: stableChapterSelector ? "//@href" : "//a/@href||//@href",
     chapterSampleUrl: chapterUrl,
     contentSelector,
     bookCount: cluster.length,

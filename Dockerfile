@@ -1,4 +1,5 @@
-FROM node:22-bookworm-slim
+ARG BASE_IMAGE=node:22-bookworm-slim
+FROM ${BASE_IMAGE}
 
 WORKDIR /app
 
@@ -9,16 +10,19 @@ ENV NODE_ENV=production \
     DATA_DIR=/data \
     GIT_SHA=${GIT_SHA}
 
-COPY package.json package-lock.json LICENSE README.md ./
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends imagemagick webp gosu ca-certificates curl openssl \
-    && npm ci --omit=dev \
+    && apt-get install -y --no-install-recommends imagemagick webp gosu ca-certificates curl openssl chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY package.json package-lock.json LICENSE README.md ./
+RUN npm ci --omit=dev \
     && mkdir -p /data \
     && chown node:node /data
 
 COPY --chown=node:node package.json package-lock.json LICENSE README.md ./
 COPY --chown=node:node bin ./bin
 COPY --chown=node:node src ./src
+COPY --chown=node:node docs/xiangse ./docs/xiangse
 COPY --chown=node:node public ./public
 COPY docker-entrypoint.sh /usr/local/bin/read2xsgg-entrypoint
 RUN chmod 0755 /usr/local/bin/read2xsgg-entrypoint

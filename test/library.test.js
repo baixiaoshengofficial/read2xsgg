@@ -32,6 +32,12 @@ test("libraryStore 持久化任务与制品", async () => {
     const job = await store.createJob({ url: "https://example.com/legado.json", name: "demo" });
     assert.equal(job.status, "queued");
     assert.match(job.subscribePath, new RegExp(`/library/${job.id}\\.xbs`));
+    const reused = await store.createJob({ url: "https://example.com/legado.json", name: "重复提交" });
+    assert.equal(reused.id, job.id);
+    assert.equal(reused.reused, true);
+    assert.equal((await store.listJobs()).length, 1);
+    const siteJob = await store.createJob({ url: "https://example.com/legado.json", mode: "site" });
+    assert.notEqual(siteJob.id, job.id);
 
     const xbs = encodeXbs(Buffer.from('{"a":1}\n'));
     const json = Buffer.from('{"a":1}\n');
@@ -44,16 +50,85 @@ test("libraryStore 持久化任务与制品", async () => {
     assertArtifactMode((await stat(path.join(artifactDir, `${job.id}.source.json`))).mode & 0o777);
 
     const listed = await store.listJobs();
-    assert.equal(listed[0].id, job.id);
-    assert.equal(listed[0].status, "done");
+    const listedJob = listed.find((item) => item.id === job.id);
+    assert.equal(listedJob?.status, "done");
     assert.deepEqual(await store.readArtifact(job.id, "xbs"), xbs);
 
     await store.deleteJob(job.id);
+    await store.deleteJob(siteJob.id);
     assert.equal(await store.getJob(job.id), null);
     assert.equal((await store.listJobs()).length, 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("library job persists per-source skip reasons with URL credentials redacted", async () => {
+  const { runLibraryJob } = await import("../src/jobRunner.js");
+  const json = Buffer.from('{"kept":{}}\n');
+  const job = {
+    id: "diagnostic-job",
+    status: "queued",
+    phase: "queued",
+    mode: "source",
+    sourceUrl: "https://example.com/sources.json",
+    imageProxyBase: "",
+  };
+  const store = {
+    async getJob() { return job; },
+    async updateJob(_id, patch) { Object.assign(job, patch); return job; },
+    async saveArtifacts() {},
+  };
+  const result = {
+    sources: { kept: {} },
+    count: 1,
+    fallbackCount: 0,
+    skippedBuckets: { "rules-stale": 1, "dead-origin": 1 },
+    skipped: [
+      {
+        source: "空目录源",
+        reason: "rules-stale: empty-list (HTTP 429 https://adapter.example/adapter/books?token=private-value)",
+        sourceType: "comic",
+        host: "comic.example",
+        stage: "chapter-content",
+        recognitionAttempts: 4,
+      },
+      { source: "不可达源", reason: "dead-origin: timeout" },
+    ],
+    json,
+    xbs: encodeXbs(json),
+  };
+
+  await runLibraryJob({
+    store,
+    config: {},
+    jobId: job.id,
+    downloadSource: async () => Buffer.alloc(0),
+    convertOnline: async () => result,
+  });
+
+  assert.equal(job.status, "done");
+  assert.deepEqual(job.skippedReasons, {
+    "dead-origin: timeout": 1,
+    "rules-stale: empty-list": 1,
+  });
+  assert.deepEqual(job.skippedSources.map((item) => item.source), ["空目录源", "不可达源"]);
+  assert.deepEqual(
+    {
+      sourceType: job.skippedSources[0].sourceType,
+      host: job.skippedSources[0].host,
+      stage: job.skippedSources[0].stage,
+      recognitionAttempts: job.skippedSources[0].recognitionAttempts,
+    },
+    {
+      sourceType: "comic",
+      host: "comic.example",
+      stage: "chapter-content",
+      recognitionAttempts: 4,
+    },
+  );
+  assert.match(job.skippedSources[0].reason, /HTTP 429 https:\/\/adapter\.example\/adapter\/books\?\[redacted\]/);
+  assert.doesNotMatch(JSON.stringify(job.skippedSources), /private-value/);
 });
 
 test("同步转换结果写入 DATA_DIR，服务重启后可直接复用", async (context) => {
@@ -164,6 +239,19 @@ test("管理 API 需要 ADMIN_TOKEN；公开 /library 仅 done 可取", async (c
   const job = await created.json();
   assert.equal(job.status, "queued");
 
+  const duplicate = await fetch(`${base}/api/jobs`, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer secret-token",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ url: "https://example.com/legado.json", name: "重复任务" }),
+  });
+  assert.equal(duplicate.status, 200);
+  const duplicateJob = await duplicate.json();
+  assert.equal(duplicateJob.id, job.id);
+  assert.equal(duplicateJob.reused, true);
+
   const pending = await fetch(`${base}/library/${job.id}.xbs`);
   assert.equal(pending.status, 409);
 
@@ -252,12 +340,17 @@ test("serverConfig 暴露 dataDir / adminToken / jobConcurrency", () => {
   assert.equal(serverConfig({}).dataDir, "./data");
   assert.equal(serverConfig({}).adminToken, "");
   assert.equal(serverConfig({}).jobConcurrency, 1);
+  assert.equal(serverConfig({}).jobIsolation, true);
   assert.equal(serverConfig({}).jobVerifyBudgetMs, 0);
+  assert.equal(serverConfig({}).jobVerifySourceBudgetMs, 120_000);
   assert.equal(serverConfig({ ADMIN_TOKEN: "x", DATA_DIR: "/data", JOB_CONCURRENCY: "2" }).adminToken, "x");
   assert.equal(serverConfig({ ADMIN_TOKEN: "x", DATA_DIR: "/data", JOB_CONCURRENCY: "2" }).dataDir, "/data");
   assert.equal(serverConfig({ ADMIN_TOKEN: "x", DATA_DIR: "/data", JOB_CONCURRENCY: "2" }).jobConcurrency, 2);
+  assert.equal(serverConfig({ JOB_ISOLATION: "false" }).jobIsolation, false);
+  assert.equal(serverConfig({ JOB_AUTOSTART: "false" }).jobAutostart, false);
   assert.equal(serverConfig({ JOB_VERIFY_BUDGET_MS: "120000" }).jobVerifyBudgetMs, 120_000);
   assert.equal(serverConfig({ JOB_VERIFY_BUDGET_MS: "0" }).jobVerifyBudgetMs, 0);
+  assert.equal(serverConfig({ JOB_VERIFY_SOURCE_BUDGET_MS: "7000" }).jobVerifySourceBudgetMs, 7000);
 });
 
 test("删除运行中任务会释放队列槽位并启动下一个", async () => {
@@ -310,6 +403,64 @@ test("删除运行中任务会释放队列槽位并启动下一个", async () =>
     assert.notEqual(secondJob.status, "queued");
   } finally {
     releaseHang?.();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("暂停任务保留进度，已取消的转换返回后不覆盖暂停状态或写入制品", async () => {
+  const { createJobWorker } = await import("../src/index.js");
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-pause-"));
+  const store = createLibraryStore(dir);
+  let releaseConversion;
+  const conversion = new Promise((resolve) => { releaseConversion = resolve; });
+  let started = false;
+  const worker = createJobWorker({
+    store,
+    config: serverConfig({ VERIFY_CONVERTED_SOURCES: "false" }),
+    concurrency: 1,
+    downloadSource: async () => Buffer.alloc(0),
+    isolate: false,
+    convertOnline: async (_url, _config, _proxy, options) => {
+      started = true;
+      await options.onProgress({ phase: "verify", done: 4, total: 10, kept: 3, skipped: 1, active: [] });
+      await conversion;
+      return { sources: {}, warnings: [], skipped: [], count: 0, json: Buffer.from("{}"), xbs: Buffer.from("xbs") };
+    },
+  });
+  try {
+    const job = await store.createJob({ url: "https://example.com/feed.json" });
+    worker.enqueue(job.id);
+    for (let i = 0; i < 50 && !started; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(started, true);
+    const paused = await worker.pause(job.id);
+    assert.equal(paused.status, "paused");
+    assert.equal(paused.progress.done, 4);
+    releaseConversion();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal((await store.getJob(job.id)).status, "paused");
+    assert.equal(await store.readArtifact(job.id, "json"), null);
+  } finally {
+    releaseConversion();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("启动策略关闭时将 queued/running 任务转为 paused 并保留进度", async () => {
+  const { createJobWorker } = await import("../src/index.js");
+  const dir = await mkdtemp(path.join(tmpdir(), "read2xsgg-pause-recover-"));
+  try {
+    const store = createLibraryStore(dir);
+    const running = await store.createJob({ url: "https://example.com/running.json" });
+    const queued = await store.createJob({ url: "https://example.com/queued.json" });
+    await store.updateJob(running.id, { status: "running", progress: { done: 7, total: 20, kept: 5, skipped: 2 } });
+    const worker = createJobWorker({ store, config: serverConfig({}), downloadSource: async () => Buffer.alloc(0) });
+    const paused = await worker.pauseRecoverable();
+    assert.deepEqual(paused.map((job) => job.id).sort(), [queued.id, running.id].sort());
+    assert.equal((await store.getJob(running.id)).status, "paused");
+    assert.equal((await store.getJob(running.id)).progress.done, 7);
+    assert.equal((await store.getJob(queued.id)).status, "paused");
+    assert.equal(worker.active, 0);
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });

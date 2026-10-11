@@ -3,18 +3,26 @@ import {
   compileChapterBridgePlan,
   compileDetailBridgePlan,
   decodeBridgePlan,
+  encodeBridgePlan,
   executeBridgePlan,
   bridgeTocUrl,
   orderChaptersAscending,
 } from "./bridgePlan.js";
-import { isPlayableMediaResponse, runXbsChapterContent, runXbsPipeline } from "./xbsRuntime.js";
+import {
+  executeXbsJavaScriptRule,
+  isPlayableMediaResponse,
+  runXbsChapterContent,
+  runXbsPipeline,
+} from "./xbsRuntime.js";
+import { CONTEXTUAL_CHAPTER_URL_MARKER } from "./chapterUrlPlan.js";
 import { downloadAsFetch } from "./xiangseValidate.js";
 import { decodeTextBuffer, encodeFormBody } from "./charset.js";
 import { refreshEphemeralHeaders } from "./requests.js";
 import { usableCoverUrl } from "./siteAnalyze/coverSelectors.js";
 import { isDateOnlyMetadata } from "./elementValidation.js";
+import { requestIdentity } from "./requestIdentity.js";
 
-async function withTimeoutSignal(parentSignal, timeoutMs, operation) {
+async function withTimeoutSignal(parentSignal, timeoutMs, operation, timeoutCode = "") {
   const controller = new AbortController();
   const duration = Math.max(1, Number(timeoutMs) || 1);
   return new Promise((resolve, reject) => {
@@ -38,11 +46,29 @@ async function withTimeoutSignal(parentSignal, timeoutMs, operation) {
       return;
     }
     parentSignal?.addEventListener("abort", abortFromParent, { once: true });
-    timer = setTimeout(() => abort(new Error(`操作超时（${duration}ms）`)), duration);
+    timer = setTimeout(() => {
+      const error = new Error(`操作超时（${duration}ms）`);
+      if (timeoutCode) error.code = timeoutCode;
+      abort(error);
+    }, duration);
     Promise.resolve()
       .then(() => operation(controller.signal))
       .then((value) => finish(resolve, value), (error) => finish(reject, error));
   });
+}
+
+function isRequestTimeout(error) {
+  const message = String(error?.message || error?.reason || error || "");
+  return error?.code === "ETIMEDOUT"
+    || error?.name === "TimeoutError"
+    || /(?:操作超时|请求超时|timed\s*out|timeout|ETIMEDOUT|ECONNABORTED|HTTP\s*(?:408|504|524)\b)/i.test(message);
+}
+
+function throwIfRequestTimedOut(error, signal) {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : error;
+  }
+  if (isRequestTimeout(error)) throw error;
 }
 
 function firstRequestFilter(action) {
@@ -50,6 +76,11 @@ function firstRequestFilter(action) {
   const line = filters.split("\n").find((item) => item.includes("::"));
   if (!line) return "";
   return line.slice(line.indexOf("::") + 2).trim();
+}
+
+function defaultSearchKeyword(sourceType) {
+  return ({ comic: "漫画", audio: "广播剧", video: "视频" })[String(sourceType || "").trim()]
+    || "小说";
 }
 
 function declarativeBridgeAction(action, type) {
@@ -74,6 +105,12 @@ function actionHeaders(source, action) {
   return { ...(source?.httpHeaders || {}), ...(action?.httpHeaders || {}) };
 }
 
+function usesWebViewMediaAction(action) {
+  const requestInfo = String(action?.requestInfo || "");
+  return /\bwebView\s*:\s*(?:""|true)/i.test(requestInfo)
+    && (/\bwebViewJs\s*:/i.test(requestInfo) || /\bwebView\s*:\s*true\b/i.test(requestInfo));
+}
+
 function executableBookAction(source, action) {
   const bridged = declarativeBridgeAction(action, "books");
   if (bridged) return bridged;
@@ -86,6 +123,53 @@ function executableBookAction(source, action) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Reuse a search action's proven list schema for browse categories whose
+ * requests return rows but whose stale selectors do not. Keep each category's
+ * request and pagination intact; the repaired candidate still has to pass a
+ * complete browse → detail → chapter → content verification before publishing.
+ */
+export function reuseSearchListRulesForBrowse(source) {
+  const searchAction = source?.searchBook;
+  const searchBridge = executableBookAction(source, searchAction);
+  const worlds = Object.entries(source?.bookWorld || {});
+  if (!searchBridge || !worlds.length) return null;
+
+  const repaired = structuredClone(source);
+  const ruleFields = [
+    "list", "bookName", "detailUrl", "author", "cover", "cat",
+    "lastChapterTitle", "status", "wordCount", "kind",
+    "responseFormatType", "parserID", "charset",
+  ];
+  let changed = 0;
+  for (const [name, originalAction] of worlds) {
+    const browseBridge = executableBookAction(source, originalAction);
+    const action = repaired.bookWorld?.[name];
+    if (!browseBridge || !action) continue;
+
+    for (const field of ruleFields) {
+      if (searchAction[field] !== undefined && searchAction[field] !== null && searchAction[field] !== "") {
+        action[field] = structuredClone(searchAction[field]);
+      }
+    }
+
+    const plan = structuredClone(browseBridge.plan);
+    plan.list = searchBridge.plan.list;
+    plan.fields = { ...(plan.fields || {}), ...(searchBridge.plan.fields || {}) };
+    const requestInfo = String(action.requestInfo || "");
+    if (/\/adapter\/books\b/i.test(requestInfo)) {
+      const tokenPattern = /([?&]plan=)([A-Za-z0-9_-]+)/;
+      if (tokenPattern.test(requestInfo)) {
+        action.requestInfo = requestInfo.replace(tokenPattern, (_match, prefix) => (
+          `${prefix}${encodeBridgePlan(plan)}`
+        ));
+      }
+    }
+    changed += 1;
+  }
+  return changed ? { source: repaired, repairedWorlds: changed } : null;
 }
 
 function executableChapterAction(source) {
@@ -144,21 +228,39 @@ function portableUrlExpression(expression, {
   host = "",
   keyWord = "",
   pageIndex = 1,
+  result = "",
+  baseUrl = result,
 } = {}) {
   const source = String(expression || "").trim();
-  if (!source || source.length > 4_000 || /[`[\]{};\\]/.test(source)) return "";
+  if (!source || source.length > 4_000) return "";
   const masked = source.replace(/(["'])(?:\\.|(?!\1)[\s\S])*?\1/g, (value) => " ".repeat(value.length));
+  if (/[`{};\\]/.test(masked) || /\[(?!\s*\d+\s*\])/.test(masked)) return "";
+  const indexed = masked.replace(/\[\s*\d+\s*\]/g, "");
+  if (/[\[\]]/.test(indexed) || /\b(?:__proto__|prototype|constructor)\b/.test(masked)) return "";
   const allowed = new Set([
-    "params", "pageIndex", "keyWord", "config", "host",
-    "encodeURIComponent", "encodeURI", "escape", "String", "Math",
+    "params", "pageIndex", "keyWord", "config", "host", "result", "baseUrl",
+    "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI", "escape", "String", "Math",
     "length", "substring", "substr", "slice", "indexOf", "charAt",
     "trim", "toLowerCase", "toUpperCase", "startsWith", "endsWith",
     "includes", "replace", "concat", "padStart", "padEnd",
     "floor", "ceil", "round", "max", "min", "abs",
     "true", "false", "null", "undefined",
   ]);
-  const identifiers = masked.match(/[A-Za-z_$][\w$]*/g) || [];
+  const identifiers = [...masked.matchAll(/[A-Za-z_$][\w$]*/g)]
+    .filter((match) => masked[match.index - 1] !== ".")
+    .map((match) => match[0]);
   if (identifiers.some((identifier) => !allowed.has(identifier))) return "";
+  const allowedMembers = new Set([
+    "length", "substring", "substr", "slice", "split", "indexOf", "charAt", "trim",
+    "toLowerCase", "toUpperCase", "startsWith", "endsWith", "includes", "replace",
+    "concat", "padStart", "padEnd",
+    // These are data properties on the frozen request context, not callable
+    // methods. Permit them so safe templates using params.keyWord/pageIndex
+    // can be evaluated during verification and generic rule repair.
+    "keyWord", "pageIndex", "host",
+  ]);
+  if ([...masked.matchAll(/\.\s*([A-Za-z_$][\w$]*)/g)]
+    .some((match) => !allowedMembers.has(match[1]))) return "";
   try {
     const evaluate = new Function(
       "params",
@@ -168,6 +270,8 @@ function portableUrlExpression(expression, {
       "escape",
       "String",
       "Math",
+      "result",
+      "baseUrl",
       `"use strict"; return (${source});`,
     );
     const value = evaluate(
@@ -178,6 +282,8 @@ function portableUrlExpression(expression, {
       globalThis.escape,
       String,
       Math,
+      String(result || ""),
+      String(baseUrl || ""),
     );
     return typeof value === "string" ? value : "";
   } catch {
@@ -188,6 +294,7 @@ function portableUrlExpression(expression, {
 function portableValueExpression(expression, {
   keyWord = "",
   pageIndex = 1,
+  filter = "",
   variables = {},
 } = {}) {
   const source = String(expression || "").trim();
@@ -200,12 +307,16 @@ function portableValueExpression(expression, {
     .replace(/\b[A-Za-z_$][\w$]*\s*:/g, (value) => " ".repeat(value.length));
   const allowed = new Set([
     "params", "keyWord", "pageIndex", "filter", "filters", "category",
-    "JSON", "parse", "String", "encodeURIComponent", "encodeURI",
+    "JSON", "parse", "stringify", "String", "encodeURIComponent", "encodeURI",
     "Math", "floor", "ceil", "round", "max", "min", "abs",
+    "indexOf", "lastIndexOf", "includes", "replace", "trim", "slice", "substring",
+    "toLowerCase", "toUpperCase", "charAt", "split", "join", "match", "test", "length",
     "true", "false", "null", "undefined",
     ...Object.keys(variables),
   ]);
-  const identifiers = masked.match(/[A-Za-z_$][\w$]*/g) || [];
+  const identifiers = [...masked.matchAll(/[A-Za-z_$][\w$]*/g)]
+    .filter((match) => masked[match.index - 1] !== ".")
+    .map((match) => match[0]);
   if (identifiers.some((identifier) => !allowed.has(identifier))) return null;
   try {
     const variableNames = Object.keys(variables)
@@ -221,7 +332,12 @@ function portableValueExpression(expression, {
       `"use strict"; return (${source});`,
     );
     const value = evaluate(
-      Object.freeze({ keyWord, pageIndex, filter: "", filters: Object.freeze({}) }),
+      Object.freeze({
+        keyWord,
+        pageIndex,
+        filter,
+        filters: Object.freeze(filter ? { category: filter } : {}),
+      }),
       JSON,
       String,
       encodeURIComponent,
@@ -328,6 +444,105 @@ function generatedRequestOptions(requestInfo, { keyWord = "小说", pageIndex = 
   return { method, params, headers, url: variables.url || "" };
 }
 
+function splitReturnedRequest(value) {
+  const source = String(value || "").trim();
+  const match = source.match(/,\s*(\{[\s\S]*\})\s*$/);
+  if (!match) return { url: source, options: {} };
+  try {
+    const options = JSON.parse(match[1]);
+    return {
+      url: source.slice(0, match.index).trim(),
+      options: options && typeof options === "object" && !Array.isArray(options) ? options : {},
+    };
+  } catch {
+    return { url: source, options: {} };
+  }
+}
+
+function returnedExpression(source, start) {
+  const input = String(source || "");
+  let quote = "";
+  let escaped = false;
+  const stack = [];
+  for (let index = start; index < input.length; index += 1) {
+    const char = input[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = "";
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "(" || char === "[" || char === "{") {
+      stack.push(char);
+      continue;
+    }
+    if (char === ")" || char === "]" || char === "}") {
+      if (!stack.length) return input.slice(start, index).trim();
+      stack.pop();
+      continue;
+    }
+    if (char === ";" && !stack.length) return input.slice(start, index).trim();
+    if (char === "\n" && !stack.length && input.slice(start, index).trim()) {
+      return input.slice(start, index).trim();
+    }
+  }
+  return input.slice(start).replace(/;\s*$/, "").trim();
+}
+
+/**
+ * Some valid Legado request scripts return `url + JSON.stringify(options)`
+ * instead of assigning `url` first. The client can execute that form, so the
+ * verifier must evaluate the same portable subset rather than treating it as
+ * an empty search target. No arbitrary script is executed here: the evaluator
+ * rejects unknown identifiers, calls and side effects.
+ */
+function evaluatedReturnedRequestOptions(requestInfo, {
+  keyWord = "小说",
+  pageIndex = 1,
+  filter = "",
+} = {}) {
+  const source = String(requestInfo || "").replace(/^@js:\s*/i, "");
+  const variables = portableRequestVariables(source, { keyWord, pageIndex, filter });
+  const returns = [...source.matchAll(/\breturn\s+/g)];
+  for (let index = returns.length - 1; index >= 0; index -= 1) {
+    const start = (returns[index].index || 0) + returns[index][0].length;
+    const expression = returnedExpression(source, start);
+    const value = portableValueExpression(expression, { keyWord, pageIndex, filter, variables });
+    if (!value || (typeof value !== "string" && (typeof value !== "object" || Array.isArray(value)))) continue;
+    const request = typeof value === "string" ? splitReturnedRequest(value) : {
+      url: String(value.url || value.uri || "").trim(),
+      options: value,
+    };
+    if (!request.url) continue;
+    const options = request.options || {};
+    const method = String(options.method || (options.POST ? "POST" : "GET")).toUpperCase();
+    const headers = options.headers || options.httpHeaders || {};
+    const params = options.body && typeof options.body === "object"
+      ? options.body
+      : options.httpParams && typeof options.httpParams === "object"
+        ? options.httpParams
+        : null;
+    return {
+      method,
+      params,
+      body: options.body,
+      headers: headers && typeof headers === "object" && !Array.isArray(headers) ? headers : {},
+      url: request.url,
+    };
+  }
+  return null;
+}
+
+function requestOptionsForVerification(requestInfo, options = {}) {
+  const generated = generatedRequestOptions(requestInfo, options);
+  if (generated?.url) return generated;
+  return evaluatedReturnedRequestOptions(requestInfo, options) || generated;
+}
+
 /**
  * Resolve the upstream page URL embedded in a bridged or plain requestInfo.
  * Supports literal templates and the `@js` wrappers that only substitute page/filter.
@@ -342,7 +557,7 @@ export function resolveBookTargetUrl(action, bridge, {
   const host = bridge.plan?.host || action?.host || "";
 
   if (/^@js:/i.test(requestInfo)) {
-    const generatedRequest = generatedRequestOptions(requestInfo, { keyWord, pageIndex });
+    const generatedRequest = requestOptionsForVerification(requestInfo, { keyWord, pageIndex, filter });
     if (generatedRequest) {
       const expression = assignedExpression(requestInfo, "url");
       const target = generatedRequest.url || portableUrlExpression(expression, { host, keyWord, pageIndex });
@@ -406,14 +621,24 @@ export function resolveBookTargetRequest(source, action, bridge, {
 } = {}) {
   const url = resolveBookTargetUrl(action, bridge, { keyWord, pageIndex, filter });
   if (!url) return null;
-  const generated = generatedRequestOptions(bridge?.requestInfo || action?.requestInfo, { keyWord, pageIndex });
+  const generated = requestOptionsForVerification(
+    bridge?.requestInfo || action?.requestInfo,
+    { keyWord, pageIndex, filter },
+  );
   const headers = { ...actionHeaders(source, action), ...(generated?.headers || {}) };
   if (!generated || generated.method !== "POST") return { url, headers, options: {} };
   const contentType = Object.entries(headers)
     .find(([key]) => key.toLowerCase() === "content-type")?.[1] || "";
-  const body = /application\/json/i.test(String(contentType))
-    ? JSON.stringify(generated.params || {})
-    : encodeFormBody(generated.params || {}, action);
+  let body;
+  if (generated.body !== undefined) {
+    body = /application\/json/i.test(String(contentType))
+      ? (typeof generated.body === "string" ? generated.body : JSON.stringify(generated.body))
+      : (typeof generated.body === "string" ? generated.body : encodeFormBody(generated.body || {}, action));
+  } else {
+    body = /application\/json/i.test(String(contentType))
+      ? JSON.stringify(generated.params || {})
+      : encodeFormBody(generated.params || {}, action);
+  }
   if (!contentType) headers["Content-Type"] = "application/x-www-form-urlencoded";
   return {
     url,
@@ -423,19 +648,22 @@ export function resolveBookTargetRequest(source, action, bridge, {
 }
 
 export function resolveBookTargetUrls(source, {
-  keyWord = "小说",
+  keyWord = "",
   pageIndex = 1,
   limit = 4,
 } = {}) {
   const urls = [];
   const seen = new Set();
   const actions = [
-    ...Object.values(source?.bookWorld || {}),
-    ...(source?.searchBook ? [source.searchBook] : []),
+    ...Object.values(source?.bookWorld || {}).map((action) => ({ action, kind: "bookWorld" })),
+    ...(source?.searchBook ? [{ action: source.searchBook, kind: "searchBook" }] : []),
   ];
-  for (const action of actions) {
+  for (const { action, kind } of actions) {
     const bridge = executableBookAction(source, action);
-    const target = resolveBookTargetUrl(action, bridge, { keyWord, pageIndex });
+    const actionKeyWord = String(action?._verifyKeyWord || (
+      kind === "searchBook" ? (keyWord || defaultSearchKeyword(source?.sourceType)) : ""
+    ));
+    const target = resolveBookTargetUrl(action, bridge, { keyWord: actionKeyWord, pageIndex });
     if (!target || seen.has(target)) continue;
     try {
       const parsed = new URL(target);
@@ -452,7 +680,7 @@ export function resolveBookTargetUrls(source, {
 }
 
 export function resolveBookTargetRequests(source, {
-  keyWord = "小说",
+  keyWord = "",
   pageIndex = 1,
   limit = 4,
 } = {}) {
@@ -469,9 +697,15 @@ export function resolveBookTargetRequests(source, {
   for (const actionInfo of actions) {
     const { action, actionName, section } = actionInfo;
     const bridge = executableBookAction(source, action);
-    const request = resolveBookTargetRequest(source, action, bridge, { keyWord, pageIndex });
+    const actionKeyWord = String(action?._verifyKeyWord || (
+      section === "searchBook" ? (keyWord || defaultSearchKeyword(source?.sourceType)) : ""
+    ));
+    const request = resolveBookTargetRequest(source, action, bridge, {
+      keyWord: actionKeyWord,
+      pageIndex,
+    });
     if (!request) continue;
-    const key = `${request.options?.method || "GET"}|${request.url}|${request.options?.body || ""}`;
+    const key = requestIdentity(request, { includeRequestInfo: true });
     if (seen.has(key)) continue;
     seen.add(key);
     requests.push({
@@ -544,14 +778,17 @@ export function resolveChapterListUrls(requestInfo, bookUrl, { pageIndex = 1 } =
 
   const bookId = extractBookIdFromUrl(bookUrl);
   const page = String(pageIndex || 1);
-  const adapterChapter = source.match(
-    /("(?:\\.|[^"\\])*\/adapter\/(?:toc|single-chapter|media-playlist|episode-list)\?[^"\\]*?url=")/i,
-  );
-  if (adapterChapter) {
-    try {
-      push(`${JSON.parse(adapterChapter[1]).replace("__PAGE__", page)}${encodeURIComponent(bookUrl)}`);
-    } catch {
-      // Fall through to ordinary chapter candidates.
+  let transformedTocUrl = "";
+  if (/\/\*\s*read2xsgg:chapter-toc-url\s*\*\//.test(source)) {
+    const expression = assignedExpression(source, "url");
+    const transformed = portableUrlExpression(expression, {
+      host: (() => { try { return new URL(bookUrl).origin; } catch { return ""; } })(),
+      pageIndex,
+      result: bookUrl,
+      baseUrl: bookUrl,
+    });
+    if (transformed) {
+      try { transformedTocUrl = new URL(transformed, bookUrl).toString(); } catch { /* ignore invalid result */ }
     }
   }
   const templateMatch = source.match(/var\s+url\s*=\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*;/);
@@ -569,6 +806,26 @@ export function resolveChapterListUrls(requestInfo, bookUrl, { pageIndex = 1 } =
       // Fall through to detail-page candidates.
     }
   }
+
+  // A generated adapter wrapper may still contain the original upstream
+  // `var url` template. Prefer that direct menu request for verification, but
+  // keep the adapter candidate for sources that have no portable upstream URL.
+  const adapterChapter = source.match(
+    /("(?:\\.|[^"\\])*\/adapter\/(?:chapters|toc|single-chapter|media-playlist|episode-list)\?[^"\\]*?url=")/i,
+  );
+  if (adapterChapter) {
+    try {
+      const prefix = JSON.parse(adapterChapter[1])
+        .replace(/__PAGE__/g, page)
+        .replace(/%@pageIndex/g, page)
+        .replace(/%@offset/g, String(Math.max(0, Number(page) - 1)));
+      push(`${prefix}${encodeURIComponent(transformedTocUrl || bookUrl)}`);
+    } catch {
+      // Fall through to ordinary chapter candidates.
+    }
+  }
+
+  if (transformedTocUrl) push(transformedTocUrl);
 
   const regexRewrite = source.match(
     /return\s+u\.replace\(new RegExp\(("(?:\\.|[^"\\])*")\),\s*("(?:\\.|[^"\\])*")\);/,
@@ -833,11 +1090,12 @@ async function fetchChapterPage(plan, targetUrl, download, { limit = 50, offset 
           charsetHint: plan.charset || "",
         }), tocUrl, plan, { limit, offset });
         if (Array.isArray(output.data) && output.data.length) {
-          return {
-            output,
-            upstreamSections: upstreamSectionsFromMenuBody(text),
-            pageCount: output.data.length,
-          };
+        return {
+          output,
+          responseUrl: String(tocPage.read2xsggResponseUrl || tocUrl),
+          upstreamSections: upstreamSectionsFromMenuBody(text),
+          pageCount: output.data.length,
+        };
         }
       } catch {
         // Fall through to direct page parsing.
@@ -847,9 +1105,41 @@ async function fetchChapterPage(plan, targetUrl, download, { limit = 50, offset 
   const output = executeBridgePlan(text, responseUrl, plan, { limit, offset });
   return {
     output,
+    responseUrl,
     upstreamSections: upstreamSectionsFromMenuBody(text),
     pageCount: Array.isArray(output.data) ? output.data.length : 0,
   };
+}
+
+function resolveContextualChapterRows(source, rows, responseUrl, book) {
+  const rule = String(source?.chapterList?.url || "");
+  if (!rule.includes(CONTEXTUAL_CHAPTER_URL_MARKER)) return rows;
+  const queryInfo = {
+    ...(book && typeof book === "object" ? book : {}),
+    detailUrl: String(book?.url || ""),
+    url: String(book?.url || ""),
+    chapterUrl: String(book?.url || ""),
+    bookName: String(book?.name || ""),
+  };
+  const config = {
+    host: String(source?.chapterList?.host || source?.sourceUrl || book?.url || ""),
+  };
+  return (Array.isArray(rows) ? rows : []).map((row) => {
+    if (!row || typeof row !== "object") return row;
+    try {
+      const value = executeXbsJavaScriptRule(rule, {
+        config,
+        params: { responseUrl: String(responseUrl || ""), queryInfo },
+        result: row,
+      });
+      row.url = typeof value === "string" || typeof value === "number"
+        ? String(value).trim()
+        : String(value?.url || "").trim();
+    } catch {
+      row.url = "";
+    }
+    return row;
+  });
 }
 
 async function executeDeclarativeUrl(plan, targetUrl, download, {
@@ -896,6 +1186,8 @@ async function verifyConvertedSourceOnce(source, {
   keyWord = "",
   timeoutMs = 3_000,
   signal,
+  onStage,
+  requireBookWorld = false,
 } = {}) {
   if (typeof download !== "function") {
     return { ok: false, reason: "rules-stale: empty-list", detail: "缺少下载器" };
@@ -905,36 +1197,100 @@ async function verifyConvertedSourceOnce(source, {
     timeoutMs,
     (requestSignal) => download(url, headers, { ...options, signal: requestSignal }),
   );
+  const markStage = (stage) => {
+    try {
+      onStage?.(stage);
+    } catch {
+      // Diagnostic callbacks must not affect verification.
+    }
+  };
 
   const worlds = [
-    ...Object.values(source?.bookWorld || {}).slice(0, 2),
-    ...(source?.searchBook ? [source.searchBook] : []),
+    ...Object.entries(source?.bookWorld || {}).map(([name, action]) => ({
+      action,
+      kind: "bookWorld",
+      name,
+    })),
+    ...(source?.searchBook ? [{ action: source.searchBook, kind: "searchBook", name: "搜索" }] : []),
   ];
+  const hasExecutableBookWorld = worlds.some((entry) => {
+    if (entry.kind !== "bookWorld") return false;
+    const bridge = executableBookAction(source, entry.action);
+    if (!bridge) return false;
+    const actionKeyWord = String(entry.action?._verifyKeyWord || keyWord || "");
+    return Boolean(resolveBookTargetRequest(source, entry.action, bridge, { keyWord: actionKeyWord }));
+  });
   const defaultKeyWord = ({ comic: "漫画", audio: "广播剧", video: "视频" })[source?.sourceType] || "小说";
   let lastDetail = "";
-  for (const action of worlds) {
-    const actionKeyWord = String(action?._verifyKeyWord || keyWord || defaultKeyWord);
+  let lastFailure = null;
+  let lastFailureRank = -1;
+  let listRequestCount = 0;
+  let listTimeoutCount = 0;
+  let lastListTimeout = "";
+  const failureRank = (reason) => {
+    if (/empty-content/i.test(String(reason || ""))) return 4;
+    if (/empty-toc/i.test(String(reason || ""))) return 3;
+    if (/invalid-elements/i.test(String(reason || ""))) return 2;
+    if (/empty-list/i.test(String(reason || ""))) return 1;
+    return 0;
+  };
+  const rememberFailure = (reason, detail, extra = {}) => {
+    const message = String(detail || "");
+    lastDetail = message;
+    const rank = failureRank(reason);
+    // Trying multiple category/search entrances should not hide a deeper
+    // failure from an earlier entrance.  For example, a category can reach a
+    // book but have an empty comic body while the search URL itself is
+    // temporarily empty; the content failure is the actionable repair stage.
+    if (rank >= lastFailureRank) {
+      lastFailureRank = rank;
+      lastFailure = { ok: false, reason, detail: message, ...extra };
+    }
+  };
+  for (const entry of worlds) {
+    const { action, kind } = entry;
+    // Browse/category and search are separate client capabilities. In strict
+    // converter verification, search is never a substitute for bookWorld —
+    // including when the source has no usable category entry at all.
+    if (requireBookWorld && kind !== "bookWorld") continue;
+    // Xiangse browse/category actions run without an implicit search query.
+    // Injecting “小说/漫画/视频” into every bookWorld request made a search
+    // endpoint masquerading as a category look healthy in verification, even
+    // though the normal browse list returned zero. Only searchBook receives
+    // the type-specific probe keyword unless the caller explicitly supplies
+    // one for a bookWorld action.
+    const actionKeyWord = String(
+      action?._verifyKeyWord || keyWord || (kind === "searchBook" ? defaultKeyWord : ""),
+    );
     const bookBridge = executableBookAction(source, action);
     if (!bookBridge) continue;
     const target = resolveBookTargetRequest(source, action, bookBridge, { keyWord: actionKeyWord });
     if (!target) continue;
     const targetUrl = target.url;
+    let listResponseReceived = false;
+    listRequestCount += 1;
     try {
+      markStage("list");
       const bookPageSize = Math.min(200, Math.max(1, Number(action?.moreKeys?.pageSize) || 20));
       const books = await executeDeclarativeUrl(bookBridge.plan, targetUrl, timedDownload, {
         limit: Math.max(3, bookPageSize),
         requestHeaders: target.headers,
         requestOptions: target.options,
       });
+      listResponseReceived = true;
       const page1Books = Array.isArray(books.data) ? books.data : [];
       const book = (books.data || []).find((item) => (
         item?.url && requiredElementPresent("name", item?.name) && requiredElementPresent("url", item?.url)
       ));
-      if (!book) continue;
+      if (!book) {
+        rememberFailure("rules-stale: empty-list", "分类/搜索列表为空或无法抽测");
+        continue;
+      }
       let bookPage2Count = 0;
       if (page1Books.length >= bookPageSize && Number(action?.moreKeys?.maxPage) !== 1) {
         const secondTarget = resolveBookTargetRequest(source, action, bookBridge, { keyWord: actionKeyWord, pageIndex: 2 });
         if (secondTarget && secondTarget.url !== targetUrl) {
+          markStage("list-page-2");
           const secondBooks = await executeDeclarativeUrl(bookBridge.plan, secondTarget.url, timedDownload, {
             limit: Math.max(3, bookPageSize),
             requestHeaders: secondTarget.headers,
@@ -942,21 +1298,13 @@ async function verifyConvertedSourceOnce(source, {
           });
           const page2Books = Array.isArray(secondBooks.data) ? secondBooks.data : [];
           bookPage2Count = page2Books.length;
-          if (!bookPage2Count) {
-            return {
-              ok: false,
-              reason: "rules-stale: empty-list",
-              detail: `书籍列表第 1 页 ${page1Books.length} 本但第 2 页为空，翻页可能失效`,
-              bookUrl: book.url,
-            };
-          }
-          if (chapterRowsMostlySame(page1Books, page2Books)) {
-            return {
-              ok: false,
-              reason: "rules-stale: empty-list",
-              detail: "书籍列表第 2 页与第 1 页重复，翻页无效",
-              bookUrl: book.url,
-            };
+          if (bookPage2Count && chapterRowsMostlySame(page1Books, page2Books)) {
+            rememberFailure(
+              "rules-stale: empty-list",
+              "书籍列表第 2 页与第 1 页重复，翻页无效",
+              { bookUrl: book.url },
+            );
+            continue;
           }
         }
       }
@@ -965,6 +1313,7 @@ async function verifyConvertedSourceOnce(source, {
       const detailBridge = executableDetailAction(source);
       if (detailBridge) {
         try {
+          markStage("detail");
           detail = await executeDeclarativeUrl(detailBridge.plan, book.url, timedDownload, { limit: 1 });
           if (detailBridge.plan.latestChapter) {
             const adapterUrl = generatedAdapterUrl(detailBridge.requestInfo, "detail", book.url);
@@ -978,7 +1327,8 @@ async function verifyConvertedSourceOnce(source, {
               }
             }
           }
-        } catch {
+        } catch (error) {
+          throwIfRequestTimedOut(error, signal);
           // Some detail actions use a separate API request that cannot be
           // reconstructed from the list URL. The catalogue may still live on it.
         }
@@ -995,17 +1345,17 @@ async function verifyConvertedSourceOnce(source, {
       let bookElements = bookElementReport(mergedBook);
       const derivedRecommended = [];
       if (bookElements.missingRequired.length) {
-        return {
-          ok: false,
-          reason: "rules-stale: invalid-elements",
-          detail: `书籍必要元素解析错误：${bookElements.missingRequired.join("、")}`,
-          bookUrl: book.url,
-          bookElements,
-        };
+        rememberFailure(
+          "rules-stale: invalid-elements",
+          `书籍必要元素解析错误：${bookElements.missingRequired.join("、")}`,
+          { bookUrl: book.url, bookElements },
+        );
+        continue;
       }
       const chapterBridge = executableChapterAction(source);
       if (!chapterBridge) {
-        return { ok: false, reason: "rules-stale: empty-toc", detail: "章节动作无法抽测", bookUrl: book.url };
+        rememberFailure("rules-stale: empty-toc", "章节动作无法抽测", { bookUrl: book.url });
+        continue;
       }
       const singlePageMediaChapter = ["audio", "video"].includes(String(source?.sourceType || ""))
         && /\/adapter\/single-chapter\?/i.test(String(chapterBridge.requestInfo || ""));
@@ -1028,6 +1378,7 @@ async function verifyConvertedSourceOnce(source, {
       )].filter(Boolean);
       for (const chapterPageUrl of [...new Set(firstPageUrls)]) {
         try {
+          markStage("chapter-list");
           const page1 = await fetchChapterPage(
             chapterBridge.plan,
             chapterPageUrl,
@@ -1036,39 +1387,53 @@ async function verifyConvertedSourceOnce(source, {
           );
           page1Count = locallySliced ? Math.min(page1.pageCount, pageSize) : page1.pageCount;
           upstreamSections = page1.upstreamSections;
-          page1Rows = Array.isArray(page1.output.data) ? page1.output.data.slice(0, pageSize) : [];
-          firstChapter = (page1.output.data || []).find((row) => (
+          const resolvedRows = resolveContextualChapterRows(
+            source,
+            page1.output.data,
+            page1.responseUrl,
+            book,
+          );
+          page1.output.data = resolvedRows;
+          page1Rows = resolvedRows.slice(0, pageSize);
+          firstChapter = resolvedRows.find((row) => (
             usableChapterRow(row)
             && (singlePageMediaChapter || !chapterUrlLooksLikeBookSibling(book.url, row))
           ));
           if (firstChapter) {
             if (locallySliced && page1.pageCount > pageSize) {
+              markStage("chapter-list-page-2");
               const page2 = await fetchChapterPage(
                 chapterBridge.plan,
                 chapterPageUrl,
                 timedDownload,
                 { limit: pageSize, offset: pageSize },
               );
+              page2.output.data = resolveContextualChapterRows(
+                source,
+                page2.output.data,
+                page2.responseUrl,
+                book,
+              );
               page2Count = page2.pageCount;
-              if (!page2Count || chapterRowsMostlySame(page1Rows, page2.output.data)) {
-                return {
-                  ok: false,
-                  reason: "rules-stale: empty-toc",
-                  detail: !page2Count
-                    ? `目录第 1 页 ${page1Count} 章但本地切片第 2 页为空`
-                    : "目录本地切片第 2 页与第 1 页重复，翻页无效",
-                  bookUrl: book.url,
-                };
+              if (page2Count && chapterRowsMostlySame(page1Rows, page2.output.data)) {
+                rememberFailure(
+                  "rules-stale: empty-toc",
+                  "目录本地切片第 2 页与第 1 页重复，翻页无效",
+                  { bookUrl: book.url },
+                );
+                continue;
               }
             }
             break;
           }
-        } catch {
+        } catch (error) {
+          throwIfRequestTimedOut(error, signal);
           // Try next candidate.
         }
       }
       if (!firstChapter) {
-        return { ok: false, reason: "rules-stale: empty-toc", detail: "目录解析为空", bookUrl: book.url };
+        rememberFailure("rules-stale: empty-toc", "目录解析为空", { bookUrl: book.url });
+        continue;
       }
       if (!recommendedElementPresent("lastChapterTitle", mergedBook.lastChapterTitle)) {
         const latestTitle = orderChaptersAscending(page1Rows, {
@@ -1090,76 +1455,106 @@ async function verifyConvertedSourceOnce(source, {
         let duplicatePage = false;
         for (const chapterPageUrl of secondPageUrls) {
           try {
+            markStage("chapter-list-page-2");
             const page2 = await fetchChapterPage(
               chapterBridge.plan,
               chapterPageUrl,
               timedDownload,
               { limit: chapterLimit },
             );
+            page2.output.data = resolveContextualChapterRows(
+              source,
+              page2.output.data,
+              page2.responseUrl,
+              book,
+            );
             page2Count = page2.pageCount;
             duplicatePage = chapterRowsMostlySame(page1Rows, page2.output.data);
             if (page2Count > 0) break;
-          } catch {
+          } catch (error) {
+            throwIfRequestTimedOut(error, signal);
             // Try next candidate.
           }
         }
-        if (!page2Count) {
-          return {
-            ok: false,
-            reason: "rules-stale: empty-toc",
-            detail: `目录第 1 页 ${page1Count} 章但第 2 页为空，翻页可能失效`,
-            bookUrl: book.url,
-          };
-        }
-        if (duplicatePage) {
-          return {
-            ok: false,
-            reason: "rules-stale: empty-toc",
-            detail: "目录第 2 页与第 1 页重复，翻页无效",
-            bookUrl: book.url,
-          };
+        if (page2Count && duplicatePage) {
+          rememberFailure(
+            "rules-stale: empty-toc",
+            "目录第 2 页与第 1 页重复，翻页无效",
+            { bookUrl: book.url },
+          );
+          continue;
         }
       }
-      const contentReport = await runXbsChapterContent(source, {
-        bookName: book.name,
-        detailUrl: book.url,
-        chapterTitle: firstChapter.title,
-        chapterUrl: firstChapter.url,
-      }, {
-        fetchImpl: downloadAsFetch(timedDownload),
-        timeoutMs,
-        signal,
-      });
-      if (!contentReport.ok) {
-        return {
-          ok: false,
-          reason: "rules-stale: empty-content",
-          detail: contentReport.error || "正文解析为空",
-          bookUrl: book.url,
+      const webViewMedia = ["audio", "video"].includes(String(source?.sourceType || ""))
+        && usesWebViewMediaAction(source?.chapterContent);
+      let contentReport;
+      if (webViewMedia) {
+        try {
+          const page = await timedDownload(
+            firstChapter.url,
+            actionHeaders(source, source?.chapterContent),
+          );
+          const pageText = decodeTextBuffer(page, {
+            headers: page.httpHeaders || {},
+            charsetHint: source?.chapterContent?.charset || "",
+          });
+          if (!String(pageText || "").trim()) throw new Error("WebView 章节页为空");
+          contentReport = {
+            ok: true,
+            itemCount: 1,
+            firstUrl: "",
+            requestUrl: String(page.read2xsggResponseUrl || firstChapter.url),
+            webView: true,
+          };
+        } catch (error) {
+          throwIfRequestTimedOut(error, signal);
+          contentReport = { ok: false, error: error?.message || String(error) };
+        }
+      } else {
+        markStage("chapter-content");
+        contentReport = await runXbsChapterContent(source, {
+          bookName: book.name,
+          detailUrl: book.url,
+          chapterTitle: firstChapter.title,
           chapterUrl: firstChapter.url,
-        };
+        }, {
+          fetchImpl: downloadAsFetch(timedDownload),
+          timeoutMs,
+          signal,
+        });
+      }
+      if (!contentReport.ok) {
+        if (isRequestTimeout(new Error(contentReport.error || ""))) {
+          throw new Error(contentReport.error || "章节正文请求超时");
+        }
+        rememberFailure(
+          "rules-stale: empty-content",
+          contentReport.error || "正文解析为空",
+          { bookUrl: book.url, chapterUrl: firstChapter.url },
+        );
+        continue;
       }
       if (String(source?.sourceType || "") === "comic"
         && !usableComicContentReport(contentReport, mergedBook.cover)) {
-        return {
-          ok: false,
-          reason: "rules-stale: empty-content",
-          detail: "漫画正文解析到封面、站点界面或占位图片，而非漫画页",
-          bookUrl: book.url,
-          chapterUrl: firstChapter.url,
-        };
+        rememberFailure(
+          "rules-stale: empty-content",
+          "漫画正文解析到封面、站点界面或占位图片，而非漫画页",
+          { bookUrl: book.url, chapterUrl: firstChapter.url },
+        );
+        continue;
       }
+      if (String(source?.sourceType || "") === "comic") markStage("comic-image");
       if (String(source?.sourceType || "") === "comic"
         && !await comicImageRequestWorks(contentReport, timedDownload, timeoutMs, signal)) {
-        return {
-          ok: false,
-          reason: "rules-stale: empty-content",
-          detail: "漫画首张正文图片请求失败或返回非图片内容",
-          bookUrl: book.url,
-          chapterUrl: firstChapter.url,
-        };
+        rememberFailure(
+          "rules-stale: empty-content",
+          "漫画首张正文图片请求失败或返回非图片内容",
+          { bookUrl: book.url, chapterUrl: firstChapter.url },
+        );
+        continue;
       }
       if (["audio", "video"].includes(String(source?.sourceType || "")) && contentReport.firstUrl) {
+        markStage("media-url");
         const mediaFetch = downloadAsFetch(timedDownload);
         let mediaResponse = await mediaFetch(contentReport.firstUrl, {
           method: "HEAD",
@@ -1175,19 +1570,19 @@ async function verifyConvertedSourceOnce(source, {
         }
         if (!isPlayableMediaResponse(mediaResponse, contentReport.firstUrl)) {
           const contentType = mediaResponse.headers?.get?.("content-type") || "unknown";
-          return {
-            ok: false,
-            reason: "rules-stale: empty-content",
-            detail: mediaResponse.ok
+          rememberFailure(
+            "rules-stale: empty-content",
+            mediaResponse.ok
               ? `播放地址返回非媒体类型：${contentType}`
               : `播放地址请求失败：HTTP ${mediaResponse.status}`,
-            bookUrl: book.url,
-            chapterUrl: firstChapter.url,
-          };
+            { bookUrl: book.url, chapterUrl: firstChapter.url },
+          );
+          continue;
         }
       }
       return {
         ok: true,
+        entryKind: kind,
         bookUrl: book.url,
         chapterUrl: firstChapter.url,
         bookName: book.name,
@@ -1202,10 +1597,42 @@ async function verifyConvertedSourceOnce(source, {
         content: contentReport,
       };
     } catch (error) {
-      lastDetail = error.message || String(error);
+      if (signal?.aborted) throwIfRequestTimedOut(error, signal);
+      const detail = error.message || String(error);
+      if (!listResponseReceived && isRequestTimeout(error)) {
+        listTimeoutCount += 1;
+        lastListTimeout = detail;
+        rememberFailure("rules-stale: empty-list", `入口请求超时，继续尝试其它分类/搜索入口：${detail}`);
+      } else {
+        rememberFailure("rules-stale: empty-list", detail);
+      }
     }
   }
-  return {
+  if (listRequestCount > 0 && listTimeoutCount === listRequestCount) {
+    return {
+      ok: false,
+      reason: "rules-stale: source-timeout",
+      detail: `全部 ${listRequestCount} 个分类/搜索入口请求均超时：${lastListTimeout}`,
+    };
+  }
+  if (requireBookWorld && !hasExecutableBookWorld) {
+    return {
+      ok: false,
+      reason: "rules-stale: empty-list",
+      detail: "缺少可执行分类/浏览入口；搜索入口不能替代分类列表",
+    };
+  }
+  if (requireBookWorld && hasExecutableBookWorld) {
+    return {
+      ...(lastFailure || {}),
+      ok: false,
+      reason: lastFailure?.reason || "rules-stale: empty-list",
+      detail: lastFailure?.detail
+        ? `分类/浏览入口未通过完整验证：${lastFailure.detail}`
+        : "分类/浏览入口未通过完整验证；搜索入口不能替代分类列表",
+    };
+  }
+  return lastFailure || {
     ok: false,
     reason: "rules-stale: empty-list",
     detail: lastDetail || "分类/搜索列表为空或无法抽测",
@@ -1214,34 +1641,83 @@ async function verifyConvertedSourceOnce(source, {
 
 async function verifyConvertedSourceWithin(source, options) {
   let primary = await verifyConvertedSourceOnce(source, options);
+  const sourceActions = [
+    ...Object.values(source?.bookWorld || {}),
+    source?.searchBook,
+  ].filter(Boolean);
+  const hasExecutableBookAction = sourceActions.some((action) => executableBookAction(source, action));
   const retryableReasons = new Set([
     "rules-stale: empty-list",
     "rules-stale: empty-toc",
     "rules-stale: empty-content",
   ]);
   if (!primary.ok && retryableReasons.has(primary.reason) && options.retryEmptyList !== false) {
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    const retried = await verifyConvertedSourceOnce(source, options);
-    if (retried.ok) return { ...retried, retryRecovered: true };
-    if (retried.detail) primary = retried;
+    const transientTransportFailure = /(?:HTTP\s+(?:408|425|429|5\d{2})|\b(?:ECONNABORTED|ECONNRESET|EAI_AGAIN|ENETUNREACH)\b|socket hang up|connection reset|temporarily unavailable|network is unreachable)/i
+      .test(String(primary.detail || ""));
+    // A busy upstream or a locally bridged adapter can return one transient
+    // 5xx while the same rule is valid.  Keep ordinary rule failures to the
+    // historical single retry, but allow a bounded second retry for transport
+    // failures.  Never retry timeouts here: the caller's source budget should
+    // be able to skip a blocked site promptly.
+    const retryCount = transientTransportFailure ? 3 : 1;
+    for (let attempt = 0; attempt < retryCount; attempt += 1) {
+      const delayMs = transientTransportFailure
+        ? Math.min(2_000, 300 * (2 ** attempt))
+        : 150;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      const retried = await verifyConvertedSourceOnce(source, options);
+      if (retried.ok) return { ...retried, retryRecovered: true, retryCount: attempt + 1 };
+      if (retried.detail) primary = retried;
+    }
   }
-  if (primary.ok || !["rules-stale: empty-toc", "rules-stale: empty-content"].includes(primary.reason)) {
+  const runtimeOnlyFallback = primary.reason === "rules-stale: empty-list"
+    && Boolean(source?.searchBook)
+    && !hasExecutableBookAction;
+  const sharedFallbackBudget = options.runtimeFallbackBudget
+    && typeof options.runtimeFallbackBudget === "object"
+    ? options.runtimeFallbackBudget
+    : null;
+  const sharedRemainingMs = Number(sharedFallbackBudget?.remainingMs);
+  if (primary.ok || (Number.isFinite(sharedRemainingMs) && sharedRemainingMs <= 0)
+    || (!runtimeOnlyFallback
+    && !["rules-stale: empty-toc", "rules-stale: empty-content"].includes(primary.reason))) {
     return primary;
   }
   const timeoutMs = options.timeoutMs || 3_000;
+  const sourceTimeoutMs = Math.max(
+    timeoutMs,
+    Number(options.sourceTimeoutMs) || Math.max(12_000, timeoutMs * 4),
+  );
+  const configuredFallbackTimeoutMs = Number(options.runtimeFallbackTimeoutMs);
+  const runtimeFallbackTimeoutMs = Math.min(
+    sourceTimeoutMs,
+    configuredFallbackTimeoutMs > 0
+      ? configuredFallbackTimeoutMs
+      : Math.min(45_000, sourceTimeoutMs),
+    Number.isFinite(sharedRemainingMs) ? Math.max(1, sharedRemainingMs) : Number.POSITIVE_INFINITY,
+  );
+  const runtimeFallbackStartedAt = Date.now();
   try {
-    const report = await runXbsPipeline(source, {
-      fetchImpl: downloadAsFetch(options.download),
-      timeoutMs,
-      signal: options.signal,
-      maxBookCandidates: Math.max(3, Number(options.attemptedBookCandidates) || 8),
-      maxChapterCandidates: Math.max(3, Number(options.attemptedChapterCandidates) || 8),
-    });
+    try { options.onStage?.("xbs-runtime-fallback"); } catch { /* diagnostics only */ }
+    const report = await withTimeoutSignal(
+      options.signal,
+      runtimeFallbackTimeoutMs,
+      (signal) => runXbsPipeline(source, {
+        fetchImpl: downloadAsFetch(options.download),
+        timeoutMs,
+        signal,
+        maxBookCandidates: Math.max(3, Number(options.attemptedBookCandidates) || 8),
+        maxChapterCandidates: Math.max(3, Number(options.attemptedChapterCandidates) || 10),
+      }),
+      "XBS_RUNTIME_FALLBACK_BUDGET",
+    );
+    if (!report.ok) throwIfRequestTimedOut(new Error(report.error || ""), options.signal);
     const attempted = Math.max(
       Number(report.attemptedCandidates) || 0,
       Number(report.attemptedChapterCandidates) || 0,
+      Number(report.attemptedWorlds) || 0,
     );
-    if (!report.ok || attempted <= 1) return primary;
+    if (!report.ok || (!runtimeOnlyFallback && attempted <= 1)) return primary;
     if (!requiredElementPresent("name", report.steps?.bookWorld?.bookName)
       || !requiredElementPresent("url", report.steps?.bookWorld?.detailUrl)) return primary;
     const fallbackChapter = {
@@ -1289,8 +1765,24 @@ async function verifyConvertedSourceWithin(source, options) {
       derivedRecommended: report.steps?.bookDetail?.derivedFields || [],
       content: report.steps?.chapterContent || {},
     };
-  } catch {
+  } catch (error) {
+    // Exhausting the local candidate scan is not proof that the site is
+    // blocked. Return the original actionable rule failure so the caller can
+    // continue content repair and whole-site recognition within the remaining
+    // per-source budget. A parent/source timeout and real request timeout still
+    // propagate through the normal skip path.
+    if (error?.code === "XBS_RUNTIME_FALLBACK_BUDGET" && !options.signal?.aborted) {
+      return primary;
+    }
+    throwIfRequestTimedOut(error, options.signal);
     return primary;
+  } finally {
+    if (sharedFallbackBudget && Number.isFinite(sharedRemainingMs)) {
+      sharedFallbackBudget.remainingMs = Math.max(
+        0,
+        sharedRemainingMs - (Date.now() - runtimeFallbackStartedAt),
+      );
+    }
   }
 }
 

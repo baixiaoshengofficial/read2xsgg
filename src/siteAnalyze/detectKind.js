@@ -17,10 +17,13 @@ function scoreKinds(html, baseUrl = "") {
   const imgRatio = linkCount > 0 ? imgCount / linkCount : imgCount;
 
   const kinds = [];
-  if (videoHits >= 2) {
+  // A real media element is a strong type signal even when the landing page
+  // contains only one player.  Textual words/extensions still require two
+  // hits to avoid classifying a navigation link as a media site.
+  if (videoHits >= 2 || /<video\b/i.test(lower)) {
     kinds.push({ kind: "video", confidence: Math.min(0.9, 0.35 + videoHits * 0.05), score: videoHits });
   }
-  if (audioHits >= 2) {
+  if (audioHits >= 2 || /<audio\b/i.test(lower)) {
     kinds.push({ kind: "audio", confidence: Math.min(0.9, 0.35 + audioHits * 0.05), score: audioHits });
   }
   if (comicHits >= 2 || (imgRatio > 1.2 && imgCount >= 20 && novelHits < comicHits + 5)) {

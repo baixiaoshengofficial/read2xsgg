@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "content": { "type": "string" },
+    "toolCalls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "arguments": { "type": "string" }
+        },
+        "required": ["name", "arguments"]
+      }
+    }
+  },
+  "required": ["content", "toolCalls"]
+}

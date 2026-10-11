@@ -113,6 +113,29 @@ function portableKeyPageExpression(expression) {
   return `(${rewriteKeyPageIdentifiers(source)})`;
 }
 
+function portableTemplateLiteralExpression(value) {
+  const source = String(value || "").trim();
+  const match = source.match(/^`([\s\S]*)`$/);
+  if (!match) return "";
+  const body = match[1];
+  const parts = [];
+  let lastIndex = 0;
+  for (const interpolation of body.matchAll(/\$\{\s*(key|page|host)\s*\}/gi)) {
+    if (interpolation.index > lastIndex) parts.push(JSON.stringify(body.slice(lastIndex, interpolation.index)));
+    const name = interpolation[1].toLowerCase();
+    parts.push(name === "key"
+      ? "String(params.keyWord)"
+      : name === "page"
+        ? "String(params.pageIndex)"
+        : "String(config.host || \"\")");
+    lastIndex = interpolation.index + interpolation[0].length;
+  }
+  if (lastIndex < body.length) parts.push(JSON.stringify(body.slice(lastIndex)));
+  const residual = body.replace(/\$\{\s*(key|page|host)\s*\}/gi, "");
+  if (!parts.length || /\$\{|`/.test(residual.replace(/\\`/g, ""))) return "";
+  return `(${parts.join(" + ")})`;
+}
+
 export function legadoTemplateExpression(value) {
   const expression = String(value || "").trim();
   if (/^key$/i.test(expression)) return "params.keyWord";
@@ -126,6 +149,11 @@ export function legadoTemplateExpression(value) {
     return "params.keyWord";
   }
   if (/^java\.(?:t2s|s2t)\(\s*key\s*\)$/i.test(expression)) return "params.keyWord";
+  const staticPut = expression.match(/^java\.put\(\s*['"][^'"]+['"]\s*,\s*([\s\S]+)\)$/i)?.[1];
+  if (staticPut) {
+    const template = portableTemplateLiteralExpression(staticPut);
+    if (template) return template;
+  }
   if (/^(?:java\.)?encodeURI(?:Component)?\(\s*key\s*(?:,\s*['"](?:gbk|gb2312|gb18030|utf-?8)['"]\s*)?\)$/i.test(expression)) {
     return "encodeURIComponent(params.keyWord)";
   }
@@ -188,6 +216,51 @@ function decodedStringLiteral(quote, body) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Read only absolute URL literals from a source's jsLib.  A number of public
+ * Legado sources use a small library as a constant table, for example
+ * `const host = 'https://example.test';` and then reference it as
+ * `{{host}}` in otherwise declarative rules.  Executing jsLib would import
+ * cookies, Android APIs, and arbitrary site code, so the converter deliberately
+ * accepts this narrow, side-effect-free subset only.
+ */
+export function extractStaticLegadoUrlConstants(jsLibrary) {
+  const source = String(jsLibrary || "");
+  if (!source.trim()) return {};
+  const constants = {};
+  const declaration = /(?:^|[;{}\n])\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(["'])((?:\\.|(?!\2)[\s\S])*?)\2\s*;?/g;
+  for (const match of source.matchAll(declaration)) {
+    const name = match[1];
+    const decoded = decodedStringLiteral(match[2], match[3]);
+    if (decoded === null || !/^https?:\/\/[^\s<>"'`{}]+$/i.test(decoded)) continue;
+    try {
+      const parsed = new URL(decoded);
+      if (!/^https?:$/.test(parsed.protocol) || !parsed.host) continue;
+    } catch {
+      continue;
+    }
+    // Conflicting declarations are not deterministic enough to export.
+    if (Object.hasOwn(constants, name) && constants[name] !== decoded) delete constants[name];
+    else if (!Object.hasOwn(constants, name)) constants[name] = decoded;
+  }
+  return constants;
+}
+
+export function replaceStaticLegadoUrlConstants(value, constants = {}) {
+  if (typeof value !== "string" || !Object.keys(constants).length) return value;
+  return value
+    .replace(/\{\{\s*([A-Za-z_$][\w$]*)\s*\}\}/g, (token, name) => (
+      Object.hasOwn(constants, name) ? constants[name] : token
+    ))
+    // Template literals in jsLib-backed rules use the same static URL table
+    // with `${host}` rather than Legado's `{{host}}` placeholder. Replacing
+    // only known absolute URL constants keeps this declarative and never
+    // evaluates the surrounding template or library code.
+    .replace(/\$\{\s*([A-Za-z_$][\w$]*)\s*\}/g, (token, name) => (
+      Object.hasOwn(constants, name) ? constants[name] : token
+    ));
 }
 
 function compileTemplateString(value) {
@@ -290,6 +363,10 @@ function maskedJavaScript(value) {
     index += 1;
   }
   return out.join("");
+}
+
+export function maskLegadoJavaScript(value) {
+  return maskedJavaScript(value);
 }
 
 function insideObjectLiteral(masked, index) {
@@ -577,7 +654,10 @@ export function hasUnsupportedLegadoRuntime(value) {
   const marker = source.search(/@js:/i);
   if (marker < 0) return false;
   if ((source.match(/@js:/gi) || []).length > 1) return true;
-  const script = source.slice(marker + 4);
+  // Xiangse allows a selector prefix before the post-processor marker
+  // (`field||@js:`). Validate only the JavaScript segment; validating the
+  // separator as JavaScript would reject an otherwise portable rule.
+  const script = source.slice(marker + 4).replace(/^\s*\|\|\s*/, "");
   const masked = maskedJavaScript(script);
   // `src`（原始响应）和 `baseUrl`（阅读当前页）是 Legado 字段脚本的
   // 隐式全局量，不在香色公开的 config/params/result 合约中。局部声明

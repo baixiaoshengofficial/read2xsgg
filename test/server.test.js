@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import { createCipheriv, createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
-import { chapterPageCandidates, compileBookBridgePlan, createAppServer, decodeBridgePlan, decodeXbs, downloadSource, encodeBridgePlan, filterReachableSources, normalizeEmbeddedSourceUrl, pageImageUrls, pageTocUrl, preferredResolvedAddress, serverConfig, skippedBuckets, sourceUrlCandidates } from "../src/index.js";
+import { chapterPageCandidates, compileBookBridgePlan, compileChapterBridgePlan, compileChapterCatalogPlan, createAppServer, createLibraryStore, decodeBridgePlan, decodeXbs, downloadSource, encodeBridgePlan, encodeChapterCatalogPlan, filterReachableSources, normalizeEmbeddedSourceUrl, pageImageUrls, pageTocUrl, preferredResolvedAddress, serverConfig, skippedBuckets, sourceUrlCandidates } from "../src/index.js";
 import { encodeSsrEpisodePlan } from "../src/siteAnalyze/ssrEpisodes.js";
+import { memoryBoundVerifyWorkers, probeRequest, resolveTarget } from "../src/server.js";
 
 const source = {
   bookSourceName: "在线示例",
@@ -75,6 +77,50 @@ test("源地址候选仅对目录段生成通用单复数回退", () => {
   ]);
 });
 
+test("预检 IPv6 网络不可达只失败当前候选，不产生未处理拒绝", async () => {
+  let resolveLateSocketError;
+  const lateSocketError = new Promise((resolve) => { resolveLateSocketError = resolve; });
+  const requestFactory = () => {
+    const request = new EventEmitter();
+    const socket = new EventEmitter();
+    request.setTimeout = () => request;
+    request.destroy = (error) => {
+      queueMicrotask(() => {
+        request.emit("error", error);
+        request.emit("close");
+      });
+      return request;
+    };
+    request.end = () => {
+      request.emit("socket", socket);
+      queueMicrotask(() => {
+        const error = Object.assign(
+          new Error("connect ENETUNREACH 2606:4700::1:443"),
+          { code: "ENETUNREACH" },
+        );
+        request.emit("error", error);
+        setImmediate(() => {
+          socket.emit("error", error);
+          socket.emit("close");
+          resolveLateSocketError();
+        });
+      });
+    };
+    return request;
+  };
+  const result = await probeRequest(
+    new URL("https://probe.example/"),
+    { address: "2606:4700::1", family: 6 },
+    { preflightTimeoutMs: 1_000 },
+    {},
+    "GET",
+    null,
+    requestFactory,
+  );
+  await lateSocketError;
+  assert.deepEqual(result, { status: 0, location: "" });
+});
+
 test("深度预检为 JSON API 详情尝试同源 HTML 章节页", () => {
   assert.deepEqual(chapterPageCandidates("https://comic.example/api/comic/123?from=list"), [
     "https://comic.example/api/comic/123?from=list",
@@ -90,7 +136,27 @@ test("DNS 同时返回 IPv6 和 IPv4 时优先使用 IPv4", () => {
   const ipv4 = { address: "8.8.8.8", family: 4 };
   assert.deepEqual(preferredResolvedAddress([ipv6, ipv4]), ipv4);
   assert.deepEqual(preferredResolvedAddress([ipv6]), ipv6);
+  assert.deepEqual(preferredResolvedAddress([ipv6, ipv4], false), ipv4);
+  assert.equal(preferredResolvedAddress([ipv6], false), null);
   assert.equal(preferredResolvedAddress([]), null);
+});
+
+test("无 IPv6 出口时不连接 IPv6-only 地址，双栈源仍走 IPv4", async () => {
+  const config = {
+    allowPrivateNetworks: false,
+    allowDnsProxyNetworks: true,
+    ipv6NetworkAvailable: false,
+  };
+  const ipv6 = { address: "2606:4700::1", family: 6 };
+  await assert.rejects(
+    () => resolveTarget(new URL("https://example.com/"), config, async () => [ipv6]),
+    /仅解析到 IPv6.*没有可用的 IPv6 网络/,
+  );
+  const ipv4 = { address: "93.184.216.34", family: 4 };
+  assert.deepEqual(
+    await resolveTarget(new URL("https://example.com/"), config, async () => [ipv6, ipv4]),
+    ipv4,
+  );
 });
 
 test("在线 URL 接口输出 XBS、JSON、缓存标识和健康状态", async (context) => {
@@ -200,6 +266,83 @@ test("发布接口允许最大阅读源大小内的 payload", async (context) =>
   assert.equal((await published.json()).status, "done");
 });
 
+test("重试已有转换任务时清除上轮逐源诊断", async (context) => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), "read2xsgg-retry-diagnostics-"));
+  const store = createLibraryStore(dataDir);
+  const enqueued = [];
+  const worker = { enqueue(id) { enqueued.push(id); }, cancel() {}, syncQueued() {} };
+  const job = await store.createJob({ url: "https://example.com/source.json", name: "retry-diagnostics" });
+  await store.updateJob(job.id, {
+    status: "done",
+    phase: "done",
+    aiAttemptCount: 3,
+    aiRepairCount: 1,
+    skippedReasons: { "rules-stale: source-timeout": 3 },
+    skippedSources: [{ source: "旧源", reason: "source-timeout", sourceType: "comic" }],
+  });
+  const app = createAppServer({
+    config: { ...testServerConfig(), adminToken: "test-token", dataDir },
+    worker,
+    store,
+  });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  const response = await fetch(`${appBase}/api/jobs/${job.id}/retry`, {
+    method: "POST",
+    headers: { Authorization: "Bearer test-token" },
+  });
+  assert.equal(response.status, 202);
+  const retried = await response.json();
+  assert.equal(retried.status, "queued");
+  assert.deepEqual(retried.skippedReasons, {});
+  assert.deepEqual(retried.skippedSources, []);
+  assert.equal(retried.aiAttemptCount, 0);
+  assert.equal(retried.aiRepairCount, 0);
+  assert.deepEqual(enqueued, [job.id]);
+});
+
+test("管理接口暂停排队任务并可通过原任务重跑", async (context) => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), "read2xsgg-pause-route-"));
+  const store = createLibraryStore(dataDir);
+  const pausedIds = [];
+  const enqueued = [];
+  const worker = {
+    async pause(id) {
+      pausedIds.push(id);
+      return store.updateJob(id, { status: "paused", phase: "paused", pausedAt: new Date().toISOString() });
+    },
+    cancel() {},
+    enqueue(id) { enqueued.push(id); },
+    syncQueued() {},
+  };
+  const job = await store.createJob({ url: "https://example.com/pause-me.json" });
+  const app = createAppServer({
+    config: { ...testServerConfig(), adminToken: "test-token", dataDir },
+    worker,
+    store,
+  });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  const headers = { Authorization: "Bearer test-token" };
+
+  const pausedResponse = await fetch(`${appBase}/api/jobs/${job.id}/pause`, { method: "POST", headers });
+  assert.equal(pausedResponse.status, 200);
+  assert.equal((await pausedResponse.json()).status, "paused");
+  assert.deepEqual(pausedIds, [job.id]);
+
+  const resumedResponse = await fetch(`${appBase}/api/jobs/${job.id}/retry`, { method: "POST", headers });
+  assert.equal(resumedResponse.status, 202);
+  assert.equal((await resumedResponse.json()).status, "queued");
+  assert.deepEqual(enqueued, [job.id]);
+});
+
 test("/url/ 对网站地址执行识站并返回 XBS", async (context) => {
   const novelHome = `<!doctype html><html><head><title>示例小说网</title></head><body>
 <ul class="list">
@@ -283,7 +426,7 @@ test("同一在线源的并发转换会合并为一个上游任务", async (cont
   assert.equal(requests, 1);
 });
 
-test("聚合源转换会在转换前过滤不可访问上游站点", async (context) => {
+test("聚合源转换不会把预检无响应当成不可访问而提前丢弃", async (context) => {
   let upstreamBase = "";
   const upstream = createServer((request, response) => {
     if (request.url?.startsWith("/source.json")) {
@@ -314,12 +457,15 @@ test("聚合源转换会在转换前过滤不可访问上游站点", async (cont
 
   const response = await fetch(`${appBase}/convert/json?url=${encodeURIComponent(`${upstreamBase}/source.json`)}`);
   assert.equal(response.status, 200);
-  assert.equal(response.headers.get("x-converted-count"), "1");
-  assert.equal(response.headers.get("x-skipped-count"), "1");
+  assert.equal(response.headers.get("x-converted-count"), "2");
+  assert.equal(response.headers.get("x-skipped-count"), "0");
   const payload = await response.json();
   assert.ok(payload.sources["可访问"]);
-  assert.equal(payload.sources["不可访问"], undefined);
-  assert.deepEqual(payload.skipped, [{ source: "不可访问", reason: "上游站点不可访问" }]);
+  assert.ok(payload.sources["不可访问"]);
+  assert.deepEqual(payload.skipped, []);
+  assert.ok(payload.warnings.some((item) => item.source === "不可访问"
+    && item.field === "origin"
+    && /尚不能判定站点不可访问/.test(item.message)));
 });
 
 test("预检使用 GET 并尝试源声明的绝对搜索入口", async (context) => {
@@ -374,6 +520,83 @@ test("预检在根路径受限时尝试源声明的实际搜索入口", async (c
   assert.deepEqual(result.skipped, []);
 });
 
+test("预检不把同主机一个失效路径的结果复用于其他路径，超时入口继续验链", async (context) => {
+  const upstream = createServer((request, response) => {
+    if (request.url?.startsWith("/live")) {
+      response.writeHead(200, { "Content-Type": "text/plain" });
+      response.end("live");
+      return;
+    }
+    setTimeout(() => {
+      if (response.destroyed) return;
+      response.writeHead(200, { "Content-Type": "text/plain" });
+      response.end("too late");
+    }, 1_000);
+  });
+  const upstreamBase = await listen(upstream);
+  context.after(() => close(upstream));
+  const makeSource = (name, searchPath) => ({
+    ...structuredClone(source),
+    bookSourceName: name,
+    bookSourceUrl: upstreamBase,
+    searchUrl: `${searchPath}?q={{key}}`,
+  });
+  const result = await filterReachableSources([
+    makeSource("超时入口", "/slow"),
+    makeSource("可用入口", "/live"),
+  ], {
+    ...testServerConfig(),
+    allowPrivateNetworks: true,
+    preflightSources: true,
+    preflightTimeoutMs: 250,
+    preflightConfirmTimeoutMs: 250,
+    preflightRetries: 1,
+    preflightConcurrency: 2,
+    preflightCandidateConcurrency: 3,
+  });
+  assert.deepEqual(result.input.map((item) => item.bookSourceName).sort(), ["可用入口", "超时入口"]);
+  assert.deepEqual(result.skipped, []);
+  assert.deepEqual(result.unconfirmed.map((item) => item.source), ["超时入口"]);
+});
+
+test("预检并发探测备选入口，快速成功时会取消仍在等待的慢入口", async (context) => {
+  const slow = createServer((_request, response) => {
+    setTimeout(() => {
+      if (response.destroyed) return;
+      response.writeHead(200, { "Content-Type": "text/plain" });
+      response.end("slow");
+    }, 700);
+  });
+  const fast = createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/plain" });
+    response.end("fast");
+  });
+  const slowBase = await listen(slow);
+  const fastBase = await listen(fast);
+  context.after(async () => {
+    await close(slow);
+    await close(fast);
+  });
+  const startedAt = Date.now();
+  const result = await filterReachableSources([{
+    ...structuredClone(source),
+    bookSourceUrl: `${slowBase}/slow-source`,
+    searchUrl: `${fastBase}/search?q={{key}}`,
+  }], {
+    ...testServerConfig(),
+    allowPrivateNetworks: true,
+    preflightSources: true,
+    preflightTimeoutMs: 300,
+    preflightConfirmTimeoutMs: 300,
+    preflightRetries: 1,
+    preflightConcurrency: 1,
+    preflightCandidateConcurrency: 3,
+  });
+  assert.equal(result.input.length, 1);
+  assert.deepEqual(result.skipped, []);
+  assert.ok(Date.now() - startedAt < 450, "应在备用入口响应时立即结束探活");
+});
+
 test("快速预检超时后使用较长时限二次确认", async (context) => {
   const upstream = createServer((_request, response) => {
     setTimeout(() => {
@@ -399,7 +622,7 @@ test("快速预检超时后使用较长时限二次确认", async (context) => {
   assert.deepEqual(result.skipped, []);
 });
 
-test("预检三次超时后只跳过该站点，不中断合集转换", async (context) => {
+test("预检多次无响应后将站点标记为待验链而不是直接跳过", async (context) => {
   let requests = 0;
   const upstream = createServer((_request, response) => {
     requests += 1;
@@ -427,8 +650,117 @@ test("预检三次超时后只跳过该站点，不中断合集转换", async (c
   // Each retry may try the source's declared entry, home page, and protocol
   // fallback. The contract is three retry rounds, not one fixed URL count.
   assert.ok(requests >= 3);
-  assert.deepEqual(result.input, []);
-  assert.deepEqual(result.skipped, [{ source: "连续超时", reason: "上游站点不可访问" }]);
+  assert.equal(result.input.length, 1);
+  assert.deepEqual(result.skipped, []);
+  assert.deepEqual(result.unconfirmed, [{
+    source: "连续超时",
+    reason: "预检未收到上游 HTTP 响应，尚不能判定站点不可访问；保留继续转换和完整验链",
+    sourceType: "text",
+    host: "127.0.0.1",
+    stage: "preflight-unconfirmed",
+  }]);
+});
+
+test("深度预检的旧列表规则失败时仍保留已响应站点进入转换", async (context) => {
+  const requests = [];
+  const upstream = createServer((request, response) => {
+    requests.push(request.url);
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    response.end("<html><body>当前列表结构已变化</body></html>");
+  });
+  const upstreamBase = await listen(upstream);
+  context.after(() => close(upstream));
+
+  const convertedSource = {
+    sourceName: "旧规则待识站",
+    sourceUrl: upstreamBase,
+    sourceType: "text",
+    bookWorld: {
+      分类: {
+        host: upstreamBase,
+        responseFormatType: "html",
+        requestInfo: `${upstreamBase}/old-list`,
+        list: "//.old-list li",
+        bookName: ".//a",
+        detailUrl: ".//a/@href",
+      },
+    },
+    chapterList: {
+      host: upstreamBase,
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      list: "//a",
+      title: ".",
+      url: "//@href",
+    },
+    chapterContent: {
+      host: upstreamBase,
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      content: "//*[@id='content']",
+    },
+  };
+  const result = await filterReachableSources([convertedSource], {
+    ...testServerConfig(),
+    allowPrivateNetworks: true,
+    preflightSources: true,
+    preflightDeep: true,
+    preflightTimeoutMs: 500,
+    preflightConfirmTimeoutMs: 500,
+    preflightConcurrency: 1,
+  });
+
+  assert.equal(result.input.length, 1);
+  assert.equal(result.skipped.length, 0);
+  assert.equal(result.warnings[0]?.field, "original-chain");
+  assert.ok(requests.includes("/old-list"));
+});
+
+test("预检收到 5xx 时仍将源交给通用转换与识站", async (context) => {
+  const upstream = createServer((_request, response) => {
+    response.writeHead(503, { "Content-Type": "text/plain" });
+    response.end("temporarily unavailable");
+  });
+  const upstreamBase = await listen(upstream);
+  context.after(() => close(upstream));
+  const result = await filterReachableSources([{
+    ...structuredClone(source),
+    bookSourceName: "临时 503",
+    bookSourceUrl: upstreamBase,
+  }], {
+    ...testServerConfig(),
+    allowPrivateNetworks: true,
+    preflightSources: true,
+    preflightTimeoutMs: 500,
+    preflightConcurrency: 1,
+  });
+
+  assert.equal(result.input.length, 1);
+  assert.equal(result.skipped.length, 0);
+});
+
+test("下载器对 GET 瞬时 502 自动重试且受配置次数限制", async (context) => {
+  let requests = 0;
+  const upstream = createServer((_request, response) => {
+    requests += 1;
+    if (requests === 1) {
+      response.writeHead(502);
+      response.end("temporary upstream failure");
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "text/plain" });
+    response.end("ok");
+  });
+  const upstreamBase = await listen(upstream);
+  context.after(() => close(upstream));
+
+  const output = await downloadSource(`${upstreamBase}/retry`, {
+    ...testServerConfig(),
+    allowPrivateNetworks: true,
+    fetchRetries: 1,
+  });
+  assert.equal(output.toString("utf8"), "ok");
+  assert.equal(requests, 2);
 });
 
 test("POST 表单可在 302 后切换 GET 且不会重放请求体", async (context) => {
@@ -637,6 +969,58 @@ test("通用书籍桥接器检测上游翻页重复并停止追加", async (cont
   assert.deepEqual(page2Body.data, []);
   assert.equal(page2Body.hasMore, false);
   assert.equal(page2Body.duplicateOfPage1, true);
+});
+
+test("桥接适配器容量至少匹配完整验链 worker 并发", async (context) => {
+  let active = 0;
+  let maxActive = 0;
+  let upstreamBase = "";
+  const upstream = createServer((_request, response) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    setTimeout(() => {
+      active -= 1;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ items: [{ name: "并发测试", url: `${upstreamBase}/detail` }] }));
+    // Leave room for worker-thread dispatch when the complete node:test suite
+    // is running several files concurrently; the test is measuring the
+    // configured concurrency ceiling, not loopback scheduler jitter.
+    }, 250);
+  });
+  upstreamBase = await listen(upstream);
+  const app = createAppServer({
+    config: {
+      ...testServerConfig(),
+      allowPrivateNetworks: true,
+      cacheTtlMs: 0,
+      maxConcurrent: 8,
+      verifyWorkers: 16,
+      jobVerifyWorkers: 16,
+    },
+  });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const plan = encodeBridgePlan({
+    version: 1,
+    kind: "books",
+    host: upstreamBase,
+    responseType: "json",
+    list: "items",
+    fields: {
+      name: { selector: "name" },
+      url: { selector: "url" },
+    },
+  });
+  const responses = await Promise.all(Array.from({ length: 16 }, (_, index) => fetch(
+    `${appBase}/adapter/books?plan=${plan}&url=${encodeURIComponent(`${upstreamBase}/list?page=${index + 1}`)}`,
+  )));
+  assert.deepEqual(responses.map((response) => response.status), Array(16).fill(200));
+  await Promise.all(responses.map((response) => response.arrayBuffer()));
+  assert.equal(maxActive, 16);
 });
 
 test("通用桥接器保留上游 JSON 查询参数的百分号编码", async (context) => {
@@ -996,8 +1380,79 @@ test("通用详情桥在旧目录选择器为空时解析内嵌目录", async (c
   assert.deepEqual(await response.json(), { name: "内嵌目录作品", lastChapterTitle: "大结局" });
 });
 
-test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", async (context) => {
+test("桥接规则解析不阻塞 HTTP 健康检查", async (context) => {
+  const page = "<ul>"
+    + Array.from({ length: 6_000 }, (_, index) => (
+      "<li><a href=\"/book/" + index + "\">测试书籍" + index + "</a></li>"
+    )).join("")
+    + "</ul>";
   const upstream = createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    response.end(page);
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({
+    config: { ...testServerConfig(), allowPrivateNetworks: true, cacheTtlMs: 0 },
+  });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const plan = encodeBridgePlan(compileBookBridgePlan({
+    host: upstreamBase,
+    responseFormatType: "html",
+    list: "//li",
+    bookName: ".//a",
+    detailUrl: ".//a/@href",
+  }));
+  const bridgeUrl = new URL("/adapter/books", appBase);
+  bridgeUrl.searchParams.set("plan", plan);
+  bridgeUrl.searchParams.set("pageSize", "2");
+  bridgeUrl.searchParams.set("url", new URL("/list", upstreamBase).toString());
+  const bridge = fetch(bridgeUrl);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const healthStarted = performance.now();
+  const health = await fetch(new URL("/healthz", appBase));
+  const healthElapsed = performance.now() - healthStarted;
+  assert.equal(health.status, 200);
+  assert.deepEqual(await health.json(), { status: "ok" });
+  assert.ok(healthElapsed < 1_000, "健康检查被桥接 DOM 解析阻塞：" + healthElapsed + "ms");
+  assert.equal((await bridge).status, 200);
+});
+
+test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", async (context) => {
+  const upstreamRequests = [];
+  const upstream = createServer((request, response) => {
+    upstreamRequests.push({
+      url: request.url,
+      ss: request.headers.ss || "",
+      tt: request.headers.tt || "",
+      xPlan: request.headers["x-plan"] || "",
+    });
+    if (["/chapter/signed", "/chapter/resolve"].includes(request.url)
+      && (request.headers.ss !== "signed" || request.headers.tt !== "123")) {
+      response.writeHead(403);
+      response.end("missing signed request headers");
+      return;
+    }
+    if (request.url === "/chapter/resolve") {
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      response.end('<meta name="chapter-id" content="42">');
+      return;
+    }
+    if (request.url === "/media-api?id=42") {
+      if (request.headers["x-plan"] !== "static"
+        || request.headers.ss || request.headers.tt) {
+        response.writeHead(403);
+        response.end("unexpected media-resolution headers");
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: { trackUrl: `${upstreamBase}/media/resolved.m4a` } }));
+      return;
+    }
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ data: { trackUrl: "/media/chapter.m4a" } }));
   });
@@ -1019,6 +1474,58 @@ test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", as
     url: `${upstreamBase}/media/chapter.m4a`,
     httpHeaders: { Referer: audioChapter },
   });
+
+  const dynamicHeaders = encodeURIComponent(JSON.stringify({ ss: "signed", tt: "123" }));
+  const signedChapter = `${upstreamBase}/chapter/signed`;
+  const signed = await fetch(
+    `${appBase}/adapter/media?kind=audio&plan=${audioPlan}&requestHeaders=${dynamicHeaders}&url=${encodeURIComponent(signedChapter)}`,
+  );
+  assert.equal(signed.status, 200);
+  assert.deepEqual(await signed.json(), {
+    url: `${upstreamBase}/media/chapter.m4a`,
+    httpHeaders: { Referer: signedChapter },
+  });
+  assert.deepEqual(upstreamRequests.find((item) => item.url === "/chapter/signed"), {
+    url: "/chapter/signed",
+    ss: "signed",
+    tt: "123",
+    xPlan: "",
+  });
+
+  const resolutionPlan = Buffer.from(JSON.stringify({
+    version: 1,
+    kind: "audio",
+    properties: ["trackUrl"],
+    attributes: [],
+    headers: { "X-Plan": "static" },
+    resolution: {
+      extract: [{ name: "chapterId", source: "meta", key: "chapter-id" }],
+      request: { url: `${upstreamBase}/media-api?id={{chapterId}}` },
+      response: { properties: ["trackUrl"] },
+    },
+  })).toString("base64url");
+  const resolvedChapter = `${upstreamBase}/chapter/resolve`;
+  const resolved = await fetch(
+    `${appBase}/adapter/media?kind=audio&plan=${resolutionPlan}&requestHeaders=${dynamicHeaders}&url=${encodeURIComponent(resolvedChapter)}`,
+  );
+  assert.equal(resolved.status, 200);
+  assert.deepEqual(await resolved.json(), {
+    url: `${upstreamBase}/media/resolved.m4a`,
+    httpHeaders: { Referer: resolvedChapter },
+  });
+  assert.deepEqual(upstreamRequests.find((item) => item.url === "/media-api?id=42"), {
+    url: "/media-api?id=42",
+    ss: "",
+    tt: "",
+    xPlan: "static",
+  });
+
+  const forbiddenHeaders = encodeURIComponent(JSON.stringify({ Host: "attacker.example" }));
+  const rejected = await fetch(
+    `${appBase}/adapter/media?kind=audio&plan=${audioPlan}&requestHeaders=${forbiddenHeaders}&url=${encodeURIComponent(signedChapter)}`,
+  );
+  assert.equal(rejected.status, 400);
+
   const detailReferer = `${upstreamBase}/book/1`;
   const referred = await fetch(`${appBase}/adapter/media?kind=audio&plan=${audioPlan}&url=${encodeURIComponent(audioChapter)}&referer=${encodeURIComponent(detailReferer)}`);
   assert.equal(referred.status, 200);
@@ -1090,6 +1597,45 @@ test("规则桥接接受空 host 计划中的绝对目标 URL", async (context) 
   }]);
 });
 
+test("规则桥接保留 URL 字段携带的 POST 请求描述符", async (context) => {
+  const requests = [];
+  const upstream = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      requests.push({ method: request.method, body });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ rows: [{ title: "第一章", url: `${upstreamBase}/chapter/1` }] }));
+    });
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const plan = encodeBridgePlan({
+    version: 1,
+    kind: "chapters",
+    host: upstreamBase,
+    responseType: "json",
+    list: "rows",
+    fields: { title: { selector: "title" }, url: { selector: "url" } },
+  });
+  const descriptor = `${upstreamBase}/detail,%7B%22method%22:%22POST%22,%22body%22:%22book_id%3D42%22%7D`;
+  const response = await fetch(
+    `${appBase}/adapter/chapters?plan=${plan}&url=${encodeURIComponent(descriptor)}`,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(requests, [{ method: "POST", body: "book_id=42" }]);
+  assert.deepEqual((await response.json()).data, [{
+    title: "第一章",
+    url: `${upstreamBase}/chapter/1`,
+  }]);
+});
+
 test("章节桥接从详情 HTML 捕获 ID 后请求目录接口", async (context) => {
   const requests = [];
   const upstream = createServer((request, response) => {
@@ -1137,6 +1683,50 @@ test("章节桥接从详情 HTML 捕获 ID 后请求目录接口", async (contex
   assert.deepEqual((await response.json()).data, [{
     title: "第一话",
     url: `${upstreamBase}/content?m=18&c=387`,
+  }]);
+});
+
+test("章节桥接保留 hydration 数据脚本并解析音频章节", async (context) => {
+  const upstream = createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    response.end('<script id="__NUXT_DATA__" type="application/json">'
+      + '[null,{"chapters":2},[3],{"title":4,"index":6},"第一集",null,"001"]'
+      + "</script>");
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const rule = [
+    "@js:",
+    "return ((function(){var s=String(result);var m=s.match(/__NUXT_DATA__[^>]*>([\\s\\S]*?)<\\/script>/);",
+    "if(!m)return [];var arr=[];try{arr=JSON.parse(m[1])}catch(e){return [];}var ci=-1;",
+    "for(var i=0;i<arr.length;i++){var o=arr[i];if(o&&typeof o==='object'&&!(o instanceof Array)&&o.chapters!==undefined){ci=i;break;}}",
+    "if(ci<0)return [];var crefs=arr[ci].chapters;var cr=(typeof crefs==='number')?arr[crefs]:crefs;",
+    "if(!cr||!cr.length)return [];var out=[];var bm=String((params.responseUrl||config.host||'')).match(/albums\\/(\\d+)/);",
+    "var bid=bm?bm[1]:'';for(var j=0;j<cr.length;j++){var co=arr[cr[j]];",
+    `if(co&&typeof co==='object'){out.push({name:String(arr[co.title]),url:'${upstreamBase}/audios/'+bid+'/'+String(arr[co.index])});}}`,
+    "return out;})());",
+  ].join("");
+  const plan = compileChapterBridgePlan({
+    host: upstreamBase,
+    responseFormatType: "json",
+    list: rule,
+    title: "name",
+    url: "url",
+  });
+  const encoded = encodeBridgePlan(plan);
+  const response = await fetch(
+    `${appBase}/adapter/chapters?plan=${encoded}&url=${encodeURIComponent(`${upstreamBase}/albums/99`)}`,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).data, [{
+    title: "第一集",
+    url: `${upstreamBase}/audios/99/001`,
   }]);
 });
 
@@ -1315,6 +1905,57 @@ test("通用 catalog 适配端点按声明式 idList 计划分页", async (conte
 
   const missing = await fetch(`${appBase}/adapter/catalog?plan=${plan}&page=1`);
   assert.equal(missing.status, 400);
+});
+
+test("章节目录适配执行声明式 JSON 目录计划并映射章节地址", async (context) => {
+  const requests = [];
+  const upstream = createServer((request, response) => {
+    requests.push({ method: request.method, url: request.url });
+    if (request.url === "/catalog" && request.method === "POST") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: [
+        { title: "卷首", ctype: "1", ordernum: 0 },
+        { title: "第一章", ctype: "0", ordernum: 1 },
+      ] }));
+      return;
+    }
+    response.writeHead(404);
+    response.end("missing");
+  });
+  const upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const plan = compileChapterCatalogPlan({
+    chapterList: [
+      "@js:",
+      'var bid = baseUrl.match(/read\\/(\\d+)/)[1];',
+      'var resp = java.post(source.getKey()+"/catalog", "bid="+bid, {});',
+      "var json = JSON.parse(resp.body()).data;",
+      "for(var i=json.length - 1; i >= 0; i--){",
+      '  if(json[i].ctype === "1"){ json.splice(i, 1); continue; }',
+      '  page = json[i]["ordernum"];',
+      '  json[i]["url"] = source.getKey() + "/read/" + bid + "/p" + page + ".html";',
+      "}",
+      "json;",
+    ].join("\n"),
+    chapterName: "title",
+    chapterUrl: "url",
+  }, { host: upstreamBase });
+  const encoded = encodeChapterCatalogPlan(plan);
+  const target = `${upstreamBase}/read/9`;
+  const result = await fetch(`${appBase}/adapter/chapter-list?plan=${encoded}&url=${encodeURIComponent(target)}`);
+  assert.equal(result.status, 200);
+  assert.deepEqual(await result.json(), {
+    data: [{ title: "第一章", url: `${upstreamBase}/read/9/p1.html` }],
+    hasMore: false,
+    pageSize: 1,
+  });
+  assert.deepEqual(requests, [{ method: "POST", url: "/catalog" }]);
 });
 
 test("媒体适配按声明式两步计划二次请求，空计划不猜测网关", async (context) => {
@@ -1868,6 +2509,59 @@ test("通用漫画适配器解密页面参数中的图片清单并保持哈希�
   assert.deepEqual(payload.urls, paths.map((name) => `${upstreamBase}/pages/${name}`));
 });
 
+test("通用漫画适配器使用转换计划中的 AES 解密正文脚本清单和图片", async (context) => {
+  const key = Buffer.from("0123456789abcdef");
+  const manifestIv = Buffer.from("manifest-iv--123");
+  const imageIv = Buffer.from("image-prefix-123");
+  const plain = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0xff, 0xd9]);
+  const encrypt = (value, iv) => {
+    const cipher = createCipheriv("aes-128-cbc", key, iv);
+    return Buffer.concat([iv, cipher.update(value), cipher.final()]);
+  };
+  const encryptedImage = encrypt(plain, imageIv);
+  let upstreamBase = "";
+  const upstream = createServer((request, response) => {
+    if (request.url === "/chapter/1") {
+      const manifest = Buffer.from(JSON.stringify({ images: ["/pages/001.jpg", "/pages/002.jpg"] }));
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end(`<script>var params = '${encrypt(manifest, manifestIv).toString("base64")}';</script>`);
+      return;
+    }
+    if (request.url?.startsWith("/pages/")) {
+      response.writeHead(200, { "Content-Type": "application/octet-stream" });
+      response.end(encryptedImage);
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  upstreamBase = await listen(upstream);
+  const app = createAppServer({ config: { ...testServerConfig(), allowPrivateNetworks: true, maxImageBytes: 1024 } });
+  const appBase = await listen(app);
+  context.after(async () => {
+    await close(app);
+    await close(upstream);
+  });
+
+  const decoder = `aes-cbc-prefix-iv-${key.toString("base64url")}`;
+  const plan = Buffer.from(JSON.stringify({
+    version: 1,
+    properties: ["images"],
+    attributes: [],
+    decoder,
+  })).toString("base64url");
+  const response = await fetch(
+    `${appBase}/adapter/images?plan=${plan}&url=${encodeURIComponent(`${upstreamBase}/chapter/1`)}`,
+  );
+  const responseBody = await response.text();
+  assert.equal(response.status, 200, responseBody);
+  const payload = JSON.parse(responseBody);
+  assert.deepEqual(payload.urls, [`${upstreamBase}/pages/001.jpg`, `${upstreamBase}/pages/002.jpg`]);
+  assert.match(payload.proxyUrls[0], new RegExp(`/image/${decoder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  const image = await fetch(payload.proxyUrls[0]);
+  assert.equal(image.status, 200);
+  assert.deepEqual(Buffer.from(await image.arrayBuffer()), plain);
+});
+
 test("通用目录跳转器从详情页选择章节目录而不是开始阅读", async (context) => {
   const html = `
     <a href="/novel/read/1"><span>开始阅读</span></a>
@@ -2133,38 +2827,80 @@ test("DNS 代理兼容开关不会放行直接填写的保留网段 IP", async (
 test("DNS 透明代理默认开启，origin 探活默认开启，深度预检默认关闭", () => {
   assert.equal(serverConfig({}).maxSourceBytes, 32 * 1024 * 1024);
   assert.equal(serverConfig({}).allowDnsProxyNetworks, true);
+  assert.equal(serverConfig({ IPV6_NETWORK_AVAILABLE: "false" }).ipv6NetworkAvailable, false);
+  assert.equal(serverConfig({ IPV6_NETWORK_AVAILABLE: "true" }).ipv6NetworkAvailable, true);
   assert.equal(serverConfig({}).preflightSources, true);
   assert.equal(serverConfig({}).preflightDeep, false);
   assert.equal(serverConfig({}).preflightTimeoutMs, 3000);
-  assert.equal(serverConfig({}).preflightConfirmTimeoutMs, 10000);
+  assert.equal(serverConfig({}).preflightConfirmTimeoutMs, 20_000);
   assert.equal(serverConfig({}).preflightConcurrency, 8);
+  assert.equal(serverConfig({}).preflightCandidateConcurrency, 4);
   assert.equal(serverConfig({}).verifyConvertedSources, true);
+  assert.equal(serverConfig({}).retainUnverifiedSources, false);
   assert.equal(serverConfig({}).analyzeFallback, true);
-  assert.equal(serverConfig({}).verifyBudgetMs, 20_000);
-  assert.equal(serverConfig({}).verifyMaxSources, 50);
+  assert.equal(serverConfig({}).analyzeAttempts, 4);
+  assert.equal(serverConfig({}).verifyRequestTimeoutMs, 20_000);
+  assert.ok(serverConfig({}).verifyWorkers >= 1);
+  assert.equal(serverConfig({}).verifyWorkerRecycleAfter, 6);
+  assert.equal(serverConfig({ VERIFY_WORKER_RECYCLE_AFTER: "24" }).verifyWorkerRecycleAfter, 6);
+  assert.equal(serverConfig({ VERIFY_WORKER_RECYCLE_AFTER: "2" }).verifyWorkerRecycleAfter, 2);
+  assert.equal(serverConfig({}).jobIsolation, true);
+  assert.ok(serverConfig({}).jobVerifyWorkers >= 1);
+  assert.equal(serverConfig({}).verifySourceBudgetMs, 120_000);
+  assert.equal(serverConfig({}).jobVerifySourceBudgetMs, 120_000);
+  assert.equal(serverConfig({}).verifyBudgetMs, 0);
+  assert.equal(serverConfig({}).verifyMaxSources, 0);
   assert.equal(serverConfig({ ALLOW_DNS_PROXY_NETWORKS: "false" }).allowDnsProxyNetworks, false);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "false" }).preflightSources, false);
   assert.equal(serverConfig({ VERIFY_CONVERTED_SOURCES: "false" }).verifyConvertedSources, false);
+  assert.equal(serverConfig({ RETAIN_UNVERIFIED_SOURCES: "false" }).retainUnverifiedSources, false);
   assert.equal(serverConfig({ ANALYZE_FALLBACK: "false" }).analyzeFallback, false);
   assert.equal(serverConfig({ ANALYZE_FALLBACK: "true" }).analyzeFallback, true);
+  assert.equal(serverConfig({ ANALYZE_ATTEMPTS: "6" }).analyzeAttempts, 6);
+  assert.equal(serverConfig({ JOB_ISOLATION: "false" }).jobIsolation, false);
   assert.equal(serverConfig({ VERIFY_BUDGET_MS: "5000" }).verifyBudgetMs, 5000);
+  assert.equal(serverConfig({ VERIFY_BUDGET_MS: "0", VERIFY_MAX_SOURCES: "0" }).verifyBudgetMs, 0);
+  assert.equal(serverConfig({ VERIFY_BUDGET_MS: "0", VERIFY_MAX_SOURCES: "0" }).verifyMaxSources, 0);
+  assert.equal(serverConfig({ VERIFY_SOURCE_BUDGET_MS: "5000" }).verifySourceBudgetMs, 5000);
+  assert.equal(serverConfig({ JOB_VERIFY_SOURCE_BUDGET_MS: "7000" }).jobVerifySourceBudgetMs, 7000);
+  assert.equal(serverConfig({ JOB_VERIFY_REQUEST_TIMEOUT_MS: "12000" }).jobVerifyRequestTimeoutMs, 12_000);
+  assert.equal(serverConfig({ VERIFY_WORKERS: "3" }).verifyWorkers, 3);
+  assert.equal(serverConfig({ JOB_VERIFY_WORKERS: "5" }).jobVerifyWorkers, 5);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "true", PREFLIGHT_DEEP_SOURCES: "true" }).preflightSources, true);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "true", PREFLIGHT_DEEP_SOURCES: "true" }).preflightDeep, true);
+  assert.equal(serverConfig({ PREFLIGHT_CANDIDATE_CONCURRENCY: "3" }).preflightCandidateConcurrency, 3);
+});
+
+test("验链 worker 并发按容器内存预算限制，预留主进程和单源峰值", () => {
+  const gib = 1024 ** 3;
+  assert.equal(memoryBoundVerifyWorkers(16, 4 * gib), 8);
+  assert.equal(memoryBoundVerifyWorkers(16, 6 * gib), 13);
+  assert.equal(memoryBoundVerifyWorkers(4, 4 * gib), 4);
+  assert.equal(memoryBoundVerifyWorkers(16, 512 * 1024 ** 2), 1);
+  assert.equal(memoryBoundVerifyWorkers(16, 0), 16);
 });
 
 test("skippedBuckets 按原因分桶", () => {
   assert.deepEqual(skippedBuckets([
     { source: "a", reason: "上游站点不可访问" },
+    { source: "a2", reason: "预检在重试后仍未收到上游 HTTP 响应" },
     { source: "b", reason: "未知 imageDecode，漫画图片将花屏" },
     { source: "c", reason: "依赖登录/分流变量 Get(...)，香色无法复现阅读登录 UI" },
     { source: "d", reason: "香色核心链路不可执行：world, content" },
     { source: "e", reason: "有声/视频缺少可播放正文，且章节链接不是可识别的媒体直链" },
+    { source: "f", reason: "analyze-failed: AI 识站失败：Codex CLI 调用失败；请检查宿主机登录状态和 CLI 版本" },
+    { source: "g", reason: "rules-stale: source-worker-timeout: 源验链 Worker 超时" },
+    { source: "h", reason: "rules-stale: source-timeout: 源验链超时（300000ms；阶段：ai-analyze；最近失败：AI 识站失败：AI 识站超时（30000ms））" },
   ]), {
     "dead-origin": 1,
+    "preflight-unconfirmed": 1,
     imageDecode: 1,
     login: 1,
     "core-chain": 1,
     media: 1,
+    "analyze-failed": 1,
+    "worker-timeout": 1,
+    "source-timeout": 1,
   });
 });
 

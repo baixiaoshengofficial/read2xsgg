@@ -1,4 +1,6 @@
 export { convertLegado, portableConvertedSource, skippedBuckets } from "./converter.js";
+export { SOURCE_KINDS, inferSourceKind } from "./contentKind.js";
+export { isLegadoSource, normalizeLegadoSources } from "./sourceInput.js";
 export {
   detectLegadoCharset,
   decodeTextBuffer,
@@ -9,20 +11,42 @@ export {
 } from "./charset.js";
 export {
   isPlayableMediaResponse,
+  executeXbsJavaScriptRule,
   loadXbsSources,
   runXbsChapterContent,
   runXbsPipeline,
 } from "./xbsRuntime.js";
 export { convertRule, cssToXPath, inferResponseType } from "./selectors.js";
-export { convertRequest, refreshEphemeralHeaders } from "./requests.js";
+export { convertRequest, parseRequestDescriptor, refreshEphemeralHeaders } from "./requests.js";
 export { compileSignedRequestPlan, decodeSignedRequestPlan, encodeSignedRequestPlan, signedRequestTarget } from "./requestPlan.js";
 export { decodeXbs, encodeXbs } from "./xbs.js";
 export { decodeImage, decoderForLegadoImageRule, imageMimeType, supportedImageDecoders } from "./imageDecoder.js";
 export { compileComicExtractionPlan, decodeComicExtractionPlan, encodeComicExtractionPlan, normalizeComicExtractionPlan } from "./comicPlan.js";
 export {
+  compileContentBridgePlan,
+  compileDownloadTextPlan,
+  decodeContentPlan,
+  encodeContentPlan,
+  executeContentPlan,
+} from "./contentPlan.js";
+export {
+  compileChapterCatalogPlan,
+  compileChapterCatalogPlanFromAction,
+  decodeChapterCatalogPlan,
+  encodeChapterCatalogPlan,
+  executeChapterCatalogPlan,
+} from "./chapterPlan.js";
+export {
+  compileSearchBridgePlan,
+  decodeSearchPlan,
+  encodeSearchPlan,
+  executeSearchPlan,
+} from "./searchPlan.js";
+export {
   compileMediaExtractionPlan,
   compileMediaResolutionFromRule,
   declaredMediaResolution,
+  decodeEmbeddedMediaUrl,
   decodeMediaExtractionPlan,
   encodeMediaExtractionPlan,
   executeMediaResolution,
@@ -41,8 +65,14 @@ export {
   executeCatalogPlan,
   normalizeCatalogPlan,
 } from "./catalogPlan.js";
-export { bridgeTocUrl, chapterSortKey, compileBookBridgePlan, compileChapterBridgePlan, compileDetailBridgePlan, compileTextBridgePlan, decodeBridgePlan, encodeBridgePlan, executeBridgePlan, htmlToPlainText, orderChaptersAscending, DEFAULT_BRIDGE_LIMITS } from "./bridgePlan.js";
-export { hasUnsupportedLegadoRuntime, legadoTemplateExpression, rewriteLegadoJavaScript } from "./legadoJs.js";
+export { bridgeTocUrl, chapterSortKey, compileBookBridgePlan, compileChapterBridgePlan, compileDomBookProjection, compileDomDetailProjection, compileDetailBridgePlan, compileTextBridgePlan, decodeBridgePlan, encodeBridgePlan, executeBridgePlan, htmlToPlainText, orderChaptersAscending, DEFAULT_BRIDGE_LIMITS } from "./bridgePlan.js";
+export {
+  extractStaticLegadoUrlConstants,
+  hasUnsupportedLegadoRuntime,
+  legadoTemplateExpression,
+  replaceStaticLegadoUrlConstants,
+  rewriteLegadoJavaScript,
+} from "./legadoJs.js";
 export {
   analyzeSite,
   detectKind,
@@ -73,6 +103,7 @@ export {
   rebaseOriginInText,
 } from "./rebaseLibrary.js";
 export { createJobWorker } from "./jobWorker.js";
+export { createBridgeExecutor } from "./bridgeExecutor.js";
 export { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
 export {
   resolveBookTargetUrl,
@@ -87,4 +118,5 @@ export {
   verifyConvertedSources,
 } from "./verifySource.js";
 export { downloadAsFetch, filterValidXiangseSources, repairXiangseEntrypoints, ruleUsesForbiddenSinglePipeJs, validateXiangseSource } from "./xiangseValidate.js";
+export { normalizeXiangseItemRule, normalizeXiangseSource } from "./xiangseRules.js";
 export { chapterPageCandidates, comicPageUrls, createAppServer, downloadImage, downloadMedia, downloadSource, filterReachableSources, HttpError, normalizeEmbeddedSourceUrl, pageImageUrls, pageMediaPlaylist, pageMediaUrls, pageText, pageTocUrl, preferredResolvedAddress, serverConfig, sourceUrlCandidates, startServer } from "./server.js";

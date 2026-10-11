@@ -62,6 +62,68 @@
         <div id="jobs" class="jobs"></div>
       </section>
 
+      <section id="ai-settings" class="panel">
+        <div class="row between">
+          <h2>AI 辅助修复</h2>
+          <span id="ai-config-state" class="hint">读取配置中…</span>
+        </div>
+        <ol class="ai-flow">
+          <li><strong>1. 转换并验证</strong><span>按阅读源规则转换，通过验证的源直接保留。</span></li>
+          <li><strong>2. 自动识站修复</strong><span>规则失败时，转换器抓取网页，重新识别列表、章节和内容并验证。</span></li>
+          <li><strong>3. AI 补充修复</strong><span>仍失败且已启用 AI 时，自动选择抓取工具，分析失败页面，生成新规则再验证。</span></li>
+        </ol>
+        <p class="hint">文本、漫画、听书和影视都要通过“分类列表 → 详情 → 章节 → 正文或媒体”的完整验证。内置香色规则说明会自动提供给 AI；超过处理时限的源会跳过。</p>
+        <form id="ai-settings-form" class="stack">
+          <label class="ai-toggle"><input id="ai-enabled" type="checkbox" /><span>自动让 AI 修复常规方法未通过的源</span></label>
+          <label><span>选择哪个 AI 来修复？</span><select id="ai-provider"><option value="api">AI 服务（填写 API Key）</option><option value="local-http">本地模型服务（填写地址）</option><option value="cli">服务器上的 Codex（使用已登录账号）</option></select></label>
+          <div id="ai-api-fields" class="stack">
+            <p class="hint">使用 OpenAI 或兼容其接口的 AI 服务。地址、模型名称和密钥由服务商提供。</p>
+            <label><span>AI 服务地址</span><input id="ai-base-url" type="url" value="https://api.openai.com/v1" placeholder="https://api.openai.com/v1" /></label>
+            <label><span>模型名称（可输入或从列表选择）</span><input id="ai-model" type="text" list="ai-api-models" autocomplete="off" /><datalist id="ai-api-models"></datalist></label>
+            <label><span>推理强度（档位）</span><select id="ai-reasoning-effort"><option value="">模型默认（不发送档位参数）</option></select></label>
+            <p id="ai-reasoning-hint" class="hint"></p>
+            <label><span>API Key（留空保持原值）</span><input id="ai-api-key" type="password" autocomplete="new-password" /></label>
+          </div>
+          <div id="ai-local-fields" class="stack" hidden>
+            <p class="hint">用于服务器上已运行的本地模型，例如提供 OpenAI 兼容接口的 Ollama。转换服务须能访问此地址。</p>
+            <label><span>本地模型服务地址</span><input id="ai-local-base-url" type="url" placeholder="http://host.docker.internal:11434/v1" /></label>
+            <label><span>本地模型名称（可输入或从列表选择）</span><input id="ai-local-model" type="text" list="ai-local-models" autocomplete="off" /><datalist id="ai-local-models"></datalist></label>
+            <label><span>推理强度（档位）</span><select id="ai-local-reasoning-effort"><option value="">模型默认（不发送档位参数）</option></select></label>
+            <p id="ai-local-reasoning-hint" class="hint"></p>
+          </div>
+          <div id="ai-cli-fields" class="stack" hidden>
+            <label><span>服务器客户端</span><select id="ai-cli-client"><option value="codex">Codex CLI</option></select></label>
+            <label><span>修复时使用哪个模型？</span><select id="ai-cli-model"><option value="">使用 Codex 内置默认模型</option><option value="__custom__">手动输入模型名称…</option></select></label>
+            <label id="ai-cli-custom-fields" hidden><span>Codex 模型名称</span><input id="ai-cli-model-custom" type="text" autocomplete="off" placeholder="填写当前账号可用的模型 ID" maxlength="200" /></label>
+            <label><span>推理强度（档位）</span><select id="ai-cli-reasoning-effort"><option value="">模型默认（不发送档位参数）</option></select></label>
+            <p id="ai-cli-reasoning-hint" class="hint"></p>
+            <p class="hint">使用服务器上 Codex 已登录的账号，无需填写 API Key。服务器须已启动 Codex 桥接服务；点击“保存并检查 AI 连接”可确认是否可用。</p>
+          </div>
+          <div class="stack">
+            <button type="button" id="ai-models-refresh" class="ghost">保存并读取模型列表</button>
+            <p id="ai-models-status" class="hint">模型名称由 AI 服务或 Codex 提供；列表缺失时仍可手动输入。</p>
+          </div>
+          <p class="hint" id="ai-auto-crawl">你只需选择 AI。网页下载、动态网页渲染、漫画和音视频接口观察由转换器按失败阶段自动选择；抓取工具（MCP）和香色规则说明均已内置，无需配置地址或密钥。</p>
+          <details class="ai-advanced" id="ai-performance-settings">
+            <summary>高级：AI 超时、重试与并发</summary>
+            <div class="stack">
+              <p class="hint">每轮时限包含抓取页面和模型响应，等待 AI 名额不占用本轮时限，但仍受整个源的处理时限约束。生成的规则验证失败时，在次数和源处理时限内再次修复。并发只控制 AI 识站，不改变站点探活并发。</p>
+              <div class="settings-grid">
+                <label><span>每轮 AI 识站最长时间（秒）</span><input id="ai-timeout" type="number" min="5" max="120" value="30" /></label>
+                <label><span>每个源最多尝试几轮</span><input id="ai-attempts" type="number" min="1" max="3" value="2" /></label>
+                <label><span>同时进行的 AI 识站数量</span><input id="ai-concurrency" type="number" min="1" max="8" value="2" /></label>
+              </div>
+            </div>
+          </details>
+          <div class="row settings-actions">
+            <button type="submit">保存设置</button><button type="button" id="ai-test" class="ghost">保存并检查 AI 连接</button>
+          </div>
+          <p class="hint">保存后，在任务列表点击原任务的“重试”，新一轮才会使用这些设置。正在运行的任务继续使用启动时的设置。</p>
+        </form>
+        <p id="ai-settings-status" class="status" hidden></p>
+        <p class="hint">连接检查只确认 AI 能响应。“AI 验链成功”只统计新规则通过完整验证的源，实际效果请看任务结果。已保存的密钥不会回显。</p>
+      </section>
+
       <footer class="foot">
         <p>同步直转：<code>/source/…xbs</code> · 识站：<code>/url/…xbs</code> · 书库订阅：<code>/library/{id}.xbs</code></p>
       </footer>

@@ -1,5 +1,6 @@
 import { hasUnsupportedLegadoRuntime } from "./legadoJs.js";
 import { decodeTextBuffer } from "./charset.js";
+import { normalizeXiangseSource } from "./xiangseRules.js";
 
 const SOURCE_TYPES = new Set(["text", "comic", "audio", "video"]);
 const RESPONSE_TYPES = new Set(["html", "json", ""]);
@@ -63,6 +64,9 @@ export function validateXiangseSource(source) {
     errors.push(`sourceType 无效（应为 text|comic|audio|video，实际 ${source.sourceType}）`);
   }
   if (!nonEmptyString(source.miniAppVersion)) errors.push("缺少 miniAppVersion");
+  if (source.weight !== undefined && Number(source.weight) <= 0) {
+    errors.push("weight 不能为 0 或负数（香色无法启用该源）");
+  }
 
   const worlds = Object.entries(source.bookWorld || {});
   if (!worlds.length && !nonEmptyString(source.searchBook?.requestInfo)) {
@@ -109,7 +113,7 @@ export function validateXiangseSource(source) {
  * hidden here; they must be repaired and verified by the live pipeline.
  */
 export function repairXiangseEntrypoints(source) {
-  let candidate = source;
+  let candidate = normalizeXiangseSource(source);
   let validation = validateXiangseSource(candidate);
   if (validation.ok) {
     return { source: candidate, validation, removedWorlds: [], replacedSearch: false };
@@ -197,58 +201,65 @@ export function filterValidXiangseSources(sources, {
 export function downloadAsFetch(download) {
   if (typeof download !== "function") throw new TypeError("downloadAsFetch 需要 download");
   return async (url, init = {}) => {
-    try {
-      const method = String(init.method || "GET").toUpperCase();
-      const raw = await download(String(url), init.headers || {}, {
-        method,
-        ...(init.body !== undefined && init.body !== null ? { body: init.body } : {}),
-        ...(init.signal ? { signal: init.signal } : {}),
-        ...(method === "POST" ? { followPostRedirects: true } : {}),
-      });
-      const buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw ?? "");
-      const responseHeaders = buffer.httpHeaders && typeof buffer.httpHeaders === "object"
-        ? buffer.httpHeaders
-        : {};
-      const responseUrl = String(buffer.read2xsggResponseUrl || url);
-      return {
-        ok: true,
-        status: 200,
-        url: responseUrl,
-        read2xsggDecodedText: Boolean(buffer.read2xsggDecodedText),
-        headers: {
-          get(name) {
-            const key = String(name || "").toLowerCase();
-            const actual = Object.entries(responseHeaders)
-              .find(([header]) => header.toLowerCase() === key)?.[1];
-            if (actual !== undefined && actual !== null) return String(actual);
-            if (key === "content-type") {
-              if (/\.(?:mp3|m4a|aac|ogg|wav|flac)(?:\?|$)/i.test(responseUrl)) return "audio/mpeg";
-              if (/\.(?:mp4|m3u8|webm)(?:\?|$)/i.test(responseUrl)) return "video/mp4";
-              if (/\.(?:avif|bmp|gif|jpe?g|png|webp)(?:\?|$)/i.test(responseUrl)) return "image/jpeg";
-              return "text/html; charset=utf-8";
-            }
-            return null;
+    const method = String(init.method || "GET").toUpperCase();
+    const attempts = /^(?:GET|HEAD)$/.test(method) ? 2 : 1;
+    let lastError;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (init.signal?.aborted) break;
+      try {
+        const raw = await download(String(url), init.headers || {}, {
+          method,
+          ...(init.body !== undefined && init.body !== null ? { body: init.body } : {}),
+          ...(init.signal ? { signal: init.signal } : {}),
+          ...(method === "POST" ? { followPostRedirects: true } : {}),
+        });
+        const buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw ?? "");
+        const responseHeaders = buffer.httpHeaders && typeof buffer.httpHeaders === "object"
+          ? buffer.httpHeaders
+          : {};
+        const responseUrl = String(buffer.read2xsggResponseUrl || url);
+        return {
+          ok: true,
+          status: 200,
+          url: responseUrl,
+          read2xsggDecodedText: Boolean(buffer.read2xsggDecodedText),
+          headers: {
+            get(name) {
+              const key = String(name || "").toLowerCase();
+              const actual = Object.entries(responseHeaders)
+                .find(([header]) => header.toLowerCase() === key)?.[1];
+              if (actual !== undefined && actual !== null) return String(actual);
+              if (key === "content-type") {
+                if (/\.(?:mp3|m4a|aac|ogg|wav|flac)(?:\?|$)/i.test(responseUrl)) return "audio/mpeg";
+                if (/\.(?:mp4|m3u8|webm)(?:\?|$)/i.test(responseUrl)) return "video/mp4";
+                if (/\.(?:avif|bmp|gif|jpe?g|png|webp)(?:\?|$)/i.test(responseUrl)) return "image/jpeg";
+                return "text/html; charset=utf-8";
+              }
+              return null;
+            },
           },
-        },
-        async text() {
-          return buffer.read2xsggDecodedText
-            ? buffer.toString("utf8")
-            : decodeTextBuffer(buffer, { headers: buffer.httpHeaders || {} });
-        },
-        async arrayBuffer() {
-          return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
-        },
-      };
-    } catch (error) {
-      const message = String(error?.message || error || "download failed");
-      return {
-        ok: false,
-        status: 502,
-        url: String(url),
-        headers: { get: () => null },
-        async text() { return message; },
-        async arrayBuffer() { return new ArrayBuffer(0); },
-      };
+          async text() {
+            return buffer.read2xsggDecodedText
+              ? buffer.toString("utf8")
+              : decodeTextBuffer(buffer, { headers: buffer.httpHeaders || {} });
+          },
+          async arrayBuffer() {
+            return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+          },
+        };
+      } catch (error) {
+        lastError = error;
+        if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, 120));
+      }
     }
+    const message = String(lastError?.message || lastError || "download failed");
+    return {
+      ok: false,
+      status: 502,
+      url: String(url),
+      headers: { get: () => null },
+      async text() { return message; },
+      async arrayBuffer() { return new ArrayBuffer(0); },
+    };
   };
 }

@@ -10,6 +10,10 @@ function newJobId() {
   return randomBytes(8).toString("hex");
 }
 
+function sourceLockKey(url, mode) {
+  return `source:${createHash("sha256").update(`${mode}\n${url}`).digest("hex")}`;
+}
+
 function contentHash(value) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -144,34 +148,60 @@ export function createLibraryStore(dataDir) {
     return full;
   }
 
+  async function findJobBySource({ url, mode = "source" } = {}) {
+    await ensure();
+    const sourceUrl = String(url || "").trim();
+    const sourceMode = mode === "site" ? "site" : "source";
+    if (!sourceUrl) return null;
+    const matches = (await listJobs()).filter((job) => (
+      job && String(job.sourceUrl || "").trim() === sourceUrl && job.mode === sourceMode
+    ));
+    // Keep the oldest matching task as the stable subscription identity. This
+    // also collapses historical duplicates without silently changing the URL
+    // users already imported into Xiangse.
+    matches.sort((left, right) => (
+      String(left.createdAt || "").localeCompare(String(right.createdAt || ""))
+    ));
+    return matches[0] || null;
+  }
+
   async function createJob({ url, mode = "source", name = "", imageProxyBase = "" } = {}) {
     await ensure();
-    const id = newJobId();
-    const createdAt = nowIso();
-    const job = {
-      id,
-      title: String(name || "").trim() || String(url || "").trim(),
-      sourceUrl: String(url || "").trim(),
-      mode: mode === "site" ? "site" : "source",
-      status: "queued",
-      phase: "queued",
-      imageProxyBase: String(imageProxyBase || ""),
-      progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, failed: 0 },
-      count: null,
-      fallbackCount: 0,
-      skippedBuckets: {},
-      error: "",
-      createdAt,
-      updatedAt: createdAt,
-      startedAt: null,
-      finishedAt: null,
-      subscribePath: `/library/${id}.xbs`,
-    };
-    await withLock(`job:${id}`, async () => {
-      await writeJsonAtomic(jobPath(id), job);
+    const sourceUrl = String(url || "").trim();
+    const sourceMode = mode === "site" ? "site" : "source";
+    return withLock(sourceLockKey(sourceUrl, sourceMode), async () => {
+      const existing = await findJobBySource({ url: sourceUrl, mode: sourceMode });
+      if (existing) return { ...existing, reused: true };
+
+      const id = newJobId();
+      const createdAt = nowIso();
+      const job = {
+        id,
+        title: String(name || "").trim() || sourceUrl,
+        sourceUrl,
+        mode: sourceMode,
+        status: "queued",
+        phase: "queued",
+        imageProxyBase: String(imageProxyBase || ""),
+        progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, aiAttemptsTotal: 0, aiRepaired: 0, failed: 0 },
+        count: null,
+        fallbackCount: 0,
+        aiAttemptCount: 0,
+        aiRepairCount: 0,
+        skippedBuckets: {},
+        error: "",
+        createdAt,
+        updatedAt: createdAt,
+        startedAt: null,
+        finishedAt: null,
+        subscribePath: `/library/${id}.xbs`,
+      };
+      await withLock(`job:${id}`, async () => {
+        await writeJsonAtomic(jobPath(id), job);
+      });
+      await upsertIndexEntry(job);
+      return job;
     });
-    await upsertIndexEntry(job);
-    return job;
   }
 
   async function updateJob(id, patch = {}) {
@@ -308,6 +338,7 @@ export function createLibraryStore(dataDir) {
     createJob,
     getJob,
     listJobs,
+    findJobBySource,
     updateJob,
     saveArtifacts,
     readArtifact,

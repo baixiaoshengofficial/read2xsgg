@@ -14,11 +14,13 @@ import {
   xpathForElement,
 } from "./domUtil.js";
 import { dynamicHtmlRequestUrl } from "./dynamicHtml.js";
+import { dynamicComicApiImages } from "./dynamicComic.js";
 import { unpackDeanEdwards } from "../mediaPlan.js";
 
-const COMIC_HREF = /\/(?:comic|comics|manga|manhua|mh|cartoon|chapter)\/|(?:漫画)/i;
-const CHAPTER_HREF = /\/(?:comic|comics|manga|manhua|mh|chapter|view)\/|\/\d+(?:-\d+)?\.html?$|[?&](?:chapter|chapter_?slot|episode|episode_?slot|section_?slot)=/i;
+const COMIC_HREF = /\/(?:comic|comics|manga|manhua|mh|cartoon|chapter)\/|(?:漫画)|[?&](?:a|action|view)=(?:bofang|detail|comic|manga|album|work)(?:&|$)|[?&](?:comic|manga|manhua|album|work)[_-]?(?:id|key)?=/i;
+const CHAPTER_HREF = /\/(?:comic|comics|manga|manhua|mh|chapter|view|read)\/|\/\d+(?:-\d+)?\.html?$|[?&](?:chapter|chapter_?slot|episode|episode_?slot|section_?slot|zjid|chapter_?id|episode_?id|section_?id)=|[?&](?:a|action|view)=(?:read|chapter|reader)(?:&|$)/i;
 const CHAPTER_TEXT = /(?:第\s*.{0,12}[話话章回卷集]|\d+\s*[話话章回卷集]|全[一1][話话]|番外|序章)/i;
+const CHAPTER_CONTROL_TEXT = /^(?:阅读|閱覽|開始閱讀|开始阅读|立即閱讀|立即阅读|點擊閱讀|点击阅读|查看|檢視|检视|进入|進入|播放|收藏|下载|下載)$/i;
 
 function likelyComicChapter(item, detailUrl) {
   let target;
@@ -32,16 +34,50 @@ function likelyComicChapter(item, detailUrl) {
   const targetPath = target.pathname.replace(/\/$/, "");
   const detailPath = detail.pathname.replace(/\/$/, "");
   const detailStem = detailPath.replace(/\.(?:html?|php|aspx?)$/i, "");
-  if (!targetPath || targetPath === detailPath) return false;
+  if (CHAPTER_CONTROL_TEXT.test(String(item.text || "").trim())) return false;
+  if (!targetPath || (targetPath === detailPath && target.search === detail.search)) return false;
   const childPath = targetPath.startsWith(`${detailPath}/`) || targetPath.startsWith(`${detailStem}/`);
   const explicitRoute = /\/(?:chapter|chapters|read|view)(?:[-_/]|$)/i.test(targetPath);
   const semanticQuery = [...target.searchParams.keys()]
-    .some((key) => /^(?:chapter|chapter_?slot|episode|episode_?slot|section_?slot)$/i.test(key));
-  return childPath || ((explicitRoute || semanticQuery) && CHAPTER_TEXT.test(item.text));
+    .some((key) => /^(?:chapter|chapter_?slot|episode|episode_?slot|section_?slot|zjid|chapter_?id|episode_?id|section_?id)$/i.test(key));
+  const readerQuery = [...target.searchParams.entries()]
+    .some(([key, value]) => /^(?:a|action|view)$/i.test(key) && /^(?:read|chapter|reader)$/i.test(value));
+  const readerHasIdentity = readerQuery && [...target.searchParams.keys()]
+    .some((key) => /(?:^|_)(?:id|key|slot)$/i.test(key) || /(?:chapter|episode|section|zjid)/i.test(key));
+  const queryChapter = semanticQuery || readerHasIdentity;
+  return childPath
+    || (queryChapter && (CHAPTER_TEXT.test(item.text) || item.text.length >= 2))
+    || ((explicitRoute || readerQuery) && CHAPTER_TEXT.test(item.text));
 }
 
 function imageCount(document) {
-  return document.querySelectorAll("img[src], img[data-src], img[data-original], source[srcset]").length;
+  return [...document.querySelectorAll("img[src], img[data-src], img[data-original], source[srcset]")]
+    .map((element) => element.getAttribute("src") || element.getAttribute("data-src") || element.getAttribute("data-original") || element.getAttribute("srcset") || "")
+    .filter((value) => !/(?:ad|avatar|banner|captcha|icon|loading|logo|placeholder)/i.test(value))
+    .length;
+}
+
+function scriptedImageCount(html, baseUrl) {
+  const groups = new Map();
+  const seen = new Set();
+  const add = (raw) => {
+    const normalized = String(raw || "").replace(/\\\//g, "/").trim();
+    if (!normalized || /(?:ad|avatar|banner|captcha|icon|loading|logo|placeholder)/i.test(normalized)) return;
+    let url;
+    try { url = new URL(normalized, baseUrl); } catch { return; }
+    if (!/^https?:$/.test(url.protocol) || !/\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(url.toString())) return;
+    const key = url.toString();
+    if (seen.has(key)) return;
+    seen.add(key);
+    const directory = `${url.origin}${url.pathname.replace(/\/[^/]*$/, "/")}`;
+    const entries = groups.get(directory) || [];
+    entries.push(key);
+    groups.set(directory, entries);
+  };
+  for (const match of String(html || "").matchAll(
+    /(?:^|["'`])((?:https?:\/\/|\/)[^"'`<>\\\s]{1,800}\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#][^"'`<>\\\s]*)?)/gi,
+  )) add(match[1]);
+  return Math.max(0, ...[...groups.values()].map((urls) => urls.length));
 }
 
 function packedImageCount(html) {
@@ -60,6 +96,84 @@ function packedImageCount(html) {
     best = Math.max(best, urls.size);
   }
   return best;
+}
+
+async function inspectComicChapter(chapterUrl, download, { adapterBase = "" } = {}) {
+  const chapterPage = await download(chapterUrl);
+  const chapterResponseUrl = String(chapterPage.read2xsggResponseUrl || chapterUrl);
+  const chapterHtml = chapterPage.toString("utf8");
+  const chapterDoc = loadDocument(chapterHtml, chapterResponseUrl);
+  const scriptedChapterImages = scriptedImageCount(chapterHtml, chapterResponseUrl);
+  let discoveredImageCount = Math.max(
+    imageCount(chapterDoc),
+    packedImageCount(chapterHtml),
+    scriptedChapterImages,
+  );
+  let dynamicChapterContent = scriptedChapterImages >= 2;
+  const dynamicChapterUrl = dynamicHtmlRequestUrl(chapterHtml, chapterResponseUrl);
+  if (dynamicChapterUrl) {
+    try {
+      const dynamicPage = await download(dynamicChapterUrl, { Referer: chapterResponseUrl });
+      const dynamicResponseUrl = String(dynamicPage.read2xsggResponseUrl || dynamicChapterUrl);
+      const dynamicHtml = dynamicPage.toString("utf8");
+      const dynamicCount = Math.max(
+        imageCount(loadDocument(dynamicHtml, dynamicResponseUrl)),
+        packedImageCount(dynamicHtml),
+        scriptedImageCount(dynamicHtml, dynamicResponseUrl),
+      );
+      if (dynamicCount >= 2) {
+        discoveredImageCount = Math.max(discoveredImageCount, dynamicCount);
+        dynamicChapterContent = true;
+      }
+    } catch {
+      // The static page and the strict repair pass remain available.
+    }
+  }
+  if (discoveredImageCount < 2) {
+    try {
+      const dynamic = await dynamicComicApiImages(chapterHtml, chapterResponseUrl, {
+        download,
+        responseHeaders: chapterPage.httpHeaders || {},
+        probeOnly: true,
+      });
+      if (dynamic.urls.length >= 2) {
+        discoveredImageCount = Math.max(discoveredImageCount, dynamic.urls.length);
+        dynamicChapterContent = true;
+      }
+    } catch {
+      // A dynamic API is optional; keep the strict static-content diagnostic.
+    }
+  }
+  // The runtime adapter is also the portable path used by the generated XBS
+  // rule. Probe it during discovery when the chapter is a script-rendered
+  // shell; otherwise a valid chapter is rejected merely because JSDOM cannot
+  // execute the site's browser JavaScript.
+  if (discoveredImageCount < 2 && /^https?:\/\//i.test(String(adapterBase || ""))) {
+    try {
+      const adapter = String(adapterBase).replace(/\/$/, "");
+      const endpoint = `${adapter}/adapter/images?v=2&url=${encodeURIComponent(chapterResponseUrl)}&referer=${encodeURIComponent(chapterResponseUrl)}`;
+      const response = await download(endpoint);
+      const payload = JSON.parse(response.toString("utf8"));
+      const urls = [
+        ...(Array.isArray(payload?.urls) ? payload.urls : []),
+        ...(Array.isArray(payload?.proxyUrls) ? payload.proxyUrls : []),
+      ].filter(Boolean);
+      if (urls.length >= 2) {
+        discoveredImageCount = Math.max(discoveredImageCount, urls.length);
+        dynamicChapterContent = true;
+      }
+    } catch {
+      // The adapter is an optional second opinion; static and source-declared
+      // API detection still decide whether the chapter is usable.
+    }
+  }
+  return {
+    chapterPage,
+    chapterResponseUrl,
+    chapterHtml,
+    discoveredImageCount,
+    dynamicChapterContent,
+  };
 }
 
 /**
@@ -131,9 +245,22 @@ export async function discoverComic(originUrl, {
     !CHAPTER_TEXT.test(item.text)
     && !/\/(?:chapter|chapters|read|view)(?:[-_/]|$)/i.test(new URL(item.href).pathname)
   ));
-  const listCandidates = coveredComicLinks.length >= 2
+  const genericListCandidates = sameOriginAnchors.filter((item) => (
+    item.text.length >= 2
+    && item.text.length <= 60
+    && !/^(?:首页|首頁|分类|分類|推荐|推薦|热门|熱門|新作|连载|連載|完结|完結|更多|下一页|下一頁|上一页|上一頁|登录|登錄|注册|註冊)$/i.test(item.text)
+  ));
+  let listCandidates = coveredComicLinks.length >= 2
     ? coveredComicLinks
-    : semanticComicLinks.length >= 2 ? semanticComicLinks : comicLinks;
+    : semanticComicLinks.length >= 2 ? semanticComicLinks
+      : comicLinks.length >= 2 ? comicLinks : genericListCandidates;
+  // A navigation label can satisfy the comic keyword test while sharing no
+  // URL shape with the actual catalogue. Prefer the broader page cluster when
+  // the semantic subset cannot form a repeated detail-link group.
+  if (scoreLinkCluster(listCandidates, homeUrl).length < 2
+    && scoreLinkCluster(genericListCandidates, homeUrl).length >= 2) {
+    listCandidates = genericListCandidates;
+  }
   const cluster = scoreLinkCluster(
     listCandidates.length ? listCandidates : sameOriginAnchors.filter((a) => a.text.length >= 2 && a.text.length <= 60),
     homeUrl,
@@ -238,7 +365,7 @@ export async function discoverComic(originUrl, {
       }
     }
   }
-  if (chapterLinks.length < 2) {
+  if (chapterLinks.length < 1) {
     diagnostics.push("toc: 漫画章节链接不足 2 条");
     return null;
   }
@@ -246,35 +373,39 @@ export async function discoverComic(originUrl, {
   const chapterElements = chapterLinks.map((item) => item.el);
   const stableChapterSelector = chapterAnchorSelectorFromLinks(chapterElements, chapterDocument, chapterListPageUrl);
   const chapterListSelector = stableChapterSelector || listSelectorFromLinks(chapterElements, chapterDocument);
-  const chapterUrl = chapterLinks[Math.min(1, chapterLinks.length - 1)].href;
-  const chapterPage = await download(chapterUrl);
-  const chapterResponseUrl = String(chapterPage.read2xsggResponseUrl || chapterUrl);
-  const chapterHtml = chapterPage.toString("utf8");
-  const chapterDoc = loadDocument(chapterHtml, chapterResponseUrl);
-  let discoveredImageCount = Math.max(imageCount(chapterDoc), packedImageCount(chapterHtml));
-  let dynamicChapterContent = false;
-  const dynamicChapterUrl = dynamicHtmlRequestUrl(chapterHtml, chapterResponseUrl);
-  if (dynamicChapterUrl) {
-    try {
-      const dynamicPage = await download(dynamicChapterUrl, { Referer: chapterResponseUrl });
-      const dynamicResponseUrl = String(dynamicPage.read2xsggResponseUrl || dynamicChapterUrl);
-      const dynamicHtml = dynamicPage.toString("utf8");
-      const dynamicCount = Math.max(
-        imageCount(loadDocument(dynamicHtml, dynamicResponseUrl)),
-        packedImageCount(dynamicHtml),
-      );
-      if (dynamicCount >= 2) {
-        discoveredImageCount = Math.max(discoveredImageCount, dynamicCount);
-        dynamicChapterContent = true;
+  // A site may expose cover/one-page entries before a normal multi-page
+  // chapter. Probe a small ordered window and retain the first usable sample;
+  // rejecting the whole site because one chapter is short makes the converter
+  // mistake valid catalogs for broken sources.
+  const chapterCandidates = [
+    ...chapterLinks.slice(1, 7),
+    chapterLinks[0],
+  ].filter((item, index, items) => item && items.findIndex((value) => value.href === item.href) === index);
+  let chapterProbe = null;
+  const probeConcurrency = Math.min(3, chapterCandidates.length);
+  for (let offset = 0; offset < chapterCandidates.length && !chapterProbe; offset += probeConcurrency) {
+    const batch = chapterCandidates.slice(offset, offset + probeConcurrency);
+    const results = await Promise.all(batch.map(async (item) => {
+      try {
+        return { item, probe: await inspectComicChapter(item.href, download, { adapterBase }) };
+      } catch {
+        return { item, probe: null };
       }
-    } catch {
-      // The static page and the strict repair pass remain available.
-    }
+    }));
+    chapterProbe = results.find((result) => result.probe?.discoveredImageCount >= 2) || null;
   }
-  if (discoveredImageCount < 2) {
+  if (!chapterProbe?.probe) {
     diagnostics.push("content: 章节图片不足 2 张");
     return null;
   }
+  const chapterUrl = chapterProbe.item.href;
+  const {
+    chapterPage,
+    chapterResponseUrl,
+    chapterHtml,
+    discoveredImageCount,
+    dynamicChapterContent,
+  } = chapterProbe.probe;
 
   let contentRequestInfo = "";
   let contentResponseFormatType = "html";
@@ -316,7 +447,7 @@ export async function discoverComic(originUrl, {
     listPageSize: pagedListUrl ? cluster.length : 20,
     listSelector,
     bookNameSelector: bookNameSelector(),
-    detailUrlSelector: stableListSelector ? "./@href||//@href" : ".//a/@href||./@href||//@href",
+    detailUrlSelector: stableListSelector ? "//@href" : "//a/@href||//@href",
     listCoverSelector,
     detailCoverSelector: detailCover,
     searchRequestInfo: search?.requestInfo || "",
@@ -328,8 +459,8 @@ export async function discoverComic(originUrl, {
     tocSelector,
     chapterRequestInfo,
     chapterListSelector,
-    chapterTitleSelector: stableChapterSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : "normalize-space(.//a)||normalize-space(/html/body/*)",
-    chapterUrlSelector: stableChapterSelector ? "./@href||//@href" : ".//a/@href||./@href||//@href",
+    chapterTitleSelector: stableChapterSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : "normalize-space(//a)||normalize-space(/html/body/*)",
+    chapterUrlSelector: stableChapterSelector ? "//@href" : "//a/@href||//@href",
     chapterSampleUrl: chapterResponseUrl,
     contentRequestInfo,
     contentResponseFormatType,

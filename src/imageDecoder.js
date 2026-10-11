@@ -16,6 +16,65 @@ export function imageMimeType(buffer) {
   return null;
 }
 
+/**
+ * Extract a short key from a bitmap's colour channel.
+ *
+ * Several reader APIs deliberately keep their chapter key outside the HTML
+ * response and encode it in a tiny bitmap.  This helper is intentionally
+ * format-agnostic: the compiler supplies the dimensions, marker and sample
+ * grid discovered from the source rule, while the decoder only deals with
+ * image bytes and RGBA pixels.
+ */
+export async function extractPixelKey(buffer, {
+  width = 100,
+  height = 36,
+  magic,
+  gridWidth = 8,
+  count = 32,
+  skip = 1,
+  channel = "r",
+} = {}) {
+  let image;
+  try {
+    image = await Jimp.read(Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer));
+  } catch (error) {
+    throw new ImageDecodeError(`无法读取像素密钥图片：${error.message}`);
+  }
+  const actualWidth = Number(image.bitmap?.width || 0);
+  const actualHeight = Number(image.bitmap?.height || 0);
+  if (actualWidth !== Number(width) || actualHeight !== Number(height)) {
+    throw new ImageDecodeError(`像素密钥图片尺寸异常：${actualWidth}x${actualHeight}`);
+  }
+  const bytes = image.bitmap?.data;
+  if (!Buffer.isBuffer(bytes) || bytes.length < actualWidth * actualHeight * 4) {
+    throw new ImageDecodeError("像素密钥图片像素数据无效");
+  }
+  const marker = Number(magic);
+  const markerByte = bytes[0 * 4 + 0];
+  if (Number.isInteger(marker) && (markerByte !== marker || marker < 0 || marker > 255)) {
+    throw new ImageDecodeError("像素密钥图片标记不匹配");
+  }
+  const sampleWidth = Number(gridWidth);
+  const sampleCount = Number(count);
+  const sampleSkip = Number(skip);
+  const channelIndex = ({ r: 0, g: 1, b: 2, a: 3 })[String(channel || "r").toLowerCase()];
+  if (!Number.isInteger(sampleWidth) || sampleWidth < 1
+    || !Number.isInteger(sampleCount) || sampleCount < 1 || sampleCount > 4096
+    || !Number.isInteger(sampleSkip) || sampleSkip < 0
+    || channelIndex === undefined) {
+    throw new ImageDecodeError("像素密钥采样参数无效");
+  }
+  const output = Buffer.alloc(sampleCount);
+  for (let index = 0; index < sampleCount; index += 1) {
+    const sample = index + sampleSkip;
+    const x = sample % sampleWidth;
+    const y = Math.floor(sample / sampleWidth);
+    if (x >= actualWidth || y >= actualHeight) throw new ImageDecodeError("像素密钥采样范围越界");
+    output[index] = bytes[(y * actualWidth + x) * 4 + channelIndex];
+  }
+  return output;
+}
+
 export class ImageDecodeError extends Error {}
 
 function aesCbcPrefixIv(buffer, { key } = {}) {
@@ -293,8 +352,38 @@ export function decoderCandidatesFromJavaScript(source) {
   }
 }
 
+function cryptoJsImageDecoder(source) {
+  const script = String(source || "");
+  if (!/(?:CryptoJS\s*\.\s*)?AES\s*\.\s*decrypt\s*\(/i.test(script)) return null;
+  if (!/(?:CryptoJS\s*\.\s*)?enc\s*\.\s*(?:Base64|Hex)\s*\.\s*parse\s*\(/i.test(script)) return null;
+
+  const keys = [];
+  for (const match of script.matchAll(/(?:CryptoJS\s*\.\s*)?enc\s*\.\s*(?:Utf8|Latin1)\s*\.\s*parse\s*\(\s*(["'])((?:\\.|(?!\1)[\s\S])*?)\1\s*\)/gi)) {
+    let value = match[2];
+    try {
+      value = match[1] === '"'
+        ? JSON.parse(`"${match[2]}"`)
+        : value.replace(/\\'/g, "'").replace(/\\\\/g, "\\");
+    } catch {
+      continue;
+    }
+    if ([16, 24, 32].includes(Buffer.byteLength(value)) && !keys.includes(value)) keys.push(value);
+  }
+  if (!keys.length) return null;
+
+  // CryptoJS WordArray uses four 32-bit words for the first 16 bytes. A
+  // number of mobile comic readers spell this as words.slice(0, 4),
+  // words.slice(0, 16), or byte-array.slice(0, 16); all three mean that the
+  // IV is prefixed to the encrypted response.
+  const prefixIv = /(?:words\s*\.\s*slice\s*\(\s*0\s*,\s*(?:4|16)\s*\)|(?:slice|subarray)\s*\(\s*0\s*,\s*16\s*\)|(?:words\s*\.\s*slice\s*\(\s*4\s*\)))/i.test(script);
+  if (!prefixIv) return null;
+  return `aes-cbc-prefix-iv-${Buffer.from(keys[0], "utf8").toString("base64url")}`;
+}
+
 export function decoderForLegadoImageRule(rule, jsLibrary = "") {
   const source = String(rule || "");
+  const cryptoJsDecoder = cryptoJsImageDecoder(source);
+  if (cryptoJsDecoder) return cryptoJsDecoder;
   if (
     /createSymmetricCrypto\s*\(\s*["']AES\/CBC\/PKCS5Padding/i.test(source)
     && /result\.slice\(0\s*,\s*16\)/.test(source)

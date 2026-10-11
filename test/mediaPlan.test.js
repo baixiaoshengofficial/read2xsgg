@@ -88,6 +88,16 @@ test("通用媒体提取解码脚本中的静态 Base64 播放地址", () => {
   assert.deepEqual(pageMediaUrls(html, "https://audio.example/player/1", { kind: "video" }), []);
 });
 
+test("通用媒体提取支持 Base64 包裹的 URL 编码播放地址", () => {
+  const videoUrl = "https://cdn.example/video/episode-1.m3u8?token=abc";
+  const encoded = Buffer.from(encodeURIComponent(videoUrl), "utf8").toString("base64");
+  const html = `<script>var player_aaaa={"url":"${encoded}"};</script>`;
+  assert.deepEqual(
+    pageMediaUrls(html, "https://video.example/vodplay/1-1.html", { kind: "video" }),
+    [videoUrl],
+  );
+});
+
 test("通用媒体提取解析 data 属性中的分隔播放列表并压过普通接口", () => {
   const html = [
     '<script>var player={"url":"https://audio.example/admin-ajax.php"}</script>',

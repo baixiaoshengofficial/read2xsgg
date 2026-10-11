@@ -63,6 +63,26 @@ test("香色动作链 fetch 保留真实响应 URL 与 Content-Type", async () =
   assert.equal(response.headers.get("Content-Type"), "text/html; charset=utf-8");
 });
 
+test("香色动作链对瞬时 GET 下载失败自动重试且不重试 POST", async () => {
+  let getCalls = 0;
+  const page = Buffer.from("<html><body>ok</body></html>");
+  const getResponse = await downloadAsFetch(async () => {
+    getCalls += 1;
+    if (getCalls === 1) throw new Error("upstream timeout");
+    return page;
+  })("https://retry.example/page");
+  assert.equal(getCalls, 2);
+  assert.equal(getResponse.ok, true);
+
+  let postCalls = 0;
+  const postResponse = await downloadAsFetch(async () => {
+    postCalls += 1;
+    throw new Error("upstream timeout");
+  })("https://retry.example/api", { method: "POST", body: "x=1" });
+  assert.equal(postCalls, 1);
+  assert.equal(postResponse.ok, false);
+});
+
 test("GBK 源转换后分类/正文动作与 bridge plan 携带编码", () => {
   const source = {
     bookSourceName: "新御书屋测试",

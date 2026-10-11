@@ -14,6 +14,95 @@ function mediaKind(value) {
   return String(value || "").toLowerCase() === "video" ? "video" : "audio";
 }
 
+const EMBEDDED_AUDIO_EXTENSION = /\.(?:aac|flac|m4a|m4b|mp3|oga|ogg|opus|wav)(?:[?#]|$)/i;
+const EMBEDDED_VIDEO_EXTENSION = /\.(?:m3u8|m4s|mp4|m4v|mov|mkv|ts|webm)(?:[?#]|$)/i;
+const EMBEDDED_STREAM_EXTENSION = /\.(?:m3u8|m4s)(?:[?#]|$)/i;
+
+function embeddedMediaExtension(kind) {
+  return kind === "video"
+    ? EMBEDDED_VIDEO_EXTENSION
+    : /\.(?:aac|flac|m3u8|m4a|m4b|m4s|mp3|oga|ogg|opus|wav)(?:[?#]|$)/i;
+}
+
+function normalizeEmbeddedMediaText(value) {
+  return String(value ?? "")
+    .replace(/\\u([\da-f]{4})/gi, (_, code) => String.fromCodePoint(Number.parseInt(code, 16)))
+    .replace(/\\\//g, "/")
+    .replace(/\\([\\"'])/g, "$1")
+    .replace(/&amp;/gi, "&")
+    .trim();
+}
+
+function enqueueDecodedUri(queue, value) {
+  const text = String(value || "");
+  if (!text.includes("%")) return;
+  try {
+    const decoded = normalizeEmbeddedMediaText(decodeURIComponent(text));
+    if (decoded && decoded !== text) queue.push(decoded);
+  } catch {
+    // A signed URL may contain a malformed percent sequence. Keep the raw
+    // candidate and let the normal URL parser decide whether it is usable.
+  }
+}
+
+function enqueueDecodedBase64(queue, value) {
+  const text = normalizeEmbeddedMediaText(value);
+  if (text.length < 16 || text.length % 4 === 1 || /[:\s<>"']/u.test(text)) return;
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(text)) return;
+  try {
+    const padded = text.replace(/-/g, "+").replace(/_/g, "/")
+      .padEnd(text.length + ((4 - (text.length % 4)) % 4), "=");
+    const decoded = normalizeEmbeddedMediaText(Buffer.from(padded, "base64").toString("utf8"));
+    if (decoded && decoded !== text && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(decoded)) {
+      queue.push(decoded);
+    }
+  } catch {
+    // Ignore strings which merely happen to look like Base64.
+  }
+}
+
+/**
+ * Decode portable player values such as Base64(URL-encoded media URL).
+ * Sites commonly wrap the same address in JSON escaping, URI encoding and
+ * Base64 in different orders; this bounded decoder keeps that transport detail
+ * in one generic layer without evaluating site JavaScript.
+ */
+export function decodeEmbeddedMediaUrl(value, baseUrl = "", kind = "audio") {
+  const queue = [normalizeEmbeddedMediaText(value)];
+  const seen = new Set();
+  const extension = embeddedMediaExtension(mediaKind(kind));
+  for (let index = 0; index < queue.length && index < 12; index += 1) {
+    const text = normalizeEmbeddedMediaText(queue[index]);
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    const embedded = text.match(/https?:\/\/[^\s"'<>]+/i)?.[0] || text;
+    const raw = embedded.replace(/[),;]+$/, "");
+    if (!/^(?:https?:)?\/\//i.test(raw) && !/^(?:\/|\.\.?\/)/.test(raw)) {
+      enqueueDecodedUri(queue, text);
+      enqueueDecodedBase64(queue, text);
+      continue;
+    }
+    try {
+      const url = new URL(raw, baseUrl || undefined);
+      if (!/^https?:$/.test(url.protocol)) continue;
+      const valueText = url.toString();
+      if (!extension.test(valueText)) continue;
+      if (mediaKind(kind) === "audio"
+        && EMBEDDED_VIDEO_EXTENSION.test(valueText)
+        && !EMBEDDED_STREAM_EXTENSION.test(valueText)) continue;
+      if (mediaKind(kind) === "video"
+        && EMBEDDED_AUDIO_EXTENSION.test(valueText)
+        && !EMBEDDED_STREAM_EXTENSION.test(valueText)) continue;
+      return valueText;
+    } catch {
+      // Continue decoding other bounded representations.
+    }
+    enqueueDecodedUri(queue, text);
+    enqueueDecodedBase64(queue, text);
+  }
+  return "";
+}
+
 function uniqueNames(values, matcher) {
   const result = [];
   for (const value of values) {
@@ -642,6 +731,26 @@ function hasHeader(headers, name) {
   return Object.keys(headers || {}).some((key) => String(key).toLowerCase() === wanted);
 }
 
+function mergeHeaders(...sources) {
+  const headers = {};
+  for (const source of sources) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) continue;
+    for (const [name, value] of Object.entries(source)) {
+      const previous = Object.keys(headers).find((key) => key.toLowerCase() === name.toLowerCase());
+      if (previous) delete headers[previous];
+      headers[name] = value;
+    }
+  }
+  return headers;
+}
+
+function removeHeader(headers, name) {
+  const wanted = String(name || "").toLowerCase();
+  for (const key of Object.keys(headers || {})) {
+    if (key.toLowerCase() === wanted) delete headers[key];
+  }
+}
+
 function responseHeader(response, name) {
   const wanted = String(name || "").toLowerCase();
   const headers = response?.httpHeaders;
@@ -901,8 +1010,9 @@ async function resolvePageScriptMedia(html, chapterUrl, plan, download, chapterR
   if (!scripts.length) return [];
 
   const cookies = chapterSessionCookies(chapterResponse);
-  const baseHeaders = { Referer: chapterUrl };
-  if (cookies) baseHeaders.Cookie = cookies;
+  let baseHeaders = mergeHeaders(plan?.headers);
+  if (!hasHeader(baseHeaders, "referer")) baseHeaders = mergeHeaders(baseHeaders, { Referer: chapterUrl });
+  if (cookies && !hasHeader(baseHeaders, "cookie")) baseHeaders = mergeHeaders(baseHeaders, { Cookie: cookies });
   const variables = staticPageVariables(html);
   for (const scriptUrl of scripts) {
     let script;
@@ -912,8 +1022,8 @@ async function resolvePageScriptMedia(html, chapterUrl, plan, download, chapterR
     Object.assign(variables, scriptStaticValues(script, html));
     const replacements = declaredMediaReplacements(script);
     for (const request of scriptAjaxRequests(script, variables, chapterUrl)) {
-      const headers = { ...baseHeaders, ...request.headers, "X-Requested-With": "XMLHttpRequest" };
-      if (!sameOrigin(request.url, chapterUrl)) delete headers.Cookie;
+      const headers = mergeHeaders(baseHeaders, request.headers, { "X-Requested-With": "XMLHttpRequest" });
+      if (!sameOrigin(request.url, chapterUrl)) removeHeader(headers, "cookie");
       let response;
       try {
         response = await download(request.url, {
@@ -948,15 +1058,19 @@ export async function executeMediaResolution(html, chapterUrl, plan, download, c
   vars.unixTime = String(Math.ceil(Date.now() / 1000));
   let url = interpolate(resolution.request.url, vars).trim();
   if (!url || /[<>\r\n]/.test(url) || !/^https?:\/\//i.test(url)) return [];
-  const headers = {};
+  let headers = mergeHeaders(plan.headers);
+  const resolutionHeaders = {};
   for (const [name, template] of Object.entries(resolution.request.headers || {})) {
     const value = interpolate(template, vars).trim();
-    if (value) headers[name] = value;
+    if (value) resolutionHeaders[name] = value;
   }
-  if (!headers.Referer && vars.chapterUrl) headers.Referer = vars.chapterUrl;
+  headers = mergeHeaders(headers, resolutionHeaders);
+  if (!hasHeader(headers, "referer") && vars.chapterUrl) {
+    headers = mergeHeaders(headers, { Referer: vars.chapterUrl });
+  }
   const sessionCookies = chapterSessionCookies(chapterResponse);
   if (sessionCookies && !hasHeader(headers, "cookie") && sameOrigin(url, chapterUrl)) {
-    headers.Cookie = sessionCookies;
+    headers = mergeHeaders(headers, { Cookie: sessionCookies });
   }
   let body = resolution.request.body ? interpolate(resolution.request.body, vars) : null;
   if (resolution.signature) {

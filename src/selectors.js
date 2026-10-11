@@ -732,6 +732,10 @@ export function convertRule(rule, { responseType = "html", warn = () => {} } = {
   if (typeof rule !== "string") return String(rule);
   let trimmed = rule.trim();
   if (!trimmed) return "";
+  // A DOM projection can intentionally select the current list node itself
+  // (for example `rows.get(i).text()`). `.` is a valid XPath context selector;
+  // translating it as a CSS tag would produce the meaningless `//*`.
+  if (trimmed === ".") return ".";
   if (/^@embedded-json-array:[A-Za-z_$][\w$]*$/.test(trimmed)
     || /^@json-media-pairs:[^:]+:[^:]+:[^:]+:[^:]+$/.test(trimmed)) return trimmed;
 
@@ -1031,6 +1035,16 @@ export function inferResponseType(rules = {}) {
   const collectionRule = [rules.bookList, rules.chapterList].find((value) => (
     typeof value === "string" && value.trim()
   ));
+  // A common Legado pattern parses an HTML response with Jsoup, then returns
+  // JSON.stringify(...) rows for the next rule stage. The return value looks
+  // like JSON, but the upstream response is still HTML and must not be fed to
+  // JSON.parse by the Xiangse bridge. Only classify it as HTML when the script
+  // does not itself parse the response as JSON.
+  if (collectionRule
+    && /(?:org\.jsoup\.Jsoup|__xsJsoup)\.parse\s*\(|\b(?:querySelector|querySelectorAll)\s*\(|\.select\s*\(/i.test(collectionRule)
+    && !/\bJSON\.parse\s*\(\s*(?:String\s*\(\s*)?result\b/i.test(collectionRule)) {
+    return "html";
+  }
   if (collectionRule && /^\s*(?:@?json:|@json-media-pairs:|\$[.[]|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[\d+\])*\[\*\])/i.test(collectionRule)) return "json";
 
   const explicitJsonCount = values.filter((value) => (

@@ -2,6 +2,7 @@ const MAX_HINTS = 16;
 const SAFE_NAME = /^[A-Za-z_$][\w$-]{0,63}$/;
 const URL_PROPERTY = /(?:url|uri|src|source|image|img|pic|picture|file|path)/i;
 const URL_ATTRIBUTE = /(?:src|source|original|lazy|url|file|style)/i;
+const SAFE_DECODER = /^(?:auto|passthrough|aes-cbc-prefix-iv-[A-Za-z0-9_-]+|aes-cbc-fixed-iv-[A-Za-z0-9_-]+-[A-Za-z0-9_-]+|md5-reverse-tiles-\d+-\d+|id-md5-reverse-tiles-[A-Za-z0-9_-]+)$/i;
 const BLOCKED_HEADERS = /^(?:host|content-length|transfer-encoding|connection|te|trailer|upgrade|proxy-|sec-websocket-)/i;
 
 function uniqueNames(values, matcher) {
@@ -34,7 +35,7 @@ function safeHeaders(value) {
  * extraction hints. The plan contains no executable JavaScript or regex from
  * the source, so an online source cannot inject code into the converter.
  */
-export function compileComicExtractionPlan(rule, headers = {}) {
+export function compileComicExtractionPlan(rule, headers = {}, options = {}) {
   const source = String(rule || "");
   const properties = [];
   const attributes = [];
@@ -60,28 +61,32 @@ export function compileComicExtractionPlan(rule, headers = {}) {
   }
 
   const normalizedHeaders = safeHeaders(headers);
+  const decoder = String(options?.decoder || "").trim();
   return {
     version: 1,
     properties: uniqueNames(properties, URL_PROPERTY),
     attributes: uniqueNames(attributes, URL_ATTRIBUTE),
     ...(Object.keys(normalizedHeaders).length ? { headers: normalizedHeaders } : {}),
+    ...(SAFE_DECODER.test(decoder) ? { decoder } : {}),
   };
 }
 
 export function normalizeComicExtractionPlan(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return { version: 1, properties: [], attributes: [] };
   const headers = safeHeaders(value.headers);
+  const decoder = String(value.decoder || "").trim();
   return {
     version: 1,
     properties: uniqueNames(Array.isArray(value.properties) ? value.properties : [], URL_PROPERTY),
     attributes: uniqueNames(Array.isArray(value.attributes) ? value.attributes : [], URL_ATTRIBUTE),
     ...(Object.keys(headers).length ? { headers } : {}),
+    ...(SAFE_DECODER.test(decoder) ? { decoder } : {}),
   };
 }
 
 export function encodeComicExtractionPlan(plan) {
   const normalized = normalizeComicExtractionPlan(plan);
-  if (!normalized.properties.length && !normalized.attributes.length) return "";
+  if (!normalized.properties.length && !normalized.attributes.length && !normalized.decoder) return "";
   return Buffer.from(JSON.stringify(normalized), "utf8").toString("base64url");
 }
 

@@ -15,6 +15,7 @@
     "test": "node --test",
     "test:live": "RUN_XBS_LIVE=1 node --test test/live-xbs.test.js",
     "test:xbs-live": "RUN_XBS_LIVE=1 node --test test/live-xbs.test.js",
+    "test:crawl-browser": "RUN_CRAWL_BROWSER=1 node --test test/crawlBrowser.test.js",
     "validate:xbs": "node ./bin/validate-xbs.js",
     "audit:sources": "node ./bin/audit-sources.js",
     "convert": "node ./bin/read2xsgg.js",
@@ -22,6 +23,7 @@
     "rebase:library": "node ./bin/rebase-library.js",
     "deploy:local": "./scripts/deploy-local.sh",
     "start": "node ./bin/server.js",
+    "agent:bridge": "node ./bin/agent-bridge.js",
     "docker:push": "./scripts/docker-push.sh"
   },
   "keywords": [
@@ -37,6 +39,7 @@
   "dependencies": {
     "iconv-lite": "^0.6.3",
     "jimp": "^1.6.1",
-    "jsdom": "^24.1.3"
+    "jsdom": "^24.1.3",
+    "playwright-core": "1.55.1"
   }
 }

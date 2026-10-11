@@ -27,6 +27,7 @@ import {
   compileDetailBridgePlan,
   decodeBridgePlan,
   executeBridgePlan,
+  parseRequestDescriptor,
 } from "../src/index.js";
 import { applyVerifyAndAnalyzeFallback } from "../src/pipeline.js";
 import {
@@ -55,6 +56,7 @@ import {
   stableAnchorSelectorFromLinks,
 } from "../src/siteAnalyze/domUtil.js";
 import { discoverSpaMedia } from "../src/siteAnalyze/spaMedia.js";
+import { dynamicComicApiImages } from "../src/siteAnalyze/dynamicComic.js";
 import { createAppServer } from "../src/server.js";
 
 function listen(server) {
@@ -205,6 +207,11 @@ test("detectKind 从视频作品路径和文字识别视频站", () => {
   assert.equal(detectKind(html, "https://media.example/").kind, "video");
 });
 
+test("detectKind 将单个明确播放器归入对应媒体类型", () => {
+  assert.equal(detectKind('<audio src="/play"></audio>').kind, "audio");
+  assert.equal(detectKind('<video src="/play"></video>').kind, "video");
+});
+
 test("detectKinds 混合站可同时命中多种类型", () => {
   const kinds = detectKinds(mixedHome, "https://mixed.example/");
   const set = new Set(kinds.map((item) => item.kind));
@@ -277,6 +284,93 @@ test("discoverNovel 从 HTML fixture 发现列表/目录/正文", async () => {
   assert.ok(discovery.chapterCount >= 2);
 });
 
+test("discoverNovel 对带封面的单本书目继续验详情、章节和正文", async () => {
+  const host = "https://single-book-list.example";
+  const home = `<html><body><ul class="book-list">
+    <li><a href="/book/only.html"><img src="/covers/only.jpg">唯一书目</a></li>
+  </ul></body></html>`;
+  const detail = `<html><body><h1>唯一书目</h1><div class="chapters">
+    <a href="/book/only/chapter/1">第一章 开始</a>
+    <a href="/book/only/chapter/2">第二章 继续</a>
+  </div></body></html>`;
+  const chapter = `<html><body><article>${"这是可完整验证的正文内容。".repeat(30)}</article></body></html>`;
+  const download = async (url) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/") return Buffer.from(home);
+    if (path === "/book/only.html") return Buffer.from(detail);
+    if (/^\/book\/only\/chapter\/\d+$/.test(path)) return Buffer.from(chapter);
+    if (path === "/covers/only.jpg") return Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    return Buffer.from("");
+  };
+  const discovery = await discoverNovel(`${host}/`, { download });
+  assert.ok(discovery);
+  assert.equal(discovery.bookCount, 1);
+  assert.equal(discovery.chapterCount, 2);
+
+  const source = novelDiscoveryToXiangse(discovery, { sourceName: "单本书目" });
+  const report = await runXbsPipeline(source, {
+    fetchImpl: downloadAsFetch(download),
+    timeoutMs: 2_000,
+  });
+  assert.equal(report.ok, true, report.error);
+  assert.equal(report.steps.bookWorld.listCount, 1);
+  assert.ok(report.steps.chapterList.listCount >= 2);
+  assert.ok(report.steps.chapterContent.itemCount > 0);
+});
+
+test("discoverNovel 不把单个普通导航链接作为书籍列表", async () => {
+  const diagnostics = [];
+  const discovery = await discoverNovel("https://single-navigation.example/", {
+    homeHtml: '<html><body><nav><a href="/directory">全部小说</a></nav></body></html>',
+    download: async () => Buffer.from(""),
+    diagnostics,
+  });
+  assert.equal(discovery, null);
+  assert.ok(diagnostics.some((item) => item.includes("书籍链接不足")));
+});
+
+test("discoverNovel 在短路径重复导航旁优先使用完整封面书目并通过动作链", async () => {
+  const host = "https://short-path-books.example";
+  const home = `<html><head><title>短路径书目</title></head><body>
+    <nav><a href="/archive">站点导航甲</a><a href="/archive">站点导航乙</a></nav>
+    <ul class="book-list">
+      <li><a href="/book-a"><img src="/covers/a.jpg">作品甲</a></li>
+      <li><a href="/book-b"><img src="/covers/b.jpg">作品乙</a></li>
+      <li><a href="/book-c"><img src="/covers/c.jpg">作品丙</a></li>
+      <li><a href="/book-d"><img src="/covers/d.jpg">作品丁</a></li>
+    </ul>
+  </body></html>`;
+  const download = async (url) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/") return Buffer.from(home);
+    if (/^\/book-[a-d]$/.test(path)) {
+      return Buffer.from(`<html><body><h1>作品详情</h1>
+        <a href="${path}/chapter/1">第一章 开始</a>
+        <a href="${path}/chapter/2">第二章 继续</a>
+      </body></html>`);
+    }
+    if (/^\/book-[a-d]\/chapter\/\d+$/.test(path)) {
+      return Buffer.from(`<article>${"这是完整的章节正文。".repeat(30)}</article>`);
+    }
+    return Buffer.from("");
+  };
+
+  const discovery = await discoverNovel(`${host}/`, { download });
+  assert.ok(discovery);
+  assert.equal(discovery.bookCount, 4);
+  assert.equal(discovery.detailSampleUrl, `${host}/book-a`);
+
+  const source = novelDiscoveryToXiangse(discovery, { sourceName: "短路径书目" });
+  const report = await runXbsPipeline(source, {
+    fetchImpl: downloadAsFetch(download),
+    timeoutMs: 2_000,
+  });
+  assert.equal(report.ok, true, report.error);
+  assert.ok(report.steps.bookWorld.listCount >= 4);
+  assert.ok(report.steps.chapterList.listCount >= 2);
+  assert.ok(report.steps.chapterContent.itemCount > 0);
+});
+
 test("discoverNovel 优先把无扩展名作品 slug 作为详情而非章节 HTML", async () => {
   const home = `<html><head><title>作品全集</title></head><body>
     <nav>
@@ -311,6 +405,57 @@ test("discoverNovel 优先把无扩展名作品 slug 作为详情而非章节 HT
   assert.equal(discovery.chapterCount, 3);
 });
 
+test("discoverNovel 识别多级书籍 URL 并跳过作者导航", async () => {
+  const home = `<!doctype html><html><body>
+    <nav><a href="/zuozhe/one/">作者一</a><a href="/zuozhe/two/">作者二</a></nav>
+    <section class="books">
+      <a href="/yanqing/21_b/book-a.html">书籍甲</a>
+      <a href="/yanqing/21_b/book-b.html">书籍乙</a>
+      <a href="/yanqing/21_b/book-c.html">书籍丙</a>
+      <a href="/yanqing/21_b/book-d.html">书籍丁</a>
+    </section>
+  </body></html>`;
+  const detail = `<!doctype html><html><body><h1>书籍甲</h1>
+    <a href="/yanqing/21_b/book-a/1.html">第一章</a>
+    <a href="/yanqing/21_b/book-a/2.html">第二章</a>
+  </body></html>`;
+  const chapter = `<!doctype html><html><body><article>${"多级路径正文。".repeat(30)}</article></body></html>`;
+  const download = async (url) => {
+    const path = new URL(url).pathname;
+    if (path === "/") return Buffer.from(home);
+    if (/\/yanqing\/21_b\/book-[a-d]\.html$/.test(path)) return Buffer.from(detail);
+    if (/\/yanqing\/21_b\/book-a\/[12]\.html$/.test(path)) return Buffer.from(chapter);
+    throw new Error(`fixture missing: ${url}`);
+  };
+
+  const discovery = await discoverNovel("https://nested-path.example/", { download });
+  assert.ok(discovery);
+  assert.match(discovery.detailSampleUrl, /\/yanqing\/21_b\/book-a\.html$/);
+  assert.match(discovery.chapterSampleUrl, /\/book-a\/[12]\.html$/);
+});
+
+test("discoverNovel 识别编号分页形式的小说章节", async () => {
+  const home = `<a href="/category/21_b/book-a.html">书籍甲</a>
+    <a href="/category/21_b/book-b.html">书籍乙</a>
+    <a href="/category/21_b/book-c.html">书籍丙</a>`;
+  const detail = `<h1>书籍甲</h1>
+    <a href="/category/21_b/book-a_2.html">第1页</a>
+    <a href="/category/21_b/book-a_3.html">第2页</a>`;
+  const chapter = `<article>${"编号分页正文。".repeat(35)}</article>`;
+  const download = async (url) => {
+    const path = new URL(url).pathname;
+    if (path === "/") return Buffer.from(home);
+    if (/\/category\/21_b\/book-[abc]\.html$/.test(path)) return Buffer.from(detail);
+    if (/\/category\/21_b\/book-a_[23]\.html$/.test(path)) return Buffer.from(chapter);
+    throw new Error(`fixture missing: ${url}`);
+  };
+
+  const discovery = await discoverNovel("https://paged-detail.example/", { download });
+  assert.ok(discovery);
+  assert.match(discovery.chapterSampleUrl, /book-a_[23]\.html$/);
+  assert.equal(discovery.chapterCount, 2);
+});
+
 test("discoverComic 从 HTML fixture 发现漫画结构", async () => {
   const discovery = await discoverComic("https://comic.example/", { download: fixtureDownload });
   assert.ok(discovery);
@@ -341,6 +486,35 @@ test("discoverComic 识别查询参数声明的章节跳转链接", async () => 
   assert.ok(discovery);
   assert.equal(discovery.chapterCount, 2);
   assert.match(discovery.chapterSampleUrl, /chapter_slot=1/);
+});
+
+test("discoverComic 识别同路径阅读参数并过滤章节页装饰图", async () => {
+  const host = "https://comic-query-reader.example";
+  const pages = new Map([
+    [`${host}/`, [
+      '<a href="/plugin.php?id=reader&a=bofang&kuid=1"><img src="/cover-1.jpg">甲漫画</a>',
+      '<a href="/plugin.php?id=reader&a=bofang&kuid=2"><img src="/cover-2.jpg">乙漫画</a>',
+    ].join("")],
+    [`${host}/plugin.php?id=reader&a=bofang&kuid=1`, [
+      '<h1>甲漫画</h1>',
+      '<a href="/plugin.php?id=reader&a=read&kuid=1&zjid=10">第1话</a>',
+      '<a href="/plugin.php?id=reader&a=read&kuid=1&zjid=11">艺术设定集</a>',
+    ].join("")],
+    [`${host}/plugin.php?id=reader&a=read&kuid=1&zjid=11`, [
+      '<img src="/assets/logo.png"><img src="/assets/loading.gif">',
+      "<script>const pages = ['/pages/1.webp', '/pages/2.webp', '/pages/3.webp'];</script>",
+    ].join("")],
+  ]);
+  const discovery = await discoverComic(`${host}/`, {
+    download: async (url) => Buffer.from(pages.get(String(url)) || ""),
+    adapterBase: "https://converter.example",
+  });
+
+  assert.ok(discovery);
+  assert.equal(discovery.chapterCount, 2);
+  assert.equal(discovery.contentResponseFormatType, "json");
+  assert.ok(discovery.imageCount >= 3);
+  assert.match(discovery.chapterSampleUrl, /a=read/);
 });
 
 test("discoverNovel 识别并验证分类列表下一页模板", async () => {
@@ -491,6 +665,36 @@ test("discoverMedia 排除媒体作者归档并选择带封面的作品详情", 
   assert.match(discovery.detailSampleUrl, /\/video\/\d+\.html$/);
   assert.doesNotMatch(discovery.detailSampleUrl, /\/author\//);
   assert.equal(discovery.chapterCount, 1);
+});
+
+test("discoverMedia 区分 voddetail 与 vodplay，并解码播放器地址", async () => {
+  const host = "https://route-media.example";
+  const videoUrl = "https://cdn.example/video/episode-1.m3u8?token=abc";
+  const encoded = Buffer.from(encodeURIComponent(videoUrl), "utf8").toString("base64");
+  const home = `<html><body><p>影视 视频 播放</p>
+    <a class="vod-item" href="/voddetail/1.html">节目甲</a>
+    <a class="vod-item" href="/voddetail/2.html">节目乙</a>
+  </body></html>`;
+  const detail = `<html><body><h1>节目甲</h1>
+    <a href="/vodplay/1-1-1.html">第1集</a>
+    <a href="/vodplay/1-1-2.html">第2集</a>
+  </body></html>`;
+  const chapter = `<html><body><script>var player_aaaa={"url":"${encoded}"};</script></body></html>`;
+  const discovery = await discoverMedia(`${host}/`, "video", {
+    download: async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/") return Buffer.from(home);
+      if (path === "/voddetail/1.html") return Buffer.from(detail);
+      if (path.startsWith("/vodplay/")) return Buffer.from(chapter);
+      throw new Error(`fixture missing: ${url}`);
+    },
+    adapterBase: "https://converter.example",
+  });
+  assert.ok(discovery);
+  assert.equal(discovery.detailSampleUrl, `${host}/voddetail/1.html`);
+  assert.equal(discovery.chapterCount, 2);
+  assert.equal(discovery.chapterSampleUrl, `${host}/vodplay/1-1-2.html`);
+  assert.equal(discovery.mediaSampleUrl, videoUrl);
 });
 
 test("discoverMedia 通用识别重复内容卡、单节目媒体和列表分页", async () => {
@@ -745,6 +949,279 @@ test("discoverSpaMedia 通用识别 SPA JSON 目录、分页、详情与音频",
   assert.equal(bridgedDetail.cat, "广播剧");
 });
 
+test("discoverSpaMedia 识别不带 api 前缀的通用影视目录接口", async () => {
+  const home = `<!doctype html><html><head><title>SPA video</title>
+  <script src="/assets/player.js"></script></head><body>影视剧集</body></html>`;
+  const script = `const loadMovies=async(e,t,n)=>await client.get(e,"/vod/list",{pagination:JSON.stringify(t),videoClassId:n});loadMovies(apiBase,{pageNo:1,moduleNum:0},90013);`;
+  const page = (index) => ({
+    data: {
+      records: Array.from({ length: 3 }, (_, offset) => ({
+        movieId: `${index}${offset + 1}`,
+        title: `第${index}页影片${offset + 1}`,
+        poster: `https://cdn.spa-video.example/cover/${index}${offset + 1}.jpg`,
+      })),
+    },
+  });
+  const detail = {
+    data: {
+      movieDetail: {
+        movieId: "11",
+        title: "影片甲",
+        poster: "https://cdn.spa-video.example/cover/11.jpg",
+        categoryName: "剧情",
+        playInfo: { videoUrl: "https://cdn.spa-video.example/video/11.m3u8" },
+      },
+    },
+  };
+  const download = async (url) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/assets/player.js") return Buffer.from(script);
+    if (parsed.pathname === "/vod/list") {
+      const query = JSON.parse(parsed.searchParams.get("pagination"));
+      return Buffer.from(JSON.stringify(page(query.pageNo)));
+    }
+    if (parsed.pathname === "/api/detail/11") return Buffer.from(JSON.stringify(detail));
+    throw new Error("unexpected fixture request");
+  };
+  const repairPlan = encodeBridgePlan({
+    version: 1,
+    kind: "books",
+    host: "https://spa-video.example",
+    responseType: "json",
+    list: "records",
+    fields: {
+      name: { selector: "title" },
+      url: {
+        selector: "movieId",
+        matchTemplate: {
+          pattern: "^([\\s\\S]+)$",
+          prefix: "https://spa-video.example/api/detail/",
+          suffix: "",
+        },
+      },
+    },
+  });
+  const repairSource = {
+    sourceName: "SPA video",
+    sourceType: "video",
+    bookWorld: {
+      推荐: { requestInfo: `https://converter.example/adapter/books?plan=${repairPlan}&url=https%3A%2F%2Fspa-video.example%2Flegacy` },
+    },
+  };
+
+  const diagnostics = [];
+  const discovery = await discoverSpaMedia("https://spa-video.example/", "video", {
+    download,
+    homeHtml: home,
+    homeResponseUrl: "https://spa-video.example/",
+    adapterBase: "https://converter.example",
+    repairSource,
+    diagnostics,
+  });
+
+  assert.ok(discovery, diagnostics.join("; "));
+  assert.equal(discovery.source.sourceType, "video");
+  assert.equal(discovery.bookCount, 3);
+  assert.equal(discovery.mediaSampleUrl, "https://cdn.spa-video.example/video/11.m3u8");
+  const validation = validateXiangseSource(discovery.source);
+  assert.equal(validation.ok, true, validation.errors.join("; "));
+});
+
+test("discoverSpaMedia 从 fetch 静态 GET 和列表详情链接识别无预置详情模板的影视源", async () => {
+  const home = `<!doctype html><html><head><script src="/assets/app.js"></script></head>
+  <body>影视剧集</body></html>`;
+  const script = `fetch("/vod/list?page=1");`;
+  const listPage = (page) => ({
+    data: {
+      records: Array.from({ length: 2 }, (_, index) => {
+        const id = `${page}${index + 1}`;
+        return { movieId: id, title: `影片${id}`, detailUrl: `/vod/detail/${id}` };
+      }),
+    },
+  });
+  const detail = {
+    data: {
+      movieDetail: {
+        movieId: "11",
+        title: "影片11",
+        categoryName: "剧情",
+        mediaUrl: "https://cdn.spa-direct.example/video/11.m3u8",
+      },
+    },
+  };
+  const download = async (url) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/assets/app.js") return Buffer.from(script);
+    if (parsed.pathname === "/vod/list") {
+      return Buffer.from(JSON.stringify(listPage(Number(parsed.searchParams.get("page")) || 1)));
+    }
+    if (/^\/vod\/detail\//.test(parsed.pathname)) return Buffer.from(JSON.stringify(detail));
+    throw new Error("unexpected fixture request");
+  };
+  const diagnostics = [];
+  const discovery = await discoverSpaMedia("https://spa-direct.example/", "video", {
+    download,
+    homeHtml: home,
+    homeResponseUrl: "https://spa-direct.example/",
+    adapterBase: "https://converter.example",
+    repairSource: { sourceName: "SPA direct", sourceType: "video" },
+    diagnostics,
+  });
+
+  assert.ok(discovery, diagnostics.join("; "));
+  assert.equal(discovery.source.sourceType, "video");
+  assert.equal(discovery.bookCount, 2);
+  assert.equal(discovery.mediaSampleUrl, "https://cdn.spa-direct.example/video/11.m3u8");
+  const validation = validateXiangseSource(discovery.source);
+  assert.equal(validation.ok, true, validation.errors.join("; "));
+  const detailToken = discovery.source.bookDetail.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)?.[1];
+  const bridgedDetail = executeBridgePlan(
+    Buffer.from(JSON.stringify(detail)),
+    "https://spa-direct.example/vod/detail/11",
+    decodeBridgePlan(detailToken),
+  );
+  assert.equal(bridgedDetail.name, "影片11");
+  const chapterToken = discovery.source.chapterList.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)?.[1];
+  const bridgedChapters = executeBridgePlan(
+    Buffer.from(JSON.stringify(detail)),
+    "https://spa-direct.example/vod/detail/11",
+    decodeBridgePlan(chapterToken),
+  );
+  assert.equal(bridgedChapters.data[0].title, "影片11");
+  assert.equal(bridgedChapters.data[0].url, "https://cdn.spa-direct.example/video/11.m3u8");
+});
+
+test("discoverSpaMedia 解析 Axios baseURL、分类参数与模板详情接口", async () => {
+  const home = '<link rel="modulepreload" href="/assets/prefetch.js"><script src="/assets/app.js"></script>';
+  const script = [
+    'import("./views/videoDetail.js");',
+    'const client=axios.create({baseURL:"/api/v1",withCredentials:true});',
+    'const api={getCategories(){return client.get("/categories",{params:{type:"video"}})},',
+    'getVideosByCategory(e,p=1,n=20){return client.get("/videos",{params:{categoryId:e,page:p,size:n}})},',
+    'getVideoById(e){return client.get(`/videos/${e}`)}};',
+  ].join("");
+  const categories = {
+    data: [
+      { id: 7, name: "剧集", type: "video", enabled: true },
+      { id: 8, name: "电影", type: "video", enabled: true },
+    ],
+  };
+  const page = (number) => ({
+    data: {
+      items: Array.from({ length: 2 }, (_, index) => ({
+        id: `${number}${index + 1}`,
+        title: `影片${number}${index + 1}`,
+        coverUrl: `https://cdn.spa-api.example/cover/${number}${index + 1}.jpg`,
+      })),
+      page: number,
+    },
+  });
+  const detail = {
+    data: {
+      videoInfo: {
+        id: 11,
+        title: "影片11",
+        categoryName: "剧集",
+        videoUrl: "jpd/2026/file.m3u8",
+      },
+    },
+  };
+  const calls = [];
+  const download = async (url) => {
+    const parsed = new URL(String(url));
+    calls.push(`${parsed.pathname}?${[...parsed.searchParams.keys()].sort().join(",")}`);
+    if (parsed.pathname === "/assets/app.js") return Buffer.from(script);
+    if (parsed.pathname === "/assets/prefetch.js") return Buffer.from("export const prefetched=true;");
+    if (parsed.pathname === "/assets/views/videoDetail.js") {
+      return Buffer.from('import {toPlayableUrl} from "../videoPlayback.js"; export {toPlayableUrl};');
+    }
+    if (parsed.pathname === "/assets/videoPlayback.js") {
+      return Buffer.from('export const toPlayableUrl=(value)=>`/api/v1/m3u8/proxy?path=${encodeURIComponent(value)}`;');
+    }
+    if (parsed.pathname === "/api/v1/categories") return Buffer.from(JSON.stringify(categories));
+    if (parsed.pathname === "/api/v1/videos" && parsed.searchParams.get("categoryId") === "7") {
+      return Buffer.from(JSON.stringify(page(Number(parsed.searchParams.get("page")) || 1)));
+    }
+    if (parsed.pathname === "/api/v1/videos/11") return Buffer.from(JSON.stringify(detail));
+    throw new Error("unexpected fixture request");
+  };
+  const diagnostics = [];
+  const discovery = await discoverSpaMedia("https://spa-api.example/", "video", {
+    download,
+    homeHtml: home,
+    adapterBase: "https://converter.example",
+    repairSource: { sourceName: "SPA API", sourceType: "video" },
+    diagnostics,
+  });
+
+  assert.ok(discovery, diagnostics.join("; "));
+  assert.deepEqual(Object.keys(discovery.source.bookWorld), ["剧集", "电影"]);
+  assert.ok(calls.includes("/assets/prefetch.js?"));
+  assert.ok(calls.includes("/assets/views/videoDetail.js?"));
+  assert.ok(calls.includes("/assets/videoPlayback.js?"));
+  assert.ok(calls.includes("/api/v1/categories?type"));
+  assert.ok(calls.includes("/api/v1/videos?categoryId,page,size"));
+  assert.ok(discovery.source.bookWorld["剧集"].requestInfo.includes("/adapter/books"));
+  const categoryRequestInfo = discovery.source.bookWorld["剧集"].requestInfo;
+  const categoryAdapterUrl = new Function("config", "params", "result", categoryRequestInfo.slice(4))(
+    {},
+    { pageIndex: 2 },
+    "",
+  );
+  assert.match(
+    new URL(categoryAdapterUrl).searchParams.get("url"),
+    /\/api\/v1\/videos\?page=2&size=20&categoryId=7/,
+  );
+  const categoryPlanToken = categoryRequestInfo.match(/plan=([A-Za-z0-9_-]+)/)?.[1];
+  const resolvedTarget = resolveBookTargetRequest(
+    discovery.source,
+    discovery.source.bookWorld["剧集"],
+    { plan: decodeBridgePlan(categoryPlanToken), requestInfo: categoryRequestInfo },
+    { pageIndex: 2 },
+  );
+  const resolvedUrl = new URL(resolvedTarget.url);
+  assert.equal(resolvedUrl.pathname, "/api/v1/videos");
+  assert.equal(resolvedUrl.searchParams.get("page"), "2");
+  assert.equal(resolvedUrl.searchParams.get("categoryId"), "7");
+  const detailToken = discovery.source.bookDetail.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)?.[1];
+  const bridgedDetail = executeBridgePlan(
+    Buffer.from(JSON.stringify(detail)),
+    "https://spa-api.example/api/v1/videos/11",
+    decodeBridgePlan(detailToken),
+  );
+  assert.equal(bridgedDetail.name, "影片11");
+  const chapterToken = discovery.source.chapterList.requestInfo.match(/plan=([A-Za-z0-9_-]+)/)?.[1];
+  const bridgedChapters = executeBridgePlan(
+    Buffer.from(JSON.stringify(detail)),
+    "https://spa-api.example/api/v1/videos/11",
+    decodeBridgePlan(chapterToken),
+  );
+  assert.deepEqual(bridgedChapters.data, [{
+    title: "影片11",
+    url: "https://spa-api.example/api/v1/m3u8/proxy?path=jpd%2F2026%2Ffile.m3u8",
+  }]);
+  const absoluteMediaDetail = {
+    data: {
+      videoInfo: {
+        id: 11,
+        title: "影片11",
+        videoUrl: "https://cdn.spa-api.example/video/11.m3u8?token=sample",
+      },
+    },
+  };
+  const absoluteMediaChapters = executeBridgePlan(
+    Buffer.from(JSON.stringify(absoluteMediaDetail)),
+    "https://spa-api.example/api/v1/videos/11",
+    decodeBridgePlan(chapterToken),
+  );
+  assert.equal(
+    absoluteMediaChapters.data[0].url,
+    "https://spa-api.example/api/v1/m3u8/proxy?path=video%2F11.m3u8%3Ftoken%3Dsample",
+  );
+  const validation = validateXiangseSource(discovery.source);
+  assert.equal(validation.ok, true, validation.errors.join("; "));
+});
+
 test("novelDiscoveryToXiangse 生成可导入的最小香色源", async () => {
   const discovery = await discoverNovel("https://novel.example/", { download: fixtureDownload });
   const source = novelDiscoveryToXiangse(discovery, { sourceName: "识站示例" });
@@ -818,8 +1295,167 @@ test("analyzeSite 对小说 fixture 返回成功源", async () => {
   assert.equal(result.ok, true, result.detail || result.reason);
   assert.equal(result.kind, "text");
   assert.ok(result.source.chapterContent.content);
-  assert.match(result.warning.message, /fallback:site-analyze/);
+  assert.match(result.warning.message, /site-analyze/);
   assert.equal(Object.keys(result.sources).length, 1);
+});
+
+test("analyzeSite 从同源书库入口继续发现文本列表并跑通正文链", async () => {
+  const host = "https://portal-novel.example";
+  const requested = [];
+  const landing = '<html><body><nav><a href="/library">小说书库</a></nav></body></html>';
+  const listing = `<html><body><ul class="books">
+    <li><a href="/book/1.html">第一本书</a></li>
+    <li><a href="/book/2.html">第二本书</a></li>
+    <li><a href="/book/3.html">第三本书</a></li>
+  </ul></body></html>`;
+  const detail = `<html><body><h1>第一本书</h1><div class="chapter-list">
+    <a href="/chapter/1.html">第一章</a><a href="/chapter/2.html">第二章</a>
+  </div></body></html>`;
+  const content = `<html><body><article id="content"><p>${"正文段落。".repeat(40)}</p></article></body></html>`;
+  const result = await analyzeSite(`${host}/`, {
+    sourceName: "同源目录文本",
+    preferKind: "text",
+    download: async (url) => {
+      const parsed = new URL(String(url));
+      requested.push(parsed.pathname);
+      if (parsed.pathname === "/") return Buffer.from(landing);
+      if (parsed.pathname === "/library") return Buffer.from(listing);
+      if (/^\/book\/\d+\.html$/.test(parsed.pathname)) return Buffer.from(detail);
+      if (/^\/chapter\/\d+\.html$/.test(parsed.pathname)) return Buffer.from(content);
+      throw new Error(`fixture missing: ${parsed.pathname}`);
+    },
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.ok(requested.includes("/library"), "应继续探测同源书库页");
+  assert.equal(result.source.sourceType, "text");
+  assert.equal(result.runtimeReports[result.source.sourceName].ok, true);
+  assert.ok(result.runtimeReports[result.source.sourceName].steps.chapterContent.itemCount > 0);
+});
+
+test("阅读源修复先验声明类型，不让无关影视发现拖住文本候选", async () => {
+  const host = "https://preferred-kind.example";
+  const requested = [];
+  const home = novelHome.replace(
+    "</body>",
+    '<p>影视 视频</p><a href="/voddetail/1.html">节目甲</a><a href="/voddetail/2.html">节目乙</a></body>',
+  );
+  const result = await analyzeSite(`${host}/`, {
+    download: async (url) => {
+      const parsed = new URL(String(url));
+      requested.push(parsed.pathname);
+      if (parsed.pathname === "/") return Buffer.from(home);
+      if (/^\/book\/\d+\.html$/.test(parsed.pathname)) return Buffer.from(novelDetail);
+      if (/^\/chapter\/\d+\.html$/.test(parsed.pathname)) return Buffer.from(novelChapter);
+      if (/^\/voddetail\/\d+\.html$/.test(parsed.pathname)) {
+        throw new Error("unrelated video detail should not be probed");
+      }
+      throw new Error(`fixture missing: ${parsed.pathname}`);
+    },
+    sourceName: "混合门户文本规则修复",
+    preferKind: "text",
+    validateRuntime: false,
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.ok(result.detectedKinds.includes("text"));
+  assert.ok(result.detectedKinds.includes("video"));
+  assert.equal(result.source.sourceType, "text");
+  assert.equal(requested.some((path) => path.startsWith("/voddetail/")), false);
+});
+
+test("analyzeSite 按声明类型探测没有媒体关键词的影视首页", async () => {
+  const host = "https://declared-video.example";
+  const home = [
+    '<article><h2><a href="/voddetail/1.html">节目甲</a></h2></article>',
+    '<article><h2><a href="/voddetail/2.html">节目乙</a></h2></article>',
+  ].join("");
+  const detail = '<html><body><h1>节目甲</h1><video src="https://cdn.example/episode.m3u8"></video></body></html>';
+  const requested = [];
+  const result = await analyzeSite(`${host}/`, {
+    download: async (url) => {
+      requested.push(String(url));
+      const path = new URL(String(url)).pathname;
+      if (path === "/") return Buffer.from(home);
+      if (/^\/voddetail\/\d+\.html$/.test(path)) return Buffer.from(detail);
+      throw new Error(`fixture missing: ${url}`);
+    },
+    sourceName: "声明影视源",
+    preferKind: "video",
+    adapterBase: "https://convert.example",
+    validateRuntime: false,
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.deepEqual(result.detectedKinds, []);
+  assert.deepEqual(result.kinds, ["video"]);
+  assert.equal(result.source.sourceType, "video");
+  assert.ok(requested.some((url) => /\/voddetail\/1\.html$/.test(url)));
+  assert.match(result.source.chapterList.requestInfo, /adapter\/single-chapter/);
+});
+
+test("analyzeSite 后续识站轮次轮换到前四个以外的声明入口", async () => {
+  const requested = [];
+  const seedRequests = Array.from({ length: 7 }, (_, index) => ({
+    url: `https://seeds.example/catalog-${index + 1}`,
+  }));
+  const download = async (url) => {
+    requested.push(new URL(url).pathname);
+    return Buffer.from("<html><body><p>未声明内容</p></body></html>");
+  };
+
+  const result = await analyzeSite("https://seeds.example/", {
+    download,
+    seedRequests,
+    attempt: 1,
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(requested.includes("/catalog-5"));
+  assert.ok(requested.includes("/catalog-7"));
+  assert.equal(requested.includes("/catalog-2"), false);
+});
+
+test("analyzeSite 在重复入口批次上于网络请求前停止", async () => {
+  const seen = new Set();
+  const fingerprints = [];
+  let downloads = 0;
+  const options = {
+    download: async () => {
+      downloads += 1;
+      return Buffer.from("<html><body>unclassified portal</body></html>");
+    },
+    onProbeBatch: (fingerprint) => {
+      fingerprints.push(fingerprint);
+      if (seen.has(fingerprint)) return false;
+      seen.add(fingerprint);
+      return true;
+    },
+  };
+
+  const first = await analyzeSite("https://repeat-batch.example/", options);
+  const firstDownloadCount = downloads;
+  const second = await analyzeSite("https://repeat-batch.example/", { ...options, attempt: 1 });
+
+  assert.equal(first.ok, false);
+  assert.equal(first.repeatedEvidence, undefined);
+  assert.equal(second.repeatedEvidence, true);
+  assert.equal(second.probeBatchFingerprint, first.probeBatchFingerprint);
+  assert.equal(fingerprints.length, 2);
+  assert.equal(downloads, firstDownloadCount, "重复批次不应再次访问站点");
+});
+
+test("analyzeSite 汇总所有探测中的 HTTP 响应证据", async () => {
+  const result = await analyzeSite("https://responding-origin.example/", {
+    download: async () => {
+      throw new Error("下载阅读源失败：上游返回 HTTP 403");
+    },
+    seedRequests: [{ url: "https://responding-origin.example/catalog" }],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.originResponded, true);
+  assert.ok(result.httpResponseStatuses.includes(403));
 });
 
 test("analyzeSite 在首页瞬时网络失败后重试并完成动作链", async () => {
@@ -913,7 +1549,7 @@ test("小说列表节点本身为链接时详情规则读取当前节点 href", 
   const discovery = await discoverNovel("https://self-link.example/", { download, maxPages: 2 });
 
   assert.ok(discovery);
-  assert.match(discovery.detailUrlSelector, /\.\/@href/);
+  assert.equal(discovery.detailUrlSelector, "//@href");
   assert.match(discovery.bookNameSelector, /normalize-space\(\.\)/);
 });
 
@@ -1082,6 +1718,83 @@ test("analyzeSite 保留已声明 POST 分类请求并重新验证动作链", as
   assert.ok(requests.some((item) => item.options.method === "POST" && item.url.endsWith("/category")));
 });
 
+test("analyzeSite 将阅读源级请求头继承到首页、分类和后续动作", async () => {
+  const requests = [];
+  const download = async (url, headers = {}, options = {}) => {
+    requests.push({ url, headers, options });
+    return fixtureDownload(url);
+  };
+  const result = await analyzeSite("https://novel.example/", {
+    download,
+    repairSource: {
+      header: JSON.stringify({
+        "User-Agent": "SourceUA/1.0",
+        Referer: "https://novel.example/",
+      }),
+    },
+    seedRequests: [{
+      url: "https://novel.example/category",
+      headers: { "X-Seed": "yes", "User-Agent": "SeedUA/1.0" },
+      options: {},
+    }],
+  });
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const home = requests.find((item) => new URL(item.url).pathname === "/");
+  const category = requests.find((item) => new URL(item.url).pathname === "/category");
+  assert.equal(home.headers["User-Agent"], "SourceUA/1.0");
+  assert.equal(home.headers.Referer, "https://novel.example/");
+  assert.equal(category.headers["User-Agent"], "SeedUA/1.0");
+  assert.equal(category.headers["X-Seed"], "yes");
+  assert.equal(category.headers.Referer, "https://novel.example/");
+});
+
+test("analyzeSite 不合并 URL 相同但请求头不同的声明入口", async () => {
+  const requestedHeaders = [];
+  const result = await analyzeSite("https://header-seeds.example/", {
+    preferKind: "text",
+    validateRuntime: false,
+    download: async (url, headers = {}) => {
+      if (new URL(String(url)).pathname === "/catalog") {
+        requestedHeaders.push(headers["X-Catalog"]);
+      }
+      return fixtureDownload(url);
+    },
+    seedRequests: [
+      { url: "https://header-seeds.example/catalog", headers: { "X-Catalog": "first" } },
+      { url: "https://header-seeds.example/catalog", headers: { "X-Catalog": "second" } },
+    ],
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.deepEqual(requestedHeaders, ["first", "second"]);
+});
+
+test("analyzeSite 并发探测首页和独立分类种子", async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const download = async (url) => {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return fixtureDownload(url);
+    } finally {
+      inFlight -= 1;
+    }
+  };
+  const result = await analyzeSite("https://novel.example/", {
+    download,
+    seedUrls: [
+      "https://novel.example/category-a",
+      "https://novel.example/category-b",
+    ],
+  });
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.ok(maxInFlight >= 2, `expected parallel seed probes, got ${maxInFlight}`);
+});
+
 test("analyzeSite 对漫画 fixture 生成漫画源", async () => {
   const result = await analyzeSite("https://comic.example/", { download: fixtureDownload });
   assert.equal(result.ok, true);
@@ -1222,6 +1935,30 @@ test("discoverComic 对章节动态 HTML 生成通用图片适配动作", async 
   const source = comicDiscoveryToXiangse(discovery, { sourceName: "动态正文漫画" });
   assert.equal(source.chapterContent.responseFormatType, "json");
   assert.match(source.chapterContent.requestInfo, /adapter\/images\?v=2/);
+});
+
+test("discoverComic 过滤阅读按钮并从短章节候选中选择可用正文", async () => {
+  const host = "https://comic-short-chapter.example";
+  const home = '<a href="/manga/first"><img src="/covers/1.jpg">第一本漫画</a>'
+    + '<a href="/manga/second"><img src="/covers/2.jpg">第二本漫画</a>';
+  const detail = `<h1>第一本漫画</h1><div class="chapters">
+    <a href="/read/0">阅读</a><a href="/read/1">第1话</a>
+    <a href="/read/2">第2话</a><a href="/read/3?chapter=3">艺术设定集</a></div>`;
+  const download = async (url) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/") return Buffer.from(home);
+    if (path.startsWith("/manga/")) return Buffer.from(detail);
+    if (path === "/read/1" || path === "/read/2") return Buffer.from('<img src="/pages/one.jpg">');
+    if (path === "/read/3") return Buffer.from('<img src="/pages/1.jpg"><img src="/pages/2.jpg">');
+    throw new Error(`fixture missing: ${url}`);
+  };
+
+  const discovery = await discoverComic(`${host}/`, { download });
+  assert.ok(discovery);
+  assert.equal(discovery.chapterCount, 3);
+  assert.equal(discovery.chapterSampleUrl, `${host}/read/3?chapter=3`);
+  assert.equal(discovery.imageCount, 2);
+  assert.match(discovery.chapterListSelector, /chapters|read/);
 });
 
 test("discoverComic 接受打包脚本中的章节图片数组", async () => {
@@ -1407,6 +2144,20 @@ test("resolveChapterListUrls 从 JSON API toc @js 解析 getBookMenu", () => {
   assert.ok(urls.includes("https://m.lrts.me/ajax/getBookDetail?bookId=79665832"));
 });
 
+test("resolveChapterListUrls 能从纯 adapter/chapters 返回脚本提取上游详情地址", () => {
+  const requestInfo = [
+    "@js:",
+    'return ("https://convert.example/adapter/chapters?plan=abc&page=%@pageIndex&url=") + encodeURIComponent(result);',
+  ].join("\n");
+  assert.deepEqual(
+    resolveChapterListUrls(requestInfo, "https://novel.example/book/42").slice(0, 2),
+    [
+      "https://convert.example/adapter/chapters?plan=abc&page=1&url=https%3A%2F%2Fnovel.example%2Fbook%2F42",
+      "https://novel.example/book/42",
+    ],
+  );
+});
+
 test("resolveChapterListUrls 执行通用媒体目录适配器包装", () => {
   const detailUrl = "https://audio.example/work/%E4%B8%AD%E6%96%87";
   const requestInfo = [
@@ -1559,6 +2310,59 @@ test("resolveBookTargetUrl 不把 bridge 包装脚本残片误判为 URL", () =>
   ), "");
 });
 
+test("resolveBookTargetUrl 提取 IIFE 内部请求和局部变量", () => {
+  const requestInfo = [
+    "@js:",
+    "var vars = {};",
+    "var api = vars.url || 'https://api.example/vod/';",
+    "var access = api.indexOf('/art/') !== -1 ? 'list' : 'videolist';",
+    "return (api + '?ac=' + access + '&wd=' + encodeURIComponent(params.keyWord) + '&pg=' + params.pageIndex);",
+  ].join("\n");
+  assert.equal(
+    resolveBookTargetUrl(
+      { host: "https://api.example", requestInfo },
+      { plan: { host: "https://api.example" }, requestInfo },
+      { keyWord: "视频", pageIndex: 2 },
+    ),
+    "https://api.example/vod/?ac=videolist&wd=%E8%A7%86%E9%A2%91&pg=2",
+  );
+});
+
+test("resolveBookTargetRequest 解析返回 URL 与 JSON.stringify 组成的 Legado 请求", () => {
+  const requestInfo = [
+    "@js:",
+    'return ("https://api.example/search," + JSON.stringify({"method":"POST","body":("app=demo&keyword=" + String(params.keyWord) + "&page=" + String(params.pageIndex-1))}));',
+  ].join("\n");
+  const action = {
+    host: "https://api.example",
+    requestInfo,
+    responseFormatType: "json",
+    list: "data",
+    bookName: "title",
+    detailUrl: "url",
+  };
+  const target = resolveBookTargetRequest(
+    { sourceUrl: "https://api.example" },
+    action,
+    { plan: { host: "https://api.example" }, requestInfo },
+    { keyWord: "测试", pageIndex: 3 },
+  );
+  assert.equal(target.url, "https://api.example/search");
+  assert.equal(target.options.method, "POST");
+  assert.equal(target.options.body, "app=demo&keyword=测试&page=2");
+});
+
+test("请求描述符保留编码 URL 中的 POST body", () => {
+  const descriptor = parseRequestDescriptor(
+    "https://api.example/detail,%7B%22method%22:%22POST%22,%22body%22:%22book_id%3D42%22%7D",
+  );
+  assert.deepEqual(descriptor, {
+    url: "https://api.example/detail",
+    headers: {},
+    options: { method: "POST", body: "book_id=42", followPostRedirects: true },
+  });
+});
+
 test("resolveBookTargetRequest 安全解析转换器生成的 POST 表单", () => {
   const requestInfo = [
     "@js:",
@@ -1661,6 +2465,88 @@ test("resolveBookTargetUrls 只输出同源可验证分类种子", () => {
     sourceUrl: "https://books.example",
     bookWorld: { 分类: action },
   }), ["https://books.example/list?page=1"]);
+});
+
+test("识站种子不向分类注入默认关键词，媒体搜索按源类型选词", () => {
+  const host = "https://probe.example";
+  const browse = {
+    actionID: "bookWorld",
+    host,
+    responseFormatType: "json",
+    requestInfo: "/catalog?kind=all&key=%@keyWord&page=%@pageIndex",
+    list: "$.items[*]",
+    bookName: "$.name",
+    detailUrl: "$.url",
+  };
+  const search = {
+    actionID: "searchBook",
+    host,
+    responseFormatType: "json",
+    requestInfo: "/search?q=%@keyWord&page=%@pageIndex",
+    list: "$.items[*]",
+    bookName: "$.name",
+    detailUrl: "$.url",
+  };
+  const requests = resolveBookTargetRequests({
+    sourceUrl: host,
+    sourceType: "video",
+    bookWorld: { 分类: browse },
+    searchBook: search,
+  });
+  assert.equal(requests[0].section, "bookWorld");
+  assert.match(requests[0].url, /\/catalog\?kind=all&key=&page=1$/);
+  assert.equal(requests[1].section, "searchBook");
+  assert.match(requests[1].url, /\/search\?q=%E8%A7%86%E9%A2%91&page=1$/);
+  assert.deepEqual(resolveBookTargetUrls({
+    sourceUrl: host,
+    sourceType: "video",
+    bookWorld: { 分类: browse },
+    searchBook: search,
+  }), [requests[0].url, requests[1].url]);
+});
+
+test("音视频搜索识站默认关键词尊重类型，明示关键词优先", () => {
+  const host = "https://typed-search.example";
+  const expected = new Map([
+    ["text", "小说"],
+    ["comic", "漫画"],
+    ["audio", "广播剧"],
+    ["video", "视频"],
+  ]);
+  for (const [sourceType, keyword] of expected) {
+    const source = {
+      sourceUrl: host,
+      sourceType,
+      searchBook: {
+        actionID: "searchBook",
+        host,
+        responseFormatType: "json",
+        requestInfo: "/search?q=%@keyWord&page=%@pageIndex",
+        list: "$.items[*]",
+        bookName: "$.name",
+        detailUrl: "$.url",
+      },
+    };
+    assert.equal(
+      resolveBookTargetRequests(source)[0].url,
+      `${host}/search?q=${encodeURIComponent(keyword)}&page=1`,
+    );
+  }
+  const explicit = {
+    sourceUrl: host,
+    sourceType: "audio",
+    searchBook: {
+      actionID: "searchBook",
+      host,
+      _verifyKeyWord: "自定义试听",
+      responseFormatType: "json",
+      requestInfo: "/search?q=%@keyWord&page=%@pageIndex",
+      list: "$.items[*]",
+      bookName: "$.name",
+      detailUrl: "$.url",
+    },
+  };
+  assert.match(resolveBookTargetRequests(explicit)[0].url, /q=%E8%87%AA%E5%AE%9A%E4%B9%89%E8%AF%95%E5%90%AC/);
 });
 
 test("verifyConvertedSource 对 JSON API 目录用 getBookMenu 而不是详情页", async () => {
@@ -2208,6 +3094,345 @@ test("verifyConvertedSource 对瞬时空列表重试后执行完整链", async (
   assert.equal(result.retryRecovered, true);
 });
 
+test("verifyConvertedSource 对正文传输 502 进行有限重试", async () => {
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel("https://novel.example/", { download: fixtureDownload }),
+    { sourceName: "正文瞬时 502" },
+  );
+  const [worldName, worldAction] = Object.entries(source.bookWorld)[0];
+  source.bookWorld = { [worldName]: worldAction };
+  delete source.searchBook;
+  let transientFailures = 0;
+  const result = await verifyConvertedSource(source, {
+    download: async (url) => {
+      if (transientFailures < 3) {
+        transientFailures += 1;
+        throw new Error("HTTP 502");
+      }
+      return fixtureDownload(url);
+    },
+    timeoutMs: 2_000,
+  });
+  assert.equal(result.ok, true, result.detail);
+  assert.equal(result.retryRecovered, true);
+  assert.equal(result.retryCount, 3);
+  assert.equal(transientFailures, 3);
+});
+
+test("单个章节接口返回 502 时仍继续整站识站并验收可用候选", async () => {
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel("https://broken-entry.example/", { download: fixtureDownload }),
+    { sourceName: "单入口 502" },
+  );
+  const candidate = novelDiscoveryToXiangse(
+    await discoverNovel("https://recovered-entry.example/", { download: fixtureDownload }),
+    { sourceName: "识站候选" },
+  );
+  const download = async (url, headers = {}, options = {}) => {
+    const target = new URL(String(url));
+    if (target.hostname === "broken-entry.example" && /(?:chapter|read|content)/i.test(target.pathname)) {
+      throw new Error("下载阅读源失败：上游返回 HTTP 502");
+    }
+    return fixtureDownload(url, headers, options);
+  };
+  let recognitionAttempts = 0;
+
+  const result = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download,
+    concurrency: 1,
+    timeoutMs: 500,
+    sourceTimeoutMs: 8_000,
+    runtimeFallbackTimeoutMs: 1_000,
+    sourceBudgetMs: 12_000,
+    analyzeTimeoutMs: 1_000,
+    recognitionAttempts: 1,
+    repairBooks: async () => null,
+    repairContent: async () => null,
+    repairChapter: async () => null,
+    repairDetail: async () => null,
+    repairJsonChapter: async () => null,
+    analyze: async () => {
+      recognitionAttempts += 1;
+      return { ok: true, sources: { [candidate.sourceName]: candidate } };
+    },
+  });
+
+  assert.equal(recognitionAttempts, 1, JSON.stringify(result.skipped));
+  assert.ok(result.sources[source.sourceName], JSON.stringify(result.skipped));
+  assert.equal(result.skipped.length, 0);
+});
+
+test("同一轮识站没有新增探测证据时不重复执行", async () => {
+  const host = "https://no-repeat-analyze.example";
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel(`${host}/`, { download: fixtureDownload }),
+    { sourceName: "不重复识站" },
+  );
+  const listAction = structuredClone(Object.values(source.bookWorld)[0]);
+  source.bookWorld = {
+    分类: { ...listAction, requestInfo: `${host}/empty-list`, list: "//.missing" },
+  };
+  delete source.searchBook;
+  let calls = 0;
+
+  const result = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download: async (url, headers = {}, options = {}) => (
+      String(url).endsWith("/empty-list")
+        ? Buffer.from("<html><body>empty</body></html>")
+        : fixtureDownload(url, headers, options)
+    ),
+    concurrency: 1,
+    timeoutMs: 250,
+    sourceTimeoutMs: 1_000,
+    sourceBudgetMs: 3_000,
+    analyzeTimeoutMs: 500,
+    recognitionAttempts: 1,
+    repairBooks: async () => null,
+    repairChapter: async () => null,
+    repairContent: async () => null,
+    repairDetail: async () => null,
+    repairJsonChapter: async () => null,
+    analyze: async () => {
+      calls += 1;
+      return {
+        ok: true,
+        sources: { "无关类型候选": { ...source, sourceType: "comic" } },
+        detectedKinds: ["text"],
+        skippedKinds: [{ kind: "text", reason: "当前入口未生成文本候选" }],
+      };
+    },
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(result.sources[source.sourceName], undefined);
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0].recognitionAttempts, 1);
+});
+
+test("识站批次单轮超时后允许重试相同批次并验收候选", async () => {
+  const host = "https://timeout-retry.example";
+  const candidate = novelDiscoveryToXiangse(
+    await discoverNovel(`${host}/`, { download: fixtureDownload }),
+    { sourceName: "超时后恢复候选" },
+  );
+  const source = structuredClone(candidate);
+  const [worldName, worldAction] = Object.entries(source.bookWorld)[0];
+  source.bookWorld = {
+    [worldName]: { ...worldAction, requestInfo: `${host}/empty-list`, list: "//.missing" },
+  };
+  delete source.searchBook;
+  let analyzeCalls = 0;
+
+  const result = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download: async (url, headers = {}, options = {}) => (
+      String(url).endsWith("/empty-list")
+        ? Buffer.from("<html><body>empty</body></html>")
+        : fixtureDownload(url, headers, options)
+    ),
+    concurrency: 1,
+    timeoutMs: 250,
+    sourceTimeoutMs: 1_000,
+    sourceBudgetMs: 3_000,
+    analyzeTimeoutMs: 20,
+    recognitionAttempts: 3,
+    requireBookWorld: true,
+    repairBooks: null,
+    repairChapter: null,
+    repairContent: null,
+    repairDetail: null,
+    repairJsonChapter: null,
+    analyze: async (_site, options) => {
+      analyzeCalls += 1;
+      assert.equal(options.onProbeBatch("same-probe-batch"), true);
+      if (analyzeCalls === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        return { ok: false, reason: "analyze-failed: 通用识站超时", probeBatchFingerprint: "same-probe-batch" };
+      }
+      return {
+        ok: true,
+        sources: { [candidate.sourceName]: candidate },
+        probeBatchFingerprint: "same-probe-batch",
+      };
+    },
+  });
+
+  assert.equal(analyzeCalls, 2);
+  assert.ok(result.sources[source.sourceName]);
+  assert.equal(result.skipped.length, 0);
+  assert.equal(result.fallbackCount, 1);
+});
+
+test("同一识站入口批次连续超时后只重试一次并停止空转", async () => {
+  const host = "https://timeout-repeat-limit.example";
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel(`${host}/`, { download: fixtureDownload }),
+    { sourceName: "重复超时批次" },
+  );
+  const [worldName, worldAction] = Object.entries(source.bookWorld)[0];
+  source.bookWorld = {
+    [worldName]: { ...worldAction, requestInfo: `${host}/empty-list`, list: "//.missing" },
+  };
+  delete source.searchBook;
+  let analyzeCalls = 0;
+
+  const result = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download: async (url, headers = {}, options = {}) => (
+      String(url).endsWith("/empty-list")
+        ? Buffer.from("<html><body>empty</body></html>")
+        : fixtureDownload(url, headers, options)
+    ),
+    concurrency: 1,
+    timeoutMs: 250,
+    sourceTimeoutMs: 1_000,
+    sourceBudgetMs: 5_000,
+    analyzeTimeoutMs: 100,
+    recognitionAttempts: 1,
+    continueRecognitionUntilTimeout: true,
+    requireBookWorld: true,
+    repairBooks: null,
+    repairChapter: null,
+    repairContent: null,
+    repairDetail: null,
+    repairJsonChapter: null,
+    analyze: async (_site, options) => {
+      const accepted = options.onProbeBatch("same-timeout-batch");
+      if (!accepted) {
+        return {
+          ok: false,
+          repeatedEvidence: true,
+          reason: "analyze-failed: 当前识站入口批次与已探测批次相同，停止重复请求",
+          probeBatchFingerprint: "same-timeout-batch",
+        };
+      }
+      analyzeCalls += 1;
+      return {
+        ok: false,
+        reason: "analyze-failed: 通用识站超时",
+        probeBatchFingerprint: "same-timeout-batch",
+      };
+    },
+  });
+
+  assert.equal(analyzeCalls, 2, "相同批次只允许一次瞬时超时重试");
+  assert.equal(result.sources[source.sourceName], undefined);
+  assert.equal(result.skipped.length, 1);
+  assert.match(result.skipped[0].reason, /入口批次与已探测批次相同/);
+  assert.doesNotMatch(result.skipped[0].reason, /dead-origin/);
+});
+
+test("WebUI 识站在相同入口批次上停止空转且不标记为死站", async () => {
+  const host = "https://pipeline-repeat-batch.example";
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel(`${host}/`, { download: fixtureDownload }),
+    { sourceName: "重复探测批次" },
+  );
+  const listAction = structuredClone(Object.values(source.bookWorld)[0]);
+  source.bookWorld = {
+    分类: { ...listAction, requestInfo: `${host}/empty-list`, list: "//.missing" },
+  };
+  delete source.searchBook;
+  let rootProbes = 0;
+  const result = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download: async (url, headers = {}, options = {}) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/") {
+        rootProbes += 1;
+        return Buffer.from("<html><body>unclassified portal</body></html>");
+      }
+      if (path === "/empty-list") return Buffer.from("<html><body>empty</body></html>");
+      return fixtureDownload(url, headers, options);
+    },
+    concurrency: 1,
+    timeoutMs: 250,
+    sourceTimeoutMs: 1_000,
+    sourceBudgetMs: 3_000,
+    analyzeTimeoutMs: 500,
+    recognitionAttempts: 1,
+    continueRecognitionUntilTimeout: true,
+    repairBooks: null,
+    repairChapter: null,
+    repairContent: null,
+    repairDetail: null,
+    repairJsonChapter: null,
+  });
+
+  assert.equal(result.sources[source.sourceName], undefined);
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0].recognitionAttempts, 2);
+  assert.match(result.skipped[0].reason, /入口批次与已探测批次相同/);
+  assert.doesNotMatch(result.skipped[0].reason, /dead-origin/);
+  assert.equal(rootProbes, 1, "第二轮重复入口应在请求前短路");
+});
+
+test("HTTP 4xx 响应不会误判为 dead-origin，并继续识站到单源预算", async () => {
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel("https://unreachable-origin.example/", { download: fixtureDownload }),
+    { sourceName: "整站不可达" },
+  );
+  delete source.searchBook;
+  let recognitionAttempts = 0;
+
+  const result = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download: async () => Buffer.from("<html><body>empty</body></html>"),
+    concurrency: 1,
+    timeoutMs: 500,
+    sourceTimeoutMs: 2_000,
+    sourceBudgetMs: 500,
+    analyzeTimeoutMs: 100,
+    recognitionAttempts: 1,
+    continueRecognitionUntilTimeout: true,
+    repairBooks: async () => null,
+    analyze: async () => {
+      recognitionAttempts += 1;
+      return {
+        ok: false,
+        reason: "analyze-failed: 首页及声明分类均不可访问（HTTP 403）",
+        originResponded: true,
+        httpResponseStatuses: [403],
+      };
+    },
+  });
+
+  assert.ok(recognitionAttempts >= 2);
+  assert.equal(result.sources[source.sourceName], undefined);
+  assert.equal(result.skipped.length, 1);
+  assert.match(result.skipped[0].reason, /rules-stale: source-timeout/);
+  assert.doesNotMatch(result.skipped[0].reason, /dead-origin/);
+  assert.equal(result.skipped[0].recognitionAttempts, recognitionAttempts);
+});
+
+test("首页和声明入口返回 5xx 时继续识站直到单源预算到期", async () => {
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel("https://transient-origin.example/", { download: fixtureDownload }),
+    { sourceName: "临时 5xx" },
+  );
+  delete source.searchBook;
+  let recognitionAttempts = 0;
+
+  const result = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download: async () => Buffer.from("<html><body>empty</body></html>"),
+    concurrency: 1,
+    timeoutMs: 100,
+    sourceTimeoutMs: 2_000,
+    sourceBudgetMs: 500,
+    analyzeTimeoutMs: 100,
+    recognitionAttempts: 1,
+    continueRecognitionUntilTimeout: true,
+    repairBooks: async () => null,
+    analyze: async () => {
+      recognitionAttempts += 1;
+      return { ok: false, reason: "analyze-failed: 首页及声明分类均不可访问（上游返回 HTTP 502）" };
+    },
+  });
+
+  assert.ok(recognitionAttempts >= 2, `recognition attempts: ${recognitionAttempts}`);
+  assert.equal(result.sources[source.sourceName], undefined);
+  assert.equal(result.skipped.length, 1);
+  assert.match(result.skipped[0].reason, /rules-stale: source-timeout/);
+  assert.doesNotMatch(result.skipped[0].reason, /dead-origin/);
+  assert.equal(result.skipped[0].recognitionAttempts, recognitionAttempts);
+});
+
 test("verifyConvertedSource 对忽略 AbortSignal 的下载器执行硬超时", async () => {
   const source = novelDiscoveryToXiangse(
     await discoverNovel("https://novel.example/", { download: fixtureDownload }),
@@ -2237,6 +3462,234 @@ test("verifyConvertedSource 会过滤章节正文解析为空的源", async () =
   });
   assert.equal(result.ok, false);
   assert.equal(result.reason, "rules-stale: empty-content");
+});
+
+test("旧规则候选扫描阶段预算耗尽后继续通用识站", async () => {
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel("https://novel.example/", { download: fixtureDownload }),
+    { sourceName: "候选扫描限时" },
+  );
+  source.chapterContent.content = "//*[@id='missing-content']";
+  let chapterRequests = 0;
+  let fallbackAborted = false;
+  let analyzeAttempts = 0;
+  const download = async (url, headers = {}, options = {}) => {
+    if (/\/chapter\//.test(String(url)) && ++chapterRequests > 1) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(Buffer.from(novelChapter)), 5_000);
+        options.signal?.addEventListener("abort", () => {
+          fallbackAborted = true;
+          clearTimeout(timer);
+          reject(options.signal.reason || new Error("aborted"));
+        }, { once: true });
+      });
+    }
+    return fixtureDownload(url, headers, options);
+  };
+
+  const gated = await applyVerifyAndAnalyzeFallback(
+    { [source.sourceName]: source },
+    {
+      download,
+      concurrency: 1,
+      timeoutMs: 1_000,
+      sourceTimeoutMs: 2_000,
+      runtimeFallbackTimeoutMs: 30,
+      sourceBudgetMs: 2_000,
+      analyzeTimeoutMs: 500,
+      recognitionAttempts: 1,
+      repairBooks: async () => null,
+      repairContent: async () => null,
+      analyze: async () => {
+        analyzeAttempts += 1;
+        return { ok: false, reason: "analyze-failed: fixture" };
+      },
+    },
+  );
+
+  assert.equal(fallbackAborted, true);
+  assert.equal(analyzeAttempts, 1);
+  assert.equal(gated.sources[source.sourceName], undefined);
+  assert.equal(gated.skipped.length, 1);
+  assert.match(gated.skipped[0].reason, /analyze-failed/);
+  assert.doesNotMatch(gated.skipped[0].reason, /source-timeout/);
+  assert.equal(gated.skipped[0].stage, "analyze");
+});
+
+test("同一源的重复验链共享运行时回退预算", async () => {
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel("https://novel.example/", { download: fixtureDownload }),
+    { sourceName: "共享回退预算" },
+  );
+  source.chapterContent.content = "//*[@id='missing-content']";
+  const runtimeFallbackBudget = { remainingMs: 40 };
+  let delayNextChapter = false;
+  let fallbackAbortObserved = false;
+  let runtimeFallbackCount = 0;
+  const download = async (url, headers = {}, options = {}) => {
+    if (delayNextChapter && /\/chapter\//.test(String(url))) {
+      delayNextChapter = false;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(Buffer.from(novelChapter)), 5_000);
+        options.signal?.addEventListener("abort", () => {
+          fallbackAbortObserved = true;
+          clearTimeout(timer);
+          reject(options.signal.reason || new Error("aborted"));
+        }, { once: true });
+      });
+    }
+    return fixtureDownload(url, headers, options);
+  };
+  const options = {
+    download,
+    timeoutMs: 1_000,
+    sourceTimeoutMs: 5_000,
+    runtimeFallbackTimeoutMs: 40,
+    runtimeFallbackBudget,
+    retryEmptyList: false,
+    onStage(stage) {
+      if (stage === "xbs-runtime-fallback") {
+        runtimeFallbackCount += 1;
+        delayNextChapter = true;
+      }
+    },
+  };
+
+  const first = await verifyConvertedSource(source, options);
+  assert.equal(first.ok, false);
+  assert.equal(fallbackAbortObserved, true);
+  assert.equal(runtimeFallbackCount, 1);
+  assert.equal(runtimeFallbackBudget.remainingMs, 0);
+
+  const second = await verifyConvertedSource(source, options);
+  assert.equal(second.ok, false);
+  assert.equal(runtimeFallbackCount, 1, "已耗尽的单源运行时预算不可在重验时重置");
+});
+
+test("verifyConvertedSource 在前八章正文为空时继续验到第九章", async () => {
+  const host = "https://chapter-budget.example";
+  const source = {
+    sourceName: "后续章节回退",
+    sourceUrl: host,
+    sourceType: "text",
+    bookWorld: {
+      分类: {
+        host,
+        responseFormatType: "json",
+        requestInfo: "/books",
+        list: "$.data",
+        bookName: "name",
+        detailUrl: "url",
+      },
+    },
+    bookDetail: { host, responseFormatType: "json", requestInfo: "%@result", bookName: "name" },
+    chapterList: {
+      host,
+      responseFormatType: "json",
+      requestInfo: "%@result",
+      list: "$.chapters",
+      title: "title",
+      url: "url",
+    },
+    chapterContent: {
+      host,
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      content: "//article",
+    },
+  };
+  const download = async (url) => {
+    const pathname = new URL(url).pathname;
+    const body = pathname === "/books"
+      ? { data: [{ name: "测试作品", url: `${host}/book/1` }] }
+      : pathname === "/book/1"
+        ? {
+          name: "测试作品",
+          chapters: [
+            { title: "目录标题", url: "" },
+            ...Array.from({ length: 8 }, (_, index) => ({
+              title: `第${index + 1}章 暂无正文`,
+              url: `${host}/chapter/${index + 1}`,
+            })),
+            { title: "第九章 正文", url: `${host}/chapter/9` },
+          ],
+        }
+        : pathname === "/chapter/9"
+          ? "<article>第九章的正文内容。</article>"
+          : "<aside>本章暂无正文</aside>";
+    return Buffer.from(typeof body === "string" ? body : JSON.stringify(body));
+  };
+
+  const result = await verifyConvertedSource(source, {
+    download,
+    timeoutMs: 1_000,
+    sourceTimeoutMs: 5_000,
+  });
+  assert.equal(result.ok, true, result.detail || result.reason);
+  assert.equal(result.chapterTitle, "第九章 正文");
+  assert.equal(result.candidateFallback, 10);
+});
+
+test("verifyConvertedSource 接受可访问且由 WebView 执行媒体脚本的正文", async () => {
+  const host = "https://audio.example";
+  const source = {
+    sourceName: "WebView 媒体验证",
+    sourceUrl: host,
+    sourceType: "audio",
+    bookWorld: {
+      分类: {
+        actionID: "bookWorld",
+        host,
+        responseFormatType: "html",
+        requestInfo: host + "/list",
+        list: "//article",
+        bookName: ".//a",
+        detailUrl: ".//a/@href",
+      },
+    },
+    bookDetail: {
+      actionID: "bookDetail",
+      host,
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      bookName: "//h1",
+      author: "//meta[@name='author']/@content",
+    },
+    chapterList: {
+      actionID: "chapterList",
+      host,
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      list: "//a[contains(@href, '/episode/') and normalize-space(.) != '']",
+      title: ".",
+      url: "./@href",
+    },
+    chapterContent: {
+      actionID: "chapterContent",
+      host,
+      responseFormatType: "json",
+      requestInfo: "@js:\nreturn {url: result, webView: \"\", webViewJs: \"document.querySelector('audio').play()\"};",
+      content: "//audio/@src",
+    },
+  };
+  const result = await verifyConvertedSource(source, {
+    download: async (url) => {
+      if (String(url).endsWith("/list")) {
+        return Buffer.from("<article><a href=\"/album/1\">节目一</a></article>");
+      }
+      if (String(url).endsWith("/album/1")) {
+        return Buffer.from("<h1>节目一</h1><meta name=\"author\" content=\"主播\"><a href=\"/episode/1\">第一集</a>");
+      }
+      if (String(url).endsWith("/episode/1")) {
+        return Buffer.from("<html><body><audio class=\"root-audio\"></audio></body></html>");
+      }
+      throw new Error("unexpected url");
+    },
+    timeoutMs: 2_000,
+  });
+  assert.equal(result.ok, true, result.detail);
+  assert.equal(result.content.webView, true);
+  assert.equal(result.chapterUrl, "https://audio.example/episode/1");
 });
 
 test("verifyConvertedSource 第一本文档失效时验证后续书籍完整链路", async () => {
@@ -2289,6 +3742,369 @@ test("verifyConvertedSource 第一本文档失效时验证后续书籍完整链�
   assert.deepEqual(result.bookElements.missingRecommended, []);
   assert.equal(result.bookElements.values.author, "作者甲");
   assert.equal(result.bookElements.values.lastChapterTitle, "第二章");
+});
+
+test("verifyConvertedSource 会继续验到第九个分类入口", async () => {
+  const host = "https://category-limit.example";
+  const categoryAction = (requestInfo) => ({
+    actionID: "bookWorld",
+    host,
+    responseFormatType: "html",
+    parserID: "DOM",
+    requestInfo,
+    list: "//li",
+    bookName: ".//a",
+    detailUrl: ".//a/@href",
+  });
+  const source = {
+    sourceName: "第九分类可用",
+    sourceUrl: host,
+    sourceType: "text",
+    bookWorld: Object.fromEntries([
+      ...Array.from({ length: 8 }, (_, index) => [
+        `失效分类 ${index + 1}`,
+        categoryAction(`${host}/empty-category-${index + 1}`),
+      ]),
+      ["第九分类", categoryAction(`${host}/available-list`)],
+    ]),
+    bookDetail: {
+      actionID: "bookDetail", host, responseFormatType: "html", parserID: "DOM", requestInfo: "%@result",
+      bookName: "//h1", cover: "//img/@src", author: "//*[@class='author']",
+      cat: "//*[@class='cat']", lastChapterTitle: "//*[@class='latest']",
+    },
+    chapterList: {
+      actionID: "chapterList", host, responseFormatType: "html", parserID: "DOM", requestInfo: "%@result",
+      list: "//div[@id='chapters']/a", title: ".", url: "./@href",
+      moreKeys: { pageSize: 20, maxPage: 1 },
+    },
+    chapterContent: {
+      actionID: "chapterContent", host, responseFormatType: "html", parserID: "DOM",
+      requestInfo: "%@result", content: "//article",
+    },
+  };
+  const probedCategories = [];
+  const download = async (url) => {
+    const target = String(url);
+    if (/\/empty-category-\d+$/.test(target)) {
+      probedCategories.push(target);
+      return Buffer.from("<html><body><p>此分类暂无作品</p></body></html>");
+    }
+    if (target.endsWith("/available-list")) {
+      probedCategories.push(target);
+      return Buffer.from(`<li><a href="${host}/book/1">可用作品</a></li>`);
+    }
+    if (target.endsWith("/book/1")) {
+      return Buffer.from(`<h1>可用作品</h1><img src="/cover.jpg"><span class="author">作者甲</span><span class="cat">奇幻</span><span class="latest">第二章</span><div id="chapters"><a href="${host}/read/1">第一章</a><a href="${host}/read/2">第二章</a></div>`);
+    }
+    if (/\/read\/[12]$/.test(target)) {
+      return Buffer.from(`<article>${"这是可用作品的正文内容。".repeat(20)}</article>`);
+    }
+    throw new Error(`unexpected request: ${target}`);
+  };
+
+  const result = await verifyConvertedSource(source, { download, timeoutMs: 1_000, sourceTimeoutMs: 10_000 });
+  assert.equal(result.ok, true, result.detail);
+  assert.equal(result.bookName, "可用作品");
+  assert.equal(probedCategories.length, 9);
+});
+
+test("verifyConvertedSource 会在分类入口目录为空时继续尝试搜索入口", async () => {
+  const host = "https://entry-fallback.example";
+  const bookAction = (path, actionID) => ({
+    actionID,
+    host,
+    responseFormatType: "html",
+    parserID: "DOM",
+    requestInfo: `${host}/${path}`,
+    list: "//li",
+    bookName: ".//a",
+    detailUrl: ".//a/@href",
+  });
+  const source = {
+    sourceName: "入口继续识别",
+    sourceUrl: host,
+    sourceType: "text",
+    bookWorld: { 分类入口: bookAction("category", "bookWorld") },
+    searchBook: { ...bookAction("search", "searchBook"), _verifyKeyWord: "可用书" },
+    chapterList: {
+      actionID: "chapterList",
+      host,
+      responseFormatType: "html",
+      parserID: "DOM",
+      requestInfo: "%@result",
+      list: "//a[contains(@href, '/read/')]",
+      title: ".",
+      url: "./@href",
+    },
+    chapterContent: {
+      actionID: "chapterContent",
+      host,
+      responseFormatType: "html",
+      parserID: "DOM",
+      requestInfo: "%@result",
+      content: "//article",
+    },
+  };
+  const download = async (url) => {
+    const value = String(url);
+    if (value.endsWith("/category")) return Buffer.from(`<li><a href="${host}/book/bad">坏入口</a></li>`);
+    if (value.endsWith("/search")) return Buffer.from(`<li><a href="${host}/book/good">可用书</a></li>`);
+    if (value.endsWith("/book/bad")) return Buffer.from("<h1>坏入口</h1>");
+    if (value.endsWith("/book/good")) return Buffer.from(`<h1>可用书</h1><a href="${host}/read/1">第一章</a>`);
+    if (value.endsWith("/read/1")) return Buffer.from("<article>这是可用搜索入口的正文。</article>");
+    throw new Error(`unexpected ${value}`);
+  };
+
+  const result = await verifyConvertedSource(source, { download, timeoutMs: 2_000 });
+  assert.equal(result.ok, true, result.detail);
+  assert.equal(result.bookName, "可用书");
+  assert.equal(result.chapterTitle, "第一章");
+
+  const strictResult = await verifyConvertedSource(source, {
+    download,
+    timeoutMs: 2_000,
+    retryEmptyList: false,
+    requireBookWorld: true,
+  });
+  assert.equal(strictResult.ok, false, "搜索成功不能掩盖声明的分类入口失效");
+  assert.match(strictResult.detail, /分类\/浏览入口未通过完整验证/);
+
+  const searchOnlyResult = await verifyConvertedSource({ ...source, bookWorld: {} }, {
+    download,
+    timeoutMs: 2_000,
+    requireBookWorld: true,
+  });
+  assert.equal(searchOnlyResult.ok, false, "搜索成功不能替代分类/浏览入口");
+  assert.match(searchOnlyResult.detail, /缺少可执行分类\/浏览入口/);
+});
+
+test("pipeline 用已验证的搜索列表结构修复失效分类并重新验链", async () => {
+  const host = "https://browse-repair.example";
+  const action = (path, actionID, list) => ({
+    actionID,
+    host,
+    responseFormatType: "html",
+    parserID: "DOM",
+    requestInfo: `${host}/${path}`,
+    list,
+    bookName: ".//a",
+    detailUrl: ".//a/@href",
+  });
+  const source = {
+    sourceName: "分类规则可复用搜索结构",
+    sourceUrl: host,
+    miniAppVersion: "1.0.0",
+    sourceType: "text",
+    bookWorld: { 分类: action("category", "bookWorld", ".//div[@class='stale']") },
+    searchBook: action("search", "searchBook", ".//li"),
+    bookDetail: {
+      actionID: "bookDetail",
+      host,
+      responseFormatType: "html",
+      parserID: "DOM",
+      requestInfo: "%@result",
+      bookName: "//h1",
+    },
+    chapterList: {
+      actionID: "chapterList",
+      host,
+      responseFormatType: "html",
+      parserID: "DOM",
+      requestInfo: "%@result",
+      list: "//a[contains(@href, '/read/')]",
+      title: ".",
+      url: "./@href",
+    },
+    chapterContent: {
+      actionID: "chapterContent",
+      host,
+      responseFormatType: "html",
+      parserID: "DOM",
+      requestInfo: "%@result",
+      content: "//article",
+    },
+  };
+  let analyzeCalls = 0;
+  const download = async (url) => {
+    const target = String(url);
+    if (target.endsWith("/category") || target.endsWith("/search")) {
+      return Buffer.from(`<ul><li><a href="${host}/book/1">可用作品</a></li></ul>`);
+    }
+    if (target.endsWith("/book/1")) {
+      return Buffer.from(`<h1>可用作品</h1><a href="${host}/read/1">第一章</a>`);
+    }
+    if (target.endsWith("/read/1")) {
+      return Buffer.from(`<article>${"这是足够长的正文内容。".repeat(20)}</article>`);
+    }
+    throw new Error(`unexpected request: ${target}`);
+  };
+
+  const result = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download,
+    concurrency: 1,
+    timeoutMs: 500,
+    sourceTimeoutMs: 3_000,
+    runtimeFallbackTimeoutMs: 1_000,
+    sourceBudgetMs: 8_000,
+    analyzeTimeoutMs: 1_000,
+    recognitionAttempts: 1,
+    requireBookWorld: true,
+    analyze: async () => {
+      analyzeCalls += 1;
+      return { ok: false, reason: "should not need whole-site recognition" };
+    },
+  });
+
+  assert.ok(result.sources[source.sourceName], JSON.stringify(result.skipped));
+  assert.equal(result.sources[source.sourceName].bookWorld["分类"].list, ".//li");
+  assert.equal(analyzeCalls, 0);
+  const repairWarning = result.warnings.find((warning) => (
+    warning.source === source.sourceName && warning.section === "bookWorld" && warning.field === "list"
+  ));
+  assert.match(repairWarning?.message || "", /复用实测可用的搜索列表结构/);
+});
+
+test("缺少分类入口时不接受搜索成功，持续通用识站生成并验收浏览列表", async () => {
+  const host = "https://missing-browse.example";
+  const action = (path, actionID) => ({
+    actionID,
+    host,
+    responseFormatType: "html",
+    parserID: "DOM",
+    requestInfo: `${host}/${path}`,
+    list: "//li",
+    bookName: ".//a",
+    detailUrl: ".//a/@href",
+  });
+  const source = {
+    sourceName: "仅搜索入口",
+    sourceUrl: host,
+    miniAppVersion: "1.0.0",
+    sourceType: "text",
+    bookWorld: {},
+    searchBook: { ...action("search?q=%@keyWord", "searchBook"), _verifyKeyWord: "测试书" },
+    bookDetail: {
+      actionID: "bookDetail", host, responseFormatType: "html", parserID: "DOM",
+      requestInfo: "%@result", bookName: "//h1",
+    },
+    chapterList: {
+      actionID: "chapterList", host, responseFormatType: "html", parserID: "DOM",
+      requestInfo: "%@result", list: "//a[contains(@href, '/read/') ]", title: ".", url: "./@href",
+      moreKeys: { pageSize: 20, maxPage: 1 },
+    },
+    chapterContent: {
+      actionID: "chapterContent", host, responseFormatType: "html", parserID: "DOM",
+      requestInfo: "%@result", content: "//article",
+    },
+  };
+  const candidate = {
+    ...source,
+    bookWorld: { "实时分类": action("category", "bookWorld") },
+  };
+  let analyzeCalls = 0;
+  const download = async (url) => {
+    const target = String(url);
+    if (target.endsWith("/category")) return Buffer.from(`<li><a href="${host}/book/1">可用书</a></li>`);
+    if (target.endsWith("/book/1")) return Buffer.from(`<h1>可用书</h1><a href="${host}/read/1">第一章</a>`);
+    if (target.endsWith("/read/1")) return Buffer.from(`<article>${"有效正文内容。".repeat(24)}</article>`);
+    throw new Error(`unexpected request: ${target}`);
+  };
+
+  const result = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download,
+    concurrency: 1,
+    timeoutMs: 500,
+    sourceTimeoutMs: 3_000,
+    sourceBudgetMs: 8_000,
+    runtimeFallbackTimeoutMs: 1_000,
+    analyzeTimeoutMs: 1_000,
+    recognitionAttempts: 1,
+    requireBookWorld: true,
+    repairBooks: async () => null,
+    analyze: async () => {
+      analyzeCalls += 1;
+      return { ok: true, sources: { [candidate.sourceName]: candidate } };
+    },
+  });
+
+  assert.ok(result.sources[source.sourceName], JSON.stringify(result.skipped));
+  assert.equal(analyzeCalls, 1);
+  assert.equal(result.sources[source.sourceName].bookWorld["实时分类"].actionID, "bookWorld");
+});
+
+test("verifyConvertedSource 不把默认搜索词注入分类列表", async () => {
+  const host = "https://browse-keyword.example";
+  const source = {
+    sourceName: "默认分类列表",
+    sourceUrl: host,
+    sourceType: "text",
+    bookWorld: {
+      首页: {
+        actionID: "bookWorld",
+        host,
+        responseFormatType: "html",
+        parserID: "DOM",
+        requestInfo: `${host}/catalog?q=%@keyWord`,
+        list: "//li",
+        bookName: ".//a",
+        detailUrl: ".//a/@href",
+      },
+    },
+    bookDetail: {
+      actionID: "bookDetail",
+      host,
+      responseFormatType: "html",
+      parserID: "DOM",
+      requestInfo: "%@result",
+      bookName: "//h1",
+    },
+    chapterList: {
+      actionID: "chapterList",
+      host,
+      responseFormatType: "html",
+      parserID: "DOM",
+      requestInfo: "%@result",
+      list: "//a[contains(@href, '/read/')]",
+      title: ".",
+      url: "./@href",
+      moreKeys: { pageSize: 20, maxPage: 1 },
+    },
+    chapterContent: {
+      actionID: "chapterContent",
+      host,
+      responseFormatType: "html",
+      parserID: "DOM",
+      requestInfo: "%@result",
+      content: "//article",
+    },
+  };
+  const browseQueries = [];
+  const download = async (url) => {
+    const target = new URL(String(url));
+    if (target.pathname === "/catalog") {
+      const query = target.searchParams.get("q") || "";
+      browseQueries.push(query);
+      if (!query) return Buffer.from("<html><body>分类首页没有书目</body></html>");
+      return Buffer.from(`<li><a href="${host}/book/1">默认关键词才会出现的书</a></li>`);
+    }
+    if (target.pathname === "/book/1") {
+      return Buffer.from(`<h1>书名</h1><a href="${host}/read/1">第一章</a>`);
+    }
+    if (target.pathname === "/read/1") {
+      return Buffer.from(`<article>${"这是足够长的章节正文，用于完整动作链测试。".repeat(4)}</article>`);
+    }
+    throw new Error(`unexpected request: ${target.pathname}`);
+  };
+
+  const result = await verifyConvertedSource(source, {
+    download,
+    timeoutMs: 1_000,
+    sourceTimeoutMs: 5_000,
+    retryEmptyList: false,
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /empty-list/);
+  assert.deepEqual(browseQueries, [""]);
 });
 
 test("抽测失败后 pipeline 可回退识站", async () => {
@@ -2414,6 +4230,36 @@ test("pipeline 不把已检测但修复失败的漫画降级成文本源", async
   assert.deepEqual(result.sources, {});
   assert.equal(result.skipped.length, 1);
   assert.match(result.skipped[0].message || result.skipped[0].reason || "", /仅有 text/);
+});
+
+test("pipeline 允许仅被声明尝试但未被页面检测的类型纠正为完整验链通过类型", async () => {
+  const textSource = novelDiscoveryToXiangse(
+    await discoverNovel("https://novel.example/", { download: fixtureDownload }),
+    { sourceName: "实际文本源" },
+  );
+  const broken = structuredClone(textSource);
+  broken.sourceName = "误标影视源";
+  broken.sourceType = "video";
+  broken.bookWorld = {
+    影视: {
+      ...Object.values(textSource.bookWorld)[0],
+      requestInfo: "https://novel.example/missing",
+      list: "//*[@id='missing']",
+    },
+  };
+  const result = await applyVerifyAndAnalyzeFallback({ [broken.sourceName]: broken }, {
+    download: fixtureDownload,
+    analyze: async () => ({
+      ok: true,
+      sources: { [textSource.sourceName]: textSource },
+      detectedKinds: [],
+      skippedKinds: [{ kind: "video", reason: "声明类型探测未生成可用影视链" }],
+    }),
+  });
+
+  assert.equal(result.sources[broken.sourceName]?.sourceType, "text");
+  assert.equal(result.fallbackCount, 1);
+  assert.match(result.warnings.find((item) => item.field === "sourceType")?.message || "", /修正为 text/);
 });
 
 test("pipeline 对已检测但瞬时缺失的目标类型清缓存重试识站", async () => {
@@ -4234,6 +6080,100 @@ test("漫画正文修复识别同源脚本声明的表单 POST 分批图片 API"
   assert.match(calls[0], /limit=5/);
 });
 
+test("漫画正文修复识别页面声明的 $.ajax 分批图片 API", async () => {
+  const host = "https://comic-ajax.example";
+  const source = {
+    sourceType: "comic",
+    sourceUrl: host,
+    chapterContent: { content: "img@src" },
+  };
+  const calls = [];
+  const download = async (url, _headers = {}, options = {}) => {
+    const target = String(url);
+    if (target === `${host}/chapter/20/91.html`) {
+      const page = Buffer.from([
+        "<div class=\"reader\"><img src=\"/loading.gif\"></div>",
+        "<script>",
+        "const AJAX_URL = '/reader/ajax/images';",
+        "const CHAPTER_ID = '91';",
+        "const PAGE_SIZE = 2;",
+        "function load(start) { $.ajax({ url: AJAX_URL, type: 'POST', dataType: 'json',",
+        "data: { chapterId: CHAPTER_ID, start: start, limit: PAGE_SIZE } }); }",
+        "</script>",
+      ].join(""));
+      Object.defineProperty(page, "httpHeaders", {
+        value: { "set-cookie": ["reader-session=abc123; Path=/; HttpOnly"] },
+      });
+      return page;
+    }
+    if (target === `${host}/reader/ajax/images` && options.method === "POST") {
+      assert.match(String(_headers.Cookie || ""), /reader-session=abc123/);
+      calls.push(String(options.body));
+      return Buffer.from(JSON.stringify({
+        cnt: 2,
+        data: [
+          { file: `${host}/pages/001.webp` },
+          { file: `${host}/pages/002.webp` },
+        ],
+      }));
+    }
+    throw new Error(`unexpected ${target}`);
+  };
+
+  const repaired = await repairContentFromChapter(source, `${host}/chapter/20/91.html`, {
+    adapterBase: "https://converter.example",
+    download,
+  });
+  assert.ok(repaired);
+  assert.match(repaired.chapterContent.requestInfo, /adapter\/images/);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /chapterId=91/);
+  assert.match(calls[0], /start=0/);
+  assert.match(calls[0], /limit=2/);
+});
+
+test("漫画图片 $.ajax 接口没有总数时按短页停止并保留顺序", async () => {
+  const host = "https://comic-ajax-pages.example";
+  const calls = [];
+  const download = async (url, _headers = {}, options = {}) => {
+    const target = String(url);
+    if (target === `${host}/chapter/91`) {
+      return Buffer.from([
+        "<script>",
+        "const API = '/ajax/read-images'; const ID = '91'; const SIZE = 2;",
+        "$.ajax({ url: API, method: 'POST', data: { chapterId: ID, start: 0, limit: SIZE } });",
+        "</script>",
+      ].join(""));
+    }
+    if (target === `${host}/ajax/read-images` && options.method === "POST") {
+      const start = Number(new URLSearchParams(String(options.body)).get("start") || 0);
+      calls.push(start);
+      const count = start < 4 ? 2 : 1;
+      return Buffer.from(JSON.stringify({
+        cnt: count,
+        data: Array.from({ length: count }, (_, index) => ({
+          file: `${host}/pages/${start + index + 1}.jpg`,
+        })),
+      }));
+    }
+    throw new Error(`unexpected ${target}`);
+  };
+
+  const result = await dynamicComicApiImages(
+    (await download(`${host}/chapter/91`)).toString("utf8"),
+    `${host}/chapter/91`,
+    { download, maxRequests: 8, concurrency: 1 },
+  );
+  assert.deepEqual(result.urls, [
+    `${host}/pages/1.jpg`,
+    `${host}/pages/2.jpg`,
+    `${host}/pages/3.jpg`,
+    `${host}/pages/4.jpg`,
+    `${host}/pages/5.jpg`,
+  ]);
+  assert.deepEqual(calls, [0, 2, 4]);
+});
+
 test("pipeline 补全详情元素后重新验证完整动作链", async () => {
   const host = "https://detail-pipeline.example";
   const listAction = {
@@ -4305,7 +6245,7 @@ test("pipeline 补全详情元素后重新验证完整动作链", async () => {
   assert.deepEqual(verified.bookElements.missingRecommended, []);
 });
 
-test("识站修复结果必须通过抽测，失败候选会继续尝试下一个", async () => {
+test("识站候选必须通过抽测，失败后会继续识站直到候选可用", async () => {
   const action = (requestInfo, list = "//li") => ({
     actionID: "bookWorld",
     host: "https://novel.example",
@@ -4375,26 +6315,241 @@ test("识站修复结果必须通过抽测，失败候选会继续尝试下一�
     return Buffer.from("<html><body><p>empty</p></body></html>");
   };
 
+  let analyzeAttempts = 0;
+  const analyzeAttemptIndexes = [];
   const gated = await applyVerifyAndAnalyzeFallback(
     { 过时源: broken },
     {
       download,
       enabled: true,
       analyzeFallback: true,
-      analyze: async () => ({
-        ok: true,
-        sources: {
-          坏候选: badCandidate,
-          好候选: goodCandidate,
-        },
-      }),
+      recognitionAttempts: 2,
+      continueRecognitionUntilTimeout: true,
+      sourceTimeoutMs: 2_000,
+      sourceBudgetMs: 5_000,
+      analyze: async (_host, options = {}) => {
+        analyzeAttemptIndexes.push(options.attempt);
+        analyzeAttempts += 1;
+        return analyzeAttempts < 5
+          ? { ok: true, sources: { 坏候选: badCandidate } }
+          : { ok: true, sources: { 好候选: goodCandidate } };
+      },
     },
   );
 
+  assert.equal(analyzeAttempts, 5);
+  assert.deepEqual(analyzeAttemptIndexes, [0, 1, 2, 3, 4]);
   assert.equal(gated.fallbackCount, 1);
   assert.ok(gated.sources["过时源"]);
   assert.equal(gated.sources["过时源"].bookWorld.分类.requestInfo, "https://novel.example/list");
   assert.equal(gated.skipped.length, 0);
+});
+
+test("单轮识站超时后继续尝试，不能提前按整站超时跳过", async () => {
+  const host = "https://recognition-timeout.example";
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel(host, { download: fixtureDownload }),
+    { sourceName: "单轮识站超时恢复" },
+  );
+  const goodSource = structuredClone(source);
+  source.bookWorld = {
+    分类: {
+      ...structuredClone(Object.values(source.bookWorld)[0]),
+      requestInfo: `${host}/bad-list`,
+      list: "//.missing",
+    },
+  };
+  delete source.searchBook;
+  let attempts = 0;
+  const gated = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download: async (url, headers = {}, options = {}) => {
+      if (String(url).endsWith("/bad-list")) {
+        return Buffer.from("<html><body>no books here</body></html>");
+      }
+      return fixtureDownload(url, headers, options);
+    },
+    concurrency: 1,
+    timeoutMs: 250,
+    sourceTimeoutMs: 1_000,
+    sourceBudgetMs: 1_500,
+    analyzeTimeoutMs: 30,
+    recognitionAttempts: 1,
+    continueRecognitionUntilTimeout: true,
+    repairBooks: async () => null,
+    repairContent: async () => null,
+    repairChapter: async () => null,
+    repairDetail: async () => null,
+    repairJsonChapter: async () => null,
+    analyze: async () => {
+      attempts += 1;
+      if (attempts === 1) return new Promise(() => {});
+      return { ok: true, source: goodSource, sources: { [goodSource.sourceName]: goodSource } };
+    },
+  });
+
+  assert.equal(attempts, 2);
+  assert.ok(gated.sources[source.sourceName]);
+  assert.equal(gated.skipped.length, 0);
+});
+
+test("当前一组声明入口均无响应时继续轮换未探测入口", async () => {
+  const host = "https://rotating-seeds.example";
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel(host, { download: fixtureDownload }),
+    { sourceName: "入口轮换恢复" },
+  );
+  const goodSource = structuredClone(source);
+  source.bookWorld = {
+    分类一: { ...structuredClone(Object.values(source.bookWorld)[0]), requestInfo: `${host}/bad-1` },
+    分类二: { ...structuredClone(Object.values(source.bookWorld)[0]), requestInfo: `${host}/bad-2` },
+  };
+  delete source.searchBook;
+  let attempts = 0;
+  const gated = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download: async (url, headers = {}, options = {}) => {
+      if (/\/bad-[12]$/.test(String(url))) return Buffer.from("<html><body>空列表</body></html>");
+      return fixtureDownload(url, headers, options);
+    },
+    concurrency: 1,
+    timeoutMs: 250,
+    sourceTimeoutMs: 1_000,
+    sourceBudgetMs: 1_500,
+    recognitionAttempts: 2,
+    continueRecognitionUntilTimeout: true,
+    repairBooks: async () => null,
+    repairContent: async () => null,
+    repairChapter: async () => null,
+    repairDetail: async () => null,
+    repairJsonChapter: async () => null,
+    analyze: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          ok: false,
+          reason: "analyze-failed: 首页及声明分类均不可访问（HTTP 503）",
+          remainingSeedRequests: 1,
+        };
+      }
+      return { ok: true, source: goodSource, sources: { [goodSource.sourceName]: goodSource } };
+    },
+  });
+
+  assert.equal(attempts, 2);
+  assert.ok(gated.sources[source.sourceName]);
+  assert.equal(gated.skipped.length, 0);
+});
+
+test("整站不可达诊断会区分尚未轮换探测的声明入口", async () => {
+  const host = "https://seed-budget.example";
+  const seedRequests = Array.from({ length: 6 }, (_, index) => ({
+    url: `${host}/category/${index + 1}`,
+  }));
+  const options = {
+    download: async () => { throw new Error("HTTP 404"); },
+    timeoutMs: 250,
+    seedRequests,
+  };
+  const first = await analyzeSite(host, { ...options, attempt: 0 });
+  const second = await analyzeSite(host, { ...options, attempt: 1 });
+
+  assert.equal(first.ok, false);
+  assert.equal(first.remainingSeedRequests, 2);
+  assert.equal(second.ok, false);
+  assert.equal(second.remainingSeedRequests, 0);
+});
+
+test("单次规则验链超时后保留源预算继续通用识站", async () => {
+  const host = "https://phase-timeout.example";
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel(host, { download: fixtureDownload }),
+    { sourceName: "阶段超时恢复" },
+  );
+  const goodSource = structuredClone(source);
+  source.bookWorld = {
+    分类: {
+      ...Object.values(source.bookWorld)[0],
+      requestInfo: `${host}/slow-list`,
+    },
+  };
+  delete source.searchBook;
+
+  let slowRequestAborted = false;
+  let analyzeAttempts = 0;
+  const download = async (url, headers = {}, options = {}) => {
+    if (String(url).endsWith("/slow-list")) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(Buffer.from("<li>迟到的列表</li>")), 5_000);
+        options.signal?.addEventListener("abort", () => {
+          slowRequestAborted = true;
+          clearTimeout(timer);
+          reject(options.signal.reason || new Error("aborted"));
+        }, { once: true });
+      });
+    }
+    return fixtureDownload(url, headers, options);
+  };
+
+  const gated = await applyVerifyAndAnalyzeFallback(
+    { [source.sourceName]: source },
+    {
+      download,
+      concurrency: 1,
+      timeoutMs: 100,
+      sourceTimeoutMs: 1_000,
+      sourceBudgetMs: 800,
+      analyzeTimeoutMs: 300,
+      recognitionAttempts: 1,
+      repairBooks: async () => null,
+      analyze: async () => {
+        analyzeAttempts += 1;
+        return { ok: true, source: goodSource, sources: { [source.sourceName]: goodSource } };
+      },
+    },
+  );
+
+  assert.equal(slowRequestAborted, true);
+  assert.equal(analyzeAttempts, 1);
+  assert.ok(gated.sources[source.sourceName]);
+  assert.equal(gated.skipped.length, 0);
+});
+
+test("单个分类请求超时后继续抽测后续分类入口", async () => {
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel("https://novel.example/", { download: fixtureDownload }),
+    { sourceName: "多分类抽测" },
+  );
+  const action = Object.values(source.bookWorld)[0];
+  source.bookWorld = {
+    超时分类: { ...structuredClone(action), requestInfo: "https://novel.example/slow-list" },
+    空分类: { ...structuredClone(action), requestInfo: "https://novel.example/empty-list" },
+    可用分类: { ...structuredClone(action), requestInfo: "https://novel.example/list" },
+  };
+  delete source.searchBook;
+  const requests = [];
+  const download = async (url, headers = {}, options = {}) => {
+    const path = new URL(url).pathname;
+    requests.push(path);
+    if (path === "/slow-list") {
+      return new Promise((resolve, reject) => {
+        const onAbort = () => reject(options.signal.reason || new Error("aborted"));
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        if (options.signal?.aborted) onAbort();
+      });
+    }
+    if (path === "/empty-list") return Buffer.from("<html><body>暂时无结果</body></html>");
+    return fixtureDownload(url, headers, options);
+  };
+
+  const verified = await verifyConvertedSource(source, {
+    download,
+    timeoutMs: 35,
+    sourceTimeoutMs: 2_000,
+  });
+
+  assert.equal(verified.ok, true, verified.detail || verified.reason);
+  assert.ok(requests.includes("/slow-list"));
+  assert.ok(requests.includes("/empty-list"));
+  assert.ok(requests.includes("/list"));
 });
 
 test("skippedBuckets 识别 rules-stale 与 analyze-failed", () => {
@@ -4407,7 +6562,7 @@ test("skippedBuckets 识别 rules-stale 与 analyze-failed", () => {
   });
 });
 
-test("verify budget 到期后保留未抽测源，已确认失败的源会跳过", async () => {
+test("verify budget 到期后跳过未完成验链的源，不发布未验证源", async () => {
   const plan = {
     version: 1,
     kind: "books",
@@ -4489,11 +6644,84 @@ test("verify budget 到期后保留未抽测源，已确认失败的源会跳过
     analyzeFallback: false,
     budgetMs: 40,
   });
-  assert.ok(gated.unverifiedCount >= 1, `expected unverified, got ${gated.unverifiedCount}`);
-  // Budget leftovers are kept; confirmed verify failures are skipped.
-  assert.equal(Object.keys(gated.sources).length, gated.unverifiedCount);
-  assert.equal(Object.keys(gated.sources).length + gated.skipped.length, 6);
-  assert.ok(gated.skipped.length >= 1 || gated.unverifiedCount === 6);
+  assert.equal(gated.unverifiedCount, 0);
+  assert.equal(Object.keys(gated.sources).length, 0);
+  assert.equal(gated.skipped.length, 6);
+});
+
+test("单源验链超时会取消回退下载并快速结算", async () => {
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel("https://novel.example/", { download: fixtureDownload }),
+    { sourceName: "单源超时" },
+  );
+  const firstWorld = Object.keys(source.bookWorld)[0];
+  source.bookWorld[firstWorld].requestInfo = "https://novel.example/slow-list";
+  delete source.searchBook;
+  let aborted = false;
+  const download = async (url, headers, options = {}) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(Buffer.from("<html><body>empty</body></html>")), 200);
+    options.signal?.addEventListener("abort", () => {
+      aborted = true;
+      clearTimeout(timer);
+      reject(options.signal.reason || new Error("aborted"));
+    }, { once: true });
+  });
+  const started = Date.now();
+  const gated = await applyVerifyAndAnalyzeFallback({ 单源超时: source }, {
+    download,
+    concurrency: 1,
+    timeoutMs: 200,
+    sourceTimeoutMs: 500,
+    sourceBudgetMs: 30,
+    analyzeFallback: true,
+    analyze: async () => ({ ok: false, reason: "should not run" }),
+  });
+  assert.ok(Date.now() - started < 180, `source took too long: ${Date.now() - started}ms`);
+  assert.equal(aborted, true);
+  assert.equal(gated.sources["单源超时"], undefined);
+  assert.equal(gated.skipped.length, 1);
+  assert.match(gated.skipped[0].reason, /source-timeout/);
+  assert.equal(gated.skipped[0].sourceType, "text");
+  assert.equal(gated.skipped[0].host, "novel.example");
+  assert.equal(gated.skipped[0].stage, "list");
+  assert.match(gated.skipped[0].reason, /阶段：list/);
+});
+
+test("详情请求真实超时会中止当前源，不再误吞并继续目录请求", async () => {
+  const source = novelDiscoveryToXiangse(
+    await discoverNovel("https://novel.example/", { download: fixtureDownload }),
+    { sourceName: "详情请求超时" },
+  );
+  let detailAborted = false;
+  let chapterRequests = 0;
+  const download = async (url, _headers, options = {}) => {
+    if (/\/book\/1\.html(?:$|[?#])/.test(String(url))) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(Buffer.from(novelDetail)), 1_000);
+        options.signal?.addEventListener("abort", () => {
+          detailAborted = true;
+          clearTimeout(timer);
+          reject(options.signal.reason || new Error("aborted"));
+        }, { once: true });
+      });
+    }
+    if (/\/chapter\//.test(String(url))) chapterRequests += 1;
+    return fixtureDownload(url);
+  };
+  const gated = await applyVerifyAndAnalyzeFallback({ [source.sourceName]: source }, {
+    download,
+    concurrency: 1,
+    timeoutMs: 35,
+    sourceTimeoutMs: 300,
+    sourceBudgetMs: 500,
+    analyzeFallback: false,
+  });
+
+  assert.equal(detailAborted, true);
+  assert.equal(chapterRequests, 0);
+  assert.equal(gated.sources[source.sourceName], undefined);
+  assert.match(gated.skipped[0].reason, /source-timeout/);
+  assert.equal(gated.skipped[0].stage, "detail");
 });
 
 test("识站失败时过滤原源", async () => {
@@ -4549,6 +6777,52 @@ test("识站失败时过滤原源", async () => {
   assert.match(gated.warnings[0].message, /已过滤/);
 });
 
+test("跨源复用识站结果时按请求头隔离相同 URL 的源", async () => {
+  const good = novelDiscoveryToXiangse(
+    await discoverNovel("https://novel.example/", { download: fixtureDownload }),
+    { sourceName: "请求头隔离" },
+  );
+  const makeBroken = (name, token) => {
+    const source = structuredClone(good);
+    source.sourceName = name;
+    source.httpHeaders = { Authorization: `Bearer ${token}` };
+    source.bookWorld[Object.keys(source.bookWorld)[0]].requestInfo = "https://novel.example/bad-list";
+    delete source.searchBook;
+    return source;
+  };
+  const observedTokens = [];
+  const gated = await applyVerifyAndAnalyzeFallback({
+    "源甲": makeBroken("源甲", "alpha"),
+    "源乙": makeBroken("源乙", "beta"),
+  }, {
+    download: async (url, headers = {}, options = {}) => (
+      String(url).endsWith("/bad-list")
+        ? Buffer.from("<html><body>需要认证</body></html>")
+        : fixtureDownload(url, headers, options)
+    ),
+    concurrency: 1,
+    timeoutMs: 500,
+    sourceTimeoutMs: 3_000,
+    sourceBudgetMs: 6_000,
+    analyzeFallback: true,
+    repairBooks: async () => null,
+    repairContent: async () => null,
+    repairChapter: async () => null,
+    repairDetail: async () => null,
+    repairJsonChapter: async () => null,
+    analyze: async (_host, options) => {
+      observedTokens.push(options.repairSource.httpHeaders.Authorization);
+      const source = structuredClone(good);
+      source.sourceName = options.sourceName;
+      return { ok: true, source, sources: { [options.sourceName]: source } };
+    },
+  });
+
+  assert.deepEqual(observedTokens, ["Bearer alpha", "Bearer beta"]);
+  assert.equal(Object.keys(gated.sources).length, 2);
+  assert.equal(gated.skipped.length, 0);
+});
+
 test("抽测失败且关闭识站回退时过滤原源", async () => {
   const broken = {
     sourceName: "过时源",
@@ -4587,7 +6861,7 @@ test("抽测失败且关闭识站回退时过滤原源", async () => {
   assert.equal(Object.keys(gated.sources).length, 0);
   assert.equal(gated.unverifiedCount, 0);
   assert.equal(gated.skipped.length, 1);
-  assert.match(gated.warnings[0].message, /未启用识站回退/);
+  assert.match(gated.warnings[0].message, /未启用持续识站/);
 });
 test("抽测进度回调包含当前站点名", async () => {
   const plan = {

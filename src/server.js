@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { availableParallelism, cpus, networkInterfaces } from "node:os";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +33,7 @@ import { dynamicComicApiImages } from "./siteAnalyze/dynamicComic.js";
 import { dynamicHtmlRequestUrl } from "./siteAnalyze/dynamicHtml.js";
 import {
   decodeMediaExtractionPlan,
+  decodeEmbeddedMediaUrl,
   mediaPlanIsLegacyHrefOnly,
   MEDIA_RECONVERSION_DIAGNOSTIC,
   normalizeMediaExtractionPlan,
@@ -41,10 +43,20 @@ import {
 import { decodeCatalogPlan, executeCatalogPlan } from "./catalogPlan.js";
 import { encodeXbs } from "./xbs.js";
 import { rebaseArtifactPair } from "./rebaseLibrary.js";
-import { parseHeaders, refreshEphemeralHeaders } from "./requests.js";
+import { parseHeaders, parseRequestDescriptor, refreshEphemeralHeaders } from "./requests.js";
+import { normalizeLegadoSources } from "./sourceInput.js";
+import { inferSourceKind } from "./contentKind.js";
 import { decodeSignedRequestPlan, signedRequestTarget } from "./requestPlan.js";
+import { decodeContentPlan, executeContentPlan } from "./contentPlan.js";
+import { decodeChapterCatalogPlan, executeChapterCatalogPlan } from "./chapterPlan.js";
+import { decodeSearchPlan, executeSearchPlan } from "./searchPlan.js";
 import { resolveChapterListUrls } from "./verifySource.js";
 import { isDateOnlyMetadata } from "./elementValidation.js";
+import { createBridgeExecutor } from "./bridgeExecutor.js";
+import { createAiSettingsStore, publicAiSettings, AiSettingsError } from "./aiSettings.js";
+import { aiProviderConfigured, probeAiProvider } from "./aiProvider.js";
+import { listAiModels } from "./aiModels.js";
+import { browserExecutable } from "./siteAnalyze/crawlTools.js";
 import {
   applyDetailSemanticFallbacks,
   bridgeTocUrl,
@@ -60,8 +72,22 @@ import {
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PUBLIC_DIR = path.resolve(MODULE_DIR, "../public");
+const CPU_PARALLELISM = Math.max(
+  1,
+  Number(typeof availableParallelism === "function" ? availableParallelism() : cpus().length) || 1,
+);
+const DETECTED_IPV6_NETWORK = Object.values(networkInterfaces()).flat().some((address) => (
+  (address.family === 6 || address.family === "IPv6")
+  && !address.internal
+  && address.address !== "::1"
+  && !address.address?.toLowerCase().startsWith("fe80:")
+));
+const DEFAULT_VERIFY_WORKERS = Math.min(8, CPU_PARALLELISM);
+const VERIFY_WORKER_MEMORY_RESERVE = 1024 * 1024 * 1024;
+const VERIFY_WORKER_MEMORY_PER_SLOT = 384 * 1024 * 1024;
 const generatedCoverCache = new Map();
 const imageScriptDecoderCache = new Map();
+const preflightSocketErrorHandlers = new WeakMap();
 
 export class HttpError extends Error {
   constructor(status, message) {
@@ -90,6 +116,16 @@ function hostList(value, defaultHosts = []) {
   )];
 }
 
+export function memoryBoundVerifyWorkers(requested, memoryBytes = process.constrainedMemory?.()) {
+  const requestedWorkers = Math.max(1, Number(requested) || 1);
+  const constrainedBytes = Number(memoryBytes);
+  if (!Number.isFinite(constrainedBytes) || constrainedBytes <= 0) return requestedWorkers;
+  const memorySlots = Math.max(1, Math.floor(
+    Math.max(0, constrainedBytes - VERIFY_WORKER_MEMORY_RESERVE) / VERIFY_WORKER_MEMORY_PER_SLOT,
+  ));
+  return Math.min(requestedWorkers, memorySlots, 16);
+}
+
 export function serverConfig(environment = process.env) {
   return {
     version: environment.npm_package_version || environment.APP_VERSION || "0.2.0",
@@ -97,6 +133,7 @@ export function serverConfig(environment = process.env) {
     host: environment.HOST || "0.0.0.0",
     port: integer(environment.PORT, 3000, 0),
     fetchTimeoutMs: integer(environment.FETCH_TIMEOUT_MS, 15_000),
+    fetchRetries: integer(environment.FETCH_RETRIES, 2, 0),
     maxSourceBytes: integer(environment.MAX_SOURCE_BYTES, 32 * 1024 * 1024),
     maxImageBytes: integer(environment.MAX_IMAGE_BYTES, 25 * 1024 * 1024),
     maxMediaBytes: integer(environment.MAX_MEDIA_BYTES, 80 * 1024 * 1024),
@@ -106,33 +143,81 @@ export function serverConfig(environment = process.env) {
     maxCacheEntries: integer(environment.MAX_CACHE_ENTRIES, 100),
     allowPrivateNetworks: boolean(environment.ALLOW_PRIVATE_NETWORKS),
     allowDnsProxyNetworks: boolean(environment.ALLOW_DNS_PROXY_NETWORKS, true),
+    // Don't try IPv6-only origins when the host has no non-local IPv6 address;
+    // the resulting ENETUNREACH must be a source failure, not a process crash.
+    ipv6NetworkAvailable: boolean(environment.IPV6_NETWORK_AVAILABLE, DETECTED_IPV6_NETWORK),
     // Explicit opt-in hosts for which /media may skip TLS verification.
     insecureMediaHosts: hostList(environment.INSECURE_MEDIA_HOSTS),
-    // Origin 探活默认开启：过滤明显死站，避免「能导入却点不开」。
+    // Origin 探活默认开启以确认可用入口；无响应时只标记待确认，
+    // 由转换和完整验链决定是否超时，不能在预检阶段直接丢源。
     // 深度预检（分类→章节→正文）成本高，聚合源默认关闭；精选发布可显式开启。
     preflightSources: boolean(environment.PREFLIGHT_SOURCES, true),
     preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES, false),
     preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 3_000),
     // A failed fast probe is not proof that a site is dead. Retry all declared
     // entry candidates with a longer timeout before filtering the source.
-    preflightConfirmTimeoutMs: integer(environment.PREFLIGHT_CONFIRM_TIMEOUT_MS, 10_000),
-    // Each source is isolated during aggregate conversion. One quick probe and
-    // two confirmation attempts balance transient rate limits against keeping a
-    // large import moving when an upstream site is unavailable.
+    preflightConfirmTimeoutMs: integer(environment.PREFLIGHT_CONFIRM_TIMEOUT_MS, 20_000),
+    // Each source is isolated during aggregate conversion. A failed probe is
+    // inconclusive: the source is deferred to conversion and full-chain
+    // verification rather than being discarded as an inaccessible site.
     preflightRetries: integer(environment.PREFLIGHT_RETRIES, 3),
     // Verify/preflight share this pool; 8 keeps large jobs moving without
     // starving small containers as badly as 16+.
     preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 8),
-    // 转换后抽测列表+目录。失败时识站修复；站点可达且仍失败则跳过（不 soft-keep 坏源）。
+    // Sources may declare several alternative URLs. A small per-source pool
+    // prevents a dead first entry from serializing the entire reachability check.
+    preflightCandidateConcurrency: integer(environment.PREFLIGHT_CANDIDATE_CONCURRENCY, 4),
+    // 转换后必须完成分类/列表→详情→章节→正文验链；规则失败继续识站，
+    // 只有超时或无法生成可执行香色规则的源才过滤。
     verifyConvertedSources: boolean(environment.VERIFY_CONVERTED_SOURCES, true),
+    // 保留未验证源会把“能导入”误报成“能阅读”，生产转换器不允许该状态。
+    retainUnverifiedSources: boolean(environment.RETAIN_UNVERIFIED_SOURCES, false),
     analyzeFallback: boolean(environment.ANALYZE_FALLBACK, true),
-    analyzeTimeoutMs: integer(environment.ANALYZE_TIMEOUT_MS, 8_000),
-    // Wall-clock budget for verify phase; remainder kept unverified.
-    verifyBudgetMs: integer(environment.VERIFY_BUDGET_MS, 20_000),
-    // Skip synchronous verification above this aggregate source count.
-    verifyMaxSources: integer(environment.VERIFY_MAX_SOURCES, 50),
+    analyzeTimeoutMs: integer(environment.ANALYZE_TIMEOUT_MS, 30_000),
+    analyzeAttempts: integer(environment.ANALYZE_ATTEMPTS, 4),
+    // The fast preflight timeout is intentionally separate from each request
+    // in the complete list → detail → chapter → content verification chain.
+    // Reusing 3s here incorrectly discards otherwise healthy slow sources.
+    verifyRequestTimeoutMs: integer(environment.VERIFY_REQUEST_TIMEOUT_MS, 20_000),
+    // Worker Thread pool for CPU-heavy DOM/JSON verification. The network
+    // preflight pool remains separately bounded by preflightConcurrency.
+    verifyWorkers: memoryBoundVerifyWorkers(integer(environment.VERIFY_WORKERS, DEFAULT_VERIFY_WORKERS)),
+    // Recreate verification workers frequently: a small per-source heap leak
+    // multiplies across the full worker pool and can exceed container limits.
+    // Keep an upper bound even when an old deployment sets a larger value.
+    verifyWorkerRecycleAfter: Math.min(6, integer(environment.VERIFY_WORKER_RECYCLE_AFTER, 6, 1)),
+    // Per-source wall-clock cap for the complete verify/repair/analyze chain.
+    // 0 is an explicit opt-out; the bounded default prevents one dead source
+    // from holding an aggregate job forever.
+    verifySourceBudgetMs: integer(environment.VERIFY_SOURCE_BUDGET_MS, 120_000, 0),
+    // Candidate-heavy XBS runtime fallback is locally bounded so a stale rule
+    // cannot consume the whole source budget before generic site analysis.
+    verifyRuntimeFallbackTimeoutMs: integer(
+      environment.VERIFY_RUNTIME_FALLBACK_TIMEOUT_MS,
+      45_000,
+      1,
+    ),
+    // Wall-clock budget for the synchronous verify phase.  0 means complete
+    // verification; a positive value is an explicit latency trade-off and may
+    // leave the tail unverified.
+    verifyBudgetMs: integer(environment.VERIFY_BUDGET_MS, 0, 0),
+    // Skip the synchronous source-count shortcut only when explicitly set to
+    // a positive number.  0 means complete verification for any aggregate.
+    verifyMaxSources: integer(environment.VERIFY_MAX_SOURCES, 0, 0),
     // Async WebUI jobs: 0 = unbounded full verify (default). Set >0 to cap wall time.
     jobVerifyBudgetMs: integer(environment.JOB_VERIFY_BUDGET_MS, 0, 0),
+    jobVerifySourceBudgetMs: integer(
+      environment.JOB_VERIFY_SOURCE_BUDGET_MS,
+      120_000,
+      0,
+    ),
+    jobVerifyRuntimeFallbackTimeoutMs: integer(
+      environment.JOB_VERIFY_RUNTIME_FALLBACK_TIMEOUT_MS,
+      45_000,
+      1,
+    ),
+    jobVerifyRequestTimeoutMs: integer(environment.JOB_VERIFY_REQUEST_TIMEOUT_MS, 20_000),
+    jobVerifyWorkers: memoryBoundVerifyWorkers(integer(environment.JOB_VERIFY_WORKERS, DEFAULT_VERIFY_WORKERS)),
     maxComicPages: integer(environment.MAX_COMIC_PAGES, 50),
     maxComicImages: integer(environment.MAX_COMIC_IMAGES, 2_000),
     comicPageConcurrency: integer(environment.COMIC_PAGE_CONCURRENCY, 4),
@@ -141,6 +226,10 @@ export function serverConfig(environment = process.env) {
     maxBridgeBookPageSize: integer(environment.MAX_BRIDGE_BOOK_PAGE_SIZE, 40),
     maxBridgeChapterPageSize: integer(environment.MAX_BRIDGE_CHAPTER_PAGE_SIZE, 100),
     maxBridgeHtmlBytes: integer(environment.MAX_BRIDGE_HTML_BYTES, 2 * 1024 * 1024),
+    // DOM/XPath bridge execution is CPU-heavy. Keep it outside the HTTP event
+    // loop and cap the small worker pool independently from network concurrency.
+    bridgeWorkers: integer(environment.BRIDGE_WORKERS, Math.min(4, CPU_PARALLELISM)),
+    bridgeExecutionTimeoutMs: integer(environment.BRIDGE_EXECUTION_TIMEOUT_MS, 12_000),
     // Back-compat aliases
     maxBridgeBooks: integer(environment.MAX_BRIDGE_BOOKS, integer(environment.MAX_BRIDGE_BOOK_PAGE_SIZE, 40)),
     maxBridgeChapters: integer(environment.MAX_BRIDGE_CHAPTERS, integer(environment.MAX_BRIDGE_CHAPTER_PAGE_SIZE, 100)),
@@ -148,6 +237,10 @@ export function serverConfig(environment = process.env) {
     dataDir: environment.DATA_DIR || "./data",
     adminToken: String(environment.ADMIN_TOKEN || "").trim(),
     jobConcurrency: integer(environment.JOB_CONCURRENCY, 1),
+    jobAutostart: boolean(environment.JOB_AUTOSTART, true),
+    // Keep long-running aggregate verification outside the HTTP event loop.
+    // Tests can opt out when injecting in-process fake converters.
+    jobIsolation: boolean(environment.JOB_ISOLATION, true),
     publicDir: environment.PUBLIC_DIR || "",
   };
 }
@@ -188,17 +281,18 @@ function isDnsProxyIpv4(address) {
   return first === 198 && (second === 18 || second === 19);
 }
 
-export function preferredResolvedAddress(addresses) {
+export function preferredResolvedAddress(addresses, allowIpv6 = true) {
   if (!Array.isArray(addresses) || addresses.length === 0) return null;
-  return addresses.find(({ family }) => Number(family) === 4) || addresses[0];
+  return addresses.find(({ family }) => Number(family) === 4)
+    || (allowIpv6 ? addresses[0] : null);
 }
 
-async function resolveTarget(url, config) {
+export async function resolveTarget(url, config, lookupTarget = lookup) {
   if (!/^https?:$/.test(url.protocol)) throw new HttpError(400, "阅读源地址只支持 http:// 或 https://");
   if (!url.hostname) throw new HttpError(400, "阅读源地址缺少主机名");
   let addresses;
   try {
-    addresses = await lookup(url.hostname, { all: true, verbatim: true });
+    addresses = await lookupTarget(url.hostname, { all: true, verbatim: true });
   } catch (error) {
     throw new HttpError(502, `无法解析阅读源域名：${error.message}`);
   }
@@ -212,7 +306,11 @@ async function resolveTarget(url, config) {
   if (!config.allowPrivateNetworks && blockedAddresses.length && !dnsProxyException) {
     throw new HttpError(403, "出于安全考虑，默认禁止访问本机或内网地址；可信环境可设置 ALLOW_PRIVATE_NETWORKS=true");
   }
-  return preferredResolvedAddress(addresses);
+  const resolved = preferredResolvedAddress(addresses, config.ipv6NetworkAvailable !== false);
+  if (!resolved) {
+    throw new HttpError(502, "阅读源仅解析到 IPv6，但当前服务器没有可用的 IPv6 网络");
+  }
+  return resolved;
 }
 
 function requestBuffer(url, resolved, config, {
@@ -320,6 +418,35 @@ function requestBuffer(url, resolved, config, {
   });
 }
 
+function isRetryableDownloadError(error, method) {
+  if (!["GET", "HEAD"].includes(String(method || "GET").toUpperCase())) return false;
+  const status = Number(error?.status);
+  if ([408, 425, 429, 500, 502, 503].includes(status)) return true;
+  return ["ECONNABORTED", "ECONNREFUSED", "ECONNRESET", "EAI_AGAIN", "ENETUNREACH"].includes(error?.code)
+    || /(?:socket hang up|connection reset|temporarily unavailable|network is unreachable)/i
+      .test(String(error?.message || ""));
+}
+
+function waitForRetry(signal, delayMs) {
+  return new Promise((resolve, reject) => {
+    let timer;
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("下载已取消"));
+    };
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, delayMs);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
 /**
  * SSRF-safe page/API fetch used by conversion and adapters.
  * Prefer createSourceDownloader(config) at call sites that need the adapter
@@ -340,13 +467,25 @@ export async function downloadSource(sourceUrl, config = serverConfig(), headers
     : redirectLimitForMethod(method, config.maxRedirects);
   for (let redirects = 0; redirects <= maxRedirects; redirects += 1) {
     const resolved = await resolveTarget(current, config);
-    const result = await requestBuffer(current, resolved, config, {
-      label: "下载阅读源",
-      headers: requestHeaders,
-      method,
-      body,
-      signal: options?.signal,
-    });
+    let result;
+    let retries = 0;
+    while (true) {
+      try {
+        result = await requestBuffer(current, resolved, config, {
+          label: "下载阅读源",
+          headers: requestHeaders,
+          method,
+          body,
+          signal: options?.signal,
+        });
+        break;
+      } catch (error) {
+        const retryLimit = Math.max(0, Number(config.fetchRetries) || 0);
+        if (retries >= retryLimit || !isRetryableDownloadError(error, method)) throw error;
+        retries += 1;
+        await waitForRetry(options?.signal, Math.min(1_000, 200 * (2 ** (retries - 1))));
+      }
+    }
     if (result.buffer) {
       Object.defineProperty(result.buffer, "httpHeaders", {
         value: result.headers || {},
@@ -386,31 +525,86 @@ export function pageText(buffer, charsetHint = "") {
   });
 }
 
-function probeRequest(url, resolved, config, headers = {}, method = "HEAD") {
-  const requester = url.protocol === "https:" ? httpsRequest : httpRequest;
-  return new Promise((resolve, reject) => {
-    const request = requester(url, {
-      method,
-      headers: {
-        Accept: "text/html,application/json;q=0.9,*/*;q=0.8",
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
-        ...headers,
-      },
-      lookup: (_hostname, options, callback) => {
-        if (options?.all) callback(null, [resolved]);
-        else callback(null, resolved.address, resolved.family);
-      },
-      ...(!isIP(url.hostname) ? { servername: url.hostname } : {}),
-    }, (response) => {
-      response.resume();
-      resolve({ status: response.statusCode || 0, location: response.headers.location });
+function keepProbeSocketErrorHandled(socket) {
+  if (preflightSocketErrorHandlers.has(socket)) return;
+  // ClientRequest may emit its own error before TLS emits a later error on the
+  // TLSSocket. Keep one no-op listener for the socket lifetime so late socket
+  // errors cannot become process-level uncaught exceptions.
+  const handler = () => {};
+  preflightSocketErrorHandlers.set(socket, handler);
+  socket.on("error", handler);
+}
+
+export function probeRequest(
+  url,
+  resolved,
+  config,
+  headers = {},
+  method = "HEAD",
+  signal = null,
+  requestFactory = null,
+) {
+  const requester = requestFactory || (url.protocol === "https:" ? httpsRequest : httpRequest);
+  return new Promise((resolve) => {
+    let request;
+    let hardTimer;
+    let settled = false;
+    let probeCancelled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimer);
+      signal?.removeEventListener("abort", abortProbe);
+      resolve(result);
+    };
+    const failProbe = () => finish({ status: 0, location: "" });
+    const abortProbe = () => {
+      if (probeCancelled) return;
+      probeCancelled = true;
+      request.destroy(new Error(signal?.reason?.message || "preflight timeout"));
+    };
+    try {
+      request = requester(url, {
+        method,
+        headers: {
+          Accept: "text/html,application/json;q=0.9,*/*;q=0.8",
+          "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
+          ...headers,
+        },
+        lookup: (_hostname, options, callback) => {
+          if (probeCancelled || settled) {
+            const error = new Error("preflight request is no longer active");
+            error.code = "ECANCELED";
+            callback(error);
+            return;
+          }
+          if (options?.all) callback(null, [resolved]);
+          else callback(null, resolved.address, resolved.family);
+        },
+        ...(!isIP(url.hostname) ? { servername: url.hostname } : {}),
+      }, (response) => {
+        response.on("error", failProbe);
+        response.on("aborted", failProbe);
+        response.resume();
+        finish({ status: response.statusCode || 0, location: response.headers.location });
+      });
+    } catch {
+      failProbe();
+      return;
+    }
+    // Treat connect/DNS/TLS failures as a failed candidate, never as an
+    // unhandled rejection. In particular, some hosts have no IPv6 route even
+    // when DNS returns an AAAA address; that must not take down the worker.
+    request.on("error", failProbe);
+    request.once("socket", (requestSocket) => {
+      keepProbeSocketErrorHandled(requestSocket);
     });
-    const abortProbe = () => request.destroy(new Error("preflight timeout"));
     // setTimeout() alone does not bound DNS/TCP/TLS connection setup.
-    const hardTimer = setTimeout(abortProbe, config.preflightTimeoutMs);
-    request.once("close", () => clearTimeout(hardTimer));
+    hardTimer = setTimeout(abortProbe, config.preflightTimeoutMs);
+    request.once("close", () => finish({ status: 0, location: "" }));
     request.setTimeout(config.preflightTimeoutMs, abortProbe);
-    request.on("error", reject);
+    if (signal?.aborted) abortProbe();
+    else signal?.addEventListener("abort", abortProbe, { once: true });
     request.end();
   });
 }
@@ -468,6 +662,23 @@ function sourceOriginCandidates(source) {
   return withRoots.slice(0, 12);
 }
 
+function sourcePreflightKey(source) {
+  const candidates = sourceOriginCandidates(source).map((url) => url.href);
+  let headers = {};
+  try {
+    headers = source?.httpHeaders && typeof source.httpHeaders === "object"
+      ? { ...source.httpHeaders }
+      : parseHeaders(source?.header);
+  } catch { headers = {}; }
+  if (source?.httpUserAgent) headers["User-Agent"] = String(source.httpUserAgent);
+  const normalizedHeaders = Object.entries(headers)
+    .map(([key, value]) => [String(key).toLowerCase(), String(value)])
+    .sort(([left], [right]) => left.localeCompare(right));
+  // Share only identical probe requests. A slow source path must not poison
+  // unrelated entries that happen to use the same host.
+  return JSON.stringify([candidates, normalizedHeaders]);
+}
+
 async function sourceOriginReachable(source, config) {
   const candidates = sourceOriginCandidates(source);
   if (!candidates.length) return "";
@@ -481,30 +692,59 @@ async function sourceOriginReachable(source, config) {
   }
   if (source?.httpUserAgent) headers["User-Agent"] = String(source.httpUserAgent);
   const probeCandidates = async (probeConfig) => {
-    for (const candidate of candidates) {
+    const controller = new AbortController();
+    let cursor = 0;
+    let reachableOrigin = "";
+    const probeCandidate = async (candidate) => {
       let current = candidate;
       for (let redirects = 0; redirects <= Math.min(config.maxRedirects, 3); redirects += 1) {
+        if (controller.signal.aborted) return "";
         try {
           const resolved = await resolveTarget(current, probeConfig);
+          if (controller.signal.aborted) return "";
           // GET is more widely supported than HEAD and the response body is
           // immediately drained, so this remains a low-cost origin probe.
-          const result = await probeRequest(current, resolved, probeConfig, headers, "GET");
+          const result = await probeRequest(
+            current,
+            resolved,
+            probeConfig,
+            headers,
+            "GET",
+            controller.signal,
+          );
           if (result.status >= 300 && result.status < 400 && result.location) {
             current = new URL(result.location, current);
             continue;
           }
-          // Any HTTP status below 500 proves the origin is serving, including
-          // 401/403 deny pages from API hosts or anti-bot filters: whether a
-          // source still works is decided by verification and site analysis,
-          // not by the probe. 5xx (e.g. Cloudflare 521) stays unreachable.
-          if (result.status > 0 && result.status < 500) return current.origin;
+          // Any HTTP response proves that the origin is reachable, including
+          // 4xx/5xx deny or transient-error pages. The converter must continue
+          // to other declared routes and site analysis instead of treating an
+          // application response as an inaccessible host.
+          if (result.status > 0) return current.origin;
           break;
         } catch {
           break;
         }
       }
-    }
-    return "";
+      return "";
+    };
+    const worker = async () => {
+      while (!controller.signal.aborted && cursor < candidates.length) {
+        const candidate = candidates[cursor];
+        cursor += 1;
+        const origin = await probeCandidate(candidate);
+        if (origin && !reachableOrigin) {
+          reachableOrigin = origin;
+          controller.abort(new Error("another declared source entry is reachable"));
+        }
+      }
+    };
+    const concurrency = Math.max(1, Number(config.preflightCandidateConcurrency) || 1);
+    await Promise.all(Array.from(
+      { length: Math.min(concurrency, candidates.length) },
+      () => worker(),
+    ));
+    return reachableOrigin;
   };
   const confirmTimeoutMs = Math.max(
     Number(config.preflightTimeoutMs) || 1,
@@ -760,27 +1000,67 @@ function bridgeHtmlText(buffer, charsetHint = "", maxBytes = 2 * 1024 * 1024) {
   return text;
 }
 
-function prepareBridgeHtml(buffer, charsetHint = "", maxBytes = 2 * 1024 * 1024) {
+function prepareBridgeHtml(buffer, charsetHint = "", maxBytes = 2 * 1024 * 1024, plan = null) {
   const text = bridgeHtmlText(buffer, charsetHint, maxBytes);
+  const projection = String(plan?.list || plan?.latest?.list || "");
+  const needsHydration = /^@hydration-(?:books|chapters):/.test(projection);
   // Drop script/style payloads before DOM construction — they inflate CPU without
-  // helping XPath book/chapter extraction.
+  // helping ordinary XPath book/chapter extraction. Hydration projections are
+  // the exception: their list data lives inside Nuxt/Next script payloads.
   return text
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, (script) => (
+      needsHydration && /__NUXT_DATA__|__NEXT_DATA__|self\.__next_f\.push|hydration/i.test(script)
+        ? script
+        : ""
+    ))
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "");
 }
 
-async function executeDeclarativeUrl(plan, targetUrl, config, { chapters = false, limit, offset = 0 } = {}) {
+async function executeBridgePlanForRequest(
+  bridgeExecutor,
+  body,
+  baseUrl,
+  plan,
+  options = {},
+) {
+  if (bridgeExecutor?.executePlan) {
+    return bridgeExecutor.executePlan(body, baseUrl, plan, options);
+  }
+  return executeBridgePlan(body, baseUrl, plan, options);
+}
+
+async function executeBridgeSelectorForRequest(
+  bridgeExecutor,
+  body,
+  baseUrl,
+  responseType,
+  selector,
+  options = {},
+) {
+  if (bridgeExecutor?.executeSelector) {
+    return bridgeExecutor.executeSelector(body, baseUrl, responseType, selector, options);
+  }
+  return executeBridgeSelector(body, baseUrl, responseType, selector, options);
+}
+
+async function executeDeclarativeUrl(
+  plan,
+  targetUrl,
+  config,
+  { chapters = false, limit, offset = 0, bridgeExecutor } = {},
+) {
   const page = await downloadSource(targetUrl, config, plan.headers);
   const responseUrl = String(page?.read2xsggResponseUrl || targetUrl);
-  const text = prepareBridgeHtml(page, plan.charset, config.maxBridgeHtmlBytes);
+  const text = prepareBridgeHtml(page, plan.charset, config.maxBridgeHtmlBytes, plan);
   const options = { limit, offset, limits: bridgeExecuteLimits(config) };
   if (chapters && plan.tocSelector) {
     const tocUrl = bridgeTocUrl(text, responseUrl, plan);
     if (tocUrl) {
       try {
         const tocPage = await downloadSource(tocUrl, config, plan.headers);
-        const output = executeBridgePlan(
-          prepareBridgeHtml(tocPage, plan.charset, config.maxBridgeHtmlBytes),
+        const output = await executeBridgePlanForRequest(
+          bridgeExecutor,
+          prepareBridgeHtml(tocPage, plan.charset, config.maxBridgeHtmlBytes, plan),
           tocUrl,
           plan,
           options,
@@ -791,7 +1071,7 @@ async function executeDeclarativeUrl(plan, targetUrl, config, { chapters = false
       }
     }
   }
-  return executeBridgePlan(text, responseUrl, plan, options);
+  return executeBridgePlanForRequest(bridgeExecutor, text, responseUrl, plan, options);
 }
 
 function usableLatestChapterTitle(value) {
@@ -808,12 +1088,12 @@ function usableDerivedChapterTitle(value) {
   return usableLatestChapterTitle(text) || /^\d+(?:\.\d+)?$/.test(text);
 }
 
-async function enrichBridgeDetailLatest(output, detailBody, detailUrl, plan, config) {
+async function enrichBridgeDetailLatest(output, detailBody, detailUrl, plan, config, bridgeExecutor) {
   const latest = plan.latestChapter;
   if (!latest || usableLatestChapterTitle(output?.lastChapterTitle)) return output;
   try {
     if (latest.mode === "direct") {
-      const chapters = executeBridgePlan(detailBody, detailUrl, {
+      const chapters = await executeBridgePlanForRequest(bridgeExecutor, detailBody, detailUrl, {
         kind: "chapters",
         host: plan.host,
         responseType: latest.responseType,
@@ -856,7 +1136,7 @@ async function enrichBridgeDetailLatest(output, detailBody, detailUrl, plan, con
           refreshEphemeralHeaders(plan.headers),
         );
         dynamicMenuBody = bridgeHtmlText(menuPage, plan.charset, config.maxBridgeHtmlBytes);
-        menuBody = prepareBridgeHtml(menuPage, plan.charset, config.maxBridgeHtmlBytes);
+        menuBody = prepareBridgeHtml(menuPage, plan.charset, config.maxBridgeHtmlBytes, { latest });
       }
       if (latest.dynamicHtml) {
         const dynamicUrl = dynamicHtmlRequestUrl(dynamicMenuBody, normalizedMenuUrl);
@@ -866,7 +1146,7 @@ async function enrichBridgeDetailLatest(output, detailBody, detailUrl, plan, con
             Referer: normalizedMenuUrl,
           });
           normalizedMenuUrl = String(dynamicPage?.read2xsggResponseUrl || dynamicUrl);
-          menuBody = prepareBridgeHtml(dynamicPage, plan.charset, config.maxBridgeHtmlBytes);
+          menuBody = prepareBridgeHtml(dynamicPage, plan.charset, config.maxBridgeHtmlBytes, { latest });
         }
       }
       // Metadata enrichment needs the actual catalogue tail, not the client
@@ -876,7 +1156,7 @@ async function enrichBridgeDetailLatest(output, detailBody, detailUrl, plan, con
       const menuCandidates = [{ body: menuBody, url: normalizedMenuUrl }];
       if (normalizedMenuUrl !== detailUrl) menuCandidates.push({ body: detailBody, url: detailUrl });
       for (const candidate of menuCandidates) {
-        const chapters = executeBridgePlan(candidate.body, candidate.url, {
+        const chapters = await executeBridgePlanForRequest(bridgeExecutor, candidate.body, candidate.url, {
           kind: "chapters",
           host: plan.host,
           responseType: "html",
@@ -904,19 +1184,37 @@ async function enrichBridgeDetailLatest(output, detailBody, detailUrl, plan, con
     }
     let menuTemplate = latest.urlTemplate;
     for (const [name, selector] of Object.entries(latest.values)) {
-      const value = executeBridgeSelector(detailBody, detailUrl, plan.responseType, selector);
+      const value = await executeBridgeSelectorForRequest(
+        bridgeExecutor,
+        detailBody,
+        detailUrl,
+        plan.responseType,
+        selector,
+      );
       if (!String(value || "").trim()) return output;
       menuTemplate = menuTemplate.split(`{{${name}}}`).join(encodeURIComponent(String(value).trim()));
     }
     let firstMenu = null;
     let countValue = latest.count && latest.countSource !== "menu"
-      ? executeBridgeSelector(detailBody, detailUrl, plan.responseType, latest.count)
+      ? await executeBridgeSelectorForRequest(
+        bridgeExecutor,
+        detailBody,
+        detailUrl,
+        plan.responseType,
+        latest.count,
+      )
       : "";
     if (latest.count && latest.countSource === "menu") {
       const firstUrl = normalizeRemoteUrl(menuTemplate.split("__PAGE__").join("1"));
       const firstPage = await downloadSource(firstUrl, config, refreshEphemeralHeaders(plan.headers));
-      const firstBody = prepareBridgeHtml(firstPage, plan.charset, config.maxBridgeHtmlBytes);
-      countValue = executeBridgeSelector(firstBody, firstUrl, latest.responseType, latest.count);
+      const firstBody = prepareBridgeHtml(firstPage, plan.charset, config.maxBridgeHtmlBytes, { latest });
+      countValue = await executeBridgeSelectorForRequest(
+        bridgeExecutor,
+        firstBody,
+        firstUrl,
+        latest.responseType,
+        latest.count,
+      );
       firstMenu = { url: firstUrl, body: firstBody };
     }
     const count = Number(String(countValue || "").match(/\d+/)?.[0] || 0);
@@ -928,9 +1226,9 @@ async function enrichBridgeDetailLatest(output, detailBody, detailUrl, plan, con
       if (page === 1 && firstMenu?.url === menuUrl) menuBody = firstMenu.body;
       else {
         const menuPage = await downloadSource(menuUrl, config, refreshEphemeralHeaders(plan.headers));
-        menuBody = prepareBridgeHtml(menuPage, plan.charset, config.maxBridgeHtmlBytes);
+        menuBody = prepareBridgeHtml(menuPage, plan.charset, config.maxBridgeHtmlBytes, { latest });
       }
-      const chapters = executeBridgePlan(menuBody, menuUrl, {
+      const chapters = await executeBridgePlanForRequest(bridgeExecutor, menuBody, menuUrl, {
         kind: "chapters",
         host: plan.host,
         responseType: latest.responseType,
@@ -980,7 +1278,21 @@ function encodedAdapterPlan(action, endpoint) {
   return match?.[1] || "";
 }
 
-async function sourceContentReachable(source, chapterUrl, config) {
+async function sourceContentReachable(source, chapterUrl, config, bridgeExecutor) {
+  const contentPlanId = encodedAdapterPlan(source?.chapterContent, "content");
+  if (contentPlanId !== null) {
+    try {
+      const plan = decodeContentPlan(contentPlanId);
+      const output = await executeContentPlan(plan, {
+        sourceUrl: chapterUrl,
+        value: chapterUrl,
+        download: createSourceDownloader(config),
+      });
+      return String(output || "").trim().length > 0;
+    } catch {
+      return false;
+    }
+  }
   let textAction = declarativeBridgeAction(source?.chapterContent, "text");
   if (!textAction && source?.sourceType === "text") {
     try {
@@ -991,7 +1303,7 @@ async function sourceContentReachable(source, chapterUrl, config) {
     }
   }
   if (textAction) {
-    const output = await executeDeclarativeUrl(textAction.plan, chapterUrl, config);
+    const output = await executeDeclarativeUrl(textAction.plan, chapterUrl, config, { bridgeExecutor });
     return String(output?.content || "").trim().length > 0;
   }
   if (source?.sourceType === "text") return false;
@@ -1023,7 +1335,7 @@ async function sourceContentReachable(source, chapterUrl, config) {
   return true;
 }
 
-async function sourceBridgeChainReachable(source, config) {
+async function sourceBridgeChainReachable(source, config, bridgeExecutor) {
   if (!config.preflightDeep) return true;
   const chapterBridge = executableChapterAction(source);
   if (!chapterBridge) return false;
@@ -1041,7 +1353,10 @@ async function sourceBridgeChainReachable(source, config) {
     const targetUrl = declarativeBookTarget(action, bookBridge, { keyWord });
     if (!bookBridge || !targetUrl) continue;
     try {
-      const books = await executeDeclarativeUrl(bookBridge.plan, targetUrl, deepConfig, { limit: 3 });
+      const books = await executeDeclarativeUrl(bookBridge.plan, targetUrl, deepConfig, {
+        limit: 3,
+        bridgeExecutor,
+      });
       for (const book of (books.data || []).slice(0, 3)) {
         if (!book?.url) continue;
         // Reachability preflight may explore a same-resource HTML page so a
@@ -1053,9 +1368,13 @@ async function sourceBridgeChainReachable(source, config) {
         ])];
         for (const chapterPageUrl of chapterPageUrls) {
           try {
-            const chapters = await executeDeclarativeUrl(chapterBridge.plan, chapterPageUrl, deepConfig, { chapters: true, limit: 2 });
+            const chapters = await executeDeclarativeUrl(chapterBridge.plan, chapterPageUrl, deepConfig, {
+              chapters: true,
+              limit: 2,
+              bridgeExecutor,
+            });
             for (const chapter of (chapters.data || []).slice(0, 2)) {
-              if (chapter?.url && await sourceContentReachable(source, chapter.url, deepConfig)) return true;
+              if (chapter?.url && await sourceContentReachable(source, chapter.url, deepConfig, bridgeExecutor)) return true;
             }
           } catch {
             // Try the next safe same-origin detail-page candidate.
@@ -1073,13 +1392,11 @@ async function sourceBridgeChainReachable(source, config) {
 }
 
 function legacySourceList(input) {
-  if (Array.isArray(input)) return input;
-  if (!input || typeof input !== "object") return [];
-  if (input.bookSourceUrl || input.bookSourceName) return [input];
-  for (const key of ["sources", "bookSources", "data"]) {
-    if (Array.isArray(input[key])) return input[key];
+  try {
+    return normalizeLegadoSources(input);
+  } catch {
+    return [];
   }
-  return [];
 }
 
 function htmlAttribute(tag, name) {
@@ -1088,7 +1405,11 @@ function htmlAttribute(tag, name) {
   return match ? (match[2] ?? match[3]) : null;
 }
 
-export async function filterReachableSources(input, config, { onProgress = null } = {}) {
+export async function filterReachableSources(
+  input,
+  config,
+  { onProgress = null, bridgeExecutor = null } = {},
+) {
   const sources = legacySourceList(input);
   const sourceLabel = (source) => {
     const name = String(source?.bookSourceName || source?.sourceName || source?.name || "").trim();
@@ -1117,9 +1438,12 @@ export async function filterReachableSources(input, config, { onProgress = null 
         });
       } catch { /* ignore */ }
     }
-    return { input, skipped: [] };
+    return { input, skipped: [], unconfirmed: [], warnings: [] };
   }
   const results = new Array(sources.length);
+  const unconfirmedOrigins = new Array(sources.length).fill(false);
+  const rejectedReasons = new Array(sources.length).fill("");
+  const deepProbeFailures = new Array(sources.length).fill(false);
   const originTasks = new Map();
   const deepTasks = new Map();
   let cursor = 0;
@@ -1150,17 +1474,24 @@ export async function filterReachableSources(input, config, { onProgress = null 
       cursor += 1;
       const source = sources[index];
       const label = sourceLabel(source);
-      const candidateOrigins = sourceOriginCandidates(source).map((url) => url.origin);
-      const key = candidateOrigins.length
-        ? candidateOrigins.join("|")
-        : String(source?.bookSourceUrl || source?.sourceUrl || source?.url || "");
+      const key = sourcePreflightKey(source);
       active.add(label);
       report();
       try {
         if (!originTasks.has(key)) originTasks.set(key, sourceOriginReachable(source, config));
         const reachableOrigin = await originTasks.get(key);
         if (!reachableOrigin) {
-          results[index] = false;
+          // A timeout/reset/DNS race is not enough evidence to call a source
+          // dead. Keep valid HTTP(S) candidates in the normal conversion and
+          // repair chain; only a source with no usable URL can be rejected at
+          // preflight.
+          if (sourceOriginCandidates(source).length) {
+            results[index] = source;
+            unconfirmedOrigins[index] = true;
+          } else {
+            results[index] = false;
+            rejectedReasons[index] = "源没有有效的 HTTP(S) 入口地址，无法进入站点转换";
+          }
           continue;
         }
         const preparedSource = sourceWithReachableOrigin(source, reachableOrigin);
@@ -1173,13 +1504,26 @@ export async function filterReachableSources(input, config, { onProgress = null 
           preparedSource?.chapterContent || null,
           preparedSource?.httpHeaders || null,
         ]);
-        if (!deepTasks.has(chainKey)) deepTasks.set(chainKey, sourceBridgeChainReachable(preparedSource, config));
-        results[index] = await deepTasks.get(chainKey) ? preparedSource : false;
+        if (!deepTasks.has(chainKey)) {
+          deepTasks.set(chainKey, sourceBridgeChainReachable(preparedSource, config, bridgeExecutor));
+        }
+        const chainReachable = await deepTasks.get(chainKey);
+        if (!chainReachable) deepProbeFailures[index] = true;
+        // A stale category/chapter rule is precisely what conversion and
+        // generic recognition are supposed to repair. Deep preflight is only
+        // a diagnostic; it must never discard an origin that answered.
+        results[index] = preparedSource;
       } catch {
-        // A timeout, TLS reset, or rate-limit disconnect must only reject this
-        // source. Letting one upstream socket error reject a worker used to
-        // abort an entire aggregate import.
-        results[index] = false;
+        // A timeout, TLS reset, or rate-limit disconnect is inconclusive, not
+        // proof of an inaccessible origin. Defer any valid HTTP(S) source to
+        // the normal converter and full-chain verification.
+        if (sourceOriginCandidates(source).length) {
+          results[index] = source;
+          unconfirmedOrigins[index] = true;
+        } else {
+          results[index] = false;
+          rejectedReasons[index] = "源没有有效的 HTTP(S) 入口地址，无法进入站点转换";
+        }
       } finally {
         processed += 1;
         active.delete(label);
@@ -1190,18 +1534,51 @@ export async function filterReachableSources(input, config, { onProgress = null 
   await Promise.all(workers);
   const reachable = [];
   const skipped = [];
+  const warnings = [];
+  const unconfirmed = [];
   sources.forEach((source, index) => {
     if (results[index]) reachable.push(results[index]);
     else {
+      const origin = sourceOriginCandidates(source)[0]?.hostname || "";
       skipped.push({
         source: String(source?.bookSourceName || source?.sourceName || source?.name || "未命名书源"),
-        reason: config.preflightDeep
-          ? "上游站点不可访问，或核心分类/章节链路没有数据"
-          : "上游站点不可访问",
+        reason: rejectedReasons[index] || "源没有有效的 HTTP(S) 入口地址，无法进入站点转换",
+        sourceType: inferSourceKind(source).kind,
+        ...(origin ? { host: origin } : {}),
+        stage: rejectedReasons[index] ? "preflight-invalid-origin" : "preflight-origin",
+      });
+      return;
+    }
+    if (unconfirmedOrigins[index]) {
+      const origin = sourceOriginCandidates(source)[0]?.origin || "";
+      const item = {
+        source: String(source?.bookSourceName || source?.sourceName || source?.name || "未命名书源"),
+        reason: "预检未收到上游 HTTP 响应，尚不能判定站点不可访问；保留继续转换和完整验链",
+        sourceType: inferSourceKind(source).kind,
+        ...(origin ? { host: new URL(origin).hostname } : {}),
+        stage: "preflight-unconfirmed",
+      };
+      unconfirmed.push(item);
+      warnings.push({
+        source: item.source,
+        section: "preflight",
+        field: "origin",
+        message: item.reason,
+        rule: origin,
+      });
+    }
+    if (deepProbeFailures[index]) {
+      const origin = sourceOriginCandidates(source)[0]?.origin || "";
+      warnings.push({
+        source: String(source?.bookSourceName || source?.sourceName || source?.name || "未命名书源"),
+        section: "preflight",
+        field: "original-chain",
+        message: "上游已响应，但原分类/章节规则快速探测未通过；保留该源继续转换和通用识站",
+        rule: origin,
       });
     }
   });
-  return { input: reachable, skipped };
+  return { input: reachable, skipped, unconfirmed, warnings };
 }
 
 function normalizeRemoteUrl(value) {
@@ -1508,8 +1885,11 @@ function adapterRequestFromRequest(request) {
         : parsed.pathname === "/adapter/toc" ? "toc-redirect"
           : parsed.pathname === "/adapter/books" ? "bridge-books"
             : parsed.pathname === "/adapter/detail" ? "bridge-detail"
-            : parsed.pathname === "/adapter/chapters" ? "bridge-chapters"
-              : parsed.pathname === "/adapter/text" ? "bridge-text"
+              : parsed.pathname === "/adapter/chapters" ? "bridge-chapters"
+                : parsed.pathname === "/adapter/text" ? "bridge-text"
+                : parsed.pathname === "/adapter/content" ? "content"
+                  : parsed.pathname === "/adapter/chapter-list" ? "chapter-list"
+                    : parsed.pathname === "/adapter/search" ? "search"
       : "";
   if (!type) return null;
   let extractionPlan;
@@ -1517,6 +1897,9 @@ function adapterRequestFromRequest(request) {
   let catalogPlan;
   let requestPlan;
   let ssrEpisodePlan;
+  let contentPlan;
+  let searchPlan;
+  let requestHeaders;
   try {
     extractionPlan = type === "page-media"
       ? decodeMediaExtractionPlan(parsed.searchParams.get("plan") || "", parsed.searchParams.get("kind") || "audio")
@@ -1525,6 +1908,12 @@ function adapterRequestFromRequest(request) {
     if (type === "catalog") catalogPlan = decodeCatalogPlan(parsed.searchParams.get("plan") || "");
     if (type === "signed-request") requestPlan = decodeSignedRequestPlan(parsed.searchParams.get("plan") || "");
     if (type === "episode-list") ssrEpisodePlan = decodeSsrEpisodePlan(parsed.searchParams.get("plan") || "");
+    if (type === "content") contentPlan = decodeContentPlan(parsed.searchParams.get("plan") || "");
+    if (type === "chapter-list") contentPlan = decodeChapterCatalogPlan(parsed.searchParams.get("plan") || "");
+    if (type === "search") searchPlan = decodeSearchPlan(parsed.searchParams.get("plan") || "");
+    requestHeaders = ["page-media", "page-images"].includes(type)
+      ? decodeAdapterRequestHeaders(parsed.searchParams.get("requestHeaders") || "")
+      : {};
   } catch (error) {
     throw new HttpError(400, error.message);
   }
@@ -1538,6 +1927,7 @@ function adapterRequestFromRequest(request) {
   return {
     type,
     sourceUrl: type.startsWith("bridge-") ? rawSourceUrl : (parsed.searchParams.get("url") || parsed.searchParams.get("u") || ""),
+    context: parsed.searchParams.get("context") || "",
     referer: parsed.searchParams.get("referer") || parsed.searchParams.get("ref") || "",
     entityId: parsed.searchParams.get("entityId") || "",
     hint: parsed.searchParams.get("hint") || "",
@@ -1548,10 +1938,14 @@ function adapterRequestFromRequest(request) {
       ? parsed.searchParams.get("kind")
       : "text",
     extractionPlan,
+    requestHeaders,
     bridgePlan,
     catalogPlan,
     requestPlan,
     ssrEpisodePlan,
+    contentPlan,
+    chapterPlan: type === "chapter-list" ? contentPlan : null,
+    searchPlan,
     keyWord: parsed.searchParams.get("keyWord") || "",
     value: parsed.searchParams.get("value") || "",
     page: parsed.searchParams.get("page") || parsed.searchParams.get("pageIndex") || "1",
@@ -1637,6 +2031,60 @@ function withoutCookieMediaPlan(plan) {
     },
     removed: true,
   };
+}
+
+function decodeAdapterRequestHeaders(rawValue) {
+  const text = String(rawValue || "");
+  if (!text) return {};
+  if (Buffer.byteLength(text, "utf8") > 8_192) throw new HttpError(400, "动态请求头过大");
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new HttpError(400, "动态请求头不是有效 JSON");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError(400, "动态请求头格式无效");
+  }
+  const entries = Object.entries(value);
+  if (entries.length > 16) throw new HttpError(400, "动态请求头数量超限");
+  const blocked = /^(?:host|content-length|transfer-encoding|connection|te|trailer|upgrade|expect|proxy-|sec-websocket-)/i;
+  const headers = {};
+  const names = new Set();
+  let totalBytes = 0;
+  for (const [name, rawHeaderValue] of entries) {
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || blocked.test(name)) {
+      throw new HttpError(400, "动态请求头名称不允许");
+    }
+    if (!["string", "number", "boolean"].includes(typeof rawHeaderValue)) {
+      throw new HttpError(400, "动态请求头值必须是标量");
+    }
+    const lowerName = name.toLowerCase();
+    if (names.has(lowerName)) throw new HttpError(400, "动态请求头名称重复");
+    names.add(lowerName);
+    const headerValue = String(rawHeaderValue);
+    const valueBytes = Buffer.byteLength(headerValue, "utf8");
+    if (/[\0\r\n]/.test(headerValue) || valueBytes > 2_048) {
+      throw new HttpError(400, "动态请求头值无效");
+    }
+    totalBytes += Buffer.byteLength(name, "utf8") + valueBytes;
+    if (totalBytes > 8_192) throw new HttpError(400, "动态请求头总长度超限");
+    headers[name] = headerValue;
+  }
+  return headers;
+}
+
+function mergeRequestHeaders(...sources) {
+  const headers = {};
+  for (const source of sources) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) continue;
+    for (const [name, value] of Object.entries(source)) {
+      const previous = Object.keys(headers).find((key) => key.toLowerCase() === name.toLowerCase());
+      if (previous) delete headers[previous];
+      headers[name] = value;
+    }
+  }
+  return headers;
 }
 
 export function pageTocUrl(page, baseUrl, hint = "", selector = "") {
@@ -1736,6 +2184,18 @@ function publicBaseUrl(request) {
       ? (forwarded || "http")
       : "https";
   return `${protocol}://${host}`;
+}
+
+function isInternalAdapterUrl(targetUrl, adapterBase) {
+  try {
+    const target = new URL(String(targetUrl));
+    const base = new URL(String(adapterBase));
+    return target.origin === base.origin
+      && isLoopbackHost(target.hostname)
+      && /^\/adapter\//i.test(target.pathname);
+  } catch {
+    return false;
+  }
 }
 
 function shouldRebaseLibraryToRequestBase(request) {
@@ -1873,7 +2333,7 @@ function libraryIdFromPath(pathname) {
 }
 
 function jobIdFromPath(pathname) {
-  const match = String(pathname || "").match(/^\/api\/jobs\/([A-Za-z0-9_-]+)(?:\/(retry|publish|rebase))?$/);
+  const match = String(pathname || "").match(/^\/api\/jobs\/([A-Za-z0-9_-]+)(?:\/(retry|pause|publish|rebase))?$/);
   if (!match) return null;
   return { id: match[1], action: match[2] || "" };
 }
@@ -2382,6 +2842,7 @@ export function comicPageUrls(page, requestUrl, maxPages = 50) {
 function imageDecoderScriptCandidates(page, baseUrl) {
   const candidates = [];
   const seen = new Set();
+  const embeddedDecoderPayload = /(?:\bparams\s*=\s*["'][A-Za-z0-9+/]{128,}|chapter[_-]?images|chapter-images|encrypted(?:Data|Payload))/i.test(String(page || ""));
   const document = new JSDOM(String(page || ""), { url: baseUrl }).window.document;
   for (const element of document.querySelectorAll("script[src], link[rel='preload'][as='script'][href]")) {
     const raw = element.getAttribute("src") || element.getAttribute("href");
@@ -2395,9 +2856,13 @@ function imageDecoderScriptCandidates(page, baseUrl) {
     if (/(?:decrypt|decipher|decode|crypto|cipher)/i.test(identity)) score += 200;
     if (/(?:chapter|reader|image|comic|picture|\bpic\b)/i.test(identity)) score += 80;
     if (/(?:jquery|swiper|toastr|template|validator|common|analytics)/i.test(filename)) score -= 100;
+    // Some CMS bundles put the only decoder in a neutral filename (for
+    // example `cms.min.js`). When the page embeds a large encrypted payload,
+    // retain a bounded set of non-framework scripts for sandbox inspection.
+    if (score === 0 && embeddedDecoderPayload) score += 10;
     if (score > 0) candidates.push({ url, score });
   }
-  return candidates.sort((left, right) => right.score - left.score).slice(0, 4);
+  return candidates.sort((left, right) => right.score - left.score).slice(0, 8);
 }
 
 async function imageDecoderContextSource(page, baseUrl, config) {
@@ -2497,6 +2962,8 @@ async function dynamicScriptPageImages(page, pageUrl, extractionPlan, config) {
   const context = pageScriptLiteralContext(page);
   if (!context.source) return [];
   const decoders = [];
+  const declaredDecoder = String(extractionPlan?.decoder || "").trim();
+  if (declaredDecoder && declaredDecoder !== "auto") decoders.push(declaredDecoder);
   for (const candidate of imageDecoderScriptCandidates(page, pageUrl)) {
     for (const decoder of await cachedScriptImageDecoder(candidate.url, config, context.source)) {
       if (!decoders.includes(decoder)) decoders.push(decoder);
@@ -2504,7 +2971,11 @@ async function dynamicScriptPageImages(page, pageUrl, extractionPlan, config) {
   }
   if (!decoders.length) return [];
   const payloads = context.values.filter((value) => (
-    value.length >= 128 && value.length <= 4 * 1024 * 1024 && /^[A-Za-z0-9+/]+={0,2}$/.test(value)
+    // A short chapter (or a small fixture) can legitimately contain only a
+    // couple of image URLs. The decoder is still verified by JSON structure
+    // and the real first image, so requiring a large ciphertext drops valid
+    // manifests unnecessarily.
+    value.length >= 32 && value.length <= 4 * 1024 * 1024 && /^[A-Za-z0-9+/]+={0,2}$/.test(value)
   ));
   for (const encoded of payloads) {
     const encrypted = Buffer.from(encoded, "base64");
@@ -2522,7 +2993,7 @@ async function dynamicScriptPageImages(page, pageUrl, extractionPlan, config) {
   return [];
 }
 
-async function verifiedPageImageDecoder(page, pageUrl, urls, config) {
+async function verifiedPageImageDecoder(page, pageUrl, urls, config, extractionPlan = null) {
   const firstUrl = urls?.[0];
   if (!firstUrl) return "auto";
   try {
@@ -2531,6 +3002,16 @@ async function verifiedPageImageDecoder(page, pageUrl, urls, config) {
   } catch {
     // Encrypted bytes and anti-leech failures both require a declared decoder
     // that succeeds against the actual first generated image request.
+  }
+  const declaredDecoder = String(extractionPlan?.decoder || "").trim();
+  if (declaredDecoder && declaredDecoder !== "auto") {
+    try {
+      await downloadImage(firstUrl, declaredDecoder, config, pageUrl);
+      return declaredDecoder;
+    } catch {
+      // Keep inspecting page scripts; a source can declare a stale decoder
+      // while the current page exposes a newer generic one.
+    }
   }
   const context = pageScriptLiteralContext(page);
   const dependencySource = await imageDecoderContextSource(page, pageUrl, config);
@@ -2550,14 +3031,20 @@ async function verifiedPageImageDecoder(page, pageUrl, urls, config) {
   return "";
 }
 
-async function downloadComicImageSequence(sourceUrl, config, extractionPlan, contextUrl = sourceUrl) {
+async function downloadComicImageSequence(
+  sourceUrl,
+  config,
+  extractionPlan,
+  contextUrl = sourceUrl,
+  initialRequestHeaders = extractionPlan?.headers,
+) {
   if (/\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(sourceUrl)) {
     return { urls: [sourceUrl], decoder: "auto" };
   }
   const maxPages = Number.isInteger(config.maxComicPages) ? config.maxComicPages : 50;
   const maxImages = Number.isInteger(config.maxComicImages) ? config.maxComicImages : 2_000;
   const concurrency = Number.isInteger(config.comicPageConcurrency) ? config.comicPageConcurrency : 4;
-  const firstPage = await downloadSource(sourceUrl, config, extractionPlan?.headers);
+  const firstPage = await downloadSource(sourceUrl, config, initialRequestHeaders);
   const firstText = firstPage.toString("utf8");
   let decoderPage = firstText;
   let decoderPageUrl = sourceUrl;
@@ -2599,6 +3086,7 @@ async function downloadComicImageSequence(sourceUrl, config, extractionPlan, con
     const dynamic = await dynamicComicApiImages(firstText, sourceUrl, {
       download: createSourceDownloader(config),
       headers: extractionPlan?.headers || {},
+      responseHeaders: firstPage.httpHeaders || {},
       maxImages,
       maxRequests: maxPages,
       concurrency,
@@ -2608,7 +3096,10 @@ async function downloadComicImageSequence(sourceUrl, config, extractionPlan, con
   const followingPages = comicPageUrls(sequenceText, sequenceUrl, maxPages);
   if (!followingPages.length) {
     const urls = firstImages.slice(0, maxImages);
-    return { urls, decoder: await verifiedPageImageDecoder(decoderPage, decoderPageUrl, urls, config) };
+    return {
+      urls,
+      decoder: await verifiedPageImageDecoder(decoderPage, decoderPageUrl, urls, config, extractionPlan),
+    };
   }
 
   const pageResults = Array.from({ length: followingPages.length }, () => []);
@@ -2637,7 +3128,10 @@ async function downloadComicImageSequence(sourceUrl, config, extractionPlan, con
     images.push(url);
     if (images.length >= maxImages) break;
   }
-  return { urls: images, decoder: await verifiedPageImageDecoder(decoderPage, decoderPageUrl, images, config) };
+  return {
+    urls: images,
+    decoder: await verifiedPageImageDecoder(decoderPage, decoderPageUrl, images, config, extractionPlan),
+  };
 }
 
 const AUDIO_ONLY_EXTENSION = /\.(?:aac|flac|m4a|m4b|mp3|oga|ogg|opus|wav)(?:[?#]|$)/i;
@@ -2736,7 +3230,8 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
     const transformedValue = plan.resultPrefix && value != null && !/^(?:https?:)?\/\//i.test(String(value).trim())
       ? `${plan.resultPrefix}${String(value)}`
       : value;
-    const url = normalizedMediaUrl(transformedValue, baseUrl, kind, { allowGeneric: allowGeneric || hints.has(key) || semantic });
+    const decodedValue = decodeEmbeddedMediaUrl(transformedValue, baseUrl, kind) || transformedValue;
+    const url = normalizedMediaUrl(decodedValue, baseUrl, kind, { allowGeneric: allowGeneric || hints.has(key) || semantic });
     if (!url || candidates.has(url)) return;
     const extension = mediaExtensionPattern(kind).test(url);
     // Chapter HTML (and mobile alternate twins with the same path) are never media.
@@ -2816,14 +3311,8 @@ export function pageMediaUrls(page, baseUrl, extractionPlan = null) {
   for (const match of text.matchAll(/(["'])([A-Za-z0-9+/_-]{32,4096}={0,2})\1/g)) {
     const encoded = match[2];
     if (encoded.length % 4 === 1) continue;
-    let decoded = "";
-    try {
-      decoded = Buffer.from(encoded.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8").trim();
-    } catch {
-      continue;
-    }
-    if (!/^https?:\/\/[^\s<>"']+$/i.test(decoded) || !mediaExtensionPattern(kind).test(decoded)) continue;
-    add("media", decoded, true);
+    const decoded = decodeEmbeddedMediaUrl(encoded, baseUrl, kind);
+    if (decoded) add("media", decoded, true);
   }
   for (const match of text.replace(/\\\//g, "/").matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
     // sourceRegex-derived extension hints (e.g. ".mp3") promote matching URLs
@@ -2921,17 +3410,60 @@ export function createAppServer(options = {}) {
   const cache = new Map();
   const pendingConversions = new Map();
   let active = 0;
+  // Aggregate verification can run more workers than the external request
+  // budget. Its workers call this service's own adapter endpoints, so those
+  // adapters must not reject the verifier's configured parallelism with 429.
+  const adapterMaxConcurrent = Math.max(
+    1,
+    Number(config.maxConcurrent) || 1,
+    Number(config.verifyWorkers) || 1,
+    Number(config.jobVerifyWorkers) || 1,
+  );
   const publicDir = path.resolve(config.publicDir || DEFAULT_PUBLIC_DIR);
   const store = options.store || createLibraryStore(config.dataDir);
+  const aiSettingsStore = options.aiSettingsStore || createAiSettingsStore(config.dataDir);
+  const aiSemaphore = typeof SharedArrayBuffer === "undefined" ? null : new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT);
+  let aiSettingsLoad = null;
+  const loadAiSettings = async () => {
+    if (!aiSettingsLoad) {
+      aiSettingsLoad = aiSettingsStore.get().then((settings) => {
+        config.aiSettings = {
+          ...settings,
+          cliSocketPath: path.join(config.dataDir, "private-settings", "agent.sock"),
+          allowDnsProxyNetworks: Boolean(config.allowDnsProxyNetworks),
+          ...(aiSemaphore ? { semaphore: aiSemaphore } : {}),
+        };
+        return config.aiSettings;
+      }).catch((error) => {
+        aiSettingsLoad = null;
+        throw error;
+      });
+    }
+    return aiSettingsLoad;
+  };
   const convertRemoteSource = options.convertOnlineSource || convertOnlineSource;
+  const bridgeExecutor = options.bridgeExecutor || createBridgeExecutor({
+    concurrency: config.bridgeWorkers,
+    timeoutMs: config.bridgeExecutionTimeoutMs,
+  });
   const worker = options.worker || createJobWorker({
     store,
     config,
     concurrency: config.jobConcurrency,
     downloadSource,
+    isolate: config.jobIsolation,
   });
   if (options.recoverJobs === true) {
-    void store.ensure().then(() => worker.recover()).catch((error) => {
+    const recoverOrPause = async () => {
+      await store.ensure();
+      if (config.jobAutostart) {
+        await loadAiSettings();
+        await worker.recover();
+      } else if (typeof worker.pauseRecoverable === "function") {
+        await worker.pauseRecoverable();
+      }
+    };
+    void recoverOrPause().catch((error) => {
       process.stderr.write(`library recover failed: ${error.message}\n`);
     });
   }
@@ -2939,7 +3471,7 @@ export function createAppServer(options = {}) {
   const server = createServer(async (request, response) => {
     const commonHeaders = {
       "Access-Control-Allow-Origin": config.corsOrigin,
-      "Access-Control-Allow-Methods": "GET,HEAD,POST,DELETE,OPTIONS",
+      "Access-Control-Allow-Methods": "GET,HEAD,POST,PUT,DELETE,OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type,If-None-Match,Authorization,X-Admin-Token",
       "X-Content-Type-Options": "nosniff",
     };
@@ -2950,8 +3482,8 @@ export function createAppServer(options = {}) {
         return;
       }
       const method = request.method || "GET";
-      const allowed = new Set(["GET", "HEAD", "POST", "DELETE"]);
-      if (!allowed.has(method)) throw new HttpError(405, "仅支持 GET、HEAD、POST、DELETE 和 OPTIONS");
+      const allowed = new Set(["GET", "HEAD", "POST", "PUT", "DELETE"]);
+      if (!allowed.has(method)) throw new HttpError(405, "仅支持 GET、HEAD、POST、PUT、DELETE 和 OPTIONS");
       const pathname = new URL(request.url || "/", "http://read2xsgg.local").pathname;
       if (pathname === "/healthz") {
         sendJson(response, 200, { status: "ok" }, commonHeaders);
@@ -3021,8 +3553,77 @@ export function createAppServer(options = {}) {
         return;
       }
 
+      if (pathname === "/api/settings/ai" || pathname === "/api/settings/ai/test" || pathname === "/api/settings/ai/models" || pathname === "/api/settings/mcp/test") {
+        requireAdmin(request, config);
+        let settings = await loadAiSettings();
+        if (pathname === "/api/settings/ai" && (method === "GET" || method === "HEAD")) {
+          sendJson(response, 200, { settings: publicAiSettings(settings) }, commonHeaders);
+          return;
+        }
+        if (pathname === "/api/settings/ai" && method === "PUT") {
+          const raw = await readRequestBody(request, { maxBytes: 24 * 1024 });
+          let body = {};
+          try { body = raw.length ? JSON.parse(raw.toString("utf8")) : {}; } catch { throw new HttpError(400, "请求体必须是 JSON"); }
+          try {
+            const saved = await aiSettingsStore.save({
+              enabled: body.enabled,
+              provider: body.provider,
+              baseUrl: body.baseUrl,
+              model: body.model,
+              reasoningEffort: body.reasoningEffort,
+              apiKey: body.apiKey,
+              clearApiKey: body.clearApiKey,
+              localBaseUrl: body.localBaseUrl,
+              localModel: body.localModel,
+              localReasoningEffort: body.localReasoningEffort,
+              cliClient: body.cliClient,
+              cliModel: body.cliModel,
+              cliReasoningEffort: body.cliReasoningEffort,
+              timeoutMs: body.timeoutMs,
+              maxAttempts: body.maxAttempts,
+              concurrency: body.concurrency,
+            });
+            settings = {
+              ...saved,
+              cliSocketPath: path.join(config.dataDir, "private-settings", "agent.sock"),
+              allowDnsProxyNetworks: Boolean(config.allowDnsProxyNetworks),
+              ...(aiSemaphore ? { semaphore: aiSemaphore } : {}),
+            };
+            config.aiSettings = settings;
+            aiSettingsLoad = Promise.resolve(settings);
+          } catch (error) {
+            if (error instanceof AiSettingsError) throw new HttpError(400, error.message);
+            throw error;
+          }
+          sendJson(response, 200, { settings: publicAiSettings(settings) }, commonHeaders);
+          return;
+        }
+        if (pathname === "/api/settings/ai/test" && method === "POST") {
+          if (!aiProviderConfigured(settings)) throw new HttpError(400, "请先完成当前 AI 接入方式的配置");
+          let result;
+          try { result = await probeAiProvider(settings); } catch (error) { throw new HttpError(502, error?.message || "AI 服务测试失败"); }
+          sendJson(response, 200, { ok: true, model: result.model, reasoningEffort: result.reasoningEffort, response: result.response }, commonHeaders);
+          return;
+        }
+        if (pathname === "/api/settings/ai/models" && method === "GET") {
+          const provider = new URL(request.url || "/", "http://read2xsgg.local").searchParams.get("provider") || settings.provider;
+          if (!["api", "local-http", "cli"].includes(provider)) throw new HttpError(400, "不支持的 AI 接入方式");
+          let result;
+          try { result = await listAiModels({ ...settings, provider }); } catch (error) { throw new HttpError(502, error?.message || "读取模型列表失败"); }
+          sendJson(response, 200, result, commonHeaders);
+          return;
+        }
+        if (pathname === "/api/settings/mcp/test" && method === "POST") {
+          try { await browserExecutable(); } catch (error) { throw new HttpError(502, error?.message || "内置浏览器检查失败"); }
+          sendJson(response, 200, { ok: true, mode: "builtin", automatic: true, toolCount: 3 }, commonHeaders);
+          return;
+        }
+        throw new HttpError(405, "设置接口不支持该方法");
+      }
+
       if (pathname === "/api/jobs" || pathname.startsWith("/api/jobs/")) {
         requireAdmin(request, config);
+        await loadAiSettings();
         if (pathname === "/api/jobs") {
           if (method === "GET" || method === "HEAD") {
             const jobs = await store.listJobs();
@@ -3052,9 +3653,11 @@ export function createAppServer(options = {}) {
               name: body.name || "",
               imageProxyBase: publicBaseUrl(request),
             });
-            worker.enqueue(job.id);
-            void worker.syncQueued?.();
-            sendJson(response, 202, job, commonHeaders);
+            if (!job.reused) {
+              worker.enqueue(job.id);
+              void worker.syncQueued?.();
+            }
+            sendJson(response, job.reused ? 200 : 202, job, commonHeaders);
             return;
           }
           throw new HttpError(405, "不支持的方法");
@@ -3074,12 +3677,36 @@ export function createAppServer(options = {}) {
             startedAt: null,
             count: null,
             fallbackCount: 0,
+            aiAttemptCount: 0,
+            aiRepairCount: 0,
             skippedBuckets: {},
-            progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, failed: 0 },
+            skippedReasons: {},
+            skippedSources: [],
+            progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, aiAttemptsTotal: 0, aiRepaired: 0, failed: 0 },
           });
           worker.cancel?.(jobRoute.id);
           worker.enqueue(jobRoute.id);
           sendJson(response, 202, next, commonHeaders);
+          return;
+        }
+        if (jobRoute.action === "pause") {
+          if (method !== "POST") throw new HttpError(405, "暂停仅支持 POST");
+          const job = await store.getJob(jobRoute.id);
+          if (!job) throw new HttpError(404, "任务不存在");
+          if (!["queued", "running"].includes(job.status)) throw new HttpError(409, "只有排队或运行中的任务可以暂停");
+          let paused;
+          if (typeof worker.pause === "function") {
+            paused = await worker.pause(jobRoute.id);
+          } else {
+            worker.cancel?.(jobRoute.id);
+            paused = await store.updateJob(jobRoute.id, {
+              status: "paused",
+              phase: "paused",
+              error: "",
+              pausedAt: new Date().toISOString(),
+            });
+          }
+          sendJson(response, 200, paused || await store.getJob(jobRoute.id), commonHeaders);
           return;
         }
         if (jobRoute.action === "publish") {
@@ -3212,10 +3839,37 @@ export function createAppServer(options = {}) {
           response.end(body);
           return;
         }
+        if (adapterTarget.type === "search") {
+          if (!adapterTarget.searchPlan) throw new HttpError(400, "缺少搜索桥接计划");
+          if (active >= adapterMaxConcurrent) throw new HttpError(429, "当前搜索解析任务过多，请稍后重试");
+          active += 1;
+          let body;
+          try {
+            body = await executeSearchPlan(adapterTarget.searchPlan, {
+              keyWord: adapterTarget.keyWord,
+              pageIndex: adapterTarget.page,
+              value: adapterTarget.value,
+              download: createSourceDownloader(config),
+            });
+          } catch (error) {
+            if (error instanceof HttpError) throw error;
+            throw new HttpError(422, `搜索桥接解析失败：${error.message}`);
+          } finally {
+            active -= 1;
+          }
+          response.writeHead(200, {
+            ...commonHeaders,
+            "Content-Type": body.httpHeaders?.["content-type"] || "text/html; charset=utf-8",
+            "Content-Length": body.length,
+            "Cache-Control": "no-store",
+          });
+          response.end(body);
+          return;
+        }
         if (adapterTarget.type === "catalog") {
           if (!adapterTarget.catalogPlan) throw new HttpError(400, "缺少分类目录计划");
           if (!adapterTarget.entityId) throw new HttpError(400, "缺少 entityId");
-          if (active >= config.maxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
+          if (active >= adapterMaxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
           active += 1;
           try {
             const download = createSourceDownloader(config);
@@ -3231,9 +3885,56 @@ export function createAppServer(options = {}) {
           }
           return;
         }
+        if (adapterTarget.type === "chapter-list") {
+          const input = adapterTarget.value || adapterTarget.sourceUrl || "";
+          if (!adapterTarget.chapterPlan) throw new HttpError(400, "缺少章节目录计划");
+          if (!input) throw new HttpError(400, "缺少章节目录地址或参数");
+          if (active >= adapterMaxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
+          active += 1;
+          let output;
+          try {
+            output = await executeChapterCatalogPlan(adapterTarget.chapterPlan, {
+              sourceUrl: adapterTarget.sourceUrl || (adapterTarget.chapterPlan.input === "url" ? input : ""),
+              value: input,
+              download: createSourceDownloader(config),
+            });
+          } catch (error) {
+            if (error instanceof HttpError) throw error;
+            throw new HttpError(422, `章节目录桥接解析失败：${error.message}`);
+          } finally {
+            active -= 1;
+          }
+          sendJson(response, 200, output, { ...commonHeaders, "Cache-Control": "no-store" });
+          return;
+        }
+        if (adapterTarget.type === "content") {
+          const input = adapterTarget.value || adapterTarget.sourceUrl || "";
+          if (!input) throw new HttpError(400, "缺少待解析章节地址或参数");
+          if (active >= adapterMaxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
+          active += 1;
+          let content;
+          try {
+            content = await executeContentPlan(adapterTarget.contentPlan, {
+              sourceUrl: adapterTarget.sourceUrl || adapterTarget.context || (adapterTarget.contentPlan?.input === "url" ? input : ""),
+              value: input,
+              download: createSourceDownloader(config),
+            });
+          } catch (error) {
+            if (error instanceof HttpError) throw error;
+            throw new HttpError(422, `正文桥接解析失败：${error.message}`);
+          } finally {
+            active -= 1;
+          }
+          sendJson(response, 200, { content }, { ...commonHeaders, "Cache-Control": "no-store" });
+          return;
+        }
         if (!adapterTarget.sourceUrl) throw new HttpError(400, "缺少待解析页面 URL");
-        if (active >= config.maxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
+        if (active >= adapterMaxConcurrent) throw new HttpError(429, "当前章节解析任务过多，请稍后重试");
         let requestedSourceUrl = adapterTarget.sourceUrl;
+        const embeddedRequest = adapterTarget.bridgePlan
+          ? parseRequestDescriptor(requestedSourceUrl)
+          : null;
+        if (embeddedRequest?.url) requestedSourceUrl = embeddedRequest.url;
         if (adapterTarget.bridgePlan) {
           try {
             requestedSourceUrl = adapterTarget.bridgePlan.host
@@ -3252,15 +3953,26 @@ export function createAppServer(options = {}) {
             const charset = adapterTarget.bridgePlan.charset || "";
             const htmlBudget = config.maxBridgeHtmlBytes;
             const paging = bridgePageOptions(adapterTarget, config);
-            const htmlCacheKey = `bridge-html:${adapterTarget.type}:${pageUrl}:${charset}:${adapterTarget.bridgePlan?.list || ""}`;
+            const embeddedRequestKey = embeddedRequest?.options
+              ? createHash("sha1").update(JSON.stringify(embeddedRequest.options)).digest("hex")
+              : "";
+            const htmlCacheKey = `bridge-html:${adapterTarget.type}:${pageUrl}:${charset}:${embeddedRequestKey}:${adapterTarget.bridgePlan?.list || ""}`;
             let html = "";
             const cachedHtml = config.cacheTtlMs > 0 ? cache.get(htmlCacheKey) : null;
             if (cachedHtml && cachedHtml.expiresAt > Date.now()) {
               html = cachedHtml.value;
             } else {
               if (cachedHtml) cache.delete(htmlCacheKey);
-              const page = await downloadSource(pageUrl, config, refreshEphemeralHeaders(adapterTarget.bridgePlan.headers));
-              html = prepareBridgeHtml(page, charset, htmlBudget);
+              const page = await downloadSource(
+                pageUrl,
+                config,
+                refreshEphemeralHeaders({
+                  ...adapterTarget.bridgePlan.headers,
+                  ...(embeddedRequest?.headers || {}),
+                }),
+                embeddedRequest?.options || {},
+              );
+              html = prepareBridgeHtml(page, charset, htmlBudget, adapterTarget.bridgePlan);
               cacheSet(cache, htmlCacheKey, html, config);
             }
             let followedPageLink = false;
@@ -3273,7 +3985,7 @@ export function createAppServer(options = {}) {
                   config,
                   refreshEphemeralHeaders(adapterTarget.bridgePlan.headers),
                 );
-                html = prepareBridgeHtml(linkedPage, charset, htmlBudget);
+                html = prepareBridgeHtml(linkedPage, charset, htmlBudget, adapterTarget.bridgePlan);
                 pageUrl = normalizedLinkedUrl;
                 followedPageLink = true;
               }
@@ -3293,8 +4005,9 @@ export function createAppServer(options = {}) {
                     ...refreshEphemeralHeaders(adapterTarget.bridgePlan.headers),
                     Referer: pageUrl,
                   });
-                  const tocHtml = prepareBridgeHtml(tocPage, charset, htmlBudget);
-                  const tocOutput = executeBridgePlan(
+                  const tocHtml = prepareBridgeHtml(tocPage, charset, htmlBudget, adapterTarget.bridgePlan);
+                  const tocOutput = await executeBridgePlanForRequest(
+                    bridgeExecutor,
                     tocHtml,
                     tocPageUrl,
                     adapterTarget.bridgePlan,
@@ -3320,10 +4033,11 @@ export function createAppServer(options = {}) {
                   } else {
                     if (cachedToc) cache.delete(tocCacheKey);
                     const tocPage = await downloadSource(tocPageUrl, config, refreshEphemeralHeaders(adapterTarget.bridgePlan.headers));
-                    tocHtml = prepareBridgeHtml(tocPage, charset, htmlBudget);
+                    tocHtml = prepareBridgeHtml(tocPage, charset, htmlBudget, adapterTarget.bridgePlan);
                     cacheSet(cache, tocCacheKey, tocHtml, config);
                   }
-                  const tocOutput = executeBridgePlan(
+                  const tocOutput = await executeBridgePlanForRequest(
+                    bridgeExecutor,
                     tocHtml,
                     tocPageUrl,
                     adapterTarget.bridgePlan,
@@ -3338,7 +4052,8 @@ export function createAppServer(options = {}) {
               }
             }
             if (!output) {
-              output = executeBridgePlan(
+              output = await executeBridgePlanForRequest(
+                bridgeExecutor,
                 html,
                 pageUrl,
                 adapterTarget.bridgePlan,
@@ -3352,6 +4067,7 @@ export function createAppServer(options = {}) {
                 pageUrl,
                 adapterTarget.bridgePlan,
                 config,
+                bridgeExecutor,
               );
               output = applyDetailSemanticFallbacks(output, adapterTarget.bridgePlan.fields);
             }
@@ -3368,8 +4084,9 @@ export function createAppServer(options = {}) {
                 ...refreshEphemeralHeaders(adapterTarget.bridgePlan.headers),
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
               });
-              const desktopHtml = prepareBridgeHtml(desktopPage, charset, htmlBudget);
-              const desktopOutput = executeBridgePlan(
+              const desktopHtml = prepareBridgeHtml(desktopPage, charset, htmlBudget, adapterTarget.bridgePlan);
+              const desktopOutput = await executeBridgePlanForRequest(
+                bridgeExecutor,
                 desktopHtml,
                 pageUrl,
                 adapterTarget.bridgePlan,
@@ -3392,10 +4109,11 @@ export function createAppServer(options = {}) {
                   } else {
                     if (cachedPage1) cache.delete(page1CacheKey);
                     const page1 = await downloadSource(normalizedPage1, config, refreshEphemeralHeaders(adapterTarget.bridgePlan.headers));
-                    page1Html = prepareBridgeHtml(page1, charset, htmlBudget);
+                    page1Html = prepareBridgeHtml(page1, charset, htmlBudget, adapterTarget.bridgePlan);
                     cacheSet(cache, page1CacheKey, page1Html, config);
                   }
-                  const page1Output = executeBridgePlan(
+                  const page1Output = await executeBridgePlanForRequest(
+                    bridgeExecutor,
                     page1Html,
                     normalizedPage1,
                     adapterTarget.bridgePlan,
@@ -3544,20 +4262,27 @@ export function createAppServer(options = {}) {
             const referer = adapterTarget.referer
               ? normalizeRemoteUrl(adapterTarget.referer)
               : sourceUrl;
-            const headers = {
-              ...(adapterTarget.extractionPlan?.headers || {}),
-              ...(/^https?:\/\//i.test(String(referer || "")) ? { Referer: referer } : {}),
-            };
+            let headers = mergeRequestHeaders(
+              adapterTarget.extractionPlan?.headers,
+              adapterTarget.requestHeaders,
+            );
+            const hasDynamicReferer = Object.keys(adapterTarget.requestHeaders || {})
+              .some((name) => name.toLowerCase() === "referer");
+            if (/^https?:\/\//i.test(String(referer || ""))
+              && (!hasDynamicReferer || adapterTarget.referer)) {
+              headers = mergeRequestHeaders(headers, { Referer: referer });
+            }
+            const extractionPlan = adapterTarget.extractionPlan;
             values = await resolveChapterMediaUrls(
               async () => download(sourceUrl, headers),
               sourceUrl,
-              adapterTarget.extractionPlan,
+              extractionPlan,
               download,
               pageMediaUrls,
             );
             if (!values.length) {
               const retryHeaders = withoutCookieHeaders(headers);
-              const retryPlan = withoutCookieMediaPlan(adapterTarget.extractionPlan);
+              const retryPlan = withoutCookieMediaPlan(extractionPlan);
               if (retryHeaders.removed || retryPlan.removed) {
                 values = await resolveChapterMediaUrls(
                   async () => download(sourceUrl, retryHeaders.headers),
@@ -3569,19 +4294,31 @@ export function createAppServer(options = {}) {
               }
             }
           } else if (adapterTarget.type === "page-images") {
+            const extractionPlan = adapterTarget.extractionPlan;
+            const chapterHeaders = mergeRequestHeaders(
+              extractionPlan?.headers,
+              adapterTarget.requestHeaders,
+            );
             const sequence = await downloadComicImageSequence(
               sourceUrl,
               config,
-              adapterTarget.extractionPlan,
+              extractionPlan,
               adapterTarget.referer || sourceUrl,
+              chapterHeaders,
             );
             values = sequence.urls;
             pageImageDecoder = sequence.decoder;
             if (!values?.length) {
-              const detailPage = await downloadSource(sourceUrl, config, adapterTarget.extractionPlan?.headers);
+              const detailPage = await downloadSource(sourceUrl, config, chapterHeaders);
               const detailText = detailPage.toString("utf8");
-              values = pageImageUrls(detailText, sourceUrl, adapterTarget.extractionPlan);
-              pageImageDecoder = await verifiedPageImageDecoder(detailText, sourceUrl, values, config);
+              values = pageImageUrls(detailText, sourceUrl, extractionPlan);
+              pageImageDecoder = await verifiedPageImageDecoder(
+                detailText,
+                sourceUrl,
+                values,
+                config,
+                extractionPlan,
+              );
             }
           }
         } finally {
@@ -3628,7 +4365,7 @@ export function createAppServer(options = {}) {
       const imageTarget = imageRequestFromRequest(request);
       if (imageTarget) {
         if (!imageTarget.imageUrl) throw new HttpError(400, "缺少图片 URL");
-        if (active >= config.maxConcurrent) throw new HttpError(429, "当前图片处理任务过多，请稍后重试");
+        if (active >= adapterMaxConcurrent) throw new HttpError(429, "当前图片处理任务过多，请稍后重试");
         active += 1;
         let image;
         try {
@@ -3650,7 +4387,7 @@ export function createAppServer(options = {}) {
       const mediaTarget = mediaProxyRequestFromRequest(request);
       if (mediaTarget) {
         if (!mediaTarget.mediaUrl) throw new HttpError(400, "缺少媒体 URL");
-        if (active >= config.maxConcurrent) throw new HttpError(429, "当前媒体处理任务过多，请稍后重试");
+        if (active >= adapterMaxConcurrent) throw new HttpError(429, "当前媒体处理任务过多，请稍后重试");
         active += 1;
         let media;
         try {
@@ -3681,15 +4418,26 @@ export function createAppServer(options = {}) {
         active += 1;
         let analyzed;
         try {
-          const download = (targetUrl, headers = {}) => downloadSource(
+          const adapterBase = publicBaseUrl(request);
+          const download = (targetUrl, headers = {}, options = {}) => downloadSource(
             targetUrl,
-            { ...config, fetchTimeoutMs: config.analyzeTimeoutMs },
+            {
+              ...config,
+              fetchTimeoutMs: config.analyzeTimeoutMs,
+              // A local direct request advertises 127.0.0.1 as the converter
+              // origin. Trust only this service's adapter path for its own
+              // analyzer; all upstream targets retain the normal SSRF guard.
+              ...(isInternalAdapterUrl(targetUrl, adapterBase)
+                ? { allowPrivateNetworks: true }
+                : {}),
+            },
             headers,
+            options,
           );
           analyzed = await analyzeSite(target.siteUrl, {
             download,
             timeoutMs: config.analyzeTimeoutMs,
-            adapterBase: publicBaseUrl(request),
+            adapterBase,
           });
         } finally {
           active -= 1;
@@ -3806,8 +4554,10 @@ export function createAppServer(options = {}) {
     }
   });
 
+  server.on("close", () => bridgeExecutor.close?.());
   server.libraryStore = store;
   server.jobWorker = worker;
+  server.bridgeExecutor = bridgeExecutor;
   return server;
 }
 

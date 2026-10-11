@@ -10,15 +10,15 @@ export function visibleText(node) {
 
 export function bookNameSelector() {
   return [
-    "normalize-space((.//*[self::h1 or self::h2 or self::h3 or self::h4",
+    "normalize-space((//*[self::h1 or self::h2 or self::h3 or self::h4",
     " or contains(concat(' ', normalize-space(@class), ' '), ' title ')",
     " or contains(concat(' ', normalize-space(@class), ' '), ' book-title ')",
     " or contains(concat(' ', normalize-space(@class), ' '), ' cardtitle ')])[1])",
     "||normalize-space(self::a/@title)",
-    "||normalize-space((.//a[@title])[1]/@title)",
+    "||normalize-space((//a[@title])[1]/@title)",
     "||normalize-space((self::a/text()[normalize-space()])[last()])",
-    "||normalize-space(((.//a)[1]/text()[normalize-space()])[last()])",
-    "||normalize-space((.//a)[1])",
+    "||normalize-space(((//a)[1]/text()[normalize-space()])[last()])",
+    "||normalize-space((//a)[1])",
     "||normalize-space(.)",
     "||normalize-space(/html/body/*)",
   ].join("");
@@ -100,6 +100,56 @@ export function scoreLinkCluster(links, baseUrl) {
 
 export function listSelectorFromLinks(links, document) {
   if (!links.length) return "";
+
+  // Links in a card grid usually do not share the same DOM parent. The old
+  // common-ancestor fallback consequently returned a broad descendant rule
+  // such as `content//div`, which also selected headers, wrappers and
+  // decoration nodes before the first real card. Detect a repeated ancestor
+  // shape first and use its stable class/tag as the item selector.
+  const repeatedAncestors = new Map();
+  for (const link of links) {
+    const seen = new Set();
+    let node = link.parentElement;
+    let depth = 0;
+    while (node && node !== document.body && node !== document.documentElement && depth < 8) {
+      const tag = String(node.tagName || "").toLowerCase();
+      const classes = [...(node.classList || [])].filter(Boolean);
+      const signatures = classes.length
+        ? classes.map((className) => ({ key: `${tag}|class:${className}`, className, tag }))
+        : [{ key: `${tag}|tag`, className: "", tag }];
+      for (const signature of signatures) {
+        if (seen.has(signature.key)) continue;
+        seen.add(signature.key);
+        const bucket = repeatedAncestors.get(signature.key) || {
+          tag: signature.tag,
+          className: signature.className,
+          links: new Set(),
+          nodes: new Set(),
+          depths: [],
+        };
+        bucket.links.add(link);
+        bucket.nodes.add(node);
+        bucket.depths.push(depth);
+        repeatedAncestors.set(signature.key, bucket);
+      }
+      node = node.parentElement;
+      depth += 1;
+    }
+  }
+  const repeated = [...repeatedAncestors.values()]
+    .filter((candidate) => candidate.nodes.size >= 2 && candidate.links.size >= 2)
+    .sort((left, right) => {
+      const coverage = right.links.size - left.links.size;
+      if (coverage) return coverage;
+      const leftDepth = left.depths.reduce((sum, value) => sum + value, 0) / left.depths.length;
+      const rightDepth = right.depths.reduce((sum, value) => sum + value, 0) / right.depths.length;
+      if (leftDepth !== rightDepth) return leftDepth - rightDepth;
+      return Number(Boolean(right.className)) - Number(Boolean(left.className));
+    })[0];
+  if (repeated) {
+    if (!repeated.className) return `//${repeated.tag}`;
+    return `${classContainsXPath(repeated.className)}[.//a[@href]]`;
+  }
 
   // Prefer the deepest ancestor that still covers most of the link cluster
   // (e.g. ul.list), not the immediate li parent of a single anchor.

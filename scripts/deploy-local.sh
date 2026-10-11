@@ -30,9 +30,25 @@ fi
 cpu_ceiling="$(awk -v count="$host_cpus" -v percent="$LIMIT_PERCENT" 'BEGIN { printf "%.2f", count * percent / 100 }')"
 memory_ceiling_mib="$((host_memory_kib * LIMIT_PERCENT / 100 / 1024))"
 
+configured_value() {
+  local key="$1"
+  local fallback="$2"
+  local value="${!key:-}"
+  if [[ -z "$value" && -r "$ROOT/.env" ]]; then
+    value="$(sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$ROOT/.env" | tail -n 1)"
+    value="${value%%#*}"
+    value="${value//[[:space:]]/}"
+    value="${value#\"}"
+    value="${value%\"}"
+    value="${value#\'}"
+    value="${value%\'}"
+  fi
+  printf '%s' "${value:-$fallback}"
+}
+
 # Preserve the repository's conservative defaults, but clamp user overrides
 # so this deployment entry point can never assign more than the host ceiling.
-requested_cpus="${CONTAINER_CPUS:-5.33}"
+requested_cpus="$(configured_value CONTAINER_CPUS 5.33)"
 container_cpus="$(awk -v requested="$requested_cpus" -v ceiling="$cpu_ceiling" 'BEGIN {
   value = requested + 0;
   if (value <= 0 || value > ceiling) value = ceiling;
@@ -64,8 +80,8 @@ memory_bytes() {
   fi
 }
 
-requested_memory_bytes="$(memory_bytes "${CONTAINER_MEMORY_LIMIT:-4g}")"
-requested_swap_bytes="$(memory_bytes "${CONTAINER_MEMORY_SWAP_LIMIT:-5g}")"
+requested_memory_bytes="$(memory_bytes "$(configured_value CONTAINER_MEMORY_LIMIT 4g)")"
+requested_swap_bytes="$(memory_bytes "$(configured_value CONTAINER_MEMORY_SWAP_LIMIT 5g)")"
 memory_ceiling_bytes="$((memory_ceiling_mib * 1024 * 1024))"
 if (( requested_memory_bytes <= 0 || requested_memory_bytes > memory_ceiling_bytes )); then
   requested_memory_bytes="$memory_ceiling_bytes"

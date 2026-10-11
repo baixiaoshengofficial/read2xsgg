@@ -1,5 +1,6 @@
 import { responseText } from "../httpTransport.js";
 import { parseHeaders } from "../requests.js";
+import { inferAjaxArrayExplore, materializeAjaxArrayExplore } from "./dynamicExplore.js";
 
 const SAFE_FIELD = /^[A-Za-z_$][\w$-]{0,63}$/;
 
@@ -239,7 +240,19 @@ async function validatePlan(inferred, entries, download) {
 
 export async function materializeDynamicCatalogSource(source, { download } = {}) {
   const inferred = inferDynamicCatalog(source);
-  if (!inferred || typeof download !== "function") return { source, materialized: false };
+  if (typeof download !== "function") return { source, materialized: false };
+  if (!inferred) {
+    const dynamicExplore = await materializeAjaxArrayExplore(source, { download });
+    if (!dynamicExplore.materialized) return { source, materialized: false };
+    return {
+      source: { ...source, exploreUrl: dynamicExplore.entries },
+      materialized: true,
+      dynamicExplore: true,
+      categoryCount: dynamicExplore.entries.length,
+      page1Count: 0,
+      page2Count: 0,
+    };
+  }
   const categoryPayload = JSON.parse(responseText(await download(inferred.categoryUrl, inferred.plan.headers)));
   const parents = valueAtPath(categoryPayload, inferred.categoryPath);
   if (!Array.isArray(parents) || !parents.length) throw new Error("动态分类接口没有返回分类数组");
@@ -290,7 +303,7 @@ export async function materializeDynamicCatalogSource(source, { download } = {})
   };
 }
 
-export async function materializeDynamicCatalogs(input, { download } = {}) {
+export async function materializeDynamicCatalogs(input, { download, concurrency = 4 } = {}) {
   const isSource = (value) => value && typeof value === "object" && !Array.isArray(value)
     && (value.bookSourceUrl || value.bookSourceName || value.searchUrl || value.exploreUrl);
   const entries = Array.isArray(input)
@@ -298,21 +311,33 @@ export async function materializeDynamicCatalogs(input, { download } = {}) {
     : isSource(input) ? [[null, input]] : Object.entries(input || {});
   const output = Array.isArray(input) ? [...input] : (isSource(input) ? input : { ...(input || {}) });
   const warnings = [];
-  const candidates = entries.filter(([, source]) => inferDynamicCatalog(source));
-  await Promise.all(candidates.map(async ([key, source]) => {
+  const candidates = entries.filter(([, source]) => (
+    inferDynamicCatalog(source) || inferAjaxArrayExplore(source)
+  ));
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(
+    candidates.length,
+    Math.max(1, Math.min(16, Number(concurrency) || 4)),
+  ) }, async () => {
+    while (cursor < candidates.length) {
+      const [key, source] = candidates[cursor++];
     const name = String(source?.bookSourceName || source?.name || key || "未命名书源");
     try {
       const result = await materializeDynamicCatalogSource(source, { download });
       if (Array.isArray(output)) output[key] = result.source;
       else if (key === null) Object.assign(output, result.source);
       else output[key] = result.source;
-      warnings.push({
-        source: name,
-        section: "bookWorld",
-        field: "exploreUrl",
-        message: `动态分类已通用物化 ${result.categoryCount} 项；首屏 ${result.page1Count} 条，第 2 页 ${result.page2Count} 条，分页未重复`,
-        rule: "",
-      });
+      if (result.materialized) {
+        warnings.push({
+          source: name,
+          section: "bookWorld",
+          field: "exploreUrl",
+          message: result.dynamicExplore
+            ? `动态 JSON 分类已安全物化 ${result.categoryCount} 项；未执行源脚本`
+            : `动态分类已通用物化 ${result.categoryCount} 项；首屏 ${result.page1Count} 条，第 2 页 ${result.page2Count} 条，分页未重复`,
+          rule: "",
+        });
+      }
     } catch (error) {
       warnings.push({
         source: name,
@@ -322,6 +347,8 @@ export async function materializeDynamicCatalogs(input, { download } = {}) {
         rule: "",
       });
     }
-  }));
+    }
+  });
+  await Promise.all(workers);
   return { input: output, warnings };
 }

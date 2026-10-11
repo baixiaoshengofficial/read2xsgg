@@ -100,6 +100,54 @@ function splitUrlAndOptions(request) {
   return { url: request.slice(0, match.index).trim(), optionsText: match[1] };
 }
 
+const REQUEST_OPTION_KEYS = new Set([
+  "method", "headers", "header", "httpHeaders", "body", "webView", "charset", "type", "retry",
+]);
+
+/**
+ * Read's URL fields may carry an encoded request descriptor after a comma,
+ * for example `https://api.example/detail,%7B%22method%22:%22POST%22...%7D`.
+ * Keep this format at the transport boundary so bridge adapters can preserve
+ * the original method/body without teaching individual site handlers about it.
+ */
+export function parseRequestDescriptor(request, warn = () => {}) {
+  if (typeof request !== "string") return null;
+  const source = request.trim();
+  const match = source.match(/^(https?:\/\/[^,\s]+),\s*(\{[\s\S]*\}|%7b[\s\S]*%7d)\s*$/i);
+  if (!match) return null;
+  let optionsText = match[2];
+  if (/^%7b/i.test(optionsText)) {
+    try { optionsText = decodeURIComponent(optionsText); } catch { return null; }
+  }
+  const options = parseLooseJson(optionsText, warn);
+  if (!options || typeof options !== "object" || Array.isArray(options)) return null;
+  const keys = Object.keys(options);
+  if (!keys.length || !keys.every((key) => REQUEST_OPTION_KEYS.has(String(key))) ) return null;
+  const headers = {
+    ...(options.headers && typeof options.headers === "object" && !Array.isArray(options.headers) ? options.headers : {}),
+    ...(options.httpHeaders && typeof options.httpHeaders === "object" && !Array.isArray(options.httpHeaders)
+      ? options.httpHeaders
+      : {}),
+  };
+  let body = options.body;
+  if (body && typeof body === "object") {
+    body = JSON.stringify(body);
+    if (!Object.keys(headers).some((key) => key.toLowerCase() === "content-type")) {
+      headers["Content-Type"] = "application/json";
+    }
+  }
+  const method = String(options.method || "GET").toUpperCase();
+  return {
+    url: match[1],
+    headers,
+    options: {
+      method,
+      ...(body !== undefined && body !== null ? { body: String(body) } : {}),
+      ...(method === "POST" ? { followPostRedirects: true } : {}),
+    },
+  };
+}
+
 /**
  * 阅读源常在请求开头放 cookie.removeCookie(...) 之类的副作用模板。
  * 它不属于 URL，香色也没有等价 cookie API；移除后继续转换后面的
@@ -235,8 +283,44 @@ function substituteFormKeyword(body, warn) {
   return source;
 }
 
+function bodyValueExpression(value, warn, seen = new Set()) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value === "string") {
+    return value.includes("{{")
+      ? expressionForTemplate(value, { warn })
+      : JSON.stringify(value);
+  }
+  if (typeof value === "number" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value !== "object") return "undefined";
+  if (seen.has(value)) {
+    warn("请求 body 含循环对象，已忽略循环引用");
+    return "undefined";
+  }
+  seen.add(value);
+  let expression;
+  if (Array.isArray(value)) {
+    expression = `[${value.map((item) => bodyValueExpression(item, warn, seen)).join(", ")}]`;
+  } else {
+    expression = `{${Object.entries(value).map(([key, item]) => (
+      `${JSON.stringify(key)}: ${bodyValueExpression(item, warn, seen)}`
+    )).join(", ")}}`;
+  }
+  seen.delete(value);
+  return expression;
+}
+
 function objectLiteralFromBody(body, warn) {
+  if (body && typeof body === "object") return bodyValueExpression(body, warn);
   const source = substituteFormKeyword(body, warn).trim();
+  // A few collections have already coerced an object-valued body with
+  // String(body), leaving the irreversible `[object Object]` sentinel. It
+  // must never be emitted as JSON.parse("[object Object]"): retain a valid
+  // empty parameter object so the request can still be tested and repaired.
+  if (/^\[object\s+Object\]$/i.test(source)) {
+    warn("请求 body 已被上游集合错误序列化为 [object Object]，已降级为空对象，避免生成不可执行请求");
+    return "{}";
+  }
   // 阅读的 POST body 既可能是表单，也可能是 JSON。把 JSON 拆成
   // key=value 会生成一个错误的单字段对象（例如 {"{\"page\"...": ""}）。
   // 先将模板拼为 JSON 文本，再在香色运行时解析，数值型 {{page}} 也能保持数值。
@@ -334,6 +418,46 @@ function splitTopLevelStatements(value) {
   return output.filter(Boolean);
 }
 
+/**
+ * A large portion of public Legado request scripts omits semicolons and puts
+ * each assignment on its own line.  Keep this splitter limited to a fresh
+ * top-level assignment so multiline objects/templates and control blocks are
+ * not reinterpreted as separate statements.
+ */
+function splitTopLevelAssignmentLines(value) {
+  const source = String(value || "");
+  const masked = maskScriptStrings(source);
+  const output = [];
+  let chunkStart = 0;
+  let lineStart = 0;
+  let depth = 0;
+  const flush = (end) => {
+    const statement = source.slice(chunkStart, end).trim();
+    if (statement) output.push(statement);
+  };
+  for (let index = 0; index <= source.length; index += 1) {
+    const atEnd = index === source.length;
+    if (!atEnd && source[index] !== "\n") continue;
+    const lineEnd = index;
+    const first = lineStart + (masked.slice(lineStart, lineEnd).match(/^\s*/)?.[0].length || 0);
+    const startsAssignment = depth === 0
+      && first < lineEnd
+      && /^(?:(?:var|let|const)\s+)?[A-Za-z_$][\w$]*\s*=/.test(masked.slice(first, lineEnd));
+    if (startsAssignment && source.slice(chunkStart, lineStart).trim()) {
+      flush(lineStart);
+      chunkStart = lineStart;
+    }
+    for (let cursor = lineStart; cursor < lineEnd; cursor += 1) {
+      const token = masked[cursor];
+      if ("([{".includes(token)) depth += 1;
+      else if (")] }".replace(/\s/g, "").includes(token)) depth = Math.max(0, depth - 1);
+    }
+    lineStart = index + 1;
+  }
+  flush(source.length);
+  return output;
+}
+
 function matchingCallArgument(expression, functionName) {
   const source = String(expression || "").trim();
   const prefix = new RegExp(`^${functionName.replace(".", "\\.")}\\s*\\(`, "i").exec(source);
@@ -353,7 +477,7 @@ function matchingCallArgument(expression, functionName) {
 }
 
 const PORTABLE_REQUEST_GLOBALS = new Set([
-  "key", "page", "params", "config", "true", "false", "null", "undefined",
+  "key", "page", "params", "config", "JSON", "true", "false", "null", "undefined",
   "String", "Number", "Boolean", "Math", "encodeURI", "encodeURIComponent",
 ]);
 
@@ -363,7 +487,7 @@ function portableExpressionDependencies(expression, declarations) {
   const calls = [...masked.matchAll(/(?:\b([A-Za-z_$][\w$]*)|\.\s*([A-Za-z_$][\w$]*))\s*\(/g)];
   const safeCalls = new Set([
     "String", "Number", "Boolean", "encodeURI", "encodeURIComponent",
-    "substring", "substr", "slice", "trim", "toLowerCase", "toUpperCase",
+    "substring", "substr", "slice", "trim", "toLowerCase", "toUpperCase", "stringify",
     "replace", "concat", "padStart", "padEnd", "floor", "ceil", "round", "abs",
   ]);
   if (calls.some((match) => !safeCalls.has(match[1] || match[2]))) return null;
@@ -379,6 +503,193 @@ function portableExpressionDependencies(expression, declarations) {
     dependencies.add(name);
   }
   return dependencies;
+}
+
+function normalizePortableRequestExpression(expression) {
+  let source = String(expression || "")
+    .replace(/\bsource\.(?:bookSourceUrl|bookSourceKey|key)\b/gi, "config.host")
+    .replace(/\bsource\.getKey\s*\(\s*\)/gi, "config.host")
+    .replace(/\bsource\.getVariable\s*\(\s*\)/gi, '""')
+    // A source variable has no cross-action equivalent in 香色.  In a
+    // request recovery candidate it is safe to use Legado's initial empty
+    // value, but only after the dependency closure proves the rest of the
+    // request is declarative.
+    .replace(/\bsource\.get\s*\(\s*["'][^"']+["']\s*\)/gi, '""')
+    .replace(/\bjava\.encodeURI(?:Component)?\s*\(/gi, "encodeURIComponent(")
+    .replace(/\bbaseUrl\b/g, "config.host");
+  // `maskScriptStrings` intentionally hides template literals, but their
+  // `${...}` expressions still need Legado's implicit key/page aliases.
+  source = source.replace(/\$\{([\s\S]*?)\}/g, (_match, expressionText) => (
+    `\${${String(expressionText)
+      .replace(/(?<![\w$.])key\b(?!\s*:)/gi, "params.keyWord")
+      .replace(/(?<![\w$.])page\b(?!\s*:)/gi, "params.pageIndex")}}`
+  ));
+  return source;
+}
+
+/**
+ * Recover the URL-producing part of a mixed Legado request script.
+ *
+ * A common source pattern performs an Android cookie/signature handshake and
+ * then builds a normal URL from `source.bookSourceUrl`, `key` and `page`:
+ *
+ *   var q = page == 1 ? source.bookSourceUrl + "/search?q=" + key : ...;
+ *   q + ',{"headers": ...}';
+ *
+ * The handshake is not executable in 香色 and must not be evaluated on the
+ * server.  This bounded recovery keeps only dependency-closed declarations
+ * whose expressions use the portable request vocabulary.  It is deliberately
+ * conservative: if any dependency needs Java/Android APIs, the original
+ * script remains unchanged and the normal analyzer/repair path handles it.
+ */
+function recoverPortableRequestScript(source, warn) {
+  const body = String(source || "")
+    .replace(/^@js:\s*/i, "")
+    .replace(/^<js>\s*/i, "")
+    .replace(/<\/js>\s*$/i, "")
+    .trim();
+  if (!body) return null;
+
+  const statements = splitTopLevelStatements(body)
+    .flatMap((statement) => splitTopLevelAssignmentLines(statement));
+  const declarations = new Map();
+  const declarationStatements = new Map();
+  for (const statement of statements) {
+    const match = statement.match(/^(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+)$/);
+    if (!match) continue;
+    let expression = normalizePortableRequestExpression(match[2].trim());
+    // `let key = encodeURI(key)` is a common local normalization idiom. The
+    // right-hand `key` refers to Legado's input, not the new local binding.
+    if (match[1] === "key" && /\bkey\b/i.test(expression)) {
+      expression = expression.replace(/\bkey\b/gi, "params.keyWord");
+    }
+    if (match[1] === "page" && /\bpage\b/i.test(expression)) {
+      expression = expression.replace(/\bpage\b/gi, "params.pageIndex");
+    }
+    declarations.set(match[1], expression);
+    declarationStatements.set(match[1], `var ${match[1]} = ${expression};`);
+  }
+
+  const declarationFor = (names) => {
+    for (const name of names) {
+      if (declarations.has(name)) return [name, declarations.get(name)];
+    }
+    return null;
+  };
+
+  let terminal = statements.at(-1) || "";
+  if (/^return\s+/i.test(terminal)) terminal = terminal.replace(/^return\s+/i, "").trim();
+  else {
+    const assignment = terminal.match(/^([A-Za-z_$][\w$]*)\s*=\s*([\s\S]+)$/);
+    if (assignment) terminal = normalizePortableRequestExpression(assignment[2].trim());
+  }
+  if (!terminal || /^(?:if|for|while|try|catch|switch|function)\b/i.test(terminal)) return null;
+  terminal = normalizePortableRequestExpression(terminal.replace(/;\s*$/, "").trim());
+  // A request script may append a Legado-only `,{headers:...}` descriptor to
+  // an otherwise portable URL. The bridge supplies static action headers and
+  // strips this descriptor later; dropping it here also prevents an
+  // unportable ticket variable from poisoning the URL recovery. Never drop a
+  // descriptor that changes the HTTP method or carries a body.
+  const descriptor = terminal.match(/^(.*)\s*\+\s*(["']),(\{[\s\S]*\})\2\s*$/);
+  if (descriptor && !/\b(?:method|body|httpParams|requestBody)\b/i.test(descriptor[3])) {
+    terminal = descriptor[1].trim();
+  }
+
+  const required = new Set();
+  const visiting = new Set();
+  const collect = (expression) => {
+    const dependencies = portableExpressionDependencies(expression, declarations);
+    if (!dependencies) return false;
+    for (const name of dependencies) {
+      if (required.has(name)) continue;
+      if (visiting.has(name) || !declarations.has(name)) return false;
+      visiting.add(name);
+      if (!collect(declarations.get(name))) return false;
+      visiting.delete(name);
+      required.add(name);
+    }
+    return true;
+  };
+
+  // Some scripts perform a POST and then follow a redirect only to construct
+  // a final search URL.  The initial URL/body remain usable by Xiangse's
+  // transport, which already follows POST redirects.  Keep just those
+  // declarative values; never retain the Java/Android response inspection.
+  const postIntent = /(?:\bjava\.post\s*\(|\bPOST\s*:\s*true\b|["']method["']\s*:\s*["']POST["'])/i.test(body);
+  const urlEntry = declarationFor(["u", "endpoint", "url"]);
+  const bodyEntry = declarationFor(["bd", "body", "hp", "httpParams", "requestBody"]);
+  if (postIntent && urlEntry && bodyEntry) {
+    const postRequired = new Set();
+    const postVisiting = new Set();
+    const collectPost = (expression) => {
+      const dependencies = portableExpressionDependencies(expression, declarations);
+      if (!dependencies) return false;
+      for (const name of dependencies) {
+        if (postRequired.has(name)) continue;
+        if (postVisiting.has(name) || !declarations.has(name)) return false;
+        postVisiting.add(name);
+        if (!collectPost(declarations.get(name))) return false;
+        postVisiting.delete(name);
+        postRequired.add(name);
+      }
+      return true;
+    };
+    if (collectPost(urlEntry[1]) && collectPost(bodyEntry[1])) {
+      postRequired.add(urlEntry[0]);
+      postRequired.add(bodyEntry[0]);
+      const headerEntry = declarationFor(["hd", "head", "headers", "httpHeaders"]);
+      let headerName = "";
+      if (headerEntry) {
+        const beforeHeaders = new Set(postRequired);
+        if (collectPost(headerEntry[1])) {
+          headerName = headerEntry[0];
+          postRequired.add(headerName);
+        }
+        else {
+          postRequired.clear();
+          for (const name of beforeHeaders) postRequired.add(name);
+        }
+      }
+      const retained = [...declarations.keys()]
+        .filter((name) => postRequired.has(name))
+        .map((name) => declarationStatements.get(name));
+      const candidate = rewriteLegadoJavaScript([
+        "@js:",
+        ...retained,
+        `return {url:${urlEntry[0]},POST:true,httpParams:${bodyEntry[0]}${headerName ? `,httpHeaders:${headerName}` : ""}};`,
+      ].join("\n"));
+      if (!hasUnsupportedLegadoRuntime(candidate)) {
+        try {
+          new Function("config", "params", "result", candidate.replace(/^@js:\s*/, ""));
+          warn("阅读请求含不可移植的 POST 前置/跳转脚本，已安全提取可移植 URL、body 和静态请求头；未执行来源 Java/Android 代码");
+          return candidate;
+        } catch {
+          // Continue with the conservative GET recovery below.
+        }
+      }
+    }
+  }
+
+  if (!collect(terminal)) return null;
+
+  const retained = [];
+  for (const statement of statements) {
+    const match = statement.match(/^(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=/);
+    if (match && required.has(match[1])) retained.push(declarationStatements.get(match[1]));
+  }
+  const candidate = rewriteLegadoJavaScript([
+    "@js:",
+    ...retained,
+    `return (${terminal});`,
+  ].join("\n"));
+  if (hasUnsupportedLegadoRuntime(candidate)) return null;
+  try {
+    new Function("config", "params", "result", candidate.replace(/^@js:\s*/i, ""));
+  } catch {
+    return null;
+  }
+  warn("阅读请求含不可移植的前置脚本，已安全提取可移植 URL 表达式；未执行来源 Java/Android 代码");
+  return candidate;
 }
 
 /**
@@ -466,7 +777,10 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
     if (portablePost) return portablePost;
     const rewritten = rewriteLegadoJavaScript(normalized);
     if (rewritten !== normalized) warn("已将阅读 JavaScript 中的分页、关键词或结果字段模板转换为香色运行时表达式");
-    else warn("阅读请求中的 JavaScript/模板表达式无法可靠翻译，已保留原规则供人工修改");
+    if (!hasUnsupportedLegadoRuntime(rewritten)) return { requestInfo: rewritten };
+    const recovered = recoverPortableRequestScript(normalized, warn);
+    if (recovered) return { requestInfo: recovered };
+    warn("阅读请求中的 JavaScript/模板表达式无法可靠翻译，已保留原规则供人工修改");
     return { requestInfo: rewritten };
   }
 
@@ -494,7 +808,7 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
   const pageBranchExpr = legadoPageBranchExpression(url, warn);
   if (pageBranchExpr) {
     const lines = ["@js:", `let url = ${pageBranchExpr};`];
-    if (options.body) lines.push(`let hp = ${objectLiteralFromBody(String(options.body), warn)};`);
+    if (options.body) lines.push(`let hp = ${objectLiteralFromBody(options.body, warn)};`);
     const result = ["url:url", `POST:${method === "POST"}`];
     if (options.body) result.push("httpParams:hp");
     if (Object.keys(mergedHeaders).length) result.push(`httpHeaders:${objectLiteralFromHeaders(mergedHeaders, warn)}`);
@@ -507,7 +821,7 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
   const getUrlExpr = rewriteGetTemplates(url, warn);
   if (getUrlExpr) {
     const lines = ["@js:", `let url = ${getUrlExpr};`];
-    if (options.body) lines.push(`let hp = ${objectLiteralFromBody(String(options.body), warn)};`);
+    if (options.body) lines.push(`let hp = ${objectLiteralFromBody(options.body, warn)};`);
     const result = ["url:url", `POST:${method === "POST"}`];
     if (options.body) result.push("httpParams:hp");
     if (Object.keys(mergedHeaders).length) result.push(`httpHeaders:${objectLiteralFromHeaders(mergedHeaders, warn)}`);
@@ -531,7 +845,7 @@ export function convertRequest(request, { headers = {}, warn = () => {}, fallbac
   }
 
   const lines = ["@js:", `let url = ${expressionForTemplate(url, { warn })};`];
-  if (options.body) lines.push(`let hp = ${objectLiteralFromBody(String(options.body), warn)};`);
+  if (options.body) lines.push(`let hp = ${objectLiteralFromBody(options.body, warn)};`);
   const result = ["url:url", `POST:${method === "POST"}`];
   if (options.body) result.push("httpParams:hp");
   if (Object.keys(mergedHeaders).length) result.push(`httpHeaders:${objectLiteralFromHeaders(mergedHeaders, warn)}`);

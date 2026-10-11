@@ -1,6 +1,7 @@
 import { JSDOM } from "jsdom";
 import { isXiangseGbkEncode } from "./charset.js";
 import { convertRule } from "./selectors.js";
+import { normalizeXiangseItemRule } from "./xiangseRules.js";
 
 const MAX_PLAN_BYTES = 24 * 1024;
 const FIELD_NAMES = new Set([
@@ -12,6 +13,61 @@ function selectorOnly(rule) {
   const value = String(rule || "").trim();
   if (!value || /^@js:/i.test(value)) return "";
   return value.split(/\|\|?\s*@js:/i, 1)[0].trim().slice(0, 4096);
+}
+
+function normalizeProjectedPaths(value) {
+  const paths = [];
+  for (const candidate of Array.isArray(value) ? value : []) {
+    const path = String(candidate || "").trim().replace(/^\$\.?/, "").replace(/\./g, "/");
+    if (!path || path.length > 256 || paths.includes(path)) continue;
+    const parts = path.split("/");
+    if (!parts.every((part) => /^(?:[A-Za-z_$][\w$]*|\d{1,5})$/.test(part)
+      && !["__proto__", "prototype", "constructor"].includes(part))) continue;
+    paths.push(path);
+    if (paths.length >= 24) break;
+  }
+  return paths;
+}
+
+function projectedPathValue(value, path) {
+  let current = value;
+  for (const part of String(path || "").split("/")) {
+    if (current == null || typeof current !== "object") return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function setProjectedPath(target, path, value) {
+  const parts = String(path || "").split("/");
+  let current = target;
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const part = parts[index];
+    if (!Object.hasOwn(current, part)) current[part] = {};
+    if (!current[part] || typeof current[part] !== "object" || Array.isArray(current[part])) return;
+    current = current[part];
+  }
+  const leaf = parts.at(-1);
+  if (leaf && !["__proto__", "prototype", "constructor"].includes(leaf)
+    && (typeof value === "string" || typeof value === "number" || typeof value === "boolean")) {
+    current[leaf] = value;
+  }
+}
+
+function projectPaths(value, paths) {
+  const result = {};
+  for (const path of paths || []) {
+    const selected = projectedPathValue(value, path);
+    if (selected !== undefined && selected !== null) setProjectedPath(result, path, selected);
+  }
+  return result;
+}
+
+function normalizeContextualRows(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const itemPaths = normalizeProjectedPaths(value.itemPaths);
+  const contextPaths = normalizeProjectedPaths(value.contextPaths);
+  return itemPaths.length && contextPaths.length ? { itemPaths, contextPaths } : null;
 }
 
 function safeRegexPattern(value) {
@@ -122,7 +178,8 @@ function normalizeField(rule) {
     }
     const urlTemplate = String(rule.urlTemplate || "").trim().slice(0, 2_048);
     const valueTemplate = String(rule.valueTemplate || "").trim().slice(0, 2_048);
-    const selector = selectorOnly(rule.selector) || (urlTemplate || valueTemplate ? "id" : "");
+    const selector = selectorOnly(normalizeXiangseItemRule(rule.selector))
+      || (urlTemplate || valueTemplate ? "id" : "");
     if (!selector) return null;
     const replacements = Array.isArray(rule.replacements) ? rule.replacements.map((item) => {
       const pattern = safeRegexPattern(item?.pattern);
@@ -150,8 +207,19 @@ function normalizeField(rule) {
     const templateFields = {};
     for (const [name, fieldSelector] of Object.entries(rule.templateFields || {}).slice(0, 8)) {
       if (!/^[A-Za-z_$][\w$]*$/.test(name)) continue;
-      const normalized = selectorOnly(fieldSelector);
+      const normalized = selectorOnly(normalizeXiangseItemRule(fieldSelector));
       if (normalized) templateFields[name] = normalized;
+    }
+    const rootTemplateFields = {};
+    for (const [name, fieldSelector] of Object.entries(rule.rootTemplateFields || {}).slice(0, 8)) {
+      if (!/^[A-Za-z_$][\w$]*$/.test(name)) continue;
+      const normalized = String(fieldSelector || "").trim()
+        .replace(/^@json:/i, "")
+        .replace(/^\$\.?/, "")
+        .replace(/\[(\*|\d+)\]/g, "/$1")
+        .replace(/\./g, "/")
+        .replace(/^\/+/, "");
+      if (normalized && normalized.length <= 512) rootTemplateFields[name] = normalized;
     }
     return {
       selector,
@@ -163,6 +231,7 @@ function normalizeField(rule) {
       ...(valueTemplate ? { valueTemplate } : {}),
       ...(Object.keys(valueMaps).length ? { valueMaps } : {}),
       ...(Object.keys(templateFields).length ? { templateFields } : {}),
+      ...(Object.keys(rootTemplateFields).length ? { rootTemplateFields } : {}),
     };
   }
   const source = String(rule || "").trim();
@@ -280,6 +349,7 @@ function normalizePlan(value) {
     const equals = String(value.filter.equals ?? "").slice(0, 512);
     if (field && equals) filter = { field, equals };
   }
+  const contextualRows = kind === "chapters" ? normalizeContextualRows(value.contextualRows) : null;
   let tocRequest = null;
   if (kind === "chapters" && value.tocRequest && typeof value.tocRequest === "object") {
     const pattern = safeRegexPattern(value.tocRequest.pattern);
@@ -362,6 +432,7 @@ function normalizePlan(value) {
     ...(filter ? { filter } : {}),
     ...(tocRequest ? { tocRequest } : {}),
     ...(latestChapter ? { latestChapter } : {}),
+    ...(contextualRows ? { contextualRows } : {}),
   };
 }
 
@@ -736,6 +807,18 @@ function inferredJsonEqualityFilter(rule) {
 function inferredDomScriptSelector(rule, preferredNames = []) {
   const source = String(rule || "").trim();
   if (!/^@js:/i.test(source)) return rule;
+  const attributes = [...source.matchAll(
+    /\.attr\s*\(\s*(['"])([A-Za-z_][\w:-]*)\1\s*\)/gi,
+  )].map((match) => match[2]);
+  // When a script reads both a child element and its href, the URL attribute
+  // is the authoritative detail target. Resolve it before the broader
+  // `.select(...).text()` fallback, which would otherwise duplicate the title
+  // as the URL.
+  if (preferredNames.some((pattern) => pattern.test("href") || pattern.test("url"))) {
+    for (const attribute of [...new Set(attributes)]) {
+      if (preferredNames.some((pattern) => pattern.test(attribute))) return "//@" + attribute;
+    }
+  }
   const selectors = [];
   const patterns = [
     /\bjava\.getString(?:List)?\s*\(\s*(['"])([^'"\\\r\n]+)\1/gi,
@@ -759,13 +842,10 @@ function inferredDomScriptSelector(rule, preferredNames = []) {
     const converted = convertRule(selector, { responseType: "html" });
     if (converted && !/^@js:/i.test(converted)) return converted;
   }
-  const attributes = [...source.matchAll(
-    /(?:\bresult|[A-Za-z_$][\w$]*)\.attr\s*\(\s*(['"])([A-Za-z_][\w:-]*)\1\s*\)/gi,
-  )].map((match) => match[2]);
   for (const attribute of [...new Set(attributes)]) {
     const wanted = preferredNames.some((pattern) => pattern.test(attribute));
     if (!wanted) continue;
-    return `./@${attribute}||.//*[@${attribute}]/@${attribute}`;
+    return "//@" + attribute;
   }
   if (preferredNames.some((pattern) => pattern.test("text") || pattern.test("title") || pattern.test("name"))
     && /\bresult\.(?:text|ownText)\s*\(\s*\)/i.test(source)) {
@@ -775,15 +855,15 @@ function inferredDomScriptSelector(rule, preferredNames = []) {
   // Legado's DOM helpers. Preserve the referenced attribute declaratively.
   if (preferredNames.some((pattern) => pattern.test("href") || pattern.test("url"))
     && /(?:getAttribute\s*\(\s*['"]href['"]|\bhref\\?=[\\]?['"])/i.test(source)) {
-    return ".//a[@href]/@href";
+    return "//a[@href]/@href";
   }
   if (preferredNames.some((pattern) => pattern.test("src") || pattern.test("img") || pattern.test("cover"))
     && /(?:getAttribute\s*\(\s*['"](?:src|data-src|data-original)['"]|\b(?:src|data-src|data-original)\\?=[\\]?['"])/i.test(source)) {
-    return ".//img/@src||.//img/@data-src||.//img/@data-original";
+    return "//img/@src||//img/@data-src||//img/@data-original";
   }
   if (preferredNames.some((pattern) => pattern.test("title") || pattern.test("name"))
     && /(?:getAttribute\s*\(\s*['"]title['"]|\btitle\\?=[\\]?['"])/i.test(source)) {
-    return "./@title";
+    return "//@title";
   }
   return "";
 }
@@ -813,7 +893,8 @@ function requireListAttribute(list, attribute) {
 function domListProjection(rule, field) {
   const source = String(rule || "");
   if (!/^@js:/i.test(source)
-    || !/(?:\b(?:Packages\.)?org\.jsoup\.Jsoup|__xsJsoup)\.parse\s*\(/i.test(source)
+    || !/(?:\b(?:Packages\.)?org\.jsoup\.Jsoup|__xsJsoup)/i.test(source)
+    || !/\.parse\s*\(/i.test(source)
     || !/\.select\s*\(/i.test(source)) return "";
   const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   if (field === "title" && new RegExp(
@@ -824,15 +905,1217 @@ function domListProjection(rule, field) {
     `\\b${escapedField}\\s*:\\s*[^,}\\r\\n]*\\.attr\\s*\\(\\s*(['"])([A-Za-z_][\\w:-]*)\\1`,
     "i",
   ))?.[2];
-  return attribute ? `./@${attribute}||.//*[@${attribute}]/@${attribute}` : "";
+  return attribute ? "//@" + attribute : "";
 }
 
 function isDomListProjection(rule) {
   const source = String(rule || "");
   return /^@js:/i.test(source)
-    && /(?:\b(?:Packages\.)?org\.jsoup\.Jsoup|__xsJsoup)\.parse\s*\(/i.test(source)
+    && /(?:\b(?:Packages\.)?org\.jsoup\.Jsoup|__xsJsoup)/i.test(source)
+    && /\.parse\s*\(/i.test(source)
     && /\.select\s*\(/i.test(source)
     && /(?:\.push\s*\(|\.add\s*\()/i.test(source);
+}
+
+function splitDomProjectionTernary(source) {
+  const value = String(source || "");
+  let quote = "";
+  let escaped = false;
+  let round = 0;
+  let square = 0;
+  let curly = 0;
+  let question = -1;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      quote = character;
+      continue;
+    }
+    if (character === "(") round += 1;
+    else if (character === ")") round -= 1;
+    else if (character === "[") square += 1;
+    else if (character === "]") square -= 1;
+    else if (character === "{") curly += 1;
+    else if (character === "}") curly -= 1;
+    if (round || square || curly) continue;
+    if (character === "?" && question < 0) {
+      question = index;
+      continue;
+    }
+    if (character === ":" && question >= 0) {
+      return [value.slice(question + 1, index).trim(), value.slice(index + 1).trim()];
+    }
+  }
+  return null;
+}
+
+function stripDomProjectionTransforms(value) {
+  let source = unwrapProjectionExpression(value);
+  for (let count = 0; count < 8; count += 1) {
+    const before = source;
+    source = source
+      .replace(/\.(?:trim|toString)\s*\(\s*\)\s*$/i, "")
+      .replace(/\.(?:replace|split|join)\s*\([\s\S]*\)\s*(?:\[\s*\d+\s*\])?\s*$/i, "");
+    const wrapper = source.match(/^(?:String|Number|Boolean|E)\s*\(([\s\S]*)\)$/i);
+    if (wrapper) source = unwrapProjectionExpression(wrapper[1]);
+    if (source === before) break;
+  }
+  return source.trim();
+}
+
+function domProjectionRelativeSelector(value) {
+  const converted = convertRule(value, { responseType: "html" });
+  if (!converted || /^@js:|^<js>/i.test(converted)) return "";
+  const first = String(converted).split(/\s*\|\|\s*/, 1)[0].trim();
+  if (!first) return "";
+  if (first.startsWith("//")) return `.${first}`;
+  if (first.startsWith("/")) return `.${first}`;
+  return first;
+}
+
+function domProjectionAppendIndex(selector, index) {
+  const base = String(selector || ".").trim() || ".";
+  // Keep the predicate on the final XPath step. normalizeXiangseItemRule
+  // intentionally removes a leading `.//` from item rules; wrapping the path
+  // in parentheses would hide that prefix and turn it back into a document-
+  // global XPath inside the bridge.
+  if (base === ".") return ".";
+  return `${base}[${Number(index) + 1}]`;
+}
+
+function domProjectionAppendDescendant(selector, child) {
+  const path = String(selector || "").trim();
+  const relative = String(child || "").trim();
+  if (!relative) return "";
+  const suffix = relative.startsWith(".//")
+    ? relative.slice(3)
+    : relative.startsWith("//")
+      ? relative.slice(2)
+      : relative.replace(/^\.\//, "");
+  if (!suffix) return path || ".";
+  if (!path || path === ".") return `.//${suffix}`;
+  return `${path}//${suffix}`;
+}
+
+function collectDomProjectionAssignments(source) {
+  const assignments = new Map();
+  const pattern = /\b(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(?!=)([^;]{1,4096})(?:;|$)/g;
+  for (const match of String(source || "").matchAll(pattern)) {
+    const initialName = match[1];
+    if (["if", "for", "while", "switch", "return", "function"].includes(initialName)) continue;
+    const chunks = splitProjectionProperties(String(match[2] || ""));
+    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+      const chunk = chunks[chunkIndex].trim();
+      const pair = chunkIndex === 0
+        ? { name: initialName, expression: chunk }
+        : chunk.match(/^([A-Za-z_$][\w$]*)\s*=\s*(?!=)([\s\S]+)$/)
+          ? { name: chunk.match(/^([A-Za-z_$][\w$]*)\s*=\s*(?!=)([\s\S]+)$/)[1], expression: chunk.match(/^([A-Za-z_$][\w$]*)\s*=\s*(?!=)([\s\S]+)$/)[2] }
+          : null;
+      if (!pair?.expression) continue;
+      const entries = assignments.get(pair.name) || [];
+      entries.push({ expression: pair.expression.trim(), index: (match.index || 0) + chunkIndex });
+      assignments.set(pair.name, entries);
+    }
+  }
+  return assignments;
+}
+
+function extractDomProjectionObjects(source) {
+  const input = String(source || "");
+  const objects = [];
+  for (const match of input.matchAll(/\.(?:push|add)\s*\(/g)) {
+    const start = (match.index || 0) + match[0].length;
+    const open = input.indexOf("{", start);
+    if (open < 0 || open > start + 128) continue;
+    let quote = "";
+    let escaped = false;
+    let depth = 0;
+    for (let index = open; index < input.length; index += 1) {
+      const character = input[index];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === quote) quote = "";
+        continue;
+      }
+      if (character === "'" || character === '"' || character === "`") {
+        quote = character;
+        continue;
+      }
+      if (character === "{") depth += 1;
+      else if (character === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          objects.push({ body: input.slice(open + 1, index), index: open });
+          break;
+        }
+      }
+    }
+  }
+  return objects;
+}
+
+function compileDomProjectionExpression(expression, position, state, resolving = new Set()) {
+  let source = stripDomProjectionTransforms(expression);
+  const ternary = splitDomProjectionTernary(source);
+  if (ternary) {
+    return compileDomProjectionExpression(ternary[0], position, state, resolving)
+      || compileDomProjectionExpression(ternary[1], position, state, resolving);
+  }
+  const plusParts = splitTopLevelPlus(source);
+  if (plusParts.length > 1) {
+    let dynamic = null;
+    for (const part of plusParts) {
+      const result = compileDomProjectionExpression(part, position, state, resolving);
+      if (result?.path) dynamic ||= result;
+      else if (result?.constant !== undefined) continue;
+    }
+    return dynamic;
+  }
+  const literal = projectionLiteral(source);
+  if (literal !== null) return { constant: literal };
+  const wrapperCall = source.match(/^([A-Za-z_$][\w$]*)\s*\(([\s\S]*)\)$/);
+  const wrapperDefinition = wrapperCall && state.wrapperBodies?.get?.(wrapperCall[1]);
+  if (wrapperDefinition) {
+    if (resolving.has(wrapperCall[1])) return null;
+    const parameter = String(wrapperDefinition.parameter || "").trim();
+    const argument = String(wrapperCall[2] || "").trim();
+    if (!parameter || !argument) return null;
+    const escaped = parameter.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const substituted = String(wrapperDefinition.expression || "")
+      .replace(new RegExp(`\\b${escaped}\\b`, "g"), argument);
+    return compileDomProjectionExpression(
+      substituted,
+      position,
+      state,
+      new Set(resolving).add(wrapperCall[1]),
+    );
+  }
+  if (wrapperCall && state.wrappers?.has(wrapperCall[1])) {
+    return compileDomProjectionExpression(wrapperCall[2], position, state, resolving);
+  }
+  const javaWrapper = source.match(
+    /^java\.(?:t2s|s2t|toSimplified|toTraditional|trim|unescape|urlDecode|decode)\s*\(([\s\S]*)\)$/i,
+  );
+  if (javaWrapper) {
+    return compileDomProjectionExpression(javaWrapper[1], position, state, resolving);
+  }
+  if (/^[A-Za-z_$][\w$]*$/.test(source)) {
+    if (resolving.has(source)) return null;
+    const root = state.rootFor(source, position);
+    if (root) return { path: ".", rootName: source, rootSelector: root.selector };
+    const candidates = (state.assignments.get(source) || [])
+      .filter((item) => item.index <= position)
+      .slice()
+      .reverse();
+    for (const assignment of candidates) {
+      const nextResolving = new Set(resolving).add(source);
+      const result = compileDomProjectionExpression(assignment.expression, assignment.index, state, nextResolving);
+      if (result?.selector || result?.constant || result?.path) return result;
+    }
+    return null;
+  }
+
+  const baseMatch = source.match(/^([A-Za-z_$][\w$]*)/);
+  if (!baseMatch) return null;
+  const baseName = baseMatch[1];
+  const root = state.rootFor(baseName, position);
+  let current = root
+    ? { path: "", rootName: baseName, rootSelector: root.selector }
+    : compileDomProjectionExpression(baseName, position, state, resolving);
+  if (!current || current.constant) return null;
+  let rest = source.slice(baseName.length).trim();
+  while (rest) {
+    let match = rest.match(/^\.get\s*\(\s*([A-Za-z_$][\w$]*|\d+)\s*\)/);
+    if (match) {
+      const token = match[1];
+      if (/^\d+$/.test(token)) current.path = domProjectionAppendIndex(current.path || ".", Number(token));
+      else if (!current.path) current.path = ".";
+      rest = rest.slice(match[0].length).trim();
+      continue;
+    }
+    match = rest.match(/^\.first\s*\(\s*\)/);
+    if (match) {
+      current.path = domProjectionAppendIndex(current.path || ".", 0);
+      rest = rest.slice(match[0].length).trim();
+      continue;
+    }
+    match = rest.match(/^\.select\s*\(\s*(['"])((?:\\.|(?!\1)[^\\])*)\1\s*\)/);
+    if (match) {
+      let selector = match[2];
+      try { selector = staticStringLiteral(`${match[1]}${selector}${match[1]}`); } catch { return null; }
+      const converted = domProjectionRelativeSelector(selector);
+      if (!converted) return null;
+      current.path = domProjectionAppendDescendant(current.path, converted);
+      rest = rest.slice(match[0].length).trim();
+      continue;
+    }
+    match = rest.match(/^\.attr\s*\(\s*(['"])([A-Za-z_][\w:-]*)\1\s*\)/i);
+    if (match) {
+      const path = current.path || ".";
+      current.path = `${path}/@${match[2]}`;
+      rest = rest.slice(match[0].length).trim();
+      continue;
+    }
+    match = rest.match(/^\.(?:text|ownText|html)\s*\(\s*\)/i);
+    if (match) {
+      current.path ||= ".";
+      rest = rest.slice(match[0].length).trim();
+      continue;
+    }
+    return null;
+  }
+  return current;
+}
+
+/**
+ * Compile a bounded Jsoup/DOM list projection into relative XPath fields.
+ * Legado scripts frequently parse HTML, build JSON-shaped rows, and then use
+ * `$.name`/`$.bookUrl` rules. The server deliberately does not execute that
+ * arbitrary JavaScript; this recognises only DOM selection chains and emits a
+ * data-only bridge plan that is reusable by every site and media category.
+ */
+export function compileDomBookProjection(rule) {
+  const source = String(rule || "").trim();
+  if (!isDomListProjection(source)) return null;
+  const assignments = collectDomProjectionAssignments(source);
+  const roots = new Map();
+  const parserOwners = new Set(["doc", "document", "root", "html"]);
+  for (const [name, entries] of assignments) {
+    if (entries.some((entry) => /(?:\.parse\s*\(|\bJsoup\b|__xsJsoup)/i.test(entry.expression))) {
+      parserOwners.add(name);
+    }
+  }
+  for (const match of source.matchAll(
+    /\b(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\.select\s*\(\s*(['"])((?:\\.|(?!\3)[^\\])*)\3\s*\)/g,
+  )) {
+    if (!parserOwners.has(match[2])) continue;
+    let selector = match[4];
+    try { selector = staticStringLiteral(`${match[3]}${match[4]}${match[3]}`); } catch { /* keep raw */ }
+    if (!selector) continue;
+    const entries = roots.get(match[1]) || [];
+    entries.push({ selector, index: match.index || 0 });
+    roots.set(match[1], entries);
+  }
+  if (!roots.size) return null;
+  const wrappers = new Set(["String", "Number", "Boolean", "E"]);
+  for (const match of source.matchAll(
+    /\bfunction\s+([A-Za-z_$][\w$]*)\s*\(\s*([A-Za-z_$][\w$]*)\s*\)\s*\{([\s\S]*?)\}/g,
+  )) {
+    if (new RegExp(`\\breturn\\b[\\s\\S]*\\b${match[2].replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\b`).test(match[3])) {
+      wrappers.add(match[1]);
+    }
+  }
+  const state = {
+    assignments,
+    wrappers,
+    rootFor(name, position) {
+      return (roots.get(name) || [])
+        .filter((item) => item.index <= position)
+        .at(-1) || null;
+    },
+  };
+  const canonical = {
+    name: "name",
+    title: "name",
+    bookName: "name",
+    n: "name",
+    bookUrl: "bookUrl",
+    detailUrl: "bookUrl",
+    url: "bookUrl",
+    href: "bookUrl",
+    link: "bookUrl",
+    u: "bookUrl",
+    author: "author",
+    intro: "intro",
+    desc: "intro",
+    description: "intro",
+    kind: "kind",
+    cat: "kind",
+    category: "kind",
+    lastChapter: "lastChapter",
+    lastChapterTitle: "lastChapter",
+    coverUrl: "coverUrl",
+    cover: "coverUrl",
+    image: "coverUrl",
+    pic: "coverUrl",
+    wordCount: "wordCount",
+    status: "status",
+  };
+  const candidates = [];
+  for (const object of extractDomProjectionObjects(source)) {
+    const properties = new Map();
+    for (const property of splitProjectionProperties(object.body)) {
+      const pair = property.match(/^([A-Za-z_$][\w$]*|['"][^'"]+['"])\s*:\s*([\s\S]+)$/);
+      if (!pair) continue;
+      const key = pair[1].replace(/^['"]|['"]$/g, "");
+      const target = canonical[key];
+      if (target) properties.set(target, pair[2].trim());
+    }
+    const nameExpression = properties.get("name");
+    const urlExpression = properties.get("bookUrl");
+    if (!nameExpression || !urlExpression) continue;
+    const name = compileDomProjectionExpression(nameExpression, object.index, state);
+    const url = compileDomProjectionExpression(urlExpression, object.index, state);
+    if (!name?.path || !url?.path || name.rootName !== url.rootName || !name.rootSelector) continue;
+    const list = domProjectionRelativeSelector(name.rootSelector).replace(/^\.\/\//, "//");
+    if (!list) continue;
+    const fields = {};
+    for (const [target, expression] of properties) {
+      const compiled = compileDomProjectionExpression(expression, object.index, state);
+      if (compiled?.path) fields[target] = compiled.path;
+      else if (compiled?.constant) fields[target] = { constant: compiled.constant };
+    }
+    if (fields.name && fields.bookUrl) candidates.push({ list, fields });
+  }
+  if (!candidates.length) return null;
+  const result = { list: "", fields: {} };
+  for (const candidate of candidates.slice(0, 8)) {
+    result.list = result.list ? `${result.list}||${candidate.list}` : candidate.list;
+    for (const [field, value] of Object.entries(candidate.fields)) {
+      if (value && typeof value === "object") {
+        if (!result.fields[field]) result.fields[field] = value;
+        continue;
+      }
+      if (!result.fields[field]) result.fields[field] = value;
+      else if (result.fields[field] !== value) result.fields[field] = `${result.fields[field]}||${value}`;
+    }
+  }
+  return result.list && result.fields.name && result.fields.bookUrl ? result : null;
+}
+
+function extractDomProjectionObjectLiterals(source) {
+  const input = String(source || "");
+  const markers = [
+    ...input.matchAll(/JSON\.stringify\s*\(/gi),
+    ...input.matchAll(/\breturn\s*(?=\{)/gi),
+  ].sort((left, right) => (left.index || 0) - (right.index || 0));
+  const objects = [];
+  for (const match of markers) {
+    const start = (match.index || 0) + match[0].length;
+    const open = input.indexOf("{", start);
+    if (open < 0 || open > start + 128) continue;
+    let quote = "";
+    let escaped = false;
+    let depth = 0;
+    for (let index = open; index < input.length; index += 1) {
+      const character = input[index];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === quote) quote = "";
+        continue;
+      }
+      if (character === "'" || character === '"' || character === "`") {
+        quote = character;
+        continue;
+      }
+      if (character === "{") depth += 1;
+      else if (character === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          objects.push({ body: input.slice(open + 1, index), index: open });
+          break;
+        }
+      }
+    }
+  }
+  return objects;
+}
+
+function domProjectionGlobalSelector(value) {
+  const path = String(value || "").trim();
+  if (!path || path === ".") return path;
+  if (path.startsWith(".//")) return path.slice(1);
+  if (path.startsWith("./")) return path.slice(1);
+  return path;
+}
+
+/**
+ * Compile a bounded DOM object returned by a detail init script. A common
+ * Legado pattern parses HTML with Jsoup, projects fields into JSON, and then
+ * applies `$.field` rules. The object is data-shaped, so its DOM chains can be
+ * represented by the same declarative bridge used for lists without running
+ * arbitrary source JavaScript.
+ */
+export function compileDomDetailProjection(rule) {
+  const source = String(rule || "").trim();
+  if (!/^@js:/i.test(source)
+    || !/(?:\b(?:Packages\.)?org\.jsoup\.Jsoup|__xsJsoup)/i.test(source)
+    || !/\.parse\s*\(/i.test(source)
+    || !/\.select\s*\(/i.test(source)) return null;
+  const assignments = collectDomProjectionAssignments(source);
+  const documentOwners = new Set(["doc", "document", "root", "html"]);
+  for (const [name, entries] of assignments) {
+    if (entries.some((entry) => /(?:\.parse\s*\(|\bJsoup\b|__xsJsoup)/i.test(entry.expression))) {
+      documentOwners.add(name);
+    }
+  }
+  const wrappers = new Map();
+  for (const match of source.matchAll(
+    /\bfunction\s+([A-Za-z_$][\w$]*)\s*\(\s*([A-Za-z_$][\w$]*)\s*\)\s*\{([\s\S]*?)\}/g,
+  )) {
+    const returnIndex = match[3].search(/\breturn\b/);
+    if (returnIndex < 0) continue;
+    const expression = match[3].slice(returnIndex + "return".length).replace(/;\s*$/, "").trim();
+    if (expression) wrappers.set(match[1], { parameter: match[2], expression });
+  }
+  const state = {
+    assignments,
+    wrappers: new Set(["String", "Number", "Boolean", "E"]),
+    wrapperBodies: wrappers,
+    rootFor(name, position) {
+      if (documentOwners.has(name)) return { selector: "", index: -1 };
+      return null;
+    },
+  };
+  const canonical = {
+    name: "name",
+    title: "name",
+    bookName: "name",
+    n: "name",
+    author: "author",
+    a: "author",
+    intro: "intro",
+    desc: "intro",
+    description: "intro",
+    o: "intro",
+    kind: "kind",
+    cat: "kind",
+    category: "kind",
+    k: "kind",
+    lastChapter: "lastChapter",
+    lastChapterTitle: "lastChapter",
+    l: "lastChapter",
+    coverUrl: "coverUrl",
+    cover: "coverUrl",
+    image: "coverUrl",
+    pic: "coverUrl",
+    c: "coverUrl",
+    wordCount: "wordCount",
+    words: "wordCount",
+    w: "wordCount",
+    status: "status",
+  };
+  for (const object of extractDomProjectionObjectLiterals(source)) {
+    const properties = new Map();
+    for (const property of splitProjectionProperties(object.body)) {
+      const pair = property.match(/^([A-Za-z_$][\w$]*|(['"])(.*?)\2)\s*:\s*([\s\S]+)$/);
+      if (!pair) continue;
+      const key = pair[1].replace(/^['"]|['"]$/g, "");
+      const target = canonical[key];
+      if (target) properties.set(target, pair[4].trim());
+    }
+    const fields = {};
+    for (const [target, expression] of properties) {
+      const compiled = compileDomProjectionExpression(expression, object.index, state);
+      if (compiled?.path) fields[target] = domProjectionGlobalSelector(compiled.path);
+    }
+    if (fields.name) return { fields };
+  }
+  return null;
+}
+
+function splitTopLevelPlus(source) {
+  const parts = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  let round = 0;
+  let square = 0;
+  let curly = 0;
+  for (const character of String(source || "")) {
+    if (quote) {
+      current += character;
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      quote = character;
+      current += character;
+      continue;
+    }
+    if (character === "(") round += 1;
+    else if (character === ")") round -= 1;
+    else if (character === "[") square += 1;
+    else if (character === "]") square -= 1;
+    else if (character === "{") curly += 1;
+    else if (character === "}") curly -= 1;
+    if (character === "+" && round === 0 && square === 0 && curly === 0) {
+      if (current.trim()) parts.push(current.trim());
+      current = "";
+    } else current += character;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+function splitProjectionProperties(source) {
+  const parts = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  let round = 0;
+  let square = 0;
+  let curly = 0;
+  for (const character of String(source || "")) {
+    if (quote) {
+      current += character;
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      quote = character;
+      current += character;
+      continue;
+    }
+    if (character === "(") round += 1;
+    else if (character === ")") round -= 1;
+    else if (character === "[") square += 1;
+    else if (character === "]") square -= 1;
+    else if (character === "{") curly += 1;
+    else if (character === "}") curly -= 1;
+    if (character === "," && round === 0 && square === 0 && curly === 0) {
+      if (current.trim()) parts.push(current.trim());
+      current = "";
+    } else current += character;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+function extractProjectionObjects(source) {
+  const input = String(source || "");
+  const objects = [];
+  for (const match of input.matchAll(/\.push\s*\(/g)) {
+    const start = (match.index || 0) + match[0].length;
+    const open = input.indexOf("{", start);
+    if (open < 0 || open > start + 64) continue;
+    let quote = "";
+    let escaped = false;
+    let depth = 0;
+    for (let index = open; index < input.length; index += 1) {
+      const character = input[index];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === quote) quote = "";
+        continue;
+      }
+      if (character === "'" || character === '"' || character === "`") {
+        quote = character;
+        continue;
+      }
+      if (character === "{") depth += 1;
+      else if (character === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          objects.push(input.slice(open + 1, index));
+          break;
+        }
+      }
+    }
+  }
+  return objects;
+}
+
+function unwrapProjectionExpression(value) {
+  let source = String(value || "").trim();
+  while (source.startsWith("(") && source.endsWith(")")) {
+    let depth = 0;
+    let balanced = true;
+    for (let index = 0; index < source.length; index += 1) {
+      if (source[index] === "(") depth += 1;
+      else if (source[index] === ")") depth -= 1;
+      if (depth === 0 && index < source.length - 1) balanced = false;
+    }
+    if (!balanced) break;
+    source = source.slice(1, -1).trim();
+  }
+  return source;
+}
+
+function encodeProjectionMetadata(prefix, value) {
+  try {
+    const encoded = Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+    return `${prefix}${encoded}`.slice(0, 8_192);
+  } catch {
+    return "";
+  }
+}
+
+function decodeProjectionMetadata(selector, prefix) {
+  const encoded = String(selector || "").slice(prefix.length);
+  if (!encoded || encoded.length > 8_000 || !/^[A-Za-z0-9_-]+$/.test(encoded)) return null;
+  try {
+    const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function projectionLiteral(value) {
+  const literal = String(value || "").trim();
+  if (!/^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')$/.test(literal)) return null;
+  try { return staticStringLiteral(literal); } catch { return null; }
+}
+
+function projectionItemPath(value, itemName, arrayName) {
+  const source = unwrapProjectionExpression(value)
+    .replace(/^(?:String|Number|Boolean)\s*\(\s*/, "")
+    .replace(/\)\s*$/, "")
+    .trim();
+  const match = source.match(new RegExp(
+    `^${itemName.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\.([A-Za-z_$][\\w$]*)$`,
+  ));
+  if (match) return match[1];
+  const indexed = source.match(new RegExp(
+    `^${arrayName.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\[${itemName.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\.([A-Za-z_$][\\w$]*)\\]$`,
+  ));
+  return indexed?.[1] || "";
+}
+
+function compileHydrationProjectionValue(value, { itemName, arrayName, responseName }) {
+  const parts = splitTopLevelPlus(unwrapProjectionExpression(value));
+  if (!parts.length) return "";
+  return parts.map((part) => {
+    const literal = projectionLiteral(part);
+    if (literal !== null) return literal;
+    const response = String(part).trim();
+    if (response === responseName) return "{{response:id}}";
+    const item = response.match(new RegExp(
+      `^(?:String\\s*\\(\\s*)?${itemName.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\.([A-Za-z_$][\\w$]*)\\s*\\)?$`,
+    ));
+    if (item) return `{{item:${item[1]}}}`;
+    const indexed = response.match(new RegExp(
+      `^(?:String\\s*\\(\\s*)?${arrayName.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\[${itemName.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\.([A-Za-z_$][\\w$]*)\\]\\s*\\)?$`,
+    ));
+    if (indexed) return `{{item:${indexed[1]}}}`;
+    return "";
+  }).join("");
+}
+
+function hydrationChapterProjection(rule) {
+  const source = String(rule || "").replace(/^@js:\s*/i, "").trim();
+  if (!source || !/JSON\.parse\s*\(/i.test(source) || !/\.push\s*\(/i.test(source)
+    || !/__NUXT_DATA__|__NEXT_DATA__|hydration/i.test(source)) return null;
+  const rootAssignment = source.match(
+    /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*\[\s*\]\s*;?[\s\S]{0,512}?\b\1\s*=\s*JSON\.parse\s*\(\s*([A-Za-z_$][\w$]*)\s*\[\s*1\s*\]\s*\)/i,
+  );
+  if (!rootAssignment) return null;
+  const [, arrayName, matchName] = rootAssignment;
+  const collection = source.match(new RegExp(
+    `\\b(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${arrayName}\\[[^\\]]+\\]\\.([A-Za-z_$][\\w$]*)`,
+  ));
+  if (!collection) return null;
+  const [, refsName, collectionField] = collection;
+  const resolvedRefs = source.match(new RegExp(
+    `\\b(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*\\(\\s*typeof\\s+${refsName}\\s*===?\\s*["']number["']\\s*\\)\\s*\\?\\s*${arrayName}\\[${refsName}\\]\\s*:\\s*${refsName}`,
+    "i",
+  ));
+  if (!resolvedRefs) return null;
+  const items = source.match(new RegExp(
+    `\\b(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${arrayName}\\[${resolvedRefs[1]}\\[[^\\]]+\\]\\]`,
+  ));
+  if (!items) return null;
+  const [, itemName] = items;
+  const objects = extractProjectionObjects(source);
+  let title = "";
+  let urlExpression = "";
+  for (const body of objects.reverse()) {
+    const properties = splitProjectionProperties(body);
+    const parsed = new Map();
+    for (const property of properties) {
+      const match = property.match(/^([A-Za-z_$][\w$]*)\s*:\s*([\s\S]+)$/);
+      if (match) parsed.set(match[1], match[2].trim());
+    }
+    const titleExpression = parsed.get("name") || parsed.get("title");
+    const candidateUrl = parsed.get("url");
+    const titlePath = titleExpression && projectionItemPath(titleExpression, itemName, arrayName);
+    if (titlePath && candidateUrl) {
+      title = titlePath;
+      urlExpression = candidateUrl;
+      break;
+    }
+  }
+  if (!title || !urlExpression) return null;
+  const responseMatch = [...source.matchAll(
+    /\b([A-Za-z_$][\w$]*)\s*=\s*[^;]*\.match\s*\(\s*\/((?:\\.|[^/])+)\/\s*\)/g,
+  )].reverse().find((match) => !/(?:NUXT|NEXT|script|hydration)/i.test(match[2])) || null;
+  const responseName = responseMatch
+    ? source.match(new RegExp(`\\b([A-Za-z_$][\\w$]*)\\s*=\\s*${responseMatch[1]}\\s*\\?`))?.[1]
+      || responseMatch[1]
+    : "";
+  const responsePattern = responseMatch?.[2]?.replace(/\\\//g, "/") || "";
+  const urlTemplate = compileHydrationProjectionValue(urlExpression, {
+    itemName,
+    arrayName,
+    responseName,
+  });
+  if (!urlTemplate || !/^https?:\/\//i.test(urlTemplate)) return null;
+  const list = encodeProjectionMetadata("@hydration-chapters:", {
+    marker: source.match(/__(?:NUXT|NEXT)_DATA__/i)?.[0] || "",
+    arrayName,
+    matchName,
+    collectionField,
+    responsePattern,
+    title,
+    urlTemplate,
+  });
+  if (!list) return null;
+  return { list, title: "name", url: "url", responseType: "html" };
+}
+
+function hydrationBookValue(value, { itemName, arrayName, bindings }) {
+  const parts = splitTopLevelPlus(unwrapProjectionExpression(value));
+  if (!parts.length) return "";
+  const escapeRegExp = (input) => String(input).replace(/[\^$.*+?()[\]{}|]/g, "\\$&");
+  return parts.map((part) => {
+    const literal = projectionLiteral(part);
+    if (literal !== null) return literal;
+    let expression = unwrapProjectionExpression(part);
+    const call = expression.match(/^(?:String|Number|Boolean|encodeURIComponent|encodeURI)\s*\(([\s\S]*)\)$/);
+    if (call) expression = unwrapProjectionExpression(call[1]);
+    const direct = expression.match(new RegExp(
+      "^" + escapeRegExp(itemName) + "\\.([A-Za-z_$][\\w$]*)$",
+    ));
+    if (direct) return "{{item:" + direct[1] + "}}";
+    const indexed = expression.match(new RegExp(
+      "^" + escapeRegExp(arrayName) + "\\[" + escapeRegExp(itemName)
+        + "\\.([A-Za-z_$][\\w$]*)\\]$",
+    ));
+    if (indexed) return "{{item:" + indexed[1] + "}}";
+    if (bindings.has(expression)) return "{{item:" + bindings.get(expression) + "}}";
+    return "";
+  }).join("");
+}
+
+/**
+ * SSR frameworks commonly serialize search/category data as a reference
+ * array. A Legado @js rule can project that array in a WebView, but the
+ * server bridge cannot execute arbitrary JavaScript. Compile the bounded
+ * object projection into a declarative adapter instead.
+ *
+ * The metadata describes only the hydration data shape, never a host or a
+ * site name, so it is reusable across text, comic, audio and video sources.
+ */
+function hydrationBookProjection(rule) {
+  const source = String(rule || "").replace(/^@js:\s*/i, "").trim();
+  if (!source || !/JSON\.parse\s*\(/i.test(source) || !/\.push\s*\(/i.test(source)
+    || !/__NUXT_DATA__|__NEXT_DATA__|hydration/i.test(source)) return null;
+  const root = source.match(
+    /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*JSON\.parse\s*\(/i,
+  )?.[1];
+  if (!root) return null;
+  const escapeRegExp = (input) => String(input).replace(/[\^$.*+?()[\]{}|]/g, "\\$&");
+  const itemReference = source.match(new RegExp(
+    escapeRegExp(root) + "\\[([A-Za-z_$][\\w$]*)\\.([A-Za-z_$][\\w$]*)\\]",
+  ));
+  if (!itemReference) return null;
+  const itemName = itemReference[1];
+  const bindings = new Map();
+  const bindingPattern = new RegExp(
+    "\\b(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*"
+      + escapeRegExp(root) + "\\[" + escapeRegExp(itemName)
+      + "\\.([A-Za-z_$][\\w$]*)\\]",
+    "g",
+  );
+  for (const match of source.matchAll(bindingPattern)) bindings.set(match[1], match[2]);
+  if (!bindings.size) return null;
+
+  const containerMatch = source.match(
+    /\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*!==?\s*undefined/i,
+  );
+  const containerField = containerMatch?.[2] || "";
+  const containerName = containerMatch?.[1] || "";
+  const listCandidates = [];
+  const memberPattern = /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*;/g;
+  for (const match of source.matchAll(memberPattern)) {
+    const candidate = { name: match[1], owner: match[2], field: match[3] };
+    if (containerName && candidate.owner === containerName) listCandidates.unshift(candidate);
+    else listCandidates.push(candidate);
+  }
+  const listMatch = listCandidates.find((candidate) => (
+    candidate.field !== containerField
+      && /(?:^list$|items|results|books|albums|data)/i.test(candidate.field)
+  ));
+  if (!listMatch || !containerField) return null;
+
+  const objects = extractProjectionObjects(source);
+  let nameTemplate = "";
+  let urlTemplate = "";
+  let coverTemplate = "";
+  for (const body of objects.reverse()) {
+    const properties = new Map();
+    for (const property of splitProjectionProperties(body)) {
+      const match = property.match(/^([A-Za-z_$][\w$]*)\s*:\s*([\s\S]+)$/);
+      if (match) properties.set(match[1], match[2].trim());
+    }
+    const nameExpression = properties.get("name") || properties.get("title");
+    const candidateUrl = properties.get("url") || properties.get("href");
+    if (!nameExpression || !candidateUrl) continue;
+    const candidateName = hydrationBookValue(nameExpression, { itemName, arrayName: root, bindings });
+    const candidateUrlTemplate = hydrationBookValue(candidateUrl, { itemName, arrayName: root, bindings });
+    if (!candidateName || !candidateUrlTemplate || !/^https?:\/\//i.test(candidateUrlTemplate)
+      || !/\{\{item:[A-Za-z_$][\w$]*\}\}/.test(candidateUrlTemplate)) continue;
+    nameTemplate = candidateName;
+    urlTemplate = candidateUrlTemplate;
+    const candidateCover = properties.get("cover") || properties.get("image") || properties.get("pic");
+    coverTemplate = candidateCover
+      ? hydrationBookValue(candidateCover, { itemName, arrayName: root, bindings })
+      : "";
+    break;
+  }
+  if (!nameTemplate || !urlTemplate) return null;
+  const list = encodeProjectionMetadata("@hydration-books:", {
+    marker: source.match(/__(?:NUXT|NEXT)_DATA__/i)?.[0] || "",
+    arrayName: root,
+    containerField,
+    listField: listMatch.field,
+    nameTemplate,
+    urlTemplate,
+    ...(coverTemplate ? { coverTemplate } : {}),
+  });
+  return list ? { list, name: "name", url: "url", cover: "cover", responseType: "html" } : null;
+}
+
+function splitJsonChapterProjection(rule) {
+  const source = String(rule || "").replace(/^@js:\s*/i, "").trim();
+  if (!source || !/JSON\.parse\s*\(\s*result\s*\)/i.test(source)
+    || !/\.split\s*\(/i.test(source) || !/\.push\s*\(/i.test(source)) return null;
+  const rootName = source.match(
+    /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\(?\s*typeof\s+result\s*===?\s*["']string["']\s*\)?\s*\?\s*)?JSON\.parse\s*\(\s*result\s*\)/i,
+  )?.[1];
+  if (!rootName) return null;
+  const vod = source.match(new RegExp(
+    `\\b(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*[^;]{0,256}?\\b${rootName}(\\.[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*\\[\\d+\\])`,
+  ));
+  if (!vod) return null;
+  const vodName = vod[1];
+  const vodPath = vod[2].replace(/^\./, "").replace(/\[(\d+)\]/g, "/$1").replace(/\./g, "/");
+  const splitFields = [];
+  for (const match of source.matchAll(new RegExp(
+    `\\b(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*\\(?\\s*${vodName}\\.([A-Za-z_$][\\w$]*)\\s*\\|\\|\\s*['"][^'"]*['"]\\s*\\)?\\.split\\(\\s*(['"])([^'"]+)\\3\\s*\\)`,
+    "g",
+  ))) {
+    splitFields.push({ name: match[1], field: match[2], separator: match[4] });
+  }
+  const playUrl = splitFields.find((item) => /(?:url|link)/i.test(item.name) || /(?:url|link)/i.test(item.field))
+    || splitFields.find((item) => /play/i.test(item.name) || /play/i.test(item.field));
+  const playFrom = splitFields.find((item) => item !== playUrl
+    && (/(?:from|line|source|site)/i.test(item.name) || /(?:from|line|source|site)/i.test(item.field)));
+  if (!playUrl) return null;
+  const episodeSplit = source.match(new RegExp(
+    `\\b(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${playUrl.name}\\[[^\\]]+\\]\\.split\\(\\s*(['"])([^'"]+)\\2\\s*\\)`,
+  ));
+  const pairSplit = source.match(new RegExp(
+    `\\b(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${episodeSplit?.[1] || "__missing__"}\\[[^\\]]+\\]\\.split\\(\\s*(['"])([^'"]+)\\2\\s*\\)`,
+  ));
+  if (!episodeSplit || !pairSplit) return null;
+  if (!/\b(?:name|title)\s*:/i.test(source) || !/\burl\s*:/i.test(source)) return null;
+  const list = encodeProjectionMetadata("@split-json-chapters:", {
+    rootPath: vodPath,
+    urlField: playUrl.field,
+    fromField: playFrom?.field || "",
+    groupSeparator: playFrom?.separator || "$$$",
+    episodeSeparator: episodeSplit[3],
+    pairSeparator: pairSplit[3],
+    fallbackCurrent: /\/art\//i.test(source),
+  });
+  return list ? { list, title: "name", url: "url", responseType: "json" } : null;
+}
+
+function dereferenceProjectionValue(value, array, depth = 0) {
+  let current = value;
+  let remaining = depth;
+  while (remaining < 8 && typeof current === "number" && Array.isArray(array)) {
+    const next = array[current];
+    if (next === undefined || next === current) break;
+    current = next;
+    remaining += 1;
+  }
+  return current;
+}
+
+function dereferenceProjectionField(value, array) {
+  if (typeof value !== "number" || !Array.isArray(array)) return value;
+  const next = array[value];
+  return next === undefined || next === value ? value : next;
+}
+
+function hydrationChapterRows(body, baseUrl, metadata) {
+  const html = String(body || "");
+  const marker = String(metadata?.marker || "");
+  if (!marker || !metadata?.arrayName || !metadata?.collectionField) return [];
+  let pattern = null;
+  if (metadata.responsePattern) {
+    const safePattern = safeRegexPattern(metadata.responsePattern);
+    if (safePattern) {
+      try { pattern = new RegExp(safePattern); } catch { pattern = null; }
+    }
+  }
+  let responseId = "";
+  if (pattern) responseId = String(baseUrl || "").match(pattern)?.[1] || "";
+  for (const match of html.matchAll(/(<script\b[^>]*>)([\s\S]*?)<\/script>/gi)) {
+    if (!String(match[1] || "").includes(marker) && !String(match[2] || "").includes(marker)) continue;
+    let array;
+    try { array = JSON.parse(match[2]); } catch { continue; }
+    if (!Array.isArray(array)) continue;
+    const entry = array.find((value) => value && typeof value === "object"
+      && !Array.isArray(value) && Object.hasOwn(value, metadata.collectionField));
+    if (!entry) continue;
+    const rawRefs = dereferenceProjectionValue(entry[metadata.collectionField], array);
+    if (!Array.isArray(rawRefs)) continue;
+    const rows = [];
+    for (const rawRef of rawRefs) {
+      const item = dereferenceProjectionValue(rawRef, array);
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const titleValue = dereferenceProjectionField(item[metadata.title], array);
+      const title = String(titleValue == null ? "" : titleValue).trim();
+      let url = String(metadata.urlTemplate || "")
+        .replace(/\{\{response:id\}\}/g, encodeURIComponent(responseId));
+      url = url.replace(/\{\{item:([A-Za-z_$][\w$]*)\}\}/g, (_match, field) => (
+        encodeURIComponent(String(dereferenceProjectionField(item[field], array) ?? ""))
+      ));
+      if (title && /^https?:\/\//i.test(url) && !/[{}]/.test(url)) rows.push({ name: title, url });
+    }
+    if (rows.length) return rows;
+  }
+  return [];
+}
+
+function hydrationBookRows(body, metadata) {
+  const html = String(body || "");
+  const marker = String(metadata?.marker || "");
+  if (!marker || !metadata?.containerField || !metadata?.listField) return [];
+  for (const match of html.matchAll(/(<script\b[^>]*>)([\s\S]*?)<\/script>/gi)) {
+    if (!String(match[1] || "").includes(marker) && !String(match[2] || "").includes(marker)) continue;
+    let array;
+    try { array = JSON.parse(match[2]); } catch { continue; }
+    if (!Array.isArray(array)) continue;
+    const entry = array.find((value) => value && typeof value === "object"
+      && !Array.isArray(value) && Object.hasOwn(value, metadata.containerField));
+    if (!entry) continue;
+    const container = dereferenceProjectionValue(entry[metadata.containerField], array);
+    const rawRefs = Array.isArray(container)
+      ? container
+      : dereferenceProjectionValue(container?.[metadata.listField], array);
+    if (!Array.isArray(rawRefs)) continue;
+    const render = (template, item, encode = false) => String(template || "").replace(
+      /\{\{item:([A-Za-z_$][\w$]*)\}\}/g,
+      (_match, field) => {
+        const value = String(dereferenceProjectionField(item?.[field], array) ?? "");
+        return encode ? encodeURIComponent(value) : value;
+      },
+    );
+    const rows = [];
+    const seen = new Set();
+    for (const rawRef of rawRefs) {
+      const item = dereferenceProjectionValue(rawRef, array);
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const name = render(metadata.nameTemplate, item).trim();
+      const url = render(metadata.urlTemplate, item, true).trim();
+      const cover = render(metadata.coverTemplate, item).trim();
+      if (!name || !/^https?:\/\//i.test(url) || /[{}]/.test(url) || seen.has(url)) continue;
+      seen.add(url);
+      rows.push({ name, url, ...(cover ? { cover } : {}) });
+    }
+    if (rows.length) return rows;
+  }
+  return [];
+}
+
+function splitJsonChapterRows(input, baseUrl, metadata) {
+  if (!metadata?.rootPath || !metadata?.urlField) return [];
+  const root = jsonPathSingle(input, metadata.rootPath);
+  if (!root || typeof root !== "object") {
+    if (metadata.fallbackCurrent && /\/art\//i.test(String(baseUrl || ""))) {
+      return [{ name: "正文浏览", url: String(baseUrl || "") }];
+    }
+    return [];
+  }
+  const urls = String(root[metadata.urlField] || "").split(String(metadata.groupSeparator || "$$$"));
+  const from = String(root[metadata.fromField] || "").split(String(metadata.groupSeparator || "$$$"));
+  const rows = [];
+  for (let groupIndex = 0; groupIndex < urls.length; groupIndex += 1) {
+    const group = String(from[groupIndex] || `线路${groupIndex + 1}`).trim();
+    const episodes = String(urls[groupIndex] || "").split(String(metadata.episodeSeparator || "#"));
+    for (let episodeIndex = 0; episodeIndex < episodes.length; episodeIndex += 1) {
+      const episode = String(episodes[episodeIndex] || "").trim();
+      if (!episode) continue;
+      const separator = String(metadata.pairSeparator || "$");
+      const pairIndex = episode.indexOf(separator);
+      const url = pairIndex > 0 ? episode.slice(pairIndex + separator.length).trim() : episode;
+      if (!url) continue;
+      const label = pairIndex > 0
+        ? episode.slice(0, pairIndex).trim()
+        : episodes.length > 1 ? `第${episodeIndex + 1}集` : "播放";
+      const name = [group, label].filter(Boolean).join(" - ");
+      if (name && url) rows.push({ name, url });
+    }
+  }
+  if (!rows.length && metadata.fallbackCurrent && /\/art\//i.test(String(baseUrl || ""))) {
+    return [{ name: "正文浏览", url: String(baseUrl || "") }];
+  }
+  return rows;
+}
+
+function chapterProjectionItems(selector, input, baseUrl) {
+  const value = String(selector || "");
+  if (value.startsWith("@hydration-chapters:")) {
+    return hydrationChapterRows(input, baseUrl, decodeProjectionMetadata(value, "@hydration-chapters:"));
+  }
+  if (value.startsWith("@split-json-chapters:")) {
+    return splitJsonChapterRows(input, baseUrl, decodeProjectionMetadata(value, "@split-json-chapters:"));
+  }
+  return null;
+}
+
+function bookProjectionItems(selector, input) {
+  const value = String(selector || "");
+  if (value.startsWith("@hydration-books:")) {
+    return hydrationBookRows(input, decodeProjectionMetadata(value, "@hydration-books:"));
+  }
+  return null;
+}
+
+function nestedJsonChapterProjection(rule) {
+  const source = String(rule || "").replace(/^@js:\s*/i, "").trim();
+  if (!source || !/JSON\.parse\s*\(\s*result\s*\)/i.test(source) || !/\.push\s*\(/i.test(source)) {
+    return null;
+  }
+  const assignments = new Map();
+  for (const match of source.matchAll(/\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;]+);/g)) {
+    assignments.set(match[1], match[2].trim());
+  }
+  const rootName = [...assignments.entries()]
+    .find(([, expression]) => /JSON\.parse\s*\(\s*result\s*\)/i.test(expression))?.[0];
+  if (!rootName) return null;
+  const pathMemo = new Map([[rootName, ""]]);
+  const resolving = new Set();
+  const pathFor = (name) => {
+    if (pathMemo.has(name)) return pathMemo.get(name);
+    if (resolving.has(name)) return null;
+    const expression = assignments.get(name);
+    if (!expression) return null;
+    resolving.add(name);
+    let value = unwrapProjectionExpression(expression).split(/\s*\|\|\s*/, 1)[0].trim();
+    value = value.replace(/^\?\s*.*?:\s*/, "");
+    const member = value.match(/^([A-Za-z_$][\w$]*)([\s\S]*)$/);
+    if (!member) {
+      resolving.delete(name);
+      return null;
+    }
+    const base = pathFor(member[1]);
+    if (base === null || base === undefined) {
+      resolving.delete(name);
+      return null;
+    }
+    const suffix = member[2]
+      .replace(/\[[A-Za-z_$][\w$]*\]/g, "")
+      .replace(/^\./, "")
+      .replace(/\./g, "/")
+      .replace(/^\/+|\/+$/g, "");
+    const path = [base, suffix].filter(Boolean).join("/");
+    pathMemo.set(name, path);
+    resolving.delete(name);
+    return path;
+  };
+
+  const itemAssignments = [...assignments.entries()]
+    .map(([name, expression]) => ({ name, expression: unwrapProjectionExpression(expression) }))
+    .filter(({ expression }) => /^[A-Za-z_$][\w$]*\s*\[[A-Za-z_$][\w$]*\]$/.test(expression));
+  if (!itemAssignments.length) return null;
+  const objects = extractProjectionObjects(source);
+  for (const body of objects.reverse()) {
+    const properties = splitProjectionProperties(body);
+    const parsed = new Map();
+    for (const property of properties) {
+      const match = property.match(/^([A-Za-z_$][\w$]*)\s*:\s*([\s\S]+)$/);
+      if (match) parsed.set(match[1], match[2].trim());
+    }
+    const titleExpression = parsed.get("name") || parsed.get("title");
+    const urlExpression = parsed.get("url");
+    if (!titleExpression || !urlExpression) continue;
+    const item = itemAssignments.find(({ name }) => (
+      new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.`).test(`${titleExpression} ${urlExpression}`)
+    ));
+    if (!item) continue;
+    const itemBase = item.expression.match(/^([A-Za-z_$][\w$]*)\s*\[/)?.[1];
+    const listPath = itemBase ? pathFor(itemBase) : null;
+    if (!listPath) continue;
+    const rootTemplateFields = {};
+    let itemField = "";
+    const compileValue = (expression, seen = new Set()) => {
+      let value = unwrapProjectionExpression(expression);
+      if (/^[A-Za-z_$][\w$]*$/.test(value) && assignments.has(value) && !seen.has(value)) {
+        seen.add(value);
+        return compileValue(assignments.get(value), seen);
+      }
+      if (/^(?:String|encodeURIComponent|encodeURI)\s*\(([\s\S]*)\)$/.test(value)) {
+        return compileValue(value.replace(/^(?:String|encodeURIComponent|encodeURI)\s*\(/, "").replace(/\)$/, ""), seen);
+      }
+      const parts = splitTopLevelPlus(value);
+      if (!parts.length) return null;
+      const output = [];
+      for (const part of parts) {
+        const literal = part.match(/^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')$/);
+        if (literal) {
+          try { output.push(staticStringLiteral(literal[0])); } catch { return null; }
+          continue;
+        }
+        if (/^[A-Za-z_$][\w$]*$/.test(part) && assignments.has(part) && !seen.has(part)) {
+          const rootPath = pathFor(part);
+          if (rootPath === null || rootPath === undefined) return null;
+          const fieldName = part;
+          rootTemplateFields[fieldName] = rootPath;
+          output.push(`{{root:${fieldName}}}`);
+          continue;
+        }
+        const member = part.match(/^([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)$/);
+        if (!member) return null;
+        if (member[1] === item.name) {
+          const field = member[2].replace(/\./g, "/");
+          itemField ||= field.split("/")[0];
+          output.push(`{{${field}}}`);
+          continue;
+        }
+        const rootPath = pathFor(member[1]);
+        if (rootPath === null || rootPath === undefined) return null;
+        const fieldName = member[1];
+        rootTemplateFields[fieldName] = [rootPath, member[2].replace(/\./g, "/")].filter(Boolean).join("/");
+        output.push(`{{root:${fieldName}}}`);
+      }
+      return output.join("");
+    };
+    const urlTemplate = compileValue(urlExpression);
+    const titleMember = unwrapProjectionExpression(titleExpression).match(
+      new RegExp(`^${item.name.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\.([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)$`),
+    );
+    const titleField = titleMember?.[1]?.replace(/\./g, "/") || "";
+    if (!urlTemplate || !/^https?:\/\//i.test(urlTemplate) || !titleField) continue;
+    return {
+      list: listPath,
+      title: titleField,
+      url: {
+        selector: itemField || titleField,
+        urlTemplate,
+        rootTemplateFields,
+      },
+    };
+  }
+  return null;
 }
 
 function planCharset(action) {
@@ -842,32 +2125,45 @@ function planCharset(action) {
 }
 
 export function compileBookBridgePlan(action, headers = {}) {
-  const guardedList = action.responseFormatType === "html"
+  const bookName = normalizeXiangseItemRule(action.bookName);
+  const detailUrl = normalizeXiangseItemRule(action.detailUrl);
+  const author = normalizeXiangseItemRule(action.author);
+  const desc = normalizeXiangseItemRule(action.desc);
+  const cat = normalizeXiangseItemRule(action.cat);
+  const lastChapterTitle = normalizeXiangseItemRule(action.lastChapterTitle);
+  const cover = normalizeXiangseItemRule(action.cover);
+  const status = normalizeXiangseItemRule(action.status);
+  const wordCount = normalizeXiangseItemRule(action.wordCount);
+  const scriptProjection = action.responseFormatType === "html"
+    ? hydrationBookProjection(action.list)
+    : null;
+  const guardedList = scriptProjection?.list || (action.responseFormatType === "html"
     ? requireListAttribute(
       inferredDomScriptSelector(action.list, [/book/i, /item/i, /list/i, /article/i]),
-      directDomAttributeGuard(action.detailUrl),
+      directDomAttributeGuard(detailUrl),
     )
-    : inferredDomScriptSelector(action.list, [/book/i, /item/i, /list/i, /article/i]);
+    : inferredDomScriptSelector(action.list, [/book/i, /item/i, /list/i, /article/i]));
   return normalizePlan({
     kind: "books",
     host: action.host,
-    responseType: action.responseFormatType,
+    responseType: scriptProjection?.responseType || action.responseFormatType,
     charset: planCharset(action),
     list: guardedList,
-    filter: inferredJsonEqualityFilter(action.bookName),
+    filter: inferredJsonEqualityFilter(bookName),
     fields: {
-      name: inferredScriptField(action.bookName, [/^(?:book)?name$/i, /title/i, /username/i]),
-      url: inferredScriptField(action.detailUrl, [/url/i, /id/i, /username/i])
-        || inferredDomScriptSelector(action.detailUrl, [/url/i, /href/i, /id/i]),
-      author: action.author,
-      desc: action.desc,
-      cat: action.cat,
-      lastChapterTitle: action.lastChapterTitle,
-      cover: inferredScriptField(action.cover, [/cover/i, /pic/i, /img/i, /icon/i])
-        || inferredDomScriptSelector(action.cover, [/cover/i, /pic/i, /img/i, /src/i])
-        || action.cover,
-      status: action.status,
-      wordCount: action.wordCount,
+      name: scriptProjection?.name || inferredScriptField(bookName, [/^(?:book)?name$/i, /title/i, /username/i])
+        || normalizeXiangseItemRule(inferredDomScriptSelector(bookName, [/name/i, /title/i, /text/i])),
+      url: scriptProjection?.url || inferredScriptField(detailUrl, [/url/i, /id/i, /username/i])
+        || normalizeXiangseItemRule(inferredDomScriptSelector(detailUrl, [/url/i, /href/i, /id/i])),
+      author,
+      desc,
+      cat,
+      lastChapterTitle,
+      cover: scriptProjection?.cover || inferredScriptField(cover, [/cover/i, /pic/i, /img/i, /icon/i])
+        || normalizeXiangseItemRule(inferredDomScriptSelector(cover, [/cover/i, /pic/i, /img/i, /src/i]))
+        || cover,
+      status,
+      wordCount,
     },
     headers,
   });
@@ -895,30 +2191,39 @@ export function compileDetailBridgePlan(action, headers = {}) {
 }
 
 export function compileChapterBridgePlan(action, {
-  tocSelector = "", tocRequest = null, headers = {}, reverse = false,
+  tocSelector = "", tocRequest = null, headers = {}, reverse = false, contextualRows = null,
 } = {}) {
+  const title = normalizeXiangseItemRule(action?.title);
+  const url = normalizeXiangseItemRule(action?.url);
+  const updateTime = normalizeXiangseItemRule(action?.updateTime);
+  const scriptProjection = nestedJsonChapterProjection(action?.list)
+    || splitJsonChapterProjection(action?.list)
+    || hydrationChapterProjection(action?.list);
   const projectedDomList = isDomListProjection(action?.list);
-  const urlRule = projectedDomList
+  const urlRule = scriptProjection?.url
+    || (projectedDomList
     ? domListProjection(action.list, "url")
-    : action?.url && typeof action.url === "object" && action.url.urlTemplate
-    ? action.url
-    : inferredScriptField(action.url, [/url/i, /id/i, /href/i]);
+    : url && typeof url === "object" && url.urlTemplate
+    ? url
+    : inferredScriptField(url, [/url/i, /id/i, /href/i]));
   return normalizePlan({
     kind: "chapters",
     host: action.host,
-    responseType: projectedDomList ? "html" : action.responseFormatType,
+    responseType: scriptProjection?.responseType || (projectedDomList ? "html" : action.responseFormatType),
     charset: planCharset(action),
-    list: inferredDomScriptSelector(action.list, [/chapter/i, /catalog/i, /directory/i, /content/i, /list/i]),
+    list: scriptProjection?.list
+      || inferredDomScriptSelector(action.list, [/chapter/i, /catalog/i, /directory/i, /content/i, /list/i]),
     tocSelector,
     tocRequest,
+    contextualRows,
     reverse: Boolean(reverse || action.reverseChapters || action.reverse),
     fields: {
-      title: (projectedDomList ? domListProjection(action.list, "title") : "")
-        || inferredScriptField(action.title, [/title/i, /name/i, /chapter/i])
-        || inferredDomScriptSelector(action.title, [/title/i, /name/i, /text/i, /alt/i])
-        || (/queryInfo\.(?:bookName|name)/i.test(String(action.title || "")) ? { constant: "播放" } : ""),
-      url: urlRule || inferredDomScriptSelector(action.url, [/href/i, /url/i, /src/i]),
-      updateTime: action.updateTime,
+      title: (scriptProjection?.title || (projectedDomList ? domListProjection(action.list, "title") : ""))
+        || inferredScriptField(title, [/title/i, /name/i, /chapter/i])
+        || normalizeXiangseItemRule(inferredDomScriptSelector(title, [/title/i, /name/i, /text/i, /alt/i]))
+        || (/queryInfo\.(?:bookName|name)/i.test(String(title || "")) ? { constant: "播放" } : ""),
+      url: urlRule || normalizeXiangseItemRule(inferredDomScriptSelector(url, [/href/i, /url/i, /src/i])),
+      updateTime,
     },
     headers,
   });
@@ -1018,6 +2323,37 @@ function terminalValues(elements, terminal, maxNodes) {
  */
 function fastXPathValues(document, rawExpression, context, { maxNodes = Infinity } = {}) {
   const expression = unwrapXPathGroup(rawExpression);
+  // List field rules are evaluated relative to every matched item. The
+  // generic XPath evaluator is needlessly expensive for the overwhelmingly
+  // common `.//tag`, `.//tag/@attr`, and `.//tag/text()` forms: a large list
+  // would otherwise invoke the evaluator once per field and once per item.
+  // Resolve this small, semantics-preserving subset through the DOM API so
+  // the parsed document is traversed directly and only once per field.
+  const relative = expression.match(
+    /^(\.)(\/\/|\/)([A-Za-z][\w:-]*|\*)(?:\[([\s\S]+)\])?(?:\/(\@[\w:-]+|text\(\)))?$/,
+  );
+  if (relative && context?.nodeType && context.nodeType !== 9) {
+    const [, , axis, tag, predicate = "", terminal = ""] = relative;
+    let selector = tag;
+    const exact = predicate.match(/^@([\w:-]+)\s*=\s*(['"])(.*?)\2$/);
+    const classContains = predicate.match(
+      /^contains\(\s*@class\s*,\s*(['"])(.*?)\1\s*\)$/i,
+    );
+    if (exact) selector += `[${exact[1]}="${exact[3].replace(/"/g, '\\"')}"]`;
+    else if (classContains) selector += `[class*="${classContains[2].replace(/"/g, '\\"')}"]`;
+    else if (predicate) return null;
+    const query = axis === "\/" ? `:scope > ${selector}` : selector;
+    let elements;
+    try {
+      elements = Array.from(context.querySelectorAll?.(query) || []);
+    } catch {
+      return null;
+    }
+    return terminalValues(elements, terminal, maxNodes);
+  }
+  if (expression === "." && context?.nodeType && context.nodeType !== 9) {
+    return [context];
+  }
   const linkedItemFilter = expression.match(/^\(([\s\S]+)\)\[self::a\[@href\] or \.\/\/a\[@href\]\]$/);
   if (linkedItemFilter) {
     const selected = fastXPathValues(document, linkedItemFilter[1], context, { maxNodes: Infinity });
@@ -1042,6 +2378,17 @@ function fastXPathValues(document, rawExpression, context, { maxNodes = Infinity
   }
 
   const scope = context?.nodeType ? context : document;
+  const simpleGlobal = expression.match(
+    /^\/\/([A-Za-z][\w:-]*|\*)(?:\/(\@[\w:-]+|text\(\)))?$/,
+  );
+  if (simpleGlobal) {
+    const [, tag, terminal = ""] = simpleGlobal;
+    return terminalValues(
+      Array.from(scope.querySelectorAll?.(tag) || []),
+      terminal,
+      maxNodes,
+    );
+  }
   const exactAttribute = expression.match(
     /^\/\/([A-Za-z][\w:-]*|\*)\[@([\w:-]+)=(['"])(.*?)\3\](?:\/(@[\w:-]+|text\(\)))?$/,
   );
@@ -1230,6 +2577,7 @@ function htmlSelect(rule, input, { list = false, content = false, maxNodes = Inf
         if (expression.startsWith("//@")) expression = `descendant-or-self::*/${expression.slice(2)}`;
         else if (expression.startsWith("//")) expression = `descendant-or-self::${expression.slice(2)}`;
         else if (/^\/(?:@|text\(\)|node\(\))/.test(expression)) expression = `.${expression}`;
+        else if (expression.startsWith("(//")) expression = `(.${expression.slice(1)}`;
         else if (expression.startsWith("(.//")) expression = `(descendant-or-self::${expression.slice(4)}`;
       }
       const selected = xpathValues(document, expression, itemInput ? input : document, {
@@ -1457,6 +2805,15 @@ function select(plan, rule, input, options = {}) {
   if (!field) return options.list ? [] : "";
   if (field.constant) return field.constant;
   if (field.currentUrl) return String(options.baseUrl || "");
+  const projectedSelector = String(field.selector || "").trim();
+  if (options.projected && projectedSelector && !/^(?:\.|\/|@)/.test(projectedSelector)) {
+    const value = jsonPath(input, projectedSelector);
+    if (value !== undefined && value !== null) {
+      if (options.list) return Array.isArray(value) ? value : [value];
+      if (Array.isArray(value)) return value.map((item) => String(item ?? "")).filter(Boolean).join("\n");
+      return String(value).trim();
+    }
+  }
   if (plan.responseType === "json" || plan.responseType === "embedded-json") {
     const value = field.selector ? jsonPath(input, field.selector) : input;
     if (options.list) return Array.isArray(value) ? value : [];
@@ -1478,6 +2835,8 @@ function transformed(plan, rule, input, options = {}) {
       value,
       field.valueMaps,
       field.templateFields,
+      options.rootInput,
+      field.rootTemplateFields,
     );
   }
   for (const replacement of field?.replacements || []) {
@@ -1507,7 +2866,16 @@ export function applyDetailSemanticFallbacks(result, fields) {
   return result;
 }
 
-function expandUrlTemplate(template, item, baseUrl, selectedValue = "", valueMaps = {}, templateFields = {}) {
+function expandUrlTemplate(
+  template,
+  item,
+  baseUrl,
+  selectedValue = "",
+  valueMaps = {},
+  templateFields = {},
+  rootInput = null,
+  rootTemplateFields = {},
+) {
   let bookId = "";
   let comicId = "";
   let entityId = "";
@@ -1550,9 +2918,25 @@ function expandUrlTemplate(template, item, baseUrl, selectedValue = "", valueMap
   if (selectedName && selectedValue && (values[selectedName] === undefined || values[selectedName] === null)) {
     values[selectedName] = selectedValue;
   }
-  return String(template || "").replace(/\{\{(?:(base|raw|text):)?([A-Za-z_$][\w$]*)\}\}/g, (_, mode, name) => {
+  return String(template || "").replace(/\{\{(?:(base|raw|text|root|rootPath):)?([A-Za-z_$][\w$]*)\}\}/g, (_, mode, name) => {
     if (mode === "base" || name === "bookId") return encodeURIComponent(String(values.bookId || bookId || ""));
-    const rawValue = values[name] ?? pageIds[name];
+    const rootSelector = mode === "root" || mode === "rootPath" ? rootTemplateFields?.[name] : "";
+    let rawValue = mode === "root" || mode === "rootPath"
+      ? (rootSelector ? jsonPathSingle(rootInput, rootSelector) : "")
+      : values[name] ?? pageIds[name];
+    if (mode === "rootPath") {
+      const source = String(rawValue == null ? "" : rawValue).trim();
+      if (/^https?:\/\//i.test(source)) {
+        try {
+          const url = new URL(source);
+          rawValue = `${url.pathname}${url.search}`.replace(/^\/+/, "");
+        } catch {
+          rawValue = source.replace(/^https?:\/\/[^/]+/i, "");
+        }
+      } else {
+        rawValue = source.replace(/^(?:\.\/|\/)+/, "");
+      }
+    }
     const mapping = valueMaps?.[name];
     const value = mapping && Object.hasOwn(mapping, String(rawValue)) ? mapping[String(rawValue)] : rawValue;
     if (mode === "text") return String(value == null ? "" : value);
@@ -1713,8 +3097,22 @@ export function orderChaptersAscending(rows, { reverseHint = false } = {}) {
 export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, limits } = {}) {
   const plan = normalizePlan(rawPlan);
   let input = body;
+  const projectionMetadata = plan.kind === "chapters" && plan.responseType === "json"
+    && String(plan.list || "").startsWith("@split-json-chapters:")
+    ? decodeProjectionMetadata(plan.list, "@split-json-chapters:")
+    : null;
   if (plan.responseType === "json") {
-    try { input = JSON.parse(String(body || "")); } catch { throw new TypeError("上游响应不是规则声明的 JSON"); }
+    try {
+      input = JSON.parse(String(body || ""));
+    } catch {
+      if (!projectionMetadata?.fallbackCurrent || !/\/art\//i.test(String(baseUrl || ""))) {
+        throw new TypeError("上游响应不是规则声明的 JSON");
+      }
+      // Some mixed media sources use the same chapter action for JSON video
+      // records and HTML art pages. Keep the generic current-page fallback
+      // available for the latter without weakening JSON validation elsewhere.
+      input = String(body || "");
+    }
   }
   const parsedInput = plan.responseType === "html" ? htmlDocument(input) : input;
   if (plan.kind === "text") {
@@ -1739,6 +3137,8 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
           result[name],
           field.valueMaps,
           field.templateFields,
+          input,
+          field.rootTemplateFields,
         );
       }
     }
@@ -1753,7 +3153,17 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     ? undefined
     : start + Math.max(pageSize, 0) + 1;
   const scanCap = resolveBridgeScanCap(plan.kind, needValid, limits);
-  let items = plan.responseType === "json" || plan.responseType === "embedded-json"
+  const projectedChapterItems = plan.kind === "chapters"
+    ? chapterProjectionItems(plan.list, input, baseUrl)
+    : null;
+  const projectedBookItems = plan.kind === "books"
+    ? bookProjectionItems(plan.list, input)
+    : null;
+  let items = projectedChapterItems
+    ? (Number.isFinite(scanCap) ? projectedChapterItems.slice(0, scanCap) : projectedChapterItems)
+    : projectedBookItems
+    ? (Number.isFinite(scanCap) ? projectedBookItems.slice(0, scanCap) : projectedBookItems)
+    : plan.responseType === "json" || plan.responseType === "embedded-json"
     ? (() => {
       const value = plan.responseType === "embedded-json"
         ? embeddedJsonArray(input, plan.list)
@@ -1776,9 +3186,24 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
     const rows = [];
     for (const item of items) {
       const row = {};
-      for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item, { baseUrl });
-      const urlField = normalizeField(plan.fields.url);
-      if (urlField?.urlTemplate) {
+      for (const [name, rule] of Object.entries(plan.fields)) {
+        row[name] = transformed(plan, rule, item, {
+          baseUrl,
+          rootInput: input,
+          projected: projectedChapterItems !== null,
+        });
+      }
+      if (plan.contextualRows) {
+        row.url = "";
+        row.__read2xsggItem = projectPaths(item, plan.contextualRows.itemPaths);
+        row.__read2xsggContext = {
+          requestUrl: String(baseUrl || ""),
+          payload: projectPaths(input, plan.contextualRows.contextPaths),
+          state: "",
+        };
+      } else {
+        const urlField = normalizeField(plan.fields.url);
+        if (urlField?.urlTemplate) {
         row.url = expandUrlTemplate(
           urlField.urlTemplate,
           item,
@@ -1786,11 +3211,14 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
           row.url,
           urlField.valueMaps,
           urlField.templateFields,
+          input,
+          urlField.rootTemplateFields,
         );
-      } else {
-        row.url = absolute(row.url, baseUrl, plan.host);
+        } else {
+          row.url = absolute(row.url, baseUrl, plan.host);
+        }
       }
-      if (!row.title || !row.url) continue;
+      if (!row.title || (!row.url && !plan.contextualRows)) continue;
       rows.push(row);
     }
     const ordered = plan.preserveOrder
@@ -1813,7 +3241,13 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
   let hasMore = false;
   for (const item of items) {
     const row = {};
-    for (const [name, rule] of Object.entries(plan.fields)) row[name] = transformed(plan, rule, item, { baseUrl });
+    for (const [name, rule] of Object.entries(plan.fields)) {
+      row[name] = transformed(plan, rule, item, {
+        baseUrl,
+        rootInput: input,
+        projected: projectedBookItems !== null,
+      });
+    }
     const urlField = normalizeField(plan.fields.url);
     row.url = urlField?.urlTemplate
       ? expandUrlTemplate(
@@ -1823,6 +3257,8 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
         row.url,
         urlField.valueMaps,
         urlField.templateFields,
+        input,
+        urlField.rootTemplateFields,
       )
       : absolute(row.url, baseUrl, plan.host);
     const coverField = normalizeField(plan.fields.cover);
@@ -1834,6 +3270,8 @@ export function executeBridgePlan(body, baseUrl, rawPlan, { limit, offset = 0, l
         row.cover,
         coverField.valueMaps,
         coverField.templateFields,
+        input,
+        coverField.rootTemplateFields,
       );
     }
     if (row.cover) row.cover = absolute(row.cover, baseUrl);

@@ -13,7 +13,7 @@ import {
 } from "./domUtil.js";
 import { discoverSpaMedia } from "./spaMedia.js";
 import { discoverPagedListUrl } from "./pagination.js";
-import { encodeMediaExtractionPlan } from "../mediaPlan.js";
+import { decodeEmbeddedMediaUrl, encodeMediaExtractionPlan } from "../mediaPlan.js";
 import { discoverSsrEpisodePlan, encodeSsrEpisodePlan } from "./ssrEpisodes.js";
 
 const AUDIO_HREF = /\/(?:audio|ting|sound|music|radio|mp3|book)\/|(?:听书|有声)/i;
@@ -21,6 +21,9 @@ const VIDEO_HREF = /\/(?:video|vod|movie|play|film|drama|tv)\/|(?:影视|电影|
 const MEDIA_FILE = /\.(?:mp3|m4a|aac|ogg|wav|flac|mp4|m3u8|webm)(?:\?|$)/i;
 const NON_CONTENT_PATH = /\/(?:about|agreement|privacy|policy|terms|help|support|contact|login|register|download|authors?|actors?|models?|stars?|directors?|categories|category|tags?|genres?|series)(?:\/|$)/i;
 const CATEGORY_PATH = /\/(?:category|categories|genres?|types?|classes?|sort|list|link)\//i;
+const MEDIA_PLAY_ROUTE = /\/(?:vod)?play(?:[\/_\-.]|$)|\/(?:watch|player|episode)(?:[\/_\-.]|$)/i;
+const MEDIA_DETAIL_ROUTE = /\/(?:vod)?detail(?:[\/_\-.]|$)|\/(?:info|subject|show|program|album|movie|video)(?:[\/_\-.]|$)/i;
+const MEDIA_NAVIGATION_ROUTE = /\/(?:topic(?:detail)?|label|gbook|map|app|vodshow|vodtype)(?:[\/_\-.]|$)/i;
 
 function mediaHrefPattern(kind) {
   return kind === "video" ? VIDEO_HREF : AUDIO_HREF;
@@ -31,6 +34,7 @@ function mediaKeyword(kind) {
 }
 
 function strongMediaLink(item, kind) {
+  if (MEDIA_NAVIGATION_ROUTE.test(item.href)) return false;
   if (MEDIA_FILE.test(item.href) || mediaKeyword(kind).test(item.text)) return true;
   return kind === "video"
     ? /\/(?:video|vod|movie|play|film|drama|tv)(?:\/|$)/i.test(item.href)
@@ -52,17 +56,20 @@ function likelyMediaEpisode(item, detailUrl) {
   const targetPath = target.pathname.replace(/\/+$/, "") || "/";
   if (detailPath === targetPath) return false;
   if (targetPath.startsWith(`${detailPath}/`)) return true;
-  if (/\/(?:chapters?|episodes?|programs?|tracks?|play)(?:\/|$)/i.test(targetPath)) return true;
+  if (MEDIA_PLAY_ROUTE.test(targetPath)
+    || /\/(?:chapters?|episodes?|programs?|tracks?)(?:\/|$)/i.test(targetPath)) return true;
   const episodeTitle = /(?:第\s*.{0,20}[集章回话話期]|\d+\s*[集章回话話期]|番外|序章|episode|chapter)/i.test(item.text);
   const routeShape = (value) => value.replace(/\d+/g, ":id");
   if (routeShape(detailPath) === routeShape(targetPath)) return episodeTitle;
   return episodeTitle;
 }
 
-function findMediaUrl(document, pageUrl, rawHtml = "") {
+function findMediaUrl(document, pageUrl, rawHtml = "", kind = "audio") {
   for (const el of document.querySelectorAll("audio[src], video[src], source[src], a[href]")) {
     const raw = el.getAttribute("src") || el.getAttribute("href") || "";
     if (!raw) continue;
+    const decoded = decodeEmbeddedMediaUrl(raw, pageUrl, kind);
+    if (decoded) return decoded;
     let href = "";
     try { href = new URL(raw, pageUrl).toString(); } catch { continue; }
     if (MEDIA_FILE.test(href) || el.tagName === "AUDIO" || el.tagName === "VIDEO" || el.tagName === "SOURCE") {
@@ -70,12 +77,27 @@ function findMediaUrl(document, pageUrl, rawHtml = "") {
     }
   }
   const html = document.documentElement?.innerHTML || "";
-  const match = html.match(/https?:\/\/[^"'\\s<>]+\.(?:mp3|m4a|aac|ogg|wav|flac|mp4|m3u8|webm)(?:\?[^"'\\s<>]*)?/i);
-  if (match?.[0]) return match[0];
-  const semantic = String(rawHtml || "").match(
-    /["'](?:audio|sound|voice|track|play|video|media|stream|hls)[\w-]*(?:url|uri|src|path)?["']\s*:\s*["']((?:https?:)?\\?\/\\?\/[^"']+)["']/i,
-  );
-  return semantic?.[1]?.replace(/\\\//g, "/") || "";
+  const match = html.match(/https?:\/\/[^"'\s<>]+\.(?:mp3|m4a|aac|ogg|wav|flac|mp4|m3u8|webm)(?:\?[^"'\s<>]*)?/i);
+  if (match?.[0]) return decodeEmbeddedMediaUrl(match[0], pageUrl, kind) || match[0];
+  const mediaKey = /(?:audio|sound|voice|track|play|video|media|stream|hls|url|uri|src|file|path)/i;
+  const directMediaKey = /(?:audio|sound|voice|track|play|video|media|stream|hls)/i;
+  for (const candidate of String(rawHtml || "").matchAll(
+    /["']([A-Za-z_$][\w$-]{0,80})["']\s*:\s*["']((?:\\.|[^"\\])*)["']/g,
+  )) {
+    if (!mediaKey.test(candidate[1])) continue;
+    const decoded = decodeEmbeddedMediaUrl(candidate[2], pageUrl, kind);
+    if (decoded) return decoded;
+    if (directMediaKey.test(candidate[1])) {
+      const raw = String(candidate[2]).replace(/\\\//g, "/").replace(/\\([\\"'])/g, "$1").trim();
+      try {
+        const url = new URL(raw, pageUrl);
+        if (/^https?:$/.test(url.protocol)) return url.toString();
+      } catch {
+        // Continue with the remaining player fields.
+      }
+    }
+  }
+  return "";
 }
 
 function delimitedMediaPlaylist(rawHtml, pageUrl, kind) {
@@ -203,11 +225,11 @@ function repeatedContentCards(document, baseUrl, origin) {
     rows: selected,
     listSelector,
     bookNameSelector: directAnchor
-      ? ".//*[contains(concat(' ', normalize-space(@class), ' '), ' title ')][1]||normalize-space(.)"
-      : ".//h1/a||.//h2/a||.//h3/a||.//h4/a||.//a[@rel='bookmark']||.//a[@title]",
+      ? "//*[contains(concat(' ', normalize-space(@class), ' '), ' title ')][1]||normalize-space(.)"
+      : "//h1/a||//h2/a||//h3/a||//h4/a||//a[@rel='bookmark']||//a[@title]",
     detailUrlSelector: directAnchor
-      ? "./@href||//@href"
-      : ".//h1/a/@href||.//h2/a/@href||.//h3/a/@href||.//h4/a/@href||.//a[@rel='bookmark']/@href||.//a[@title]/@href",
+      ? "//@href"
+      : "//h1/a/@href||//h2/a/@href||//h3/a/@href||//h4/a/@href||//a[@rel='bookmark']/@href||//a[@title]/@href",
   };
 }
 
@@ -291,12 +313,25 @@ export async function discoverMedia(originUrl, kind, {
     diagnostics,
   });
   if (spa) return spa;
-  const cluster = cards?.rows?.length ? cards.rows : scoreLinkCluster(
+  let cluster = cards?.rows?.length ? cards.rows : scoreLinkCluster(
     coveredLinks.length >= 2 ? coveredLinks
       : strongLinks.length ? strongLinks
       : (mediaLinks.length ? mediaLinks : usableAnchors.filter((a) => a.text.length >= 2 && a.text.length <= 60)),
     homeUrl,
   ).slice(0, 30);
+  // A media homepage can contain editorial/topic links whose text happens to
+  // say “电影” or “有声”. Prefer a repeated, explicit detail route whenever
+  // the first cluster was assembled from those generic labels.
+  const explicitDetailLinks = usableAnchors.filter((item) => (
+    !MEDIA_PLAY_ROUTE.test(item.href)
+    && MEDIA_DETAIL_ROUTE.test(item.href)
+    && item.text.length >= 2
+    && item.text.length <= 80
+  ));
+  if (!cluster.some((item) => MEDIA_DETAIL_ROUTE.test(item.href)) && explicitDetailLinks.length >= 2) {
+    const explicitCluster = scoreLinkCluster(explicitDetailLinks, homeUrl).slice(0, 30);
+    if (explicitCluster.length >= 2) cluster = explicitCluster;
+  }
   // Audio/video home pages are often SPA shells with few static anchors.
   // Prefer a short cluster over giving up when the page already looks media-like.
   const minCluster = mediaLinks.length >= 1 || mediaKeyword(kind).test(html) ? 1 : 2;
@@ -309,7 +344,12 @@ export async function discoverMedia(originUrl, kind, {
   const stableListSelector = cards ? "" : stableAnchorSelectorFromLinks(listLinks, document, homeUrl);
   const listSelector = cards?.listSelector || stableListSelector || listSelectorFromLinks(listLinks, document);
   const listCoverSelector = listCoverSelectorFromLinks(listLinks);
-  const detailUrl = cluster.find((item) => hrefRe.test(item.href) || MEDIA_FILE.test(item.href))?.href || cluster[0].href;
+  const detailUrl = cluster.find((item) => (
+    !MEDIA_PLAY_ROUTE.test(item.href) && MEDIA_DETAIL_ROUTE.test(item.href)
+  ))?.href
+    || cluster.find((item) => !MEDIA_PLAY_ROUTE.test(item.href)
+      && (hrefRe.test(item.href) || MEDIA_FILE.test(item.href)))?.href
+    || cluster[0].href;
   if (!detailUrl) {
     diagnostics.push("detail: 未取得媒体详情 URL");
     return null;
@@ -337,7 +377,7 @@ export async function discoverMedia(originUrl, kind, {
   let chapterListSelector = "";
   let stableChapterSelector = "";
   let chapterUrl = "";
-  let directMedia = findMediaUrl(detailDoc, detailUrl, detailHtml);
+  let directMedia = findMediaUrl(detailDoc, detailUrl, detailHtml, kind);
   const playlist = delimitedMediaPlaylist(detailHtml, detailUrl, kind);
   let singleChapter = false;
   let ssrEpisodes = null;
@@ -355,7 +395,7 @@ export async function discoverMedia(originUrl, kind, {
     chapterListSelector = "$.data";
     try {
       const chapterHtml = (await download(chapterUrl)).toString("utf8");
-      directMedia = findMediaUrl(loadDocument(chapterHtml, chapterUrl), chapterUrl, chapterHtml) || directMedia;
+      directMedia = findMediaUrl(loadDocument(chapterHtml, chapterUrl), chapterUrl, chapterHtml, kind) || directMedia;
     } catch {
       // Runtime verification will reject the candidate if playback is stale.
     }
@@ -381,7 +421,7 @@ export async function discoverMedia(originUrl, kind, {
     chapterUrl = chapterLinks[Math.min(1, chapterLinks.length - 1)].href;
     if (!MEDIA_FILE.test(chapterUrl)) {
       const chapterHtml = (await download(chapterUrl)).toString("utf8");
-      directMedia = findMediaUrl(loadDocument(chapterHtml, chapterUrl), chapterUrl, chapterHtml) || directMedia;
+      directMedia = findMediaUrl(loadDocument(chapterHtml, chapterUrl), chapterUrl, chapterHtml, kind) || directMedia;
     } else {
       directMedia = chapterUrl;
     }
@@ -487,8 +527,8 @@ export async function discoverMedia(originUrl, kind, {
     listRequestInfo: pagedListUrl || homeRequestInfo,
     categoryFilters,
     listSelector,
-    bookNameSelector: cards?.bookNameSelector || (stableListSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : ".//a||normalize-space(/html/body/*)"),
-    detailUrlSelector: cards?.detailUrlSelector || (stableListSelector ? "./@href||//@href" : ".//a/@href||//@href"),
+    bookNameSelector: cards?.bookNameSelector || (stableListSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : "normalize-space(//a)||normalize-space(/html/body/*)"),
+    detailUrlSelector: cards?.detailUrlSelector || (stableListSelector ? "//@href" : "//a/@href||//@href"),
     listCoverSelector,
     detailCoverSelector: detailCover,
     detailLastChapterSelector,
@@ -501,8 +541,8 @@ export async function discoverMedia(originUrl, kind, {
     chapterListSelector,
     chapterRequestInfo,
     chapterResponseFormatType: singleChapter || playlist.length >= 2 || ssrEpisodes ? "json" : "html",
-    chapterTitleSelector: singleChapter || playlist.length >= 2 || ssrEpisodes ? "title" : stableChapterSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : "normalize-space(.//a)||normalize-space(/html/body/*)",
-    chapterUrlSelector: singleChapter || playlist.length >= 2 || ssrEpisodes ? "url" : stableChapterSelector ? "./@href||//@href" : ".//a/@href||./@href||//@href",
+    chapterTitleSelector: singleChapter || playlist.length >= 2 || ssrEpisodes ? "title" : stableChapterSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : "normalize-space(//a)||normalize-space(/html/body/*)",
+    chapterUrlSelector: singleChapter || playlist.length >= 2 || ssrEpisodes ? "url" : stableChapterSelector ? "//@href" : "//a/@href||//@href",
     chapterPageSize: ssrEpisodes?.pageSize || 0,
     chapterMaxPage: ssrEpisodes?.total && ssrEpisodes?.pageSize
       ? Math.ceil(ssrEpisodes.total / ssrEpisodes.pageSize)

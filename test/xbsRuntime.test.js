@@ -101,6 +101,150 @@ test("媒体响应校验拒绝伪装成播放地址的 HTML 页面", () => {
   assert.equal(isPlayableMediaResponse(response("text/html", "https://cdn.test/1.mp3")), false);
 });
 
+test("音视频 WebView 播放页按香色 webViewJs 语义验链", async () => {
+  const host = "https://webview-media.example";
+  const source = {
+    sourceName: "WebView 音频回归",
+    sourceUrl: host,
+    sourceType: "audio",
+    bookWorld: {
+      分类: {
+        host,
+        responseFormatType: "json",
+        requestInfo: "/books",
+        list: "$.data",
+        bookName: "name",
+        detailUrl: "url",
+      },
+    },
+    bookDetail: {
+      host,
+      responseFormatType: "json",
+      requestInfo: "%@result",
+      bookName: "name",
+    },
+    chapterList: {
+      host,
+      responseFormatType: "json",
+      requestInfo: "%@result",
+      list: "$.chapters",
+      title: "title",
+      url: "url",
+    },
+    chapterContent: {
+      host,
+      responseFormatType: "html",
+      requestInfo: [
+        "@js:",
+        'return {url: String(result || ""), webView: "", webViewJs: "return document.querySelector(\\\".player\\\").src"};',
+      ].join("\n"),
+      content: "//audio/@src||//source/@src",
+    },
+  };
+  const requested = [];
+  const fetchImpl = async (url) => {
+    requested.push(new URL(url).pathname);
+    const pathname = new URL(url).pathname;
+    const body = pathname === "/books"
+      ? { data: [{ name: "测试节目", url: `${host}/album/1` }] }
+      : pathname === "/album/1"
+        ? { name: "测试节目", chapters: [{ title: "第一集", url: `${host}/episode/1` }] }
+        : "<!doctype html><main class='player'>播放器由页面脚本初始化</main>";
+    const response = new Response(typeof body === "string" ? body : JSON.stringify(body), {
+      headers: { "Content-Type": typeof body === "string" ? "text/html" : "application/json" },
+    });
+    Object.defineProperty(response, "url", { value: url });
+    return response;
+  };
+
+  const report = await runXbsPipeline(source, { fetchImpl });
+  assert.equal(report.ok, true, report.error);
+  assert.equal(report.steps.chapterContent.itemCount, 1);
+  assert.equal(report.steps.chapterContent.webView, true);
+  assert.equal(report.steps.chapterContent.firstUrl, "");
+});
+
+test("跳过无 URL 和空正文章节后继续尝试后续可读章节", async () => {
+  const host = "https://chapter-candidate.example";
+  const source = {
+    sourceName: "章节候选回归",
+    sourceUrl: host,
+    sourceType: "text",
+    bookWorld: {
+      分类: {
+        host,
+        responseFormatType: "json",
+        requestInfo: "/books",
+        list: "$.data",
+        bookName: "name",
+        detailUrl: "url",
+      },
+    },
+    bookDetail: { host, responseFormatType: "json", requestInfo: "%@result", bookName: "name" },
+    chapterList: {
+      host,
+      responseFormatType: "json",
+      requestInfo: "%@result",
+      list: "$.chapters",
+      title: "title",
+      url: "url",
+    },
+    chapterContent: {
+      host,
+      responseFormatType: "html",
+      requestInfo: "%@result",
+      content: "//article",
+    },
+  };
+  const requested = [];
+  const fetchImpl = async (url) => {
+    requested.push(new URL(url).pathname);
+    const pathname = new URL(url).pathname;
+    const body = pathname === "/books"
+      ? { data: [{ name: "测试小说", url: `${host}/book/1` }] }
+      : pathname === "/book/1"
+        ? {
+          name: "测试小说",
+          chapters: [
+            { title: "目录标题", url: "" },
+            ...Array.from({ length: 8 }, (_, index) => ({
+              title: `第${index + 1}章 暂无正文`,
+              url: `${host}/chapter/${index + 1}`,
+            })),
+            { title: "第九章 正文", url: `${host}/chapter/9` },
+          ],
+        }
+        : pathname === "/chapter/9"
+          ? "<article>可读正文内容</article>"
+          : "<aside>本章暂无正文</aside>";
+    const response = new Response(typeof body === "string" ? body : JSON.stringify(body), {
+      headers: { "Content-Type": typeof body === "string" ? "text/html" : "application/json" },
+    });
+    Object.defineProperty(response, "url", { value: url });
+    return response;
+  };
+
+  const report = await runXbsPipeline(source, { fetchImpl });
+  assert.equal(report.ok, true, report.error);
+  assert.equal(report.steps.chapterList.listCount, 10);
+  assert.equal(report.steps.chapterList.candidateIndex, 9);
+  assert.equal(report.steps.chapterList.chapterTitle, "第九章 正文");
+  assert.equal(report.attemptedChapterCandidates, 10);
+  assert.equal(requested.filter((path) => path === "/books").length, 1);
+  assert.equal(requested.filter((path) => path === "/book/1").length, 2);
+  assert.deepEqual(requested.filter((path) => path.startsWith("/chapter/")),
+    Array.from({ length: 9 }, (_, index) => `/chapter/${index + 1}`));
+
+  requested.length = 0;
+  const uncachedSource = {
+    ...source,
+    bookWorld: { 分类: { ...source.bookWorld.分类, forbidCache: true } },
+  };
+  const uncachedReport = await runXbsPipeline(uncachedSource, { fetchImpl });
+  assert.equal(uncachedReport.ok, true, uncachedReport.error);
+  assert.equal(requested.filter((path) => path === "/books").length, 10);
+});
+
 test("整源取消后不再重试其它分类、书籍或章节", async () => {
   const host = "https://cancel.example";
   const controller = new AbortController();
@@ -215,6 +359,25 @@ test("香色动作链执行器验证分类、详情、章节和正文", async (c
   assert.equal(fallbackReport.ok, true, fallbackReport.error);
   assert.equal(fallbackReport.steps.bookWorld.title, "可用分类");
   assert.equal(fallbackReport.attemptedWorlds, 2);
+
+  const thirteenthCategoryOnly = {
+    ...converted,
+    searchBook: null,
+    bookWorld: Object.fromEntries([
+      ...Array.from({ length: 12 }, (_, index) => [
+        `失效分类 ${index + 1}`,
+        { ...converted.bookWorld["分类"], requestInfo: `${base}/missing-category-${index + 1}` },
+      ]),
+      ["第十三分类", converted.bookWorld["分类"]],
+    ]),
+  };
+  const thirteenthCategoryReport = await runXbsPipeline(thirteenthCategoryOnly, {
+    filter: "分类 12",
+    pageIndex: 2,
+  });
+  assert.equal(thirteenthCategoryReport.ok, true, thirteenthCategoryReport.error);
+  assert.equal(thirteenthCategoryReport.steps.bookWorld.title, "第十三分类");
+  assert.equal(thirteenthCategoryReport.attemptedWorlds, 13);
 });
 
 test("JSON 动作链会展开分组数组中的书籍列表", async (context) => {

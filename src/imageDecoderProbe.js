@@ -144,6 +144,43 @@ function instrumentImageDecoderFunctions(source) {
   return output;
 }
 
+function invokeObjectDecoderMembers(context) {
+  // Minified browser bundles commonly keep the decoder as an object method
+  // (`chapter: { decrypt: function (...) { ... } }`) instead of a top-level
+  // function. Walk only a shallow, name-filtered view of the sandbox so the
+  // probe can observe CryptoJS key material without executing unrelated site
+  // code or requiring a DOM.
+  try {
+    new vm.Script(`
+      (function walk(value, depth, seen) {
+        if (!value || depth > 5) return;
+        var kind = typeof value;
+        if (kind !== "object" && kind !== "function") return;
+        if (seen.indexOf(value) >= 0) return;
+        seen.push(value);
+        var keys = [];
+        try { keys = Object.keys(value).slice(0, 128); } catch (_error) { return; }
+        for (var i = 0; i < keys.length; i += 1) {
+          var key = keys[i];
+          var child;
+          try { child = value[key]; } catch (_error) { continue; }
+          if (typeof child === "function" && /(?:decrypt|decode|decipher)/i.test(key)) {
+            try {
+              var result = child.call(value, new Uint8Array(64));
+              if (result && typeof result.catch === "function") result.catch(function () {});
+            } catch (_error) {}
+            continue;
+          }
+          if (depth < 5) walk(child, depth + 1, seen);
+        }
+      })(globalThis, 0, []);
+    `).runInContext(context, { timeout: 300 });
+  } catch {
+    // A bundle may expose hostile getters or an incomplete object graph. The
+    // static/function declaration probes remain valid in that case.
+  }
+}
+
 function lexicalString(context, name) {
   if (!/^[A-Za-z_$][\w$]*$/.test(name)) return "";
   try {
@@ -212,6 +249,7 @@ function probe(source) {
     // Browser scripts commonly reach an unavailable DOM API after declaring
     // their decoder. Declarations made before that point remain inspectable.
   }
+  invokeObjectDecoderMembers(context);
 
   const strings = [];
   for (const [name, value] of Object.entries(context)) {

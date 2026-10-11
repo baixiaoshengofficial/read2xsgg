@@ -58,6 +58,15 @@ function runJavaScript(script, config, params, result) {
   return new Function("config", "params", "result", source)(config, params, result);
 }
 
+/** Execute one pure @js field rule with the same config/params/result contract as Xiangse. */
+export function executeXbsJavaScriptRule(rule, {
+  config = {}, params = {}, result,
+} = {}) {
+  const { selector, script } = splitPostScript(rule);
+  if (selector || !script) throw new TypeError("需要不带选择器的 @js 规则");
+  return runJavaScript(script, config, params, result);
+}
+
 function xpathValues(document, expression, context = document) {
   const view = document.defaultView;
   const result = document.evaluate(expression, context, null, view.XPathResult.ANY_TYPE, null);
@@ -365,6 +374,14 @@ async function requestAction(source, action, context, fetchImpl) {
   const method = request.POST ? "POST" : "GET";
   const headers = { ...config.httpHeaders, ...(request.httpHeaders || {}) };
   let url = absoluteUrl(request.url, config.host || source.sourceUrl);
+  const requestCache = context.requestCache;
+  const cacheableAction = ["world", "detail", "chapterList"].includes(context.cacheRole);
+  const cacheAllowed = requestCache instanceof Map
+    && cacheableAction
+    && method === "GET"
+    && !context.mediaProbe
+    && !action?.forbidCache
+    && !request?.forbidCache;
   const timeoutSignal = AbortSignal.timeout(context.timeoutMs || 20_000);
   const signal = context.signal
     ? AbortSignal.any([context.signal, timeoutSignal])
@@ -386,6 +403,24 @@ async function requestAction(source, action, context, fetchImpl) {
       if (!contentType) headers["Content-Type"] = "application/x-www-form-urlencoded";
     }
   }
+  const cacheKey = cacheAllowed
+    ? JSON.stringify({
+      role: context.cacheRole,
+      method,
+      url,
+      headers: Object.entries(headers).map(([key, value]) => [key.toLowerCase(), String(value)])
+        .sort(([left], [right]) => left.localeCompare(right)),
+      responseFormatType: action.responseFormatType || "",
+      responseEncode: action.responseEncode || "",
+      charset: action.charset || "",
+    })
+    : "";
+  if (cacheKey && requestCache.has(cacheKey)) {
+    const cached = requestCache.get(cacheKey);
+    requestCache.delete(cacheKey);
+    requestCache.set(cacheKey, cached);
+    return { ...cached, params, config, request };
+  }
   // 媒体直链探测：content 阶段请求的是音频/视频文件本身时，用 Range 只取
   // 文件头即可确认可播性，避免整段 MP3/MP4 下载烧尽验证预算。
   if (context.mediaProbe && method === "GET" && MEDIA_EXTENSION.test(String(url).split("?")[0])) {
@@ -399,6 +434,7 @@ async function requestAction(source, action, context, fetchImpl) {
         parsed: "",
         params,
         config,
+        request,
       };
     }
   }
@@ -420,7 +456,21 @@ async function requestAction(source, action, context, fetchImpl) {
       throw new Error(`${action.actionID} 声明 JSON，但响应无法解析：${error.message}`);
     }
   }
-  return { response, body, parsed, config, params, requestUrl: url };
+  const result = { response, body, parsed, config, params, requestUrl: url, request };
+  const cacheControl = response.headers?.get?.("cache-control") || "";
+  if (cacheKey
+    && Buffer.byteLength(body) <= 2 * 1024 * 1024
+    && !/(?:no-store|no-cache)/i.test(cacheControl)) {
+    // A single action-chain verification often retries another book/chapter
+    // after a content miss. Reuse only the identical successful list/detail/
+    // catalogue GET within that verification; never cache content/media or
+    // actions which explicitly forbid caching.
+    requestCache.set(cacheKey, result);
+    while (requestCache.size > 16) {
+      requestCache.delete(requestCache.keys().next().value);
+    }
+  }
+  return result;
 }
 
 function select(action, rule, input, options = {}) {
@@ -564,6 +614,10 @@ export async function runXbsChapterContent(source, {
 }
 
 export async function runXbsPipeline(source, options = {}) {
+  // Recursive candidate fallback re-enters this function. Keep safe, exact
+  // upstream GET snapshots across those attempts so changing the selected
+  // book/chapter does not redownload the same list, detail, and catalogue.
+  options = { ...options, _requestCache: options._requestCache || new Map() };
   const fetchImpl = options.fetchImpl || fetch;
   const timeoutMs = options.timeoutMs || 20_000;
   const report = { source: source.sourceName, sourceType: source.sourceType || "text", ok: false, steps: {} };
@@ -584,6 +638,8 @@ export async function runXbsPipeline(source, options = {}) {
       ...selectedFilter,
       timeoutMs,
       signal: options.signal,
+      requestCache: options._requestCache,
+      cacheRole: "world",
     }, fetchImpl);
     const books = select(world, world.list, worldResponse.parsed, {
       list: true,
@@ -618,6 +674,8 @@ export async function runXbsPipeline(source, options = {}) {
       queryInfo,
       timeoutMs,
       signal: options.signal,
+      requestCache: options._requestCache,
+      cacheRole: "detail",
     }, fetchImpl);
     const detailParams = {
       ...detailResponse.params,
@@ -659,6 +717,8 @@ export async function runXbsPipeline(source, options = {}) {
       lastResponse: detailResponse.parsed,
       timeoutMs,
       signal: options.signal,
+      requestCache: options._requestCache,
+      cacheRole: "chapterList",
     }, fetchImpl);
     const tocDocument = toc.responseFormatType === "html"
       ? htmlDocument(tocResponse.parsed)
@@ -671,6 +731,16 @@ export async function runXbsPipeline(source, options = {}) {
     });
     const chapterIndex = Number.isInteger(options.chapterIndex) ? options.chapterIndex : 0;
     const firstChapter = chapters[chapterIndex];
+    // Record the catalogue before validating the selected row. If the first
+    // entry is a section heading or stale link, the caller can then try later
+    // chapters instead of losing the candidate count at the first bad row.
+    report.steps.chapterList = {
+      requestUrl: tocResponse.response.url,
+      status: tocResponse.response.status,
+      bytes: Buffer.byteLength(tocResponse.body),
+      listCount: chapters.length,
+      candidateIndex: chapterIndex,
+    };
     if (!firstChapter) throw new Error("chapterList.list 解析结果为 0");
     const tocParams = { ...tocResponse.params, responseUrl: tocResponse.response.url };
     const chapterTitle = firstString(select(toc, toc.title, firstChapter, { config: tocResponse.config, params: tocParams }));
@@ -690,13 +760,9 @@ export async function runXbsPipeline(source, options = {}) {
       }
     }
     report.steps.chapterList = {
-      requestUrl: tocResponse.response.url,
-      status: tocResponse.response.status,
-      bytes: Buffer.byteLength(tocResponse.body),
-      listCount: chapters.length,
+      ...report.steps.chapterList,
       chapterTitle,
       chapterUrl,
-      candidateIndex: chapterIndex,
     };
 
     const content = source.chapterContent || {};
@@ -717,7 +783,17 @@ export async function runXbsPipeline(source, options = {}) {
       config: contentResponse.config,
       params: contentParams,
     });
-    const summary = contentSummary(source.sourceType || "text", contentValue);
+    const webViewMedia = ["audio", "video"].includes(source.sourceType || "text")
+      && (Boolean(contentResponse.request?.webView)
+        || Boolean(String(contentResponse.request?.webViewJs || "").trim()))
+      && Boolean(String(contentResponse.body || "").trim());
+    // Xiangse can execute media extraction in its WebView after page scripts
+    // initialize the player. In that mode a static audio/video selector is
+    // expected to be empty; validate the reachable playback page and declared
+    // WebView action instead of misclassifying the source as empty content.
+    const summary = webViewMedia
+      ? { count: 1, firstUrl: "", value: null }
+      : contentSummary(source.sourceType || "text", contentValue);
     if (!summary.count) throw new Error("chapterContent.content 解析为空");
     report.steps.chapterContent = {
       requestUrl: contentResponse.response.url,
@@ -725,6 +801,7 @@ export async function runXbsPipeline(source, options = {}) {
       bytes: Buffer.byteLength(contentResponse.body),
       itemCount: summary.count,
       firstUrl: summary.firstUrl,
+      ...(webViewMedia ? { webView: true } : {}),
     };
     if (summary.firstUrl
       && ["audio", "video"].includes(source.sourceType)
@@ -747,8 +824,12 @@ export async function runXbsPipeline(source, options = {}) {
     report.error = error.message;
     if (options.signal?.aborted) return report;
     if (!options.world && !options.useSearch && !options._worldFallback) {
-      const maxWorldCandidates = Math.max(1, Math.min(12, options.maxWorldCandidates || 8));
-      const alternatives = Object.keys(source.bookWorld || {}).slice(1, maxWorldCandidates);
+      const worldEntries = Object.keys(source.bookWorld || {});
+      const requestedWorldLimit = Number(options.maxWorldCandidates);
+      const maxWorldCandidates = requestedWorldLimit > 0 && Number.isFinite(requestedWorldLimit)
+        ? Math.min(worldEntries.length, Math.floor(requestedWorldLimit))
+        : worldEntries.length;
+      const alternatives = worldEntries.slice(1, maxWorldCandidates);
       for (const world of alternatives) {
         const candidate = await runXbsPipeline(source, {
           ...options,
@@ -777,7 +858,7 @@ export async function runXbsPipeline(source, options = {}) {
     if (!Number.isInteger(options.chapterIndex)
       && Number(report.steps?.chapterList?.listCount || 0) > 1) {
       const maxCandidates = Math.max(1, Math.min(20,
-        options.maxChapterCandidates || options.maxCandidates || 5));
+        options.maxChapterCandidates || options.maxCandidates || 10));
       for (let index = 1; index < maxCandidates; index += 1) {
         const candidate = await runXbsPipeline(source, { ...options, chapterIndex: index });
         if (options.signal?.aborted) return candidate;
