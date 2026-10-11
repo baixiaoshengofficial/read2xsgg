@@ -54,6 +54,94 @@
         <p id="create-status" class="status" hidden></p>
       </section>
 
+      <section id="ai-settings" class="panel">
+        <div class="row between">
+          <h2>AI 识站与 MCP 爬取</h2>
+          <span id="ai-config-state" class="hint">读取配置中…</span>
+        </div>
+        <p class="hint">确定性转换和通用识站未能通过后，AI 才会介入。模型生成的是声明式规则草案，必须再通过列表、详情、章节和正文的完整实测才会保留。</p>
+        <form id="ai-settings-form" class="stack">
+          <label class="inline">
+            <input id="ai-enabled" type="checkbox" />
+            <span>启用 AI 识站修复（仅对规则解析失败且站点可达的源调用）</span>
+          </label>
+          <label>
+            <span>AI 接入方式</span>
+            <select id="ai-provider">
+              <option value="api">API Key 服务</option>
+              <option value="local-http">本地 Agent / 模型 HTTP 服务</option>
+              <option value="cli">宿主机 CLI 客户端</option>
+            </select>
+          </label>
+          <div id="ai-api-fields" class="stack provider-fields">
+            <label>
+              <span>OpenAI 兼容 API Base URL</span>
+              <input id="ai-base-url" type="url" autocomplete="url" value="https://api.openai.com/v1" placeholder="https://api.openai.com/v1" />
+            </label>
+            <label>
+              <span>模型名称</span>
+              <input id="ai-model" type="text" autocomplete="off" placeholder="填写服务商提供的模型 ID" />
+            </label>
+            <label>
+              <span>AI API Key（保存后不会再次显示；留空保持原值）</span>
+              <input id="ai-api-key" type="password" autocomplete="new-password" placeholder="sk-…" />
+            </label>
+          </div>
+          <div id="ai-local-fields" class="stack provider-fields" hidden>
+            <label>
+              <span>本地服务地址（容器可访问的 OpenAI 兼容接口）</span>
+              <input id="ai-local-base-url" type="url" autocomplete="url" placeholder="http://host.docker.internal:11434/v1" />
+            </label>
+            <label>
+              <span>本地模型名称</span>
+              <input id="ai-local-model" type="text" autocomplete="off" placeholder="填写本地服务加载的模型 ID" />
+            </label>
+          </div>
+          <div id="ai-cli-fields" class="stack provider-fields" hidden>
+            <label>
+              <span>宿主机 CLI 客户端</span>
+              <select id="ai-cli-client"><option value="codex">Codex CLI</option></select>
+            </label>
+            <p class="hint">先在宿主机同一用户下完成 CLI 登录，再运行 <code>npm run agent:bridge</code>。容器只通过私有 Unix Socket 调用，不挂载登录凭据；保存后点击“测试当前 AI 接入”。</p>
+          </div>
+          <label>
+            <span>MCP Streamable HTTP 地址（可选，例如 Playwright 浏览器 MCP）</span>
+            <input id="mcp-endpoint" type="url" autocomplete="url" placeholder="https://mcp.example.com/mcp" />
+          </label>
+          <label>
+            <span>MCP Bearer Token（可选；留空保持原值）</span>
+            <input id="mcp-token" type="password" autocomplete="new-password" placeholder="仅在 MCP 服务要求认证时填写" />
+          </label>
+          <div class="settings-grid">
+            <label>
+              <span>单次 AI 识站预算（秒）</span>
+              <input id="ai-timeout" type="number" min="5" max="120" value="30" />
+            </label>
+            <label>
+              <span>AI 修正规则轮数（1–3）</span>
+              <input id="ai-attempts" type="number" min="1" max="3" value="2" />
+            </label>
+            <label>
+              <span>AI 最大并发</span>
+              <input id="ai-concurrency" type="number" min="1" max="8" value="2" />
+            </label>
+            <label>
+              <span>每轮 MCP 只读工具调用上限</span>
+              <input id="mcp-tool-calls" type="number" min="0" max="8" value="4" />
+            </label>
+          </div>
+          <div class="row settings-actions">
+            <button type="submit">保存 AI 设置</button>
+            <button type="button" id="ai-test" class="ghost">测试当前 AI 接入</button>
+            <button type="button" id="mcp-test" class="ghost">测试 MCP</button>
+            <button type="button" id="ai-clear-key" class="danger">清除 AI Key</button>
+            <button type="button" id="mcp-clear-token" class="danger">清除 MCP Token</button>
+          </div>
+        </form>
+        <p id="ai-settings-status" class="status" hidden></p>
+        <p class="hint">API Key 存于 Docker 的 <code>/data/private-settings/ai.json</code>，浏览器接口不会回显。HTTP 本地模式不读取宿主机 Agent 的登录文件；CLI 模式由宿主机桥接进程使用已登录的客户端。网页证据会限制大小并脱敏；MCP 仅开放筛选后的只读浏览工具。</p>
+      </section>
+
       <section class="panel">
         <div class="row between">
           <h2>任务列表</h2>

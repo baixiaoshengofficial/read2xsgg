@@ -16,6 +16,30 @@ const els = {
   jobs: document.getElementById("jobs"),
   refresh: document.getElementById("refresh"),
   logout: document.getElementById("logout"),
+  aiSettingsForm: document.getElementById("ai-settings-form"),
+  aiEnabled: document.getElementById("ai-enabled"),
+  aiProvider: document.getElementById("ai-provider"),
+  aiApiFields: document.getElementById("ai-api-fields"),
+  aiLocalFields: document.getElementById("ai-local-fields"),
+  aiCliFields: document.getElementById("ai-cli-fields"),
+  aiCliClient: document.getElementById("ai-cli-client"),
+  aiBaseUrl: document.getElementById("ai-base-url"),
+  aiModel: document.getElementById("ai-model"),
+  aiApiKey: document.getElementById("ai-api-key"),
+  aiLocalBaseUrl: document.getElementById("ai-local-base-url"),
+  aiLocalModel: document.getElementById("ai-local-model"),
+  mcpEndpoint: document.getElementById("mcp-endpoint"),
+  mcpToken: document.getElementById("mcp-token"),
+  aiTimeout: document.getElementById("ai-timeout"),
+  aiAttempts: document.getElementById("ai-attempts"),
+  aiConcurrency: document.getElementById("ai-concurrency"),
+  mcpToolCalls: document.getElementById("mcp-tool-calls"),
+  aiConfigState: document.getElementById("ai-config-state"),
+  aiSettingsStatus: document.getElementById("ai-settings-status"),
+  aiTest: document.getElementById("ai-test"),
+  mcpTest: document.getElementById("mcp-test"),
+  aiClearKey: document.getElementById("ai-clear-key"),
+  mcpClearToken: document.getElementById("mcp-clear-token"),
   confirmDialog: document.getElementById("confirm-dialog"),
   confirmMessage: document.getElementById("confirm-message"),
   confirmOk: document.getElementById("confirm-ok"),
@@ -107,12 +131,23 @@ function progressRatio(job) {
   return Math.max(0, Math.min(1, done / total));
 }
 
-function statusLabel(status) {
-  if (status === "queued") return "排队中";
-  if (status === "running") return "运行中";
-  if (status === "done") return "完成";
-  if (status === "failed") return "失败";
-  return status || "";
+function statusLabel(job) {
+  if (job.status === "queued") return "排队中";
+  if (job.status === "running") return "运行中";
+  if (job.status === "done") {
+    const skipped = Number(job.progress?.skipped || 0);
+    const unverified = Number(job.progress?.unverified || 0);
+    return skipped || unverified ? "本轮结束·待调优" : "验证通过";
+  }
+  if (job.status === "failed") return "失败";
+  return job.status || "";
+}
+
+function statusClass(job) {
+  if (job.status === "done" && (Number(job.progress?.skipped || 0) || Number(job.progress?.unverified || 0))) {
+    return "partial";
+  }
+  return job.status || "";
 }
 
 function phaseLabel(job) {
@@ -120,8 +155,35 @@ function phaseLabel(job) {
   const current = currentSitesLabel(job);
   if (job.status === "queued") return "等待调度";
   if (job.status === "done") {
-    const unverified = job.progress?.unverified ? ` · 未抽测保留 ${job.progress.unverified}` : "";
-    return job.count != null ? `保留 ${job.count} 源${unverified}` : "完成";
+    const unverifiedCount = Number(job.progress?.unverified || 0);
+    const verified = Math.max(0, Number(job.progress?.kept ?? job.count ?? 0) - unverifiedCount);
+    const aiRepaired = Number(job.progress?.aiRepaired || 0);
+    const summary = `实测通过 ${verified}${aiRepaired ? `（AI 修复 ${aiRepaired}）` : ""}${unverifiedCount ? ` · 未验证保留 ${unverifiedCount}` : ""}`;
+    const skipped = Number(job.progress?.skipped || 0);
+    if (!skipped) return job.count != null ? `本轮结束 · ${summary}` : "本轮处理结束";
+    const unreachable = Number(job.skippedBuckets?.["dead-origin"] || 0);
+    const repairable = Math.max(0, skipped - unreachable);
+    const reasons = Object.entries(job.skippedReasons || {})
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 3)
+      .map(([reason, count]) => `${reason}×${count}`)
+      .join("，");
+    const sampleNames = (Array.isArray(job.skippedSources) ? job.skippedSources : [])
+      .slice()
+      .sort((a, b) => Number(/dead-origin|上游站点不可访问/i.test(a?.reason || ""))
+        - Number(/dead-origin|上游站点不可访问/i.test(b?.reason || "")))
+      .slice(0, 3)
+      .map((item) => String(item?.source || "").trim())
+      .filter(Boolean);
+    const samples = sampleNames.length
+      ? ` · 待处理样例 ${sampleNames.join("、")}${skipped > sampleNames.length ? ` 等 ${skipped - sampleNames.length} 个` : ""}`
+      : "";
+    const breakdown = [
+      repairable ? `待调优 ${repairable}` : "",
+      unreachable ? `不可达 ${unreachable}` : "",
+      reasons ? `原因 ${reasons}` : "",
+    ].filter(Boolean).join(" · ");
+    return `本轮结束 · ${summary} · 跳过 ${skipped}${breakdown ? `（${breakdown}）` : ""}${samples}`;
   }
   if (job.status === "failed") return job.error || "失败";
   if (phase === "download") return "下载阅读源…";
@@ -136,10 +198,14 @@ function phaseLabel(job) {
     return current ? `${base} · ${current}` : base;
   }
   if (phase === "verify") {
-    const step = job.progress?.step === "analyze" ? "识站修复" : "抽测";
+    const step = job.progress?.step === "ai-analyze"
+      ? `AI 识站 ${job.progress.aiAttempt || 1}/${job.progress.aiAttempts || 1}`
+      : job.progress?.step === "analyze" ? "通用识站修复" : "抽测";
     if (job.progress?.total) {
-      const unverified = job.progress.unverified ? ` · 未抽测保留 ${job.progress.unverified}` : "";
-      const base = `${step} ${job.progress.done || 0}/${job.progress.total} · 保留 ${job.progress.kept || 0} · 跳过 ${job.progress.skipped || 0}${unverified}`;
+      const unverified = Number(job.progress.unverified || 0);
+      const verified = Math.max(0, Number(job.progress.kept || 0) - unverified);
+      const aiRepaired = Number(job.progress.aiRepaired || 0);
+      const base = `${step} ${job.progress.done || 0}/${job.progress.total} · 实测通过 ${verified}${aiRepaired ? `（AI 修复 ${aiRepaired}）` : ""} · 跳过 ${job.progress.skipped || 0}${unverified ? ` · 未验证保留 ${unverified}` : ""}`;
       return current ? `${base}\n当前：${current}` : base;
     }
     return current ? `${step}中… · ${current}` : `${step}中…`;
@@ -180,7 +246,7 @@ function renderJobs(jobs) {
     ].filter(Boolean).join("");
     return `
       <article class="job" data-id="${job.id}">
-        <p class="job-title"><span class="badge ${job.status}">${statusLabel(job.status)}</span><span class="job-name">${escapeHtml(job.title || job.id)}</span></p>
+        <p class="job-title"><span class="badge ${statusClass(job)}">${statusLabel(job)}</span><span class="job-name">${escapeHtml(job.title || job.id)}</span></p>
         <p class="meta">${escapeHtml(job.sourceUrl || "")}</p>
         <p class="meta progress-text">${escapeHtml(progressText).replaceAll("\n", "<br>")}</p>
         <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}" aria-label="转换进度"><span style="width:${pct}%"></span></div>
@@ -227,6 +293,45 @@ async function refreshJobs() {
   if (busy) schedulePoll();
 }
 
+function updateAiProviderView() {
+  const local = els.aiProvider.value === "local-http";
+  const cli = els.aiProvider.value === "cli";
+  els.aiApiFields.hidden = local || cli;
+  els.aiLocalFields.hidden = !local;
+  els.aiCliFields.hidden = !cli;
+  els.aiClearKey.hidden = local || cli;
+}
+
+function aiConfigStateText(settings) {
+  const provider = settings.provider === "local-http"
+    ? `本地模型 ${settings.localModel || "未配置"}`
+    : (settings.provider === "cli" ? `CLI ${settings.cliClient || "codex"}` : (settings.apiKeyConfigured ? "AI Key 已保存" : "尚未设置 AI Key"));
+  const mcp = settings.mcpEndpoint
+    ? `MCP ${settings.mcpTokenConfigured ? "已配置认证" : "未配置认证"}`
+    : "MCP 未配置";
+  return `${provider} · ${mcp}`;
+}
+
+async function loadAiSettings() {
+  const { settings } = await api("/api/settings/ai");
+  els.aiEnabled.checked = Boolean(settings.enabled);
+  els.aiProvider.value = settings.provider || "api";
+  els.aiBaseUrl.value = settings.baseUrl || "https://api.openai.com/v1";
+  els.aiModel.value = settings.model || "";
+  els.aiLocalBaseUrl.value = settings.localBaseUrl || "";
+  els.aiLocalModel.value = settings.localModel || "";
+  els.aiCliClient.value = settings.cliClient || "codex";
+  els.mcpEndpoint.value = settings.mcpEndpoint || "";
+  els.aiTimeout.value = Math.round((Number(settings.timeoutMs) || 30_000) / 1000);
+  els.aiAttempts.value = settings.maxAttempts || 2;
+  els.aiConcurrency.value = settings.concurrency || 2;
+  els.mcpToolCalls.value = settings.maxToolCalls ?? 4;
+  els.aiApiKey.value = "";
+  els.mcpToken.value = "";
+  els.aiConfigState.textContent = aiConfigStateText(settings);
+  updateAiProviderView();
+}
+
 let pollTimer = 0;
 function schedulePoll() {
   clearTimeout(pollTimer);
@@ -241,6 +346,7 @@ async function enterApp(token) {
   setToken(token);
   await refreshJobs();
   showApp();
+  loadAiSettings().catch((error) => showStatus(els.aiSettingsStatus, error.message || "读取 AI 设置失败", false));
 }
 
 function logout(message = "") {
@@ -311,6 +417,113 @@ els.refresh.addEventListener("click", () => {
 });
 
 els.logout.addEventListener("click", () => logout());
+
+els.aiProvider.addEventListener("change", updateAiProviderView);
+
+els.aiSettingsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = els.aiSettingsForm.querySelector("button[type=submit]");
+  button.disabled = true;
+  try {
+    const settings = {
+      enabled: els.aiEnabled.checked,
+      provider: els.aiProvider.value,
+      baseUrl: els.aiBaseUrl.value.trim(),
+      model: els.aiModel.value.trim(),
+      localBaseUrl: els.aiLocalBaseUrl.value.trim(),
+      localModel: els.aiLocalModel.value.trim(),
+      cliClient: els.aiCliClient.value,
+      mcpEndpoint: els.mcpEndpoint.value.trim(),
+      timeoutMs: Number(els.aiTimeout.value) * 1000,
+      maxAttempts: Number(els.aiAttempts.value),
+      concurrency: Number(els.aiConcurrency.value),
+      maxToolCalls: Number(els.mcpToolCalls.value),
+    };
+    if (els.aiApiKey.value.trim()) settings.apiKey = els.aiApiKey.value.trim();
+    if (els.mcpToken.value.trim()) settings.mcpToken = els.mcpToken.value.trim();
+    const result = await api("/api/settings/ai", { method: "PUT", body: JSON.stringify(settings) });
+    els.aiApiKey.value = "";
+    els.mcpToken.value = "";
+    const state = result.settings;
+    els.aiConfigState.textContent = aiConfigStateText(state);
+    showStatus(els.aiSettingsStatus, "AI 设置已安全保存；新启动的任务将使用此配置", true);
+  } catch (error) {
+    if (error.status === 401 || error.status === 503) logout(error.message);
+    else showStatus(els.aiSettingsStatus, error.message || "保存设置失败", false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+els.aiTest.addEventListener("click", async () => {
+  els.aiTest.disabled = true;
+  try {
+    const result = await api("/api/settings/ai/test", { method: "POST", body: "{}" });
+    showStatus(els.aiSettingsStatus, `AI 服务连通：${result.model} · ${result.response || "服务已响应"}`, true);
+  } catch (error) {
+    if (error.status === 401 || error.status === 503) logout(error.message);
+    else showStatus(els.aiSettingsStatus, error.message || "AI 服务测试失败", false);
+  } finally {
+    els.aiTest.disabled = false;
+  }
+});
+
+els.mcpTest.addEventListener("click", async () => {
+  els.mcpTest.disabled = true;
+  try {
+    const result = await api("/api/settings/mcp/test", { method: "POST", body: "{}" });
+    showStatus(els.aiSettingsStatus, `MCP 连通：发现 ${result.toolCount} 个工具${result.toolNames?.length ? `（${result.toolNames.join("、")}）` : ""}`, true);
+  } catch (error) {
+    if (error.status === 401 || error.status === 503) logout(error.message);
+    else showStatus(els.aiSettingsStatus, error.message || "MCP 测试失败", false);
+  } finally {
+    els.mcpTest.disabled = false;
+  }
+});
+
+els.aiClearKey.addEventListener("click", async () => {
+  if (!await confirmAction("清除已保存的 AI API Key，并关闭 AI 识站？", {
+    title: "清除 AI API Key",
+    confirmLabel: "清除",
+  })) return;
+  els.aiClearKey.disabled = true;
+  try {
+    const result = await api("/api/settings/ai", {
+      method: "PUT",
+      body: JSON.stringify({ clearApiKey: true, enabled: false }),
+    });
+    els.aiEnabled.checked = false;
+    els.aiConfigState.textContent = aiConfigStateText(result.settings);
+    showStatus(els.aiSettingsStatus, "AI API Key 已清除，AI 识站已关闭", true);
+  } catch (error) {
+    if (error.status === 401 || error.status === 503) logout(error.message);
+    else showStatus(els.aiSettingsStatus, error.message || "清除 Key 失败", false);
+  } finally {
+    els.aiClearKey.disabled = false;
+  }
+});
+
+els.mcpClearToken.addEventListener("click", async () => {
+  if (!await confirmAction("清除已保存的 MCP Bearer Token？", {
+    title: "清除 MCP Token",
+    confirmLabel: "清除",
+  })) return;
+  els.mcpClearToken.disabled = true;
+  try {
+    const result = await api("/api/settings/ai", {
+      method: "PUT",
+      body: JSON.stringify({ clearMcpToken: true }),
+    });
+    els.mcpToken.value = "";
+    els.aiConfigState.textContent = aiConfigStateText(result.settings);
+    showStatus(els.aiSettingsStatus, "MCP Bearer Token 已清除", true);
+  } catch (error) {
+    if (error.status === 401 || error.status === 503) logout(error.message);
+    else showStatus(els.aiSettingsStatus, error.message || "清除 MCP Token 失败", false);
+  } finally {
+    els.mcpClearToken.disabled = false;
+  }
+});
 
 els.jobs.addEventListener("click", async (event) => {
   const target = event.target;

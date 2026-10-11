@@ -10,15 +10,15 @@ export function visibleText(node) {
 
 export function bookNameSelector() {
   return [
-    "normalize-space((.//*[self::h1 or self::h2 or self::h3 or self::h4",
+    "normalize-space((//*[self::h1 or self::h2 or self::h3 or self::h4",
     " or contains(concat(' ', normalize-space(@class), ' '), ' title ')",
     " or contains(concat(' ', normalize-space(@class), ' '), ' book-title ')",
     " or contains(concat(' ', normalize-space(@class), ' '), ' cardtitle ')])[1])",
     "||normalize-space(self::a/@title)",
-    "||normalize-space((.//a[@title])[1]/@title)",
+    "||normalize-space((//a[@title])[1]/@title)",
     "||normalize-space((self::a/text()[normalize-space()])[last()])",
-    "||normalize-space(((.//a)[1]/text()[normalize-space()])[last()])",
-    "||normalize-space((.//a)[1])",
+    "||normalize-space(((//a)[1]/text()[normalize-space()])[last()])",
+    "||normalize-space((//a)[1])",
     "||normalize-space(.)",
     "||normalize-space(/html/body/*)",
   ].join("");

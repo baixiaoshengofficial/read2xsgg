@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { aiProviderReady } from "./aiProvider.js";
 import { convertLegado, skippedBuckets } from "./converter.js";
 import { applyVerifyAndAnalyzeFallback } from "./pipeline.js";
 import { filterValidXiangseSources } from "./xiangseValidate.js";
@@ -30,6 +31,13 @@ export async function convertParsedSource(parsed, config, imageProxyBase = "", o
   const HttpError = options.HttpError || server.HttpError;
 
   const onProgress = options.onProgress || null;
+  // The short preflight timeout is only for quick origin probes. Full
+  // list→detail→chapter→content verification must use the configured fetch
+  // timeout, or valid but slower sources are falsely classified as stale.
+  const verificationTimeoutMs = Math.max(
+    Number(config.fetchTimeoutMs) || 15_000,
+    Number(config.preflightTimeoutMs) || 1_000,
+  );
   const emit = (payload) => {
     if (typeof onProgress !== "function") return;
     try {
@@ -47,7 +55,7 @@ export async function convertParsedSource(parsed, config, imageProxyBase = "", o
 
   const catalogDownload = (url, headers = {}, requestOptions = {}) => downloadSource(
     url,
-    { ...config, fetchTimeoutMs: Math.max(config.preflightTimeoutMs, 1_000) },
+    { ...config, fetchTimeoutMs: verificationTimeoutMs },
     headers,
     requestOptions,
   );
@@ -78,11 +86,15 @@ export async function convertParsedSource(parsed, config, imageProxyBase = "", o
 
   const sourceCount = Object.keys(converted.sources).length;
   const fullVerify = Boolean(options.fullVerify);
+  const verifyMaxSources = Number(config.verifyMaxSources);
+  const withinVerifySourceLimit = !Number.isFinite(verifyMaxSources)
+    || verifyMaxSources <= 0
+    || sourceCount <= verifyMaxSources;
   const verifyEnabled = Boolean(config.verifyConvertedSources) && sourceCount > 0
-    && (fullVerify || sourceCount <= (config.verifyMaxSources || 50));
+    && (fullVerify || withinVerifySourceLimit);
   const download = (url, headers = {}, requestOptions = {}) => downloadSource(
     url,
-    { ...config, fetchTimeoutMs: Math.max(config.preflightTimeoutMs, 1_000) },
+    { ...config, fetchTimeoutMs: verificationTimeoutMs },
     headers,
     requestOptions,
   );
@@ -90,15 +102,37 @@ export async function convertParsedSource(parsed, config, imageProxyBase = "", o
   const budgetMs = fullVerify
     ? (Number.isFinite(jobBudget) && jobBudget > 0 ? jobBudget : 0)
     : config.verifyBudgetMs;
+  const aiSettings = config.aiSettings || null;
+  const configuredSourceBudget = fullVerify
+    ? config.jobVerifySourceBudgetMs
+    : config.verifySourceBudgetMs;
+  const aiSourceBudget = aiProviderReady(aiSettings)
+    && Number(configuredSourceBudget) > 0
+    ? Math.max(
+      Number(configuredSourceBudget),
+      Math.min(180_000, (Number(aiSettings.timeoutMs) || 30_000) * (Number(aiSettings.maxAttempts) || 2) + 60_000),
+    )
+    : configuredSourceBudget;
+  const workerPoolEnabled = options.workerPoolEnabled !== undefined
+    ? Boolean(options.workerPoolEnabled)
+    : typeof options.downloadSource !== "function";
   const gated = await applyVerifyAndAnalyzeFallback(converted.sources, {
     download,
     concurrency: config.preflightConcurrency,
-    timeoutMs: config.preflightTimeoutMs,
+    timeoutMs: verificationTimeoutMs,
     analyzeTimeoutMs: config.analyzeTimeoutMs,
+    workerCount: fullVerify ? config.jobVerifyWorkers : config.verifyWorkers,
+    workerConfig: config,
+    workerPoolEnabled,
+    sourceBudgetMs: aiSourceBudget,
+    aiSettings,
     enabled: verifyEnabled,
     analyzeFallback: options.analyzeFallback !== undefined
       ? Boolean(options.analyzeFallback)
       : config.analyzeFallback,
+    retainUnverified: options.retainUnverified !== undefined
+      ? Boolean(options.retainUnverified)
+      : Boolean(config.retainUnverifiedSources),
     budgetMs,
     adapterBase: (() => {
       try { return new URL(imageProxyBase).origin; } catch { return ""; }
@@ -112,12 +146,12 @@ export async function convertParsedSource(parsed, config, imageProxyBase = "", o
     skipped: converted.skipped,
     stage: "post-verify",
   }).sources;
-  if (!verifyEnabled && config.verifyConvertedSources && sourceCount > (config.verifyMaxSources || 50)) {
+  if (!verifyEnabled && config.verifyConvertedSources && verifyMaxSources > 0 && sourceCount > verifyMaxSources) {
     converted.warnings.push({
       source: "",
       section: "source",
       field: "verify",
-      message: `源数量 ${sourceCount} 超过同步抽测上限 ${config.verifyMaxSources}，请使用任务导入执行完整抽测`,
+      message: `源数量 ${sourceCount} 超过同步抽测上限 ${verifyMaxSources}，请使用任务导入执行完整抽测`,
       rule: "",
     });
   }
@@ -139,6 +173,8 @@ export async function convertParsedSource(parsed, config, imageProxyBase = "", o
     ...converted,
     count,
     fallbackCount: gated.fallbackCount || 0,
+    aiRepairCount: gated.aiRepairCount || 0,
+    verifiedCount: gated.verifiedCount || 0,
     unverifiedCount: gated.unverifiedCount || 0,
     skippedBuckets: buckets,
     json,

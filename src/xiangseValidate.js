@@ -1,5 +1,6 @@
 import { hasUnsupportedLegadoRuntime } from "./legadoJs.js";
 import { decodeTextBuffer } from "./charset.js";
+import { normalizeXiangseSource } from "./xiangseRules.js";
 
 const SOURCE_TYPES = new Set(["text", "comic", "audio", "video"]);
 const RESPONSE_TYPES = new Set(["html", "json", ""]);
@@ -63,6 +64,9 @@ export function validateXiangseSource(source) {
     errors.push(`sourceType 无效（应为 text|comic|audio|video，实际 ${source.sourceType}）`);
   }
   if (!nonEmptyString(source.miniAppVersion)) errors.push("缺少 miniAppVersion");
+  if (source.weight !== undefined && Number(source.weight) <= 0) {
+    errors.push("weight 不能为 0 或负数（香色无法启用该源）");
+  }
 
   const worlds = Object.entries(source.bookWorld || {});
   if (!worlds.length && !nonEmptyString(source.searchBook?.requestInfo)) {
@@ -109,7 +113,7 @@ export function validateXiangseSource(source) {
  * hidden here; they must be repaired and verified by the live pipeline.
  */
 export function repairXiangseEntrypoints(source) {
-  let candidate = source;
+  let candidate = normalizeXiangseSource(source);
   let validation = validateXiangseSource(candidate);
   if (validation.ok) {
     return { source: candidate, validation, removedWorlds: [], replacedSearch: false };

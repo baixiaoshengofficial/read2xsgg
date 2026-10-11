@@ -22,40 +22,61 @@ function splitPostScript(rule) {
 }
 
 function runJavaScript(script, config, params, result) {
-  const source = String(script || "");
-  if (!source.trim()) return result;
+  const original = String(script || "");
+  if (!original.trim()) return result;
+  // Xiangse evaluates each @js rule independently. Keep java.put/get state
+  // local to this invocation so validation cannot pass on cross-rule state
+  // that the client does not preserve.
+  const source = original.replace(/\bvar\s+__xsState\s*=\s*\{\s*\};?/g, "");
+  const state = Object.create(null);
+  const document = typeof result === "string" ? htmlDocument(result) : null;
+  const domGetElements = (selector) => {
+    if (!document) return [];
+    const nodes = [];
+    try {
+      const found = document.querySelectorAll(String(selector));
+      for (const node of found) nodes.push(node);
+    } catch { return []; }
+    nodes.size = () => nodes.length;
+    nodes.get = (index) => nodes[Number(index)] || null;
+    nodes.getFirst = () => nodes[0] || null;
+    return nodes;
+  };
+  const java = {
+    get: (key) => state[String(key)] ?? "",
+    put: (key, value) => {
+      state[String(key)] = value;
+      return value;
+    },
+    getElements: domGetElements,
+    getElement: (selector) => domGetElements(selector)[0] || null,
+    getString: (rule) => {
+      const [selector, attribute = "text"] = String(rule || "").split("@");
+      const element = domGetElements(selector)[0];
+      if (!element) return "";
+      if (attribute === "text") return element.textContent.trim();
+      if (attribute === "html") return element.innerHTML;
+      return element.getAttribute(attribute) || "";
+    },
+    getStringList: (rule) => {
+      const [selector, attribute = "text"] = String(rule || "").split("@");
+      return domGetElements(selector).map((element) => attribute === "text"
+        ? element.textContent.trim()
+        : attribute === "html" ? element.innerHTML : element.getAttribute(attribute) || "");
+    },
+    log: () => {},
+    toast: () => {},
+  };
   // 阅读 JS 列表脚本常用 java.getElements/getElement。香色运行时没有该桥，
   // 这里用 JSDOM 提供等价实现，使此类规则在本运行时可验证。
   if (/\bjava\.(?:getElements?|getString(?:List)?)\s*\(/.test(source)) {
-    const document = typeof result === "string" ? htmlDocument(result) : null;
-    const domGetElements = (selector) => {
-      if (!document) return [];
-      const nodes = [];
-      try {
-        const found = document.querySelectorAll(String(selector));
-        for (const node of found) nodes.push(node);
-      } catch { return []; }
-      nodes.size = () => nodes.length;
-      nodes.getFirst = () => nodes[0] || null;
-      return nodes;
-    };
-    const java = {
-      getElements: domGetElements,
-      getElement: (selector) => domGetElements(selector)[0] || null,
-      getString: (rule) => {
-        const [selector, attribute = "text"] = String(rule || "").split("@");
-        const element = domGetElements(selector)[0];
-        if (!element) return "";
-        if (attribute === "text") return element.textContent.trim();
-        if (attribute === "html") return element.innerHTML;
-        return element.getAttribute(attribute) || "";
-      },
-      log: () => {},
-      toast: () => {},
-    };
-    return new Function("config", "params", "result", "java", source)(config, params, result, java);
+    return new Function("config", "params", "result", "java", "__xsState", source)(
+      config, params, result, java, state,
+    );
   }
-  return new Function("config", "params", "result", source)(config, params, result);
+  return new Function("config", "params", "result", "java", "__xsState", source)(
+    config, params, result, java, state,
+  );
 }
 
 function xpathValues(document, expression, context = document) {
@@ -99,6 +120,7 @@ function htmlSelect(rule, input, {
   content = false,
   config,
   params,
+  javaState,
   document: preparedDocument,
 } = {}) {
   const { selector, script } = splitPostScript(rule);
@@ -106,14 +128,14 @@ function htmlSelect(rule, input, {
     const result = typeof input === "string"
       ? input
       : nodeValue(input, { content });
-    return runJavaScript(script, config, params, result);
+    return runJavaScript(script, config, params, result, javaState);
   }
   if (!selector && script && list) {
     // 纯 @js: 列表规则：执行脚本并把返回值（元素数组/字符串数组）作为列表项。
     const seed = typeof input === "string"
       ? input
       : nodeValue(input, { content });
-    const value = runJavaScript(script, config, params, seed);
+    const value = runJavaScript(script, config, params, seed, javaState);
     const items = Array.isArray(value) ? value : (value == null ? [] : [value]);
     return items.filter((item) => item?.nodeType === 1
       || (typeof item === "string" && item.trim())
@@ -161,7 +183,7 @@ function htmlSelect(rule, input, {
     result = selected.map((value) => nodeValue(value)).filter(Boolean);
   }
   result = result.length <= 1 ? (result[0] ?? "") : result;
-  return script ? runJavaScript(script, config, params, result) : result;
+  return script ? runJavaScript(script, config, params, result, javaState) : result;
 }
 
 function jsonPathValue(input, path) {
@@ -232,7 +254,7 @@ function jsonRecursiveValue(input, rule) {
   });
 }
 
-function jsonSelect(rule, input, { list = false, config, params } = {}) {
+function jsonSelect(rule, input, { list = false, config, params, javaState } = {}) {
   const { selector, script } = splitPostScript(rule);
   if (selector && /@json-recursive:/i.test(selector)) {
     // 允许 `@json-recursive:x||path` 的联合：按顺序取首个非空备选。
@@ -248,7 +270,7 @@ function jsonSelect(rule, input, { list = false, config, params } = {}) {
       }
     }
     const value = list ? (Array.isArray(collected) ? collected : []) : collected;
-    return script ? runJavaScript(script, config, params, value) : value;
+    return script ? runJavaScript(script, config, params, value, javaState) : value;
   }
   let result = input;
   if (selector) {
@@ -263,7 +285,7 @@ function jsonSelect(rule, input, { list = false, config, params } = {}) {
     }
   }
   if (list) return Array.isArray(result) ? result : [];
-  return script ? runJavaScript(script, config, params, result) : result;
+  return script ? runJavaScript(script, config, params, result, javaState) : result;
 }
 
 function actionConfig(source, action) {
@@ -326,13 +348,31 @@ function substituteRequest(template, values) {
     .replaceAll("%@filter", String(values.filter || ""));
 }
 
+function splitRequestOptionsSuffix(value) {
+  const source = String(value || "").trim();
+  const match = source.match(/,\s*(\{[\s\S]*\})\s*$/);
+  if (!match) return { url: source, suffix: "" };
+  try {
+    const options = JSON.parse(match[1]);
+    const keys = Object.keys(options || {});
+    const supported = keys.length > 0
+      && keys.every((key) => /^(?:method|body|headers?|webView|charset|type|retry)$/i.test(key))
+      && (String(options.method || "").toUpperCase() === "POST" || options.body !== undefined);
+    if (supported) return { url: source.slice(0, match.index).trim(), suffix: source.slice(match.index) };
+  } catch {
+    // Leave ordinary comma-containing URLs untouched.
+  }
+  return { url: source, suffix: "" };
+}
+
 function absoluteUrl(value, base) {
   const url = String(value || "").trim();
   if (!url) return "";
+  const request = splitRequestOptionsSuffix(url);
   // 条目字段（如 `$.id` → "7"）不是地址：没有 base 可拼时原样返回，
   // 由后续的请求脚本（如 POST 复合详情）自行解释。
   try {
-    return new URL(url, base).href;
+    return `${new URL(request.url, base).href}${request.suffix}`;
   } catch {
     return url;
   }
@@ -355,7 +395,13 @@ async function requestAction(source, action, context, fetchImpl) {
   let request = action?.requestInfo;
   if (!request || request === "%@result") request = previous;
   else if (/^@js:/i.test(String(request).trim())) {
-    request = runJavaScript(String(request).trim().replace(/^@js:\s*/i, ""), config, params, previous);
+    request = runJavaScript(
+      String(request).trim().replace(/^@js:\s*/i, ""),
+      config,
+      params,
+      previous,
+      context.javaState,
+    );
   } else {
     request = substituteRequest(request, { ...params, result: previous });
   }
@@ -402,22 +448,45 @@ async function requestAction(source, action, context, fetchImpl) {
       };
     }
   }
-  const response = await fetchImpl(url, init);
-  const body = !response.read2xsggDecodedText && typeof response.arrayBuffer === "function"
-    ? decodeTextBuffer(Buffer.from(await response.arrayBuffer()), {
-      headers: { "content-type": response.headers?.get?.("content-type") || "" },
-      charsetHint: String(action.responseEncode || "") === XIANGSE_GBK_ENCODE
-        ? "gbk"
-        : action.charset || "",
-    })
-    : await response.text();
+  const responseCache = context.responseCache;
+  const cacheKey = responseCache instanceof Map
+    ? JSON.stringify([
+      method,
+      url,
+      typeof init.body === "string" ? init.body : String(init.body || ""),
+      Object.entries(headers).map(([name, value]) => [name.toLowerCase(), String(value)])
+        .sort(([left], [right]) => left.localeCompare(right)),
+    ])
+    : "";
+  let cached = cacheKey ? responseCache.get(cacheKey) : null;
+  let response = cached?.response;
+  let body = cached?.body;
+  if (!cached) {
+    response = await fetchImpl(url, init);
+    body = !response.read2xsggDecodedText && typeof response.arrayBuffer === "function"
+      ? decodeTextBuffer(Buffer.from(await response.arrayBuffer()), {
+        headers: { "content-type": response.headers?.get?.("content-type") || "" },
+        charsetHint: String(action.responseEncode || "") === XIANGSE_GBK_ENCODE
+          ? "gbk"
+          : action.charset || "",
+      })
+      : await response.text();
+    if (cacheKey && response.ok && !response.headers?.get?.("set-cookie")) {
+      responseCache.set(cacheKey, { response, body });
+    }
+  }
   if (!response.ok) throw new Error(`${action.actionID} 请求失败：HTTP ${response.status} ${response.url}`);
   let parsed = body;
   if (action.responseFormatType === "json") {
     try {
       parsed = JSON.parse(body);
     } catch (error) {
-      throw new Error(`${action.actionID} 声明 JSON，但响应无法解析：${error.message}`);
+      const contentType = String(response.headers?.get?.("content-type") || "");
+      const htmlPayload = /(?:text\/html|application\/xhtml\+xml)/i.test(contentType)
+        || /^\s*(?:<!doctype\s+html\b|<html\b|<body\b|<[a-z][\w:-]*(?:\s|>))/i.test(body);
+      if (!htmlPayload) {
+        throw new Error(`${action.actionID} 声明 JSON，但响应无法解析：${error.message}`);
+      }
     }
   }
   return { response, body, parsed, config, params, requestUrl: url };
@@ -427,9 +496,12 @@ function select(action, rule, input, options = {}) {
   if (!rule) return options.list ? [] : "";
   const config = options.config;
   const params = options.params;
-  return action.responseFormatType === "json"
-    ? jsonSelect(rule, input, { ...options, config, params })
-    : htmlSelect(rule, input, { ...options, config, params });
+  const htmlPayload = action.responseFormatType === "json"
+    && typeof input === "string"
+    && /^\s*(?:<!doctype\s+html\b|<html\b|<body\b|<[a-z][\w:-]*(?:\s|>))/i.test(input);
+  return action.responseFormatType === "json" && !htmlPayload
+    ? jsonSelect(rule, input, { ...options, config, params, javaState: options.javaState })
+    : htmlSelect(rule, input, { ...options, config, params, javaState: options.javaState });
 }
 
 function firstString(value) {
@@ -523,6 +595,7 @@ export async function runXbsChapterContent(source, {
 } = {}, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
   const timeoutMs = options.timeoutMs || 20_000;
+  const javaState = options.javaState || Object.create(null);
   const report = { ok: false, itemCount: 0, firstUrl: "", error: "" };
   try {
     if (!chapterUrl) throw new Error("chapterContent 缺少章节 URL");
@@ -541,11 +614,14 @@ export async function runXbsChapterContent(source, {
       responseUrl: detailUrl,
       timeoutMs,
       signal: options.signal,
+      responseCache: options.responseCache || new Map(),
+      javaState,
     }, fetchImpl);
     const value = select(content, content.content, response.parsed, {
       content: (source.sourceType || "text") === "text",
       config: response.config,
       params: { ...response.params, responseUrl: response.response.url },
+      javaState,
     });
     const summary = contentSummary(source.sourceType || "text", value);
     if (!summary.count) throw new Error("chapterContent.content 解析为空");
@@ -566,6 +642,8 @@ export async function runXbsChapterContent(source, {
 export async function runXbsPipeline(source, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
   const timeoutMs = options.timeoutMs || 20_000;
+  const responseCache = new Map();
+  const javaState = Object.create(null);
   const report = { source: source.sourceName, sourceType: source.sourceType || "text", ok: false, steps: {} };
   try {
     const worldEntries = Object.entries(source.bookWorld || {});
@@ -584,18 +662,25 @@ export async function runXbsPipeline(source, options = {}) {
       ...selectedFilter,
       timeoutMs,
       signal: options.signal,
+      responseCache,
+      javaState,
     }, fetchImpl);
     const books = select(world, world.list, worldResponse.parsed, {
       list: true,
       config: worldResponse.config,
       params: { ...worldResponse.params, responseUrl: worldResponse.response.url },
+      javaState,
     });
     const candidateIndex = Number.isInteger(options.bookIndex) ? options.bookIndex : 0;
     const firstBook = books[candidateIndex];
     if (!firstBook) throw new Error("bookWorld.list 解析结果为 0");
     const fieldParams = { ...worldResponse.params, responseUrl: worldResponse.response.url };
-    const bookName = firstString(select(world, world.bookName, firstBook, { config: worldResponse.config, params: fieldParams }));
-    const rawDetailUrl = firstString(select(world, world.detailUrl, firstBook, { config: worldResponse.config, params: fieldParams }));
+    const bookName = firstString(select(world, world.bookName, firstBook, {
+      config: worldResponse.config, params: fieldParams, javaState,
+    }));
+    const rawDetailUrl = firstString(select(world, world.detailUrl, firstBook, {
+      config: worldResponse.config, params: fieldParams, javaState,
+    }));
     const detailUrl = absoluteUrl(rawDetailUrl, worldResponse.response.url);
     if (!bookName) throw new Error("bookWorld.bookName 解析为空");
     if (!detailUrl) throw new Error("bookWorld.detailUrl 解析为空");
@@ -618,6 +703,8 @@ export async function runXbsPipeline(source, options = {}) {
       queryInfo,
       timeoutMs,
       signal: options.signal,
+      responseCache,
+      javaState,
     }, fetchImpl);
     const detailParams = {
       ...detailResponse.params,
@@ -639,6 +726,7 @@ export async function runXbsPipeline(source, options = {}) {
         config: detailResponse.config,
         params: detailParams,
         document: detailDocument,
+        javaState,
       }));
       if (value) detailValues[name] = name === "cover"
         ? absoluteUrl(value, detailResponse.response.url)
@@ -659,6 +747,8 @@ export async function runXbsPipeline(source, options = {}) {
       lastResponse: detailResponse.parsed,
       timeoutMs,
       signal: options.signal,
+      responseCache,
+      javaState,
     }, fetchImpl);
     const tocDocument = toc.responseFormatType === "html"
       ? htmlDocument(tocResponse.parsed)
@@ -668,19 +758,26 @@ export async function runXbsPipeline(source, options = {}) {
       config: tocResponse.config,
       params: { ...tocResponse.params, responseUrl: tocResponse.response.url },
       document: tocDocument,
+      javaState,
     });
     const chapterIndex = Number.isInteger(options.chapterIndex) ? options.chapterIndex : 0;
     const firstChapter = chapters[chapterIndex];
     if (!firstChapter) throw new Error("chapterList.list 解析结果为 0");
     const tocParams = { ...tocResponse.params, responseUrl: tocResponse.response.url };
-    const chapterTitle = firstString(select(toc, toc.title, firstChapter, { config: tocResponse.config, params: tocParams }));
-    const rawChapterUrl = firstString(select(toc, toc.url, firstChapter, { config: tocResponse.config, params: tocParams }));
+    const chapterTitle = firstString(select(toc, toc.title, firstChapter, {
+      config: tocResponse.config, params: tocParams, javaState,
+    }));
+    const rawChapterUrl = firstString(select(toc, toc.url, firstChapter, {
+      config: tocResponse.config, params: tocParams, javaState,
+    }));
     const chapterUrl = absoluteUrl(rawChapterUrl, tocResponse.response.url);
     if (!chapterTitle) throw new Error("chapterList.title 解析为空");
     if (!chapterUrl) throw new Error("chapterList.url 解析为空");
     if (!report.steps.bookDetail.lastChapterTitle) {
       const chapterRows = chapters.map((item) => ({
-        title: firstString(select(toc, toc.title, item, { config: tocResponse.config, params: tocParams })),
+        title: firstString(select(toc, toc.title, item, {
+          config: tocResponse.config, params: tocParams, javaState,
+        })),
       })).filter((item) => item.title);
       report.steps.bookDetail.lastChapterTitle = orderChaptersAscending(chapterRows, {
         reverseHint: Boolean(toc.reverseChapters || toc.reverse),
@@ -709,6 +806,8 @@ export async function runXbsPipeline(source, options = {}) {
       responseUrl: tocResponse.response.url,
       timeoutMs,
       signal: options.signal,
+      responseCache,
+      javaState,
       mediaProbe: ["audio", "video"].includes(source.sourceType || "text"),
     }, fetchImpl);
     const contentParams = { ...contentResponse.params, responseUrl: contentResponse.response.url };
@@ -716,6 +815,7 @@ export async function runXbsPipeline(source, options = {}) {
       content: source.sourceType === "text",
       config: contentResponse.config,
       params: contentParams,
+      javaState,
     });
     const summary = contentSummary(source.sourceType || "text", contentValue);
     if (!summary.count) throw new Error("chapterContent.content 解析为空");

@@ -15,6 +15,9 @@ import { encodeCatalogPlan, normalizeCatalogPlan } from "./catalogPlan.js";
 import { hasUnsupportedLegadoRuntime, rewriteLegadoJavaScriptRaw } from "./legadoJs.js";
 import { injectRuntimeHelpers } from "./legadoRuntime.js";
 import { compileSignedRequestPlan, encodeSignedRequestPlan } from "./requestPlan.js";
+import { inferSourceKind } from "./contentKind.js";
+import { normalizeLegadoSources } from "./sourceInput.js";
+import { normalizeXiangseItemRule } from "./xiangseRules.js";
 import {
   compileBookBridgePlan,
   compileChapterBridgePlan,
@@ -87,34 +90,6 @@ function requestHostFromSource(source) {
     if (host) return host;
   }
   return "";
-}
-
-function sourceType(source) {
-  const type = source?.bookSourceType;
-  if (type === 1 || type === "1") return "audio";
-  if (type === 2 || type === "2") return "comic";
-  // 新版/扩展阅读源已使用 4 表示影视，香色有原生 video 类型。
-  if (type === 4 || type === "4") return "video";
-  const group = String(source?.bookSourceGroup || "");
-  const contentRules = getRules(source, "ruleContent", "contentRule");
-  const contentRule = `${contentRules?.content || ""}\n${contentRules?.imageStyle || ""}\n${contentRules?.imageDecode || ""}`;
-  // Some collections keep the old numeric type while grouping newer media
-  // sources correctly. Infer capabilities from declarative metadata/rules, not
-  // from a site name or domain.
-  if (/(?:影视|视频|电影|直播)/i.test(group)) return "video";
-  if (/(?:有声|音频|音乐|听书)/i.test(group)) return "audio";
-  if (/(?:漫画|图片|图集|写真)/i.test(group)
-    || ((type === 3 || type === "3") && /(?:\bimg\b|image|page-chapter|cp_img|data-original|imageStyle)/i.test(contentRule))) {
-    return "comic";
-  }
-  // 正文规则里出现 m3u8/播放页解析（如 player_aaaa）的源实际是影视源，
-  // 即使 bookSourceType 仍是旧的 0 也应按 video 转换。
-  if (/(?:\.m3u8\b|\.mp4\b|player_aaaa|play_from|vodplayinfo)/i.test(contentRule)) {
-    return "video";
-  }
-  // True file/download sources have no direct 香色 equivalent and remain text.
-  if (type === 3 || type === "3") return "text";
-  return "text";
 }
 
 function sourceWeight(source) {
@@ -440,18 +415,64 @@ function proxiedLineImageContent(contentRule, imageProxyBase, decoder) {
   return selector ? `${selector}||${proxyJs}` : proxyJs;
 }
 
-function runtimeResultRequestInfo() {
+function ruleMayReturnRequestOptions(rule) {
+  return /(?:JSON\.stringify\s*\(\s*\{[\s\S]{0,512}?\b(?:method|body|headers?)\s*:|\b(?:POST\s*:\s*true|httpParams\s*:|body\s*=))/i
+    .test(String(rule || ""));
+}
+
+function runtimeResultRequestInfo({
+  preferNextPage = false,
+  lastResponsePath = "",
+  preserveRequestOptions = false,
+} = {}) {
+  const responsePath = String(lastResponsePath || "").split("/").filter(Boolean);
   return [
     "@js:",
     'var q = (params && params.queryInfo) || {};',
+    ...(responsePath.length ? [
+      'var u = (params && params.lastResponse) || "";',
+      ...responsePath.map((field) => `u = (u && typeof u === "object") ? u[${JSON.stringify(field)}] : "";`),
+      'if (u && typeof u === "object") u = u.url || u.detailUrl || "";',
+      'u = (u == null) ? "" : String(u).trim();',
+    ] : preferNextPage ? [
+      'var u = (params && params.lastResponse && params.lastResponse.nextPageUrl) || "";',
+    ] : [
+      'var u = "";',
+    ]),
     // Prefer chapter `result` over leftover queryInfo.url/detailUrl (Xiangse H5).
-    'var u = (typeof result == "string" && result && result != "%@result") ? result : "";',
-    'if (!u) u = q.chapterUrl || q.url || q.detailUrl || "";',
-    'if (!u && result && typeof result == "object") u = result.url || result.detailUrl || "";',
+    ...(!responsePath.length ? [
+      'if (!u) u = (typeof result == "string" && result && result != "%@result") ? result : "";',
+      'if (!u) u = q.chapterUrl || q.url || q.detailUrl || "";',
+      'if (!u && result && typeof result == "object") u = result.url || result.detailUrl || "";',
+    ] : []),
     'if (u == "%@result") u = "";',
     'u = String(u || "").trim();',
+    ...(preserveRequestOptions ? [
+      'var optionMatch = u.match(/,\\s*(\\{[\\s\\S]*\\})\\s*$/);',
+      'if (optionMatch) {',
+      '  try {',
+      '    var requestOptions = JSON.parse(optionMatch[1]);',
+      '    var optionKeys = Object.keys(requestOptions);',
+      '    var knownOptions = optionKeys.length && optionKeys.every(function (key) { return /^(?:method|body|headers?|webView|charset|type|retry)$/i.test(key); });',
+      '    var requestMethod = String(requestOptions.method || "").toUpperCase();',
+      '    if (knownOptions && (requestMethod === "POST" || requestOptions.body !== undefined)) {',
+      '      var request = {url: u.slice(0, optionMatch.index)};',
+      '      request.POST = true;',
+      '      if (requestOptions.body !== undefined) request.httpParams = requestOptions.body;',
+      '      var requestHeaders = requestOptions.headers || requestOptions.header;',
+      '      if (requestHeaders && typeof requestHeaders === "object" && !Array.isArray(requestHeaders)) request.httpHeaders = requestHeaders;',
+      '      return request;',
+      '    }',
+      '  } catch (e) {}',
+      '}',
+    ] : []),
     'if (u.indexOf("//") == 0) u = "https:" + u;',
-    'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
+    'else if (u && !/^https?:\\/\\//i.test(u)) {',
+    '  var base = String((params && params.responseUrl) || (config && config.host) || "");',
+    '  var origin = base.match(/^(https?:\\/\\/[^/]+)/i);',
+    '  if (u.charAt(0) == "/") u = (origin ? origin[1] : base) + u;',
+    '  else u = base.replace(/\\/[^/]*$/, "").replace(/\\/$/, "") + "/" + u.replace(/^\\/+/, "");',
+    '}',
     "try { return encodeURI(decodeURI(u)); } catch (e) { return encodeURI(u); }",
   ].join("\n");
 }
@@ -489,7 +510,7 @@ function runtimeLegadoRequestOptionStrip(variable = "u") {
   ];
 }
 
-function runtimeAdapterRequestInfo(endpoint, { preferDetail = false } = {}) {
+function runtimeAdapterRequestInfo(endpoint, { preferDetail = false, preserveRequestHeaders = false } = {}) {
   // Chapter lists prefer detailUrl (catalogue seed).
   // Chapter content / media must prefer `result` first: Xiangse H5 commonly keeps
   // queryInfo.url as the book detail URL while passing the chapter URL as result
@@ -507,16 +528,39 @@ function runtimeAdapterRequestInfo(endpoint, { preferDetail = false } = {}) {
       'if (!u) u = q.url || q.detailUrl || "";',
       'if (!u && result && typeof result == "object") u = result.url || result.detailUrl || "";',
     ];
+  const requestHeaderBlock = preserveRequestHeaders ? [
+    'var requestHeaders = {};',
+    'var optionMatch = u.match(/,\\s*(\\{[\\s\\S]*\\})\\s*$/);',
+    'if (optionMatch) {',
+    '  try {',
+    '    var requestOptions = JSON.parse(optionMatch[1]);',
+    '    var optionKeys = Object.keys(requestOptions);',
+    '    var optionHeaders = requestOptions.headers || requestOptions.header;',
+    '    var headerOnlyOptions = optionKeys.length && optionKeys.every(function (key) { return /^(?:headers?|webView|charset|type|retry)$/i.test(key); });',
+    '    if (headerOnlyOptions && optionHeaders && typeof optionHeaders == "object" && !Array.isArray(optionHeaders)) {',
+    '      requestHeaders = optionHeaders;',
+    '      u = u.slice(0, optionMatch.index).trim();',
+    '    }',
+    '  } catch (e) {}',
+    '}',
+  ] : [];
   return [
     "@js:",
     'var q = (params && params.queryInfo) || {};',
     ...seedBlock,
     'if (u == "%@result") u = "";',
     'u = String(u || "").trim();',
-    ...runtimeLegadoRequestOptionStrip(),
+    ...requestHeaderBlock,
     'if (u.indexOf("//") == 0) u = "https:" + u;',
     'else if (u && !/^https?:\\/\\//i.test(u)) u = config.host + (u.charAt(0) == "/" ? u : "/" + u);',
-    `return ${finalizeAdapterUrlExpression(endpoint)} + encodeURIComponent(u);`,
+    `var endpoint = ${finalizeAdapterUrlExpression(endpoint)};`,
+    ...(preserveRequestHeaders ? [
+      'if (Object.keys(requestHeaders).length) {',
+      '  var endpointMarker = endpoint.match(/([?&])url=$/);',
+      '  if (endpointMarker) endpoint = endpoint.slice(0, -endpointMarker[0].length) + endpointMarker[1] + "requestHeaders=" + encodeURIComponent(JSON.stringify(requestHeaders)) + "&url=";',
+      '}',
+    ] : []),
+    'return endpoint + encodeURIComponent(u);',
   ].join("\n");
 }
 
@@ -1300,7 +1344,7 @@ function proxiedMediaChapterContent(host, imageProxyBase, kind, extractionPlan, 
   const endpoint = `${base}/adapter/media?kind=${kind}&plan=${encodedPlan}&url=`;
   return {
     ...commonAction("chapterContent", host, "json"),
-    requestInfo: runtimeAdapterRequestInfo(endpoint),
+    requestInfo: runtimeAdapterRequestInfo(endpoint, { preserveRequestHeaders: true }),
     content: [
       // Keep full JSON payload in `result` (do not preselect $.url) so adapter
       // httpHeaders (chapter Referer) can merge with source Cookie/UA headers.
@@ -1393,15 +1437,8 @@ function xsggModifyTime(value) {
 }
 
 function normalizeInput(input) {
-  if (Array.isArray(input)) return input;
   if (!input || typeof input !== "object") throw new TypeError("阅读源 JSON 必须是对象或数组");
-  if (input.bookSourceUrl || input.bookSourceName) return [input];
-  for (const key of ["sources", "bookSources", "data"]) {
-    if (Array.isArray(input[key])) return input[key];
-  }
-  const values = Object.values(input);
-  if (values.length && values.every((value) => value && typeof value === "object")) return values;
-  throw new TypeError("没有在输入 JSON 中找到阅读书源");
+  return normalizeLegadoSources(input);
 }
 
 function getRules(source, modern, legacy) {
@@ -1655,7 +1692,10 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
     if (rules[from] !== undefined && rules[from] !== "") {
       if (from === "coverUrl") {
         const convertedCover = convertCoverRule(rules[from], responseType, warningFor);
-        if (convertedCover) result[to] = applyJsonInitPath(convertedCover, initPath, responseType);
+        if (convertedCover) {
+          const resolvedCover = applyJsonInitPath(convertedCover, initPath, responseType);
+          result[to] = listContext ? normalizeXiangseItemRule(resolvedCover) : resolvedCover;
+        }
         continue;
       }
       if (from === "kind") {
@@ -1664,7 +1704,8 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
           warningFor("kind", rules[from])("列表分类字段依赖阅读专用 JavaScript，已忽略以避免香色丢弃整个列表");
           continue;
         }
-        result[to] = applyJsonInitPath(convertedKind, initPath, responseType);
+        const resolvedKind = applyJsonInitPath(convertedKind, initPath, responseType);
+        result[to] = listContext ? normalizeXiangseItemRule(resolvedKind) : resolvedKind;
         continue;
       }
       const convertedRule = compatibleTextRule(
@@ -1678,7 +1719,7 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
         if (cleaned !== convertedRule) {
           warningFor(from, rules[from])("bookUrl 携带的请求选项已从详情地址剥离（webView 等需在香色请求配置中手工处理）");
         }
-        result[to] = cleaned;
+        result[to] = listContext ? normalizeXiangseItemRule(cleaned) : cleaned;
         continue;
       }
       // 阅读 ruleBookInfo.init 会将后续 JSONPath 的根切换到该节点。
@@ -1687,7 +1728,7 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
       const resolvedRule = rulePath
         ? applyJsonInitPath(rulePath, initPath, responseType)
         : applyJsonInitPath(convertedRule, initPath, responseType);
-      result[to] = resolvedRule;
+      result[to] = listContext ? normalizeXiangseItemRule(resolvedRule) : resolvedRule;
     }
   }
   return result;
@@ -1696,7 +1737,10 @@ function mapBookRules(rules, responseType, warningFor, { initPath = "", listCont
 function mapDetailRules(rules, responseType, warningFor) {
   const result = mapBookRules(rules, responseType, warningFor, { initPath: simpleJsonPath(rules.init) });
   if (rules.init) {
-    warningFor("init", rules.init)("详情页 init 规则没有直接等价字段，已忽略；请检查详情页请求与解析结果");
+    const requiresClientCookie = /cookie\s*\.\s*(?:getCookie|get)|putLoginHeader/i.test(String(rules.init));
+    warningFor("init", rules.init)(requiresClientCookie
+      ? "详情 init 依赖阅读客户端 Cookie/登录请求头；不会迁移客户端凭据，香色需自行保持登录态，服务端无凭据时只能标记未验证"
+      : "详情页 init 规则没有直接等价字段，已忽略；请检查详情页请求与解析结果");
   }
   return result;
 }
@@ -1751,10 +1795,13 @@ function mapTocRules(rules, responseType, warningFor) {
           continue;
         }
       }
-      result[to] = compatibleTextRule(
+      const convertedValue = compatibleTextRule(
         raw,
         convertRule(raw, { responseType, warn: warningFor(from, raw) }),
       );
+      result[to] = ["title", "url", "updateTime"].includes(to)
+        ? normalizeXiangseItemRule(convertedValue)
+        : convertedValue;
     }
   }
   if (postChapterPlan) result._postChapterPlan = postChapterPlan;
@@ -1772,7 +1819,7 @@ function mapTocRules(rules, responseType, warningFor) {
     && (rules.chapterUrl === undefined || rules.chapterUrl === "" || /^\s*-\s*$/.test(String(rules.chapterUrl)))) {
     const anchorItems = responseType === "html" && /(?:^|@|\s)a(?:\s*$|\[|[.#:@])/i.test(String(chapterListRule || ""));
     if (anchorItems) {
-      result.url = "./@href";
+      result.url = "//@href";
       warningFor("chapterUrl", rules.chapterUrl)("目录列表已选中链接元素，缺省章节 URL 已使用当前条目的 href");
     } else {
       result.url = [
@@ -2052,7 +2099,7 @@ function buildBookAction({ actionID, host, request, rules, headers, warnings, so
   // 搜索列表是 `<a>`/含链接节点而源未声明 bookUrl 时，条目自身就是链接，
   // 用条目 href 兜底，避免整个源因缺必填字段被过滤。
   if (!action.detailUrl && responseType === "html" && action.list) {
-    action.detailUrl = ".//a/@href||./@href";
+    action.detailUrl = "//a/@href||//@href";
     warningFor("bookUrl", rules.bookUrl)("阅读源未声明 bookUrl，已用条目内的链接地址兜底详情页地址");
   }
   const verifyKeyWord = String(rules.checkKeyWord || "").split(/[|,，\n]/)[0].trim();
@@ -2536,12 +2583,14 @@ function convertOne(source, warnings, options = {}) {
   } else if (!host) {
     warningForSource("bookSourceUrl", source.bookSourceUrl)("缺少有效的 bookSourceUrl，且请求规则中没有可推导的绝对地址");
   }
-  const resolvedType = sourceType(source);
+  const kindInfo = inferSourceKind(source);
+  const resolvedType = kindInfo.kind;
   if ((source.bookSourceType === 3 || source.bookSourceType === "3") && resolvedType === "text") {
     warningForSource("bookSourceType", source.bookSourceType)("阅读的文件源类型在香色中没有直接等价类型，已按普通文本源输出");
   }
   if (![1, 2, 4, "1", "2", "4"].includes(source.bookSourceType) && resolvedType !== "text") {
-    warningForSource("bookSourceType", source.bookSourceType)(`已根据源分组和正文媒体规则自动识别为 ${resolvedType}`);
+    const evidence = kindInfo.evidence?.length ? `（依据：${kindInfo.evidence.join("、")}）` : "";
+    warningForSource("bookSourceType", source.bookSourceType)(`已根据源元数据和正文媒体能力自动识别为 ${resolvedType}${evidence}`);
   }
   if (source.loginUrl || source.loginUi || source.loginCheckJs) {
     warningForSource("loginUrl", source.loginUrl || source.loginUi)(
@@ -2623,17 +2672,25 @@ function convertOne(source, warnings, options = {}) {
   const postChapterPlanForContent = tocRules.chapterUrl
     ? compilePostChapterUrlRule(tocRules.chapterUrl)
     : null;
+  const detailRequestHasOptions = ruleMayReturnRequestOptions(effectiveSearchRules.bookUrl);
+  const chapterRequestHasOptions = detailRequestHasOptions || ruleMayReturnRequestOptions(detailRules.tocUrl);
+  const htmlTocSelector = detailResponseType === "html" && detailRules.tocUrl
+    ? convertRule(detailRules.tocUrl, {
+      responseType: "html",
+      warn: detailWarningFor("tocUrl", detailRules.tocUrl),
+    })
+    : "";
   const bookDetail = {
     ...commonAction("bookDetail", host, postDetailPlan ? "json" : detailResponseType),
     requestInfo: postDetailPlan
       ? postDetailRequestInfo(postDetailPlan, headers)
-      : runtimeResultRequestInfo(),
+      : runtimeResultRequestInfo({ preserveRequestOptions: detailRequestHasOptions }),
     ...mapDetailRules(detailRules, detailResponseType, detailWarningFor),
   };
 
   // 《香色闺阁书源规则》§七：chapterList.requestInfo 的 result = 书籍详情页 URL。
   // 官方 bookDetail 无 tocUrl；若阅读源带 tocUrl，仅作额外提取字段，不能代替 §七 的 result 语义。
-  let chapterListRequestInfo = runtimeResultRequestInfo();
+  let chapterListRequestInfo = runtimeResultRequestInfo({ preserveRequestOptions: chapterRequestHasOptions });
   let jsonApiToc = false;
   if (detailRules.tocUrl) {
     if (isDetailUrlAlias(detailRules.tocUrl)) {
@@ -2641,7 +2698,7 @@ function convertOne(source, warnings, options = {}) {
       detailWarningFor("tocUrl", detailRules.tocUrl)(
         "阅读 tocUrl 为 baseUrl（目录即详情页），章节列表直接请求详情 URL",
       );
-      chapterListRequestInfo = runtimeResultRequestInfo();
+      chapterListRequestInfo = runtimeResultRequestInfo({ preserveRequestOptions: chapterRequestHasOptions });
     } else {
       const absoluteTocRequest = buildJsonApiTocRequestInfo(detailRules.tocUrl)
         || buildDetailJsonScriptTocRequestInfo(detailRules.tocUrl)
@@ -2653,34 +2710,35 @@ function convertOne(source, warnings, options = {}) {
           "阅读 JSON API tocUrl 已编译为目录请求（从详情 URL / bookId 取 id，并用 pageIndex 翻页）",
         );
       } else {
-        bookDetail.tocUrl = convertRule(detailRules.tocUrl, {
-          responseType: detailResponseType,
-          warn: detailWarningFor("tocUrl", detailRules.tocUrl),
-        });
         const nameTemplate = String(detailRules.name || "").trim().match(/^\{\{\s*([\s\S]*?)\s*\}\}$/)?.[0];
         const tocTemplate = String(detailRules.tocUrl || "");
-        if (nameTemplate && tocTemplate.includes(nameTemplate)) {
+        const tocPath = detailResponseType === "json" ? simpleJsonPath(detailRules.tocUrl) : "";
+        const initPath = simpleJsonPath(detailRules.init);
+        const responsePath = tocPath
+          ? applyJsonInitPath(tocPath, initPath, "json")
+          : "";
+        const pathLeaf = responsePath.split("/").at(-1) || "";
+        if (responsePath && /(?:url|href|link|toc|catalog|menu|chapter|list)$/i.test(pathLeaf)) {
+          chapterListRequestInfo = runtimeResultRequestInfo({
+            lastResponsePath: responsePath,
+            preserveRequestOptions: true,
+          });
+          detailWarningFor("tocUrl", detailRules.tocUrl)(
+            "详情 JSON 中的目录地址字段已在 chapterList.requestInfo 从 params.lastResponse 读取（未使用非标准 bookDetail.tocUrl）",
+          );
+        } else if (nameTemplate && tocTemplate.includes(nameTemplate)) {
           const request = tocTemplate.split(nameTemplate).join("{{book.name}}");
           chapterListRequestInfo = convertRequest(request, {
             headers,
             warn: tocWarningFor("request", request),
-            fallback: runtimeResultRequestInfo(),
+            fallback: runtimeResultRequestInfo({ preserveRequestOptions: chapterRequestHasOptions }),
           }).requestInfo;
           detailWarningFor("tocUrl", detailRules.tocUrl)("目录 URL 与详情书名使用同一字段，已改为从香色 queryInfo.bookName 构造目录请求");
         } else {
-          // 非官方字段兜底：部分客户端若把 tocUrl 写入 queryInfo 则可直连目录
-          chapterListRequestInfo = [
-            "@js:",
-            "var q = params.queryInfo || {};",
-            'var u = (typeof result === "string") ? result : "";',
-            'if (!u && result && typeof result === "object") u = result.detailUrl || result.url || "";',
-            "u = String(q.tocUrl || q.detailUrl || u || q.url || \"\");",
-            "return u;",
-          ].join("\n");
+          detailWarningFor("tocUrl", detailRules.tocUrl)(
+            "阅读 tocUrl 无法安全编译为香色官方目录请求规则；chapterList 仍按 result 详情 URL 请求，并交由动作链验链/通用识站修复",
+          );
         }
-        detailWarningFor("tocUrl", detailRules.tocUrl)(
-          "阅读源含 tocUrl：已写入 bookDetail.tocUrl；章节请求仍以书源规则§七的 result（详情 URL）为准，请实测目录页",
-        );
       }
     }
   }
@@ -2689,7 +2747,7 @@ function convertOne(source, warnings, options = {}) {
     && !/^(?:@js:|<js>|https?:\/\/|\{\{)/i.test(String(detailRules.tocUrl).trim())) {
     const base = String(options.imageProxyBase).replace(/\/$/, "");
     const hint = tocLinkHint(detailRules.tocUrl);
-    const selector = String(bookDetail.tocUrl || "");
+    const selector = String(htmlTocSelector || "");
     chapterListRequestInfo = runtimeAdapterRequestInfo(
       `${base}/adapter/toc?hint=${encodeURIComponent(hint)}&selector=${encodeURIComponent(selector)}&url=`,
     );
@@ -2800,7 +2858,10 @@ function convertOne(source, warnings, options = {}) {
       ...commonAction("chapterContent", host, postChapterPlanForContent ? "json" : contentResponseType),
       requestInfo: postChapterPlanForContent
         ? postChapterRequestInfo(postChapterPlanForContent, headers)
-        : runtimeResultRequestInfo(),
+        : runtimeResultRequestInfo({
+          preferNextPage: true,
+          preserveRequestOptions: ruleMayReturnRequestOptions(tocRules.chapterUrl),
+        }),
       ...(content !== undefined ? { content } : {}),
       ...((contentRules.nextContentUrl || contentRules.nextUrl) ? {
         nextPageUrl: convertRule(contentRules.nextContentUrl || contentRules.nextUrl, {
@@ -2997,7 +3058,7 @@ function convertOne(source, warnings, options = {}) {
     converted.searchBook = bridgeBookAction(converted.searchBook, options.imageProxyBase, headers);
     converted.bookDetail = bridgeDetailAction(converted.bookDetail, options.imageProxyBase, headers, latestChapter);
     converted.chapterList = bridgeChapterAction(converted.chapterList, options.imageProxyBase, {
-      tocSelector: jsonApiToc ? "" : (bookDetail.tocUrl || ""),
+      tocSelector: jsonApiToc ? "" : htmlTocSelector,
       headers,
     });
     if (resolvedType === "text") {
@@ -3164,8 +3225,33 @@ export function convertLegado(input, options = {}) {
   const sources = {};
   const skipped = [];
   for (const source of normalizeInput(input)) {
-    if (!source || typeof source !== "object") continue;
-    const converted = convertOne(source, warnings, options);
+    if (!source || typeof source !== "object") {
+      skipped.push({ source: "未命名书源", reason: "convert-failed: 书源条目不是对象" });
+      warnings.push({
+        source: "未命名书源",
+        section: "source",
+        field: "input",
+        message: "已跳过不是对象的书源条目，继续转换其余源",
+        rule: "",
+      });
+      continue;
+    }
+    let converted;
+    try {
+      converted = convertOne(source, warnings, options);
+    } catch (error) {
+      const name = String(source.bookSourceName ?? source.name ?? "未命名书源").trim() || "未命名书源";
+      const message = String(error?.message || error || "未知转换错误").replace(/[\r\n]+/g, " ").slice(0, 500);
+      skipped.push({ source: name, reason: `convert-failed: ${message}` });
+      warnings.push({
+        source: name,
+        section: "source",
+        field: "conversion",
+        message: `该源转换失败，已隔离并继续处理其余源：${message}`,
+        rule: "",
+      });
+      continue;
+    }
     if (options.omitNonPortable) {
       const mediaReason = nonPortableOmitReason(source, converted, options);
       if (mediaReason) {
@@ -3246,12 +3332,15 @@ export function skippedBuckets(skipped = []) {
   for (const item of skipped) {
     const reason = String(item?.reason || "unknown");
     let key = "other";
-    if (/上游站点不可访问|没有数据|dead-origin/i.test(reason)) key = "dead-origin";
+    if (/上游站点不可访问[^。；]*(?:或|或者)[^。；]*没有数据/i.test(reason)) key = "preflight-inconclusive";
+    else if (/上游站点不可访问|dead-origin/i.test(reason)) key = "dead-origin";
+    else if (/没有数据/i.test(reason)) key = "core-chain";
     else if (/imageDecode|花屏|解码代理/i.test(reason)) key = "imageDecode";
     else if (/登录|分流|Get\s*\(/i.test(reason)) key = "login";
     else if (/sourceRegex|媒体流|可播放|媒体/i.test(reason)) key = "media";
     else if (/有效 URL|请求地址为空|不可移植/i.test(reason)) key = "core-chain";
     else if (/核心链路/i.test(reason)) key = "core-chain";
+    else if (/convert-failed|转换失败/i.test(reason)) key = "conversion";
     else if (/rules-stale/i.test(reason)) key = "rules-stale";
     else if (/analyze-failed/i.test(reason)) key = "analyze-failed";
     buckets[key] = (buckets[key] || 0) + 1;

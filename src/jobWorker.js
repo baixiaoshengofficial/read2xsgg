@@ -1,9 +1,12 @@
+import { Worker } from "node:worker_threads";
 import { convertOnlineSource, convertParsedSource } from "./convertOnline.js";
-import { analyzeSite } from "./siteAnalyze/index.js";
-import { encodeXbs } from "./xbs.js";
+import { runLibraryJob } from "./jobRunner.js";
 
 /**
- * In-process queue that converts, verifies, and persists source artifacts.
+ * Persistent queue that converts, verifies, and persists source artifacts.
+ * Production uses a Worker Thread per active job by default so a large or
+ * pathological conversion cannot starve the HTTP event loop. Tests may keep
+ * the in-process path when injecting fake converters/downloaders.
  *
  * Deleting a running job cancels it and frees the concurrency slot so the
  * next queued job can start immediately.
@@ -15,6 +18,7 @@ export function createJobWorker({
   downloadSource,
   convertParsed = convertParsedSource,
   convertOnline = convertOnlineSource,
+  isolate = false,
 } = {}) {
   if (!store) throw new Error("createJobWorker requires a library store");
   if (typeof downloadSource !== "function") throw new Error("createJobWorker requires downloadSource");
@@ -22,7 +26,7 @@ export function createJobWorker({
   let active = 0;
   const queue = [];
   const cancelled = new Set();
-  /** @type {Map<string, { freed: boolean }>} */
+  /** @type {Map<string, { freed: boolean, worker?: Worker }>} */
   const running = new Map();
   let pumping = false;
 
@@ -55,6 +59,8 @@ export function createJobWorker({
     if (!jobId) return;
     cancelled.add(jobId);
     removeFromQueue(jobId);
+    const handle = running.get(jobId);
+    if (handle?.worker) void handle.worker.terminate();
     if (releaseSlot(jobId)) void pump();
     else void pump();
   }
@@ -65,6 +71,7 @@ export function createJobWorker({
       if (job.status === "running") {
         await store.updateJob(job.id, {
           status: "queued",
+          phase: "queued",
           error: "",
           progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, failed: 0 },
         });
@@ -110,130 +117,64 @@ export function createJobWorker({
     return cancelled.has(jobId);
   }
 
-  async function runJob(jobId) {
-    try {
-      if (isCancelled(jobId)) return;
-      const job = await store.getJob(jobId);
-      if (!job || (job.status !== "queued" && job.status !== "running")) return;
-      if (isCancelled(jobId)) return;
-
-      await store.updateJob(jobId, {
-        status: "running",
-        phase: "download",
-        startedAt: job.startedAt || new Date().toISOString(),
-        error: "",
-      });
-
-      const onProgress = async (progress) => {
-        if (isCancelled(jobId)) return;
-        try {
-          const phase = progress?.phase || "verify";
-          await store.updateJob(jobId, { progress, phase });
-        } catch {
-          // Ignore progress write races.
-        }
+  async function runIsolatedJob(jobId) {
+    const worker = new Worker(new URL("./jobWorkerThread.js", import.meta.url), {
+      workerData: { jobId, config },
+    });
+    const handle = running.get(jobId);
+    if (handle) handle.worker = worker;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        callback(value);
       };
-
-      let result;
-      if (job.mode === "site") {
-        await store.updateJob(jobId, { phase: "analyze" });
-        const download = (url, headers = {}) => downloadSource(
-          url,
-          { ...config, fetchTimeoutMs: config.analyzeTimeoutMs },
-          headers,
-        );
-        const analyzed = await analyzeSite(job.sourceUrl, {
-          download,
-          timeoutMs: config.analyzeTimeoutMs,
-          sourceName: job.title || undefined,
-        });
-        if (isCancelled(jobId)) return;
-        if (!analyzed.ok) throw new Error(analyzed.reason || "自动识站失败");
-        const sources = analyzed.sources || { [analyzed.source.sourceName]: analyzed.source };
-        const count = Object.keys(sources).length;
-        const json = Buffer.from(`${JSON.stringify(sources, null, 2)}\n`, "utf8");
-        const xbs = encodeXbs(json);
-        result = {
-          sources,
-          warnings: analyzed.warnings || (analyzed.warning ? [analyzed.warning] : []),
-          skipped: [],
-          count,
-          fallbackCount: count,
-          skippedBuckets: {},
-          json,
-          xbs,
-        };
-        await onProgress({ done: count, total: count, kept: count, skipped: 0, unverified: 0, fallback: count, failed: 0 });
-      } else {
-        await store.updateJob(jobId, { phase: "convert" });
-        const progressOpts = {
-          // Library jobs intentionally verify the full aggregate. The sync
-          // endpoint has a small bounded sample budget for interactive use.
-          fullVerify: true,
-          analyzeFallback: true,
-          downloadSource,
-          onProgress: (progress) => {
-            if (isCancelled(jobId)) return;
-            return onProgress(progress);
-          },
-        };
-        // Prefer an explicitly published payload when present so retries keep
-        // declarative fields (e.g. mediaResolution) that remote legacy JSON lacks.
-        const sourcePayload = typeof store.readSourcePayload === "function"
-          ? await store.readSourcePayload(jobId)
-          : null;
-        result = sourcePayload
-          ? await convertParsed(
-            sourcePayload,
-            config,
-            job.imageProxyBase || "",
-            progressOpts,
-          )
-          : await convertOnline(
-            job.sourceUrl,
-            config,
-            job.imageProxyBase || "",
-            progressOpts,
-          );
-      }
-
-      if (isCancelled(jobId)) return;
-
-      await store.updateJob(jobId, { phase: "save" });
-      await store.saveArtifacts(jobId, { xbs: result.xbs, json: result.json });
-      await store.updateJob(jobId, {
-        status: "done",
-        phase: "done",
-        count: result.count,
-        fallbackCount: result.fallbackCount || 0,
-        skippedBuckets: result.skippedBuckets || {},
-        error: "",
-        finishedAt: new Date().toISOString(),
-        progress: {
-          done: result.count + (result.skipped?.length || 0),
-          total: result.count + (result.skipped?.length || 0),
-          kept: result.count,
-          skipped: result.skipped?.length || 0,
-          unverified: result.unverifiedCount || 0,
-          fallback: result.fallbackCount || 0,
-          failed: 0,
-        },
+      worker.once("error", (error) => {
+        if (!isCancelled(jobId)) {
+          void store.updateJob(jobId, {
+            status: "failed",
+            phase: "failed",
+            error: `任务工作线程异常：${error.message || error}`,
+            finishedAt: new Date().toISOString(),
+          });
+        }
+        settle(reject, error);
       });
-    } catch (error) {
-      if (isCancelled(jobId)) return;
-      try {
-        await store.updateJob(jobId, {
-          status: "failed",
-          phase: "failed",
-          error: error?.message || String(error),
-          finishedAt: new Date().toISOString(),
-        });
-      } catch {
-        // Job may have been deleted.
-      }
-    } finally {
-      cancelled.delete(jobId);
+      worker.once("exit", (code) => {
+        if (code !== 0 && !isCancelled(jobId)) {
+          const error = new Error(`任务工作线程退出（code ${code}）`);
+          void store.updateJob(jobId, {
+            status: "failed",
+            phase: "failed",
+            error: error.message,
+            finishedAt: new Date().toISOString(),
+          });
+          settle(reject, error);
+          return;
+        }
+        settle(resolve);
+      });
+    });
+  }
+
+  async function runJob(jobId) {
+    if (isolate) {
+      return runIsolatedJob(jobId).finally(() => {
+        cancelled.delete(jobId);
+      });
     }
+    return runLibraryJob({
+      store,
+      config,
+      jobId,
+      downloadSource,
+      convertParsed,
+      convertOnline,
+      isCancelled: () => isCancelled(jobId),
+    }).finally(() => {
+      cancelled.delete(jobId);
+    });
   }
 
   return {

@@ -15,6 +15,8 @@ services:
     oom_score_adj: 500
     ports:
       - "${APP_PORT:-3000}:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - path: .env
         required: false
@@ -38,13 +40,24 @@ services:
       PREFLIGHT_TIMEOUT_MS: ${PREFLIGHT_TIMEOUT_MS:-3000}
       PREFLIGHT_CONFIRM_TIMEOUT_MS: ${PREFLIGHT_CONFIRM_TIMEOUT_MS:-10000}
       PREFLIGHT_CONCURRENCY: ${PREFLIGHT_CONCURRENCY:-8}
+      PREFLIGHT_SOURCE_BUDGET_MS: ${PREFLIGHT_SOURCE_BUDGET_MS:-30000}
       VERIFY_CONVERTED_SOURCES: ${VERIFY_CONVERTED_SOURCES:-true}
+      RETAIN_UNVERIFIED_SOURCES: ${RETAIN_UNVERIFIED_SOURCES:-true}
       ANALYZE_FALLBACK: ${ANALYZE_FALLBACK:-true}
       ANALYZE_TIMEOUT_MS: ${ANALYZE_TIMEOUT_MS:-8000}
-      VERIFY_BUDGET_MS: ${VERIFY_BUDGET_MS:-20000}
-      VERIFY_MAX_SOURCES: ${VERIFY_MAX_SOURCES:-50}
+      VERIFY_WORKERS: ${VERIFY_WORKERS:-}
+      VERIFY_SOURCE_BUDGET_MS: ${VERIFY_SOURCE_BUDGET_MS:-30000}
+      # 0 means no synchronous verification deadline/source-count shortcut.
+      # A reachable source is fully verified/repaired when possible; a
+      # structurally valid source is retained as unverified when upstream
+      # responses cannot be reproduced during this run.
+      VERIFY_BUDGET_MS: ${VERIFY_BUDGET_MS:-0}
+      VERIFY_MAX_SOURCES: ${VERIFY_MAX_SOURCES:-0}
       JOB_CONCURRENCY: ${JOB_CONCURRENCY:-1}
+      JOB_ISOLATION: ${JOB_ISOLATION:-true}
       JOB_VERIFY_BUDGET_MS: ${JOB_VERIFY_BUDGET_MS:-0}
+      JOB_VERIFY_SOURCE_BUDGET_MS: ${JOB_VERIFY_SOURCE_BUDGET_MS:-30000}
+      JOB_VERIFY_WORKERS: ${JOB_VERIFY_WORKERS:-}
       MAX_COMIC_PAGES: ${MAX_COMIC_PAGES:-50}
       MAX_COMIC_IMAGES: ${MAX_COMIC_IMAGES:-2000}
       COMIC_PAGE_CONCURRENCY: ${COMIC_PAGE_CONCURRENCY:-4}

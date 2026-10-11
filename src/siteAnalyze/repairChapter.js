@@ -17,6 +17,21 @@ const CHAPTER_HREF = /(?:\/(?:c|chapter|chapters|read|view|content|book)\/|\/\d+
 const CHAPTER_TEXT = /(?:\d|章|节|回|话|集|卷|序|楔子|正文)/;
 const STRONG_CHAPTER_TEXT = /(?:第.{0,20}[章节回话集卷]|^\s*\d+[.、\s]|序章|楔子)/;
 
+function abortError(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  return new Error(String(signal?.reason || "操作已取消"));
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+async function yieldToEventLoop(signal) {
+  throwIfAborted(signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  throwIfAborted(signal);
+}
+
 function discoveredChapterRules(html, pageUrl) {
   let origin;
   try {
@@ -48,8 +63,8 @@ function discoveredChapterRules(html, pageUrl) {
     list: stable || listSelectorFromLinks(elements, document),
     title: stable
       ? "normalize-space(.)||normalize-space(/html/body/*)"
-      : "normalize-space(.//a)||normalize-space(/html/body/*)",
-    url: stable ? "./@href||//@href" : ".//a/@href||./@href||//@href",
+      : "normalize-space(//a)||normalize-space(/html/body/*)",
+    url: stable ? "//@href" : "//a/@href||//@href",
   };
 }
 
@@ -195,8 +210,13 @@ function replaceLinkedChapterAction(source, host, rules, tocSelector, adapterBas
 }
 
 /** Repair only the catalogue action after a converted list produced a real book URL. */
-export async function repairChapterFromBook(source, bookUrl, { download, adapterBase = "" } = {}) {
+export async function repairChapterFromBook(source, bookUrl, {
+  download,
+  adapterBase = "",
+  signal = null,
+} = {}) {
   if (typeof download !== "function") return null;
+  throwIfAborted(signal);
   try {
     new URL(bookUrl);
   } catch {
@@ -211,15 +231,18 @@ export async function repairChapterFromBook(source, bookUrl, { download, adapter
   if (initialHtmlUrl) queue.push({ url: initialHtmlUrl, stripApi: true });
   const seen = new Set();
   while (queue.length) {
+    await yieldToEventLoop(signal);
     const candidatePage = queue.shift();
     if (!candidatePage?.url || seen.has(candidatePage.url)) continue;
     seen.add(candidatePage.url);
     let page;
     try {
       page = await download(candidatePage.url, headers);
-    } catch {
+    } catch (error) {
+      if (signal?.aborted) throw error;
       continue;
     }
+    throwIfAborted(signal);
     const detailUrl = String(page.read2xsggResponseUrl || candidatePage.url);
     const detailHtml = decodeTextBuffer(page, { headers: page.httpHeaders || {} });
     const redirectedHtmlUrl = apiHtmlCandidateUrl(detailUrl);
@@ -255,12 +278,15 @@ export async function repairChapterFromBook(source, bookUrl, { download, adapter
       };
     }
     for (const candidate of catalogueCandidates(detailHtml, detailUrl)) {
+      await yieldToEventLoop(signal);
       let cataloguePage;
       try {
         cataloguePage = await download(candidate.href, headers);
-      } catch {
+      } catch (error) {
+        if (signal?.aborted) throw error;
         continue;
       }
+      throwIfAborted(signal);
       const catalogueUrl = String(cataloguePage.read2xsggResponseUrl || candidate.href);
       const linkedRules = discoveredChapterRules(
         decodeTextBuffer(cataloguePage, { headers: cataloguePage.httpHeaders || {} }),

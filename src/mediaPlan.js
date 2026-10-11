@@ -642,6 +642,26 @@ function hasHeader(headers, name) {
   return Object.keys(headers || {}).some((key) => String(key).toLowerCase() === wanted);
 }
 
+function mergeHeaders(...sources) {
+  const headers = {};
+  for (const source of sources) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) continue;
+    for (const [name, value] of Object.entries(source)) {
+      const previous = Object.keys(headers).find((key) => key.toLowerCase() === name.toLowerCase());
+      if (previous) delete headers[previous];
+      headers[name] = value;
+    }
+  }
+  return headers;
+}
+
+function removeHeader(headers, name) {
+  const wanted = String(name || "").toLowerCase();
+  for (const key of Object.keys(headers || {})) {
+    if (key.toLowerCase() === wanted) delete headers[key];
+  }
+}
+
 function responseHeader(response, name) {
   const wanted = String(name || "").toLowerCase();
   const headers = response?.httpHeaders;
@@ -901,8 +921,9 @@ async function resolvePageScriptMedia(html, chapterUrl, plan, download, chapterR
   if (!scripts.length) return [];
 
   const cookies = chapterSessionCookies(chapterResponse);
-  const baseHeaders = { Referer: chapterUrl };
-  if (cookies) baseHeaders.Cookie = cookies;
+  let baseHeaders = mergeHeaders(plan?.headers);
+  if (!hasHeader(baseHeaders, "referer")) baseHeaders = mergeHeaders(baseHeaders, { Referer: chapterUrl });
+  if (cookies && !hasHeader(baseHeaders, "cookie")) baseHeaders = mergeHeaders(baseHeaders, { Cookie: cookies });
   const variables = staticPageVariables(html);
   for (const scriptUrl of scripts) {
     let script;
@@ -912,8 +933,8 @@ async function resolvePageScriptMedia(html, chapterUrl, plan, download, chapterR
     Object.assign(variables, scriptStaticValues(script, html));
     const replacements = declaredMediaReplacements(script);
     for (const request of scriptAjaxRequests(script, variables, chapterUrl)) {
-      const headers = { ...baseHeaders, ...request.headers, "X-Requested-With": "XMLHttpRequest" };
-      if (!sameOrigin(request.url, chapterUrl)) delete headers.Cookie;
+      const headers = mergeHeaders(baseHeaders, request.headers, { "X-Requested-With": "XMLHttpRequest" });
+      if (!sameOrigin(request.url, chapterUrl)) removeHeader(headers, "cookie");
       let response;
       try {
         response = await download(request.url, {
@@ -948,15 +969,19 @@ export async function executeMediaResolution(html, chapterUrl, plan, download, c
   vars.unixTime = String(Math.ceil(Date.now() / 1000));
   let url = interpolate(resolution.request.url, vars).trim();
   if (!url || /[<>\r\n]/.test(url) || !/^https?:\/\//i.test(url)) return [];
-  const headers = {};
+  let headers = mergeHeaders(plan.headers);
+  const resolutionHeaders = {};
   for (const [name, template] of Object.entries(resolution.request.headers || {})) {
     const value = interpolate(template, vars).trim();
-    if (value) headers[name] = value;
+    if (value) resolutionHeaders[name] = value;
   }
-  if (!headers.Referer && vars.chapterUrl) headers.Referer = vars.chapterUrl;
+  headers = mergeHeaders(headers, resolutionHeaders);
+  if (!hasHeader(headers, "referer") && vars.chapterUrl) {
+    headers = mergeHeaders(headers, { Referer: vars.chapterUrl });
+  }
   const sessionCookies = chapterSessionCookies(chapterResponse);
   if (sessionCookies && !hasHeader(headers, "cookie") && sameOrigin(url, chapterUrl)) {
-    headers.Cookie = sessionCookies;
+    headers = mergeHeaders(headers, { Cookie: sessionCookies });
   }
   let body = resolution.request.body ? interpolate(resolution.request.body, vars) : null;
   if (resolution.signature) {

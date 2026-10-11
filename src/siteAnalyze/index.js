@@ -13,6 +13,15 @@ import { carryReusableComicDecoder, repairContentFromChapter } from "./repairCon
 const CONTENT_NAV_TEXT = /(?:小说|书库|阅读|漫画|动漫|听书|有声|音频|广播剧|视频|影视|轻小说|novel|books?|comic|manga|audio|podcast|video)/i;
 const TRANSIENT_NETWORK_ERROR = /(?:abort|timed?\s*out|超时|timeout|socket|network|fetch failed|connection|连接|econnreset|econnrefused|ehostunreach|enetunreach|eai_again|enotfound|tls|ssl|http\s*(?:408|425|429|5\d\d)\b)/i;
 
+function abortError(signal, fallback = "操作已取消") {
+  if (signal?.reason instanceof Error) return signal.reason;
+  return new Error(String(signal?.reason || fallback));
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw abortError(signal);
+}
+
 function retryableDownloadError(error) {
   if (error?.name === "AbortError") return true;
   const code = String(error?.code || error?.cause?.code || "").toUpperCase();
@@ -131,6 +140,7 @@ export async function analyzeSite(siteUrl, {
   repairSource = null,
   contentRepair = repairContentFromChapter,
   maxPageBytes = 2 * 1024 * 1024,
+  signal = null,
 } = {}) {
   if (typeof download !== "function") {
     return { ok: false, reason: "analyze-failed: 缺少下载器" };
@@ -146,8 +156,14 @@ export async function analyzeSite(siteUrl, {
   }
 
   const timedDownload = async (url, headers = {}, options = {}) => {
+    throwIfAborted(signal);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const abortParent = () => controller.abort(abortError(signal));
+    const timer = setTimeout(() => controller.abort(new Error(`页面下载超时（${timeoutMs}ms）`)), timeoutMs);
+    if (signal) {
+      if (signal.aborted) abortParent();
+      else signal.addEventListener("abort", abortParent, { once: true });
+    }
     try {
       const page = await download(url, headers, { ...options, signal: controller.signal });
       const buffer = Buffer.isBuffer(page) ? page : Buffer.from(page ?? "");
@@ -166,6 +182,7 @@ export async function analyzeSite(siteUrl, {
       return decoded;
     } finally {
       clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", abortParent);
     }
   };
 
@@ -173,8 +190,9 @@ export async function analyzeSite(siteUrl, {
     try {
       return await timedDownload(url, headers, options);
     } catch (error) {
-      if (!retryableDownloadError(error) || options?.signal?.aborted) throw error;
+      if (!retryableDownloadError(error) || options?.signal?.aborted || signal?.aborted) throw error;
       await new Promise((resolve) => setTimeout(resolve, 120));
+      throwIfAborted(signal);
       return timedDownload(url, headers, options);
     }
   };
@@ -218,6 +236,7 @@ export async function analyzeSite(siteUrl, {
   const pages = [];
   let homeError = "";
   for (const request of uniqueRequests.slice(0, 5)) {
+    throwIfAborted(signal);
     try {
       const downloaded = await retryingSeedDownload(request.url, request.headers, request.options);
       pages.push({
@@ -252,6 +271,7 @@ export async function analyzeSite(siteUrl, {
   }
 
   for (const linkedUrl of relatedContentLinks(pages, homeUrl)) {
+    throwIfAborted(signal);
     try {
       const downloaded = await timedDownload(linkedUrl);
       pages.push({
@@ -297,6 +317,7 @@ export async function analyzeSite(siteUrl, {
   const fetchImpl = downloadAsFetch(timedDownload);
 
   for (const info of kindInfos) {
+    throwIfAborted(signal);
     let discovery = null;
     const diagnostics = [];
     try {
@@ -344,6 +365,7 @@ export async function analyzeSite(siteUrl, {
   const attemptsByKind = new Map();
 
   for (const item of built) {
+    throwIfAborted(signal);
     if (acceptedKinds.has(item.kind)) continue;
     const name = multi ? `${baseName}·${kindLabel(item.kind)}` : baseName;
     const attempt = (attemptsByKind.get(item.kind) || 0) + 1;
@@ -383,6 +405,7 @@ export async function analyzeSite(siteUrl, {
           const repaired = await contentRepair(source, chapterUrl, {
             download: timedDownload,
             adapterBase,
+            signal,
           });
           if (repaired) {
             const repairedStructural = validateXiangseSource(repaired);

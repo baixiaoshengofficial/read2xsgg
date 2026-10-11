@@ -1,3 +1,5 @@
+import { normalizeXiangseSource } from "../xiangseRules.js";
+
 function commonAction(actionID, host, responseFormatType = "html") {
   return {
     actionID,
@@ -74,8 +76,8 @@ function baseSource(discovery, { sourceName = "", miniAppVersion = "2.56.1", sou
     : {};
   const listFields = {
     list: discovery.listSelector,
-    bookName: discovery.bookNameSelector || ".//a||normalize-space(/html/body/*)",
-    detailUrl: discovery.detailUrlSelector || ".//a/@href||//@href",
+    bookName: discovery.bookNameSelector || "//a||normalize-space(/html/body/*)",
+    detailUrl: discovery.detailUrlSelector || "//a/@href||//@href",
     ...(listCover ? { cover: listCover } : {}),
   };
   const listPageSize = Math.max(1, Math.min(200, Number(discovery.listPageSize) || 20));
@@ -100,10 +102,10 @@ function baseSource(discovery, { sourceName = "", miniAppVersion = "2.56.1", sou
       _sIndex: 1,
     };
   }
-  return {
+  const source = {
     sourceName: name,
     sourceUrl: host,
-    weight: 0,
+    weight: "100",
     enable: 1,
     miniAppVersion,
     authorId: "",
@@ -131,8 +133,8 @@ function baseSource(discovery, { sourceName = "", miniAppVersion = "2.56.1", sou
       ...commonAction("chapterList", host, discovery.chapterResponseFormatType || "html"),
       requestInfo: discovery.chapterRequestInfo || "%@result",
       list: discovery.chapterListSelector,
-      title: discovery.chapterTitleSelector || "normalize-space(.//a)||normalize-space(/html/body/*)",
-      url: discovery.chapterUrlSelector || ".//a/@href||./@href||//@href",
+      title: discovery.chapterTitleSelector || "normalize-space(//a)||normalize-space(/html/body/*)",
+      url: discovery.chapterUrlSelector || "//a/@href||//@href",
       ...(Number(discovery.chapterPageSize) > 0 ? {
         moreKeys: {
           pageSize: Number(discovery.chapterPageSize),
@@ -142,6 +144,7 @@ function baseSource(discovery, { sourceName = "", miniAppVersion = "2.56.1", sou
       ...encode,
     },
   };
+  return normalizeXiangseSource(source);
 }
 
 /**
@@ -190,7 +193,7 @@ export function mediaDiscoveryToXiangse(discovery, options = {}) {
 export function discoveryToXiangse(discovery, options = {}) {
   if (!discovery?.kind) return null;
   if (discovery.source && typeof discovery.source === "object") {
-    const source = structuredClone(discovery.source);
+    const source = normalizeXiangseSource(discovery.source);
     source.sourceName = String(options.sourceName || source.sourceName || discovery.title || discovery.host).trim();
     return source;
   }

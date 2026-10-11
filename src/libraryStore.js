@@ -6,6 +6,22 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function emptyProgress() {
+  return {
+    done: 0,
+    total: 0,
+    kept: 0,
+    skipped: 0,
+    unverified: 0,
+    fallback: 0,
+    aiRepaired: 0,
+    failed: 0,
+    current: "",
+    active: [],
+    step: "",
+  };
+}
+
 function newJobId() {
   return randomBytes(8).toString("hex");
 }
@@ -108,9 +124,13 @@ export function createLibraryStore(dataDir) {
         status: entry.status,
         updatedAt: entry.updatedAt || nowIso(),
         count: entry.count ?? null,
+        verifiedCount: entry.verifiedCount ?? null,
+        aiRepairCount: entry.aiRepairCount || 0,
         error: entry.error || "",
         progress: entry.progress || null,
         phase: entry.phase || "",
+        skippedBuckets: entry.skippedBuckets || {},
+        skippedReasons: entry.skippedReasons || {},
       };
       const pos = index.jobs.findIndex((item) => item.id === next.id);
       if (pos >= 0) index.jobs[pos] = next;
@@ -156,10 +176,14 @@ export function createLibraryStore(dataDir) {
       status: "queued",
       phase: "queued",
       imageProxyBase: String(imageProxyBase || ""),
-      progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, failed: 0 },
+      progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, aiRepaired: 0, failed: 0 },
       count: null,
       fallbackCount: 0,
+      aiRepairCount: 0,
+      verifiedCount: null,
       skippedBuckets: {},
+      skippedReasons: {},
+      skippedSources: [],
       error: "",
       createdAt,
       updatedAt: createdAt,
@@ -182,12 +206,15 @@ export function createLibraryStore(dataDir) {
       if (terminal && patch.status === undefined) {
         return current;
       }
+      const phaseChanged = patch.phase !== undefined && patch.phase !== current.phase;
       const next = {
         ...current,
         ...patch,
         id: current.id,
         updatedAt: nowIso(),
-        progress: patch.progress ? { ...current.progress, ...patch.progress } : current.progress,
+        progress: patch.progress
+          ? { ...(phaseChanged ? emptyProgress() : current.progress), ...patch.progress }
+          : phaseChanged ? emptyProgress() : current.progress,
       };
       await writeJsonAtomic(jobPath(id), next);
       return next;

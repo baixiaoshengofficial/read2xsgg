@@ -203,11 +203,11 @@ function repeatedContentCards(document, baseUrl, origin) {
     rows: selected,
     listSelector,
     bookNameSelector: directAnchor
-      ? ".//*[contains(concat(' ', normalize-space(@class), ' '), ' title ')][1]||normalize-space(.)"
-      : ".//h1/a||.//h2/a||.//h3/a||.//h4/a||.//a[@rel='bookmark']||.//a[@title]",
+      ? "//*[contains(concat(' ', normalize-space(@class), ' '), ' title ')][1]||normalize-space(.)"
+      : "//h1/a||//h2/a||//h3/a||//h4/a||//a[@rel='bookmark']||//a[@title]",
     detailUrlSelector: directAnchor
-      ? "./@href||//@href"
-      : ".//h1/a/@href||.//h2/a/@href||.//h3/a/@href||.//h4/a/@href||.//a[@rel='bookmark']/@href||.//a[@title]/@href",
+      ? "//@href"
+      : "//h1/a/@href||//h2/a/@href||//h3/a/@href||//h4/a/@href||//a[@rel='bookmark']/@href||//a[@title]/@href",
   };
 }
 
@@ -487,8 +487,8 @@ export async function discoverMedia(originUrl, kind, {
     listRequestInfo: pagedListUrl || homeRequestInfo,
     categoryFilters,
     listSelector,
-    bookNameSelector: cards?.bookNameSelector || (stableListSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : ".//a||normalize-space(/html/body/*)"),
-    detailUrlSelector: cards?.detailUrlSelector || (stableListSelector ? "./@href||//@href" : ".//a/@href||//@href"),
+    bookNameSelector: cards?.bookNameSelector || (stableListSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : "normalize-space(//a)||normalize-space(/html/body/*)"),
+    detailUrlSelector: cards?.detailUrlSelector || (stableListSelector ? "//@href" : "//a/@href||//@href"),
     listCoverSelector,
     detailCoverSelector: detailCover,
     detailLastChapterSelector,
@@ -501,8 +501,8 @@ export async function discoverMedia(originUrl, kind, {
     chapterListSelector,
     chapterRequestInfo,
     chapterResponseFormatType: singleChapter || playlist.length >= 2 || ssrEpisodes ? "json" : "html",
-    chapterTitleSelector: singleChapter || playlist.length >= 2 || ssrEpisodes ? "title" : stableChapterSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : "normalize-space(.//a)||normalize-space(/html/body/*)",
-    chapterUrlSelector: singleChapter || playlist.length >= 2 || ssrEpisodes ? "url" : stableChapterSelector ? "./@href||//@href" : ".//a/@href||./@href||//@href",
+    chapterTitleSelector: singleChapter || playlist.length >= 2 || ssrEpisodes ? "title" : stableChapterSelector ? "normalize-space(.)||normalize-space(/html/body/*)" : "normalize-space(//a)||normalize-space(/html/body/*)",
+    chapterUrlSelector: singleChapter || playlist.length >= 2 || ssrEpisodes ? "url" : stableChapterSelector ? "//@href" : "//a/@href||//@href",
     chapterPageSize: ssrEpisodes?.pageSize || 0,
     chapterMaxPage: ssrEpisodes?.total && ssrEpisodes?.pageSize
       ? Math.ceil(ssrEpisodes.total / ssrEpisodes.pageSize)

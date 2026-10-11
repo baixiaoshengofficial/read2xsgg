@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { availableParallelism, cpus } from "node:os";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,8 +43,12 @@ import { decodeCatalogPlan, executeCatalogPlan } from "./catalogPlan.js";
 import { encodeXbs } from "./xbs.js";
 import { rebaseArtifactPair } from "./rebaseLibrary.js";
 import { parseHeaders, refreshEphemeralHeaders } from "./requests.js";
+import { normalizeLegadoSources } from "./sourceInput.js";
 import { decodeSignedRequestPlan, signedRequestTarget } from "./requestPlan.js";
 import { resolveChapterListUrls } from "./verifySource.js";
+import { createAiSettingsStore, publicAiSettings, AiSettingsError } from "./aiSettings.js";
+import { aiProviderConfigured, probeAiProvider } from "./aiProvider.js";
+import { probeMcp } from "./mcpClient.js";
 import { isDateOnlyMetadata } from "./elementValidation.js";
 import {
   applyDetailSemanticFallbacks,
@@ -60,6 +65,11 @@ import {
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PUBLIC_DIR = path.resolve(MODULE_DIR, "../public");
+const CPU_PARALLELISM = Math.max(
+  1,
+  Number(typeof availableParallelism === "function" ? availableParallelism() : cpus().length) || 1,
+);
+const DEFAULT_VERIFY_WORKERS = Math.min(8, CPU_PARALLELISM);
 const generatedCoverCache = new Map();
 const imageScriptDecoderCache = new Map();
 
@@ -113,9 +123,13 @@ export function serverConfig(environment = process.env) {
     preflightSources: boolean(environment.PREFLIGHT_SOURCES, true),
     preflightDeep: boolean(environment.PREFLIGHT_DEEP_SOURCES, false),
     preflightTimeoutMs: integer(environment.PREFLIGHT_TIMEOUT_MS, 3_000),
-    // A failed fast probe is not proof that a site is dead. Retry all declared
-    // entry candidates with a longer timeout before filtering the source.
+    // A failed fast probe is not proof that a site is dead. Retry declared
+    // origins and one alternate entry/root with a longer timeout before filtering.
     preflightConfirmTimeoutMs: integer(environment.PREFLIGHT_CONFIRM_TIMEOUT_MS, 10_000),
+    // Cap total wall time spent probing one source, including all declared
+    // entry URLs and retry rounds. Without this cap a dead host with many
+    // endpoints could occupy a preflight worker for several minutes.
+    preflightSourceBudgetMs: integer(environment.PREFLIGHT_SOURCE_BUDGET_MS, 30_000, 1),
     // Each source is isolated during aggregate conversion. One quick probe and
     // two confirmation attempts balance transient rate limits against keeping a
     // large import moving when an upstream site is unavailable.
@@ -123,16 +137,35 @@ export function serverConfig(environment = process.env) {
     // Verify/preflight share this pool; 8 keeps large jobs moving without
     // starving small containers as badly as 16+.
     preflightConcurrency: integer(environment.PREFLIGHT_CONCURRENCY, 8),
-    // 转换后抽测列表+目录。失败时识站修复；站点可达且仍失败则跳过（不 soft-keep 坏源）。
+    // 转换后抽测列表+目录。失败时识站修复；结构合法但暂时无法复现的源
+    // 默认保留为未验证，只有不可访问或无法生成合法 XBS 的源才过滤。
     verifyConvertedSources: boolean(environment.VERIFY_CONVERTED_SOURCES, true),
+    retainUnverifiedSources: boolean(environment.RETAIN_UNVERIFIED_SOURCES, true),
     analyzeFallback: boolean(environment.ANALYZE_FALLBACK, true),
     analyzeTimeoutMs: integer(environment.ANALYZE_TIMEOUT_MS, 8_000),
-    // Wall-clock budget for verify phase; remainder kept unverified.
-    verifyBudgetMs: integer(environment.VERIFY_BUDGET_MS, 20_000),
-    // Skip synchronous verification above this aggregate source count.
-    verifyMaxSources: integer(environment.VERIFY_MAX_SOURCES, 50),
+    // Worker Thread pool for CPU-heavy DOM/JSON verification. The network
+    // preflight pool remains separately bounded by preflightConcurrency. Do
+    // not oversubscribe cgroup CPU even when an env override requests more.
+    verifyWorkers: Math.min(16, CPU_PARALLELISM, integer(environment.VERIFY_WORKERS, DEFAULT_VERIFY_WORKERS)),
+    // Per-source wall-clock cap for the complete verify/repair/analyze chain.
+    // 0 is an explicit opt-out; the bounded default prevents one dead source
+    // from holding an aggregate job forever.
+    verifySourceBudgetMs: integer(environment.VERIFY_SOURCE_BUDGET_MS, 30_000, 0),
+    // Wall-clock budget for the synchronous verify phase.  0 means complete
+    // verification; a positive value is an explicit latency trade-off and may
+    // leave the tail unverified.
+    verifyBudgetMs: integer(environment.VERIFY_BUDGET_MS, 0, 0),
+    // Skip the synchronous source-count shortcut only when explicitly set to
+    // a positive number.  0 means complete verification for any aggregate.
+    verifyMaxSources: integer(environment.VERIFY_MAX_SOURCES, 0, 0),
     // Async WebUI jobs: 0 = unbounded full verify (default). Set >0 to cap wall time.
     jobVerifyBudgetMs: integer(environment.JOB_VERIFY_BUDGET_MS, 0, 0),
+    jobVerifySourceBudgetMs: integer(
+      environment.JOB_VERIFY_SOURCE_BUDGET_MS,
+      30_000,
+      0,
+    ),
+    jobVerifyWorkers: Math.min(16, CPU_PARALLELISM, integer(environment.JOB_VERIFY_WORKERS, DEFAULT_VERIFY_WORKERS)),
     maxComicPages: integer(environment.MAX_COMIC_PAGES, 50),
     maxComicImages: integer(environment.MAX_COMIC_IMAGES, 2_000),
     comicPageConcurrency: integer(environment.COMIC_PAGE_CONCURRENCY, 4),
@@ -148,6 +181,9 @@ export function serverConfig(environment = process.env) {
     dataDir: environment.DATA_DIR || "./data",
     adminToken: String(environment.ADMIN_TOKEN || "").trim(),
     jobConcurrency: integer(environment.JOB_CONCURRENCY, 1),
+    // Keep long-running aggregate verification outside the HTTP event loop.
+    // Tests can opt out when injecting in-process fake converters.
+    jobIsolation: boolean(environment.JOB_ISOLATION, true),
     publicDir: environment.PUBLIC_DIR || "",
   };
 }
@@ -386,7 +422,7 @@ export function pageText(buffer, charsetHint = "") {
   });
 }
 
-function probeRequest(url, resolved, config, headers = {}, method = "HEAD") {
+function probeRequest(url, resolved, config, headers = {}, method = "HEAD", signal = null) {
   const requester = url.protocol === "https:" ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
     const request = requester(url, {
@@ -405,12 +441,21 @@ function probeRequest(url, resolved, config, headers = {}, method = "HEAD") {
       response.resume();
       resolve({ status: response.statusCode || 0, location: response.headers.location });
     });
-    const abortProbe = () => request.destroy(new Error("preflight timeout"));
+    const abortProbe = () => request.destroy(signal?.reason instanceof Error
+      ? signal.reason
+      : new Error("preflight timeout"));
     // setTimeout() alone does not bound DNS/TCP/TLS connection setup.
     const hardTimer = setTimeout(abortProbe, config.preflightTimeoutMs);
     request.once("close", () => clearTimeout(hardTimer));
     request.setTimeout(config.preflightTimeoutMs, abortProbe);
     request.on("error", reject);
+    if (signal) {
+      if (signal.aborted) abortProbe();
+      else {
+        signal.addEventListener("abort", abortProbe, { once: true });
+        request.once("close", () => signal.removeEventListener("abort", abortProbe));
+      }
+    }
     request.end();
   });
 }
@@ -468,9 +513,7 @@ function sourceOriginCandidates(source) {
   return withRoots.slice(0, 12);
 }
 
-async function sourceOriginReachable(source, config) {
-  const candidates = sourceOriginCandidates(source);
-  if (!candidates.length) return "";
+function sourceOriginProbeHeaders(source) {
   let headers = {};
   try {
     headers = source?.httpHeaders && typeof source.httpHeaders === "object"
@@ -480,43 +523,97 @@ async function sourceOriginReachable(source, config) {
     headers = {};
   }
   if (source?.httpUserAgent) headers["User-Agent"] = String(source.httpUserAgent);
-  const probeCandidates = async (probeConfig) => {
-    for (const candidate of candidates) {
-      let current = candidate;
-      for (let redirects = 0; redirects <= Math.min(config.maxRedirects, 3); redirects += 1) {
-        try {
-          const resolved = await resolveTarget(current, probeConfig);
-          // GET is more widely supported than HEAD and the response body is
-          // immediately drained, so this remains a low-cost origin probe.
-          const result = await probeRequest(current, resolved, probeConfig, headers, "GET");
-          if (result.status >= 300 && result.status < 400 && result.location) {
-            current = new URL(result.location, current);
-            continue;
-          }
-          // Any HTTP status below 500 proves the origin is serving, including
-          // 401/403 deny pages from API hosts or anti-bot filters: whether a
-          // source still works is decided by verification and site analysis,
-          // not by the probe. 5xx (e.g. Cloudflare 521) stays unreachable.
-          if (result.status > 0 && result.status < 500) return current.origin;
-          break;
-        } catch {
-          break;
-        }
-      }
-    }
-    return "";
-  };
+  return headers;
+}
+
+function sourceOriginProbeKey(source) {
+  const headerEntries = Object.entries(sourceOriginProbeHeaders(source))
+    .map(([name, value]) => [String(name).toLowerCase(), String(value)])
+    .sort(([left], [right]) => left.localeCompare(right));
+  const candidates = sourceOriginCandidates(source).map((candidate) => candidate.href);
+  return JSON.stringify([candidates, headerEntries]);
+}
+
+async function sourceOriginReachable(source, config) {
+  const candidates = sourceOriginCandidates(source);
+  if (!candidates.length) return "";
+  const headers = sourceOriginProbeHeaders(source);
+  const candidatesByOrigin = new Map();
+  for (const candidate of candidates) {
+    const group = candidatesByOrigin.get(candidate.origin) || [];
+    // The source entry, origin root, and first declared action distinguish a
+    // live host from path-specific failures. Avoid retrying every API endpoint
+    // on a host that has already timed out; other origins are still tried.
+    if (group.length < 3 && !group.some((value) => value.href === candidate.href)) group.push(candidate);
+    candidatesByOrigin.set(candidate.origin, group);
+  }
+  const deadline = Date.now() + Math.max(1, Number(config.preflightSourceBudgetMs) || 30_000);
+  const attempts = Math.max(1, Number(config.preflightRetries) || 3);
   const confirmTimeoutMs = Math.max(
     Number(config.preflightTimeoutMs) || 1,
     Number(config.preflightConfirmTimeoutMs) || 10_000,
   );
-  const attempts = Math.max(1, Number(config.preflightRetries) || 3);
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const probeConfig = attempt === 0
-      ? config
-      : { ...config, preflightTimeoutMs: confirmTimeoutMs };
-    const reachable = await probeCandidates(probeConfig);
-    if (reachable) return reachable;
+  const timeoutError = () => new Error("preflight source budget exceeded");
+  const resolveWithin = async (url, probeConfig, signal) => {
+    if (signal.aborted) throw signal.reason || timeoutError();
+    let timer;
+    let abort;
+    const timeout = new Promise((_, reject) => {
+      const remaining = Math.max(1, Math.min(probeConfig.preflightTimeoutMs, deadline - Date.now()));
+      timer = setTimeout(() => reject(timeoutError()), remaining);
+      abort = () => reject(signal.reason || timeoutError());
+      signal.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      return await Promise.race([
+        resolveTarget(url, probeConfig),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+      if (abort) signal.removeEventListener("abort", abort);
+    }
+  };
+  for (let attempt = 0; attempt < attempts && Date.now() < deadline; attempt += 1) {
+    const controller = new AbortController();
+    const remaining = Math.max(1, deadline - Date.now());
+    const requestTimeoutMs = Math.min(
+      attempt === 0 ? config.preflightTimeoutMs : confirmTimeoutMs,
+      remaining,
+    );
+    const probeConfig = { ...config, preflightTimeoutMs: requestTimeoutMs };
+    const budgetTimer = setTimeout(() => controller.abort(timeoutError()), remaining);
+    try {
+      for (const originCandidates of candidatesByOrigin.values()) {
+        for (const candidate of originCandidates) {
+          if (Date.now() >= deadline) break;
+          let current = candidate;
+          for (let redirects = 0; redirects <= Math.min(config.maxRedirects, 3); redirects += 1) {
+            try {
+              const resolved = await resolveWithin(current, probeConfig, controller.signal);
+              // GET is more widely supported than HEAD and the response body is
+              // immediately drained, so this remains a low-cost origin probe.
+              const result = await probeRequest(current, resolved, probeConfig, headers, "GET", controller.signal);
+              if (result.status >= 300 && result.status < 400 && result.location) {
+                current = new URL(result.location, current);
+                continue;
+              }
+              // Any HTTP status below 500 proves the origin is serving,
+              // including 401/403 anti-bot pages. A 5xx may be path-specific,
+              // so try the single alternate entry/root for this origin.
+              if (result.status > 0 && result.status < 500) return current.origin;
+              break;
+            } catch {
+              break;
+            }
+          }
+          if (controller.signal.aborted || Date.now() >= deadline) break;
+        }
+        if (controller.signal.aborted || Date.now() >= deadline) break;
+      }
+    } finally {
+      clearTimeout(budgetTimer);
+    }
   }
   return "";
 }
@@ -1073,13 +1170,11 @@ async function sourceBridgeChainReachable(source, config) {
 }
 
 function legacySourceList(input) {
-  if (Array.isArray(input)) return input;
-  if (!input || typeof input !== "object") return [];
-  if (input.bookSourceUrl || input.bookSourceName) return [input];
-  for (const key of ["sources", "bookSources", "data"]) {
-    if (Array.isArray(input[key])) return input[key];
+  try {
+    return normalizeLegadoSources(input);
+  } catch {
+    return [];
   }
-  return [];
 }
 
 function htmlAttribute(tag, name) {
@@ -1150,9 +1245,9 @@ export async function filterReachableSources(input, config, { onProgress = null 
       cursor += 1;
       const source = sources[index];
       const label = sourceLabel(source);
-      const candidateOrigins = sourceOriginCandidates(source).map((url) => url.origin);
-      const key = candidateOrigins.length
-        ? candidateOrigins.join("|")
+      const candidateUrls = sourceOriginCandidates(source);
+      const key = candidateUrls.length
+        ? sourceOriginProbeKey(source)
         : String(source?.bookSourceUrl || source?.sourceUrl || source?.url || "");
       active.add(label);
       report();
@@ -1494,6 +1589,79 @@ function mediaProxyRequestFromRequest(request) {
   };
 }
 
+function decodeAdapterRequestHeaders(rawValue) {
+  const text = String(rawValue || "");
+  if (!text) return {};
+  if (Buffer.byteLength(text, "utf8") > 8_192) throw new HttpError(400, "动态请求头过大");
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new HttpError(400, "动态请求头不是有效 JSON");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError(400, "动态请求头格式无效");
+  }
+  const entries = Object.entries(value);
+  if (entries.length > 16) throw new HttpError(400, "动态请求头数量超限");
+  const blocked = /^(?:host|content-length|transfer-encoding|connection|te|trailer|upgrade|expect|proxy-|sec-websocket-)/i;
+  const headers = {};
+  const names = new Set();
+  let totalBytes = 0;
+  for (const [rawName, rawHeaderValue] of entries) {
+    const name = String(rawName || "");
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || blocked.test(name)) {
+      throw new HttpError(400, "动态请求头名称不允许");
+    }
+    if (!["string", "number", "boolean"].includes(typeof rawHeaderValue)) {
+      throw new HttpError(400, "动态请求头值必须是标量");
+    }
+    const normalizedName = name.toLowerCase();
+    if (names.has(normalizedName)) throw new HttpError(400, "动态请求头名称重复");
+    names.add(normalizedName);
+    const headerValue = String(rawHeaderValue);
+    const valueBytes = Buffer.byteLength(headerValue, "utf8");
+    if (/[\0\r\n]/.test(headerValue) || valueBytes > 2_048) {
+      throw new HttpError(400, "动态请求头值无效");
+    }
+    totalBytes += Buffer.byteLength(name, "utf8") + valueBytes;
+    if (totalBytes > 8_192) throw new HttpError(400, "动态请求头总长度超限");
+    headers[name] = headerValue;
+  }
+  return headers;
+}
+
+function mergeRequestHeaders(...sources) {
+  const headers = {};
+  for (const source of sources) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) continue;
+    for (const [name, value] of Object.entries(source)) {
+      const previous = Object.keys(headers).find((key) => key.toLowerCase() === name.toLowerCase());
+      if (previous) delete headers[previous];
+      headers[name] = value;
+    }
+  }
+  return headers;
+}
+
+function mediaPlanWithRequestHeaders(plan, headers) {
+  if (!plan || typeof plan !== "object") return plan;
+  const resolution = plan.resolution && typeof plan.resolution === "object"
+    ? {
+      ...plan.resolution,
+      request: {
+        ...(plan.resolution.request || {}),
+        headers: mergeRequestHeaders(plan.resolution.request?.headers, headers),
+      },
+    }
+    : null;
+  return {
+    ...plan,
+    headers: mergeRequestHeaders(plan.headers, headers),
+    ...(resolution ? { resolution } : {}),
+  };
+}
+
 function adapterRequestFromRequest(request) {
   const parsed = new URL(request.url || "/", "http://read2xsgg.local");
   const type = parsed.pathname === "/adapter/catalog" ? "catalog"
@@ -1517,6 +1685,7 @@ function adapterRequestFromRequest(request) {
   let catalogPlan;
   let requestPlan;
   let ssrEpisodePlan;
+  let requestHeaders;
   try {
     extractionPlan = type === "page-media"
       ? decodeMediaExtractionPlan(parsed.searchParams.get("plan") || "", parsed.searchParams.get("kind") || "audio")
@@ -1525,6 +1694,9 @@ function adapterRequestFromRequest(request) {
     if (type === "catalog") catalogPlan = decodeCatalogPlan(parsed.searchParams.get("plan") || "");
     if (type === "signed-request") requestPlan = decodeSignedRequestPlan(parsed.searchParams.get("plan") || "");
     if (type === "episode-list") ssrEpisodePlan = decodeSsrEpisodePlan(parsed.searchParams.get("plan") || "");
+    requestHeaders = type === "page-media"
+      ? decodeAdapterRequestHeaders(parsed.searchParams.get("requestHeaders") || "")
+      : {};
   } catch (error) {
     throw new HttpError(400, error.message);
   }
@@ -1548,6 +1720,7 @@ function adapterRequestFromRequest(request) {
       ? parsed.searchParams.get("kind")
       : "text",
     extractionPlan,
+    requestHeaders,
     bridgePlan,
     catalogPlan,
     requestPlan,
@@ -2923,15 +3096,31 @@ export function createAppServer(options = {}) {
   let active = 0;
   const publicDir = path.resolve(config.publicDir || DEFAULT_PUBLIC_DIR);
   const store = options.store || createLibraryStore(config.dataDir);
+  const aiSettingsStore = options.aiSettingsStore || createAiSettingsStore(config.dataDir);
+  const aiSemaphore = typeof SharedArrayBuffer === "undefined" ? null : new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  let aiSettingsLoad = null;
+  const loadAiSettings = async () => {
+    if (!aiSettingsLoad) {
+      aiSettingsLoad = aiSettingsStore.get().then((settings) => {
+        config.aiSettings = { ...settings, cliSocketPath: path.join(config.dataDir, "private-settings", "agent.sock"), ...(aiSemaphore ? { semaphore: aiSemaphore } : {}) };
+        return config.aiSettings;
+      }).catch((error) => {
+        aiSettingsLoad = null;
+        throw error;
+      });
+    }
+    return aiSettingsLoad;
+  };
   const convertRemoteSource = options.convertOnlineSource || convertOnlineSource;
   const worker = options.worker || createJobWorker({
     store,
     config,
     concurrency: config.jobConcurrency,
     downloadSource,
+    isolate: config.jobIsolation,
   });
   if (options.recoverJobs === true) {
-    void store.ensure().then(() => worker.recover()).catch((error) => {
+    void store.ensure().then(loadAiSettings).then(() => worker.recover()).catch((error) => {
       process.stderr.write(`library recover failed: ${error.message}\n`);
     });
   }
@@ -2939,7 +3128,7 @@ export function createAppServer(options = {}) {
   const server = createServer(async (request, response) => {
     const commonHeaders = {
       "Access-Control-Allow-Origin": config.corsOrigin,
-      "Access-Control-Allow-Methods": "GET,HEAD,POST,DELETE,OPTIONS",
+      "Access-Control-Allow-Methods": "GET,HEAD,POST,PUT,DELETE,OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type,If-None-Match,Authorization,X-Admin-Token",
       "X-Content-Type-Options": "nosniff",
     };
@@ -2950,7 +3139,7 @@ export function createAppServer(options = {}) {
         return;
       }
       const method = request.method || "GET";
-      const allowed = new Set(["GET", "HEAD", "POST", "DELETE"]);
+      const allowed = new Set(["GET", "HEAD", "POST", "PUT", "DELETE"]);
       if (!allowed.has(method)) throw new HttpError(405, "仅支持 GET、HEAD、POST、DELETE 和 OPTIONS");
       const pathname = new URL(request.url || "/", "http://read2xsgg.local").pathname;
       if (pathname === "/healthz") {
@@ -2966,6 +3155,63 @@ export function createAppServer(options = {}) {
         const rel = pathname.slice("/ui/".length) || "index.html";
         await servePublicFile(response, publicDir, rel, commonHeaders);
         return;
+      }
+
+      if (pathname === "/api/settings/ai" || pathname === "/api/settings/ai/test" || pathname === "/api/settings/mcp/test") {
+        requireAdmin(request, config);
+        let settings = await loadAiSettings();
+        if (pathname === "/api/settings/ai" && (method === "GET" || method === "HEAD")) {
+          sendJson(response, 200, { settings: publicAiSettings(settings) }, commonHeaders);
+          return;
+        }
+        if (pathname === "/api/settings/ai" && method === "PUT") {
+          const raw = await readRequestBody(request, { maxBytes: 24 * 1024 });
+          let body = {};
+          try { body = raw.length ? JSON.parse(raw.toString("utf8")) : {}; } catch { throw new HttpError(400, "请求体必须是 JSON"); }
+          try {
+            const saved = await aiSettingsStore.save({
+              enabled: body.enabled,
+              provider: body.provider,
+              baseUrl: body.baseUrl,
+              model: body.model,
+              apiKey: body.apiKey,
+              clearApiKey: body.clearApiKey,
+              localBaseUrl: body.localBaseUrl,
+              localModel: body.localModel,
+              cliClient: body.cliClient,
+              mcpEndpoint: body.mcpEndpoint,
+              mcpToken: body.mcpToken,
+              clearMcpToken: body.clearMcpToken,
+              timeoutMs: body.timeoutMs,
+              maxToolCalls: body.maxToolCalls,
+              maxAttempts: body.maxAttempts,
+              concurrency: body.concurrency,
+            });
+            settings = { ...saved, cliSocketPath: path.join(config.dataDir, "private-settings", "agent.sock"), ...(aiSemaphore ? { semaphore: aiSemaphore } : {}) };
+            config.aiSettings = settings;
+            aiSettingsLoad = Promise.resolve(settings);
+          } catch (error) {
+            if (error instanceof AiSettingsError) throw new HttpError(400, error.message);
+            throw error;
+          }
+          sendJson(response, 200, { settings: publicAiSettings(settings) }, commonHeaders);
+          return;
+        }
+        if (pathname === "/api/settings/ai/test" && method === "POST") {
+          if (!aiProviderConfigured(settings)) throw new HttpError(400, "请先完成当前 AI 接入方式的配置");
+          let result;
+          try { result = await probeAiProvider(settings); } catch (error) { throw new HttpError(502, error?.message || "AI 服务测试失败"); }
+          sendJson(response, 200, { ok: true, model: result.model, response: result.response }, commonHeaders);
+          return;
+        }
+        if (pathname === "/api/settings/mcp/test" && method === "POST") {
+          if (!settings.mcpEndpoint) throw new HttpError(400, "请先保存 MCP 地址");
+          let result;
+          try { result = await probeMcp(settings); } catch (error) { throw new HttpError(502, error?.message || "MCP 测试失败"); }
+          sendJson(response, 200, { ok: true, ...result }, commonHeaders);
+          return;
+        }
+        throw new HttpError(405, "设置接口不支持该方法");
       }
 
       const libraryTarget = libraryIdFromPath(pathname);
@@ -3023,6 +3269,7 @@ export function createAppServer(options = {}) {
 
       if (pathname === "/api/jobs" || pathname.startsWith("/api/jobs/")) {
         requireAdmin(request, config);
+        await loadAiSettings();
         if (pathname === "/api/jobs") {
           if (method === "GET" || method === "HEAD") {
             const jobs = await store.listJobs();
@@ -3075,6 +3322,8 @@ export function createAppServer(options = {}) {
             count: null,
             fallbackCount: 0,
             skippedBuckets: {},
+            skippedReasons: {},
+            skippedSources: [],
             progress: { done: 0, total: 0, kept: 0, skipped: 0, unverified: 0, fallback: 0, failed: 0 },
           });
           worker.cancel?.(jobRoute.id);
@@ -3544,20 +3793,27 @@ export function createAppServer(options = {}) {
             const referer = adapterTarget.referer
               ? normalizeRemoteUrl(adapterTarget.referer)
               : sourceUrl;
-            const headers = {
-              ...(adapterTarget.extractionPlan?.headers || {}),
-              ...(/^https?:\/\//i.test(String(referer || "")) ? { Referer: referer } : {}),
-            };
+            let headers = mergeRequestHeaders(
+              adapterTarget.extractionPlan?.headers,
+              adapterTarget.requestHeaders,
+            );
+            const hasDynamicReferer = Object.keys(adapterTarget.requestHeaders || {})
+              .some((name) => name.toLowerCase() === "referer");
+            if (/^https?:\/\//i.test(String(referer || ""))
+              && (!hasDynamicReferer || adapterTarget.referer)) {
+              headers = mergeRequestHeaders(headers, { Referer: referer });
+            }
+            const extractionPlan = mediaPlanWithRequestHeaders(adapterTarget.extractionPlan, headers);
             values = await resolveChapterMediaUrls(
               async () => download(sourceUrl, headers),
               sourceUrl,
-              adapterTarget.extractionPlan,
+              extractionPlan,
               download,
               pageMediaUrls,
             );
             if (!values.length) {
               const retryHeaders = withoutCookieHeaders(headers);
-              const retryPlan = withoutCookieMediaPlan(adapterTarget.extractionPlan);
+              const retryPlan = withoutCookieMediaPlan(extractionPlan);
               if (retryHeaders.removed || retryPlan.removed) {
                 values = await resolveChapterMediaUrls(
                   async () => download(sourceUrl, retryHeaders.headers),

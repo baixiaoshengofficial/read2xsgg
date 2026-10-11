@@ -3,6 +3,7 @@ import { createCipheriv, createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { Jimp, JimpMime } from "jimp";
@@ -374,6 +375,37 @@ test("预检在根路径受限时尝试源声明的实际搜索入口", async (c
   assert.deepEqual(result.skipped, []);
 });
 
+test("探活缓存区分相同源站上的不同请求头", async (context) => {
+  const upstream = createServer((request, response) => {
+    const reachable = request.headers["x-probe-key"] === "valid";
+    response.writeHead(reachable ? 200 : 500, { "Content-Type": "text/plain" });
+    response.end(reachable ? "ok" : "upstream error");
+  });
+  const upstreamBase = await listen(upstream);
+  context.after(() => close(upstream));
+  const common = {
+    ...structuredClone(source),
+    bookSourceUrl: upstreamBase,
+    searchUrl: "/search?q={{key}}",
+  };
+  const result = await filterReachableSources([
+    { ...common, bookSourceName: "缺少探活头" },
+    { ...common, bookSourceName: "带有效请求头", httpHeaders: { "X-Probe-Key": "valid" } },
+  ], {
+    ...testServerConfig(),
+    allowPrivateNetworks: true,
+    preflightSources: true,
+    preflightTimeoutMs: 150,
+    preflightConfirmTimeoutMs: 150,
+    preflightSourceBudgetMs: 1_000,
+    preflightRetries: 1,
+    preflightConcurrency: 2,
+  });
+
+  assert.deepEqual(result.input.map((item) => item.bookSourceName), ["带有效请求头"]);
+  assert.deepEqual(result.skipped.map((item) => item.source), ["缺少探活头"]);
+});
+
 test("快速预检超时后使用较长时限二次确认", async (context) => {
   const upstream = createServer((_request, response) => {
     setTimeout(() => {
@@ -429,6 +461,39 @@ test("预检三次超时后只跳过该站点，不中断合集转换", async (c
   assert.ok(requests >= 3);
   assert.deepEqual(result.input, []);
   assert.deepEqual(result.skipped, [{ source: "连续超时", reason: "上游站点不可访问" }]);
+});
+
+test("多入口站点的探活总耗时受单源预算约束", async (context) => {
+  let requests = 0;
+  const upstream = createServer(() => {
+    requests += 1;
+    // Intentionally leave every request open to simulate a filtered/hung host.
+  });
+  const upstreamBase = await listen(upstream);
+  context.after(() => close(upstream));
+  const searchUrls = Array.from({ length: 8 }, (_, index) => `${upstreamBase}/search/${index}`);
+  const startedAt = Date.now();
+  const result = await filterReachableSources([{
+    ...structuredClone(source),
+    bookSourceName: "多入口超时",
+    bookSourceUrl: `${upstreamBase}/source`,
+    searchUrl: searchUrls.join("\n"),
+  }], {
+    ...testServerConfig(),
+    allowPrivateNetworks: true,
+    preflightSources: true,
+    preflightTimeoutMs: 20,
+    preflightConfirmTimeoutMs: 50,
+    preflightSourceBudgetMs: 80,
+    preflightRetries: 3,
+    preflightConcurrency: 1,
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.ok(elapsedMs < 500, `expected bounded probe, took ${elapsedMs}ms`);
+  assert.ok(requests < 10, `expected per-origin probes instead of every path, got ${requests}`);
+  assert.deepEqual(result.input, []);
+  assert.deepEqual(result.skipped, [{ source: "多入口超时", reason: "上游站点不可访问" }]);
 });
 
 test("POST 表单可在 302 后切换 GET 且不会重放请求体", async (context) => {
@@ -997,7 +1062,35 @@ test("通用详情桥在旧目录选择器为空时解析内嵌目录", async (c
 });
 
 test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", async (context) => {
-  const upstream = createServer((_request, response) => {
+  const upstreamRequests = [];
+  const upstream = createServer((request, response) => {
+    upstreamRequests.push({
+      url: request.url,
+      ss: request.headers.ss || "",
+      tt: request.headers.tt || "",
+    });
+    if (request.url === "/chapter/signed" || request.url === "/chapter/resolve") {
+      if (request.headers.ss !== "signed" || request.headers.tt !== "123") {
+        response.writeHead(403);
+        response.end("missing signed request headers");
+        return;
+      }
+    }
+    if (request.url === "/chapter/resolve") {
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      response.end('<meta name="chapter-id" content="42">');
+      return;
+    }
+    if (request.url === "/media-api?id=42") {
+      if (request.headers.ss !== "signed" || request.headers.tt !== "123") {
+        response.writeHead(403);
+        response.end("missing signed resolution headers");
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: { trackUrl: `${upstreamBase}/media/resolved.m4a` } }));
+      return;
+    }
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ data: { trackUrl: "/media/chapter.m4a" } }));
   });
@@ -1019,6 +1112,55 @@ test("通用媒体适配端点解析 JSON 音频并直通视频播放地址", as
     url: `${upstreamBase}/media/chapter.m4a`,
     httpHeaders: { Referer: audioChapter },
   });
+
+  const dynamicHeaders = encodeURIComponent(JSON.stringify({ ss: "signed", tt: "123" }));
+  const signedChapter = `${upstreamBase}/chapter/signed`;
+  const signed = await fetch(
+    `${appBase}/adapter/media?kind=audio&plan=${audioPlan}&requestHeaders=${dynamicHeaders}&url=${encodeURIComponent(signedChapter)}`,
+  );
+  assert.equal(signed.status, 200);
+  assert.deepEqual(await signed.json(), {
+    url: `${upstreamBase}/media/chapter.m4a`,
+    httpHeaders: { Referer: signedChapter },
+  });
+  assert.deepEqual(upstreamRequests.find((item) => item.url === "/chapter/signed"), {
+    url: "/chapter/signed",
+    ss: "signed",
+    tt: "123",
+  });
+
+  const resolutionPlan = Buffer.from(JSON.stringify({
+    version: 1,
+    kind: "audio",
+    properties: ["trackUrl"],
+    attributes: [],
+    resolution: {
+      extract: [{ name: "chapterId", source: "meta", key: "chapter-id" }],
+      request: { url: `${upstreamBase}/media-api?id={{chapterId}}` },
+      response: { properties: ["trackUrl"] },
+    },
+  })).toString("base64url");
+  const resolvedChapter = `${upstreamBase}/chapter/resolve`;
+  const resolved = await fetch(
+    `${appBase}/adapter/media?kind=audio&plan=${resolutionPlan}&requestHeaders=${dynamicHeaders}&url=${encodeURIComponent(resolvedChapter)}`,
+  );
+  assert.equal(resolved.status, 200);
+  assert.deepEqual(await resolved.json(), {
+    url: `${upstreamBase}/media/resolved.m4a`,
+    httpHeaders: { Referer: resolvedChapter },
+  });
+  assert.deepEqual(upstreamRequests.find((item) => item.url === "/media-api?id=42"), {
+    url: "/media-api?id=42",
+    ss: "signed",
+    tt: "123",
+  });
+
+  const forbiddenHeaders = encodeURIComponent(JSON.stringify({ Host: "attacker.example" }));
+  const rejected = await fetch(
+    `${appBase}/adapter/media?kind=audio&plan=${audioPlan}&requestHeaders=${forbiddenHeaders}&url=${encodeURIComponent(signedChapter)}`,
+  );
+  assert.equal(rejected.status, 400);
+
   const detailReferer = `${upstreamBase}/book/1`;
   const referred = await fetch(`${appBase}/adapter/media?kind=audio&plan=${audioPlan}&url=${encodeURIComponent(audioChapter)}&referer=${encodeURIComponent(detailReferer)}`);
   assert.equal(referred.status, 200);
@@ -2137,17 +2279,36 @@ test("DNS 透明代理默认开启，origin 探活默认开启，深度预检默
   assert.equal(serverConfig({}).preflightDeep, false);
   assert.equal(serverConfig({}).preflightTimeoutMs, 3000);
   assert.equal(serverConfig({}).preflightConfirmTimeoutMs, 10000);
+  assert.equal(serverConfig({}).preflightSourceBudgetMs, 30000);
   assert.equal(serverConfig({}).preflightConcurrency, 8);
   assert.equal(serverConfig({}).verifyConvertedSources, true);
+  assert.equal(serverConfig({}).retainUnverifiedSources, true);
   assert.equal(serverConfig({}).analyzeFallback, true);
-  assert.equal(serverConfig({}).verifyBudgetMs, 20_000);
-  assert.equal(serverConfig({}).verifyMaxSources, 50);
+  assert.ok(serverConfig({}).verifyWorkers >= 1);
+  assert.equal(serverConfig({}).jobIsolation, true);
+  assert.ok(serverConfig({}).jobVerifyWorkers >= 1);
+  assert.equal(serverConfig({}).verifySourceBudgetMs, 30_000);
+  assert.equal(serverConfig({}).jobVerifySourceBudgetMs, 30_000);
+  assert.equal(serverConfig({}).verifyBudgetMs, 0);
+  assert.equal(serverConfig({}).verifyMaxSources, 0);
   assert.equal(serverConfig({ ALLOW_DNS_PROXY_NETWORKS: "false" }).allowDnsProxyNetworks, false);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "false" }).preflightSources, false);
+  assert.equal(serverConfig({ PREFLIGHT_SOURCE_BUDGET_MS: "9000" }).preflightSourceBudgetMs, 9000);
   assert.equal(serverConfig({ VERIFY_CONVERTED_SOURCES: "false" }).verifyConvertedSources, false);
+  assert.equal(serverConfig({ RETAIN_UNVERIFIED_SOURCES: "false" }).retainUnverifiedSources, false);
   assert.equal(serverConfig({ ANALYZE_FALLBACK: "false" }).analyzeFallback, false);
   assert.equal(serverConfig({ ANALYZE_FALLBACK: "true" }).analyzeFallback, true);
+  assert.equal(serverConfig({ JOB_ISOLATION: "false" }).jobIsolation, false);
   assert.equal(serverConfig({ VERIFY_BUDGET_MS: "5000" }).verifyBudgetMs, 5000);
+  assert.equal(serverConfig({ VERIFY_BUDGET_MS: "0", VERIFY_MAX_SOURCES: "0" }).verifyBudgetMs, 0);
+  assert.equal(serverConfig({ VERIFY_BUDGET_MS: "0", VERIFY_MAX_SOURCES: "0" }).verifyMaxSources, 0);
+  assert.equal(serverConfig({ VERIFY_SOURCE_BUDGET_MS: "5000" }).verifySourceBudgetMs, 5000);
+  assert.equal(serverConfig({ JOB_VERIFY_SOURCE_BUDGET_MS: "7000" }).jobVerifySourceBudgetMs, 7000);
+  const availableParallelism = Math.max(1, Number(os.availableParallelism?.() || os.cpus().length) || 1);
+  assert.equal(serverConfig({ VERIFY_WORKERS: "3" }).verifyWorkers, Math.min(3, availableParallelism));
+  assert.equal(serverConfig({ JOB_VERIFY_WORKERS: "5" }).jobVerifyWorkers, Math.min(5, availableParallelism));
+  assert.equal(serverConfig({ JOB_VERIFY_WORKERS: "16" }).jobVerifyWorkers, Math.min(16, availableParallelism));
+  assert.equal(serverConfig({ JOB_VERIFY_WORKERS: "2" }).jobVerifyWorkers, Math.min(2, availableParallelism));
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "true", PREFLIGHT_DEEP_SOURCES: "true" }).preflightSources, true);
   assert.equal(serverConfig({ PREFLIGHT_SOURCES: "true", PREFLIGHT_DEEP_SOURCES: "true" }).preflightDeep, true);
 });
@@ -2159,12 +2320,14 @@ test("skippedBuckets 按原因分桶", () => {
     { source: "c", reason: "依赖登录/分流变量 Get(...)，香色无法复现阅读登录 UI" },
     { source: "d", reason: "香色核心链路不可执行：world, content" },
     { source: "e", reason: "有声/视频缺少可播放正文，且章节链接不是可识别的媒体直链" },
+    { source: "f", reason: "上游站点不可访问，或核心分类/章节链路没有数据" },
   ]), {
     "dead-origin": 1,
     imageDecode: 1,
     login: 1,
     "core-chain": 1,
     media: 1,
+    "preflight-inconclusive": 1,
   });
 });
 

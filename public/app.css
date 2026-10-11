@@ -258,6 +258,36 @@ select:focus-visible {
   gap: 0.75rem;
 }
 
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr));
+  gap: 0.75rem;
+}
+
+.settings-actions {
+  flex-wrap: wrap;
+}
+
+.provider-fields[hidden] {
+  display: none;
+}
+
+#ai-enabled {
+  width: 1.2rem;
+  min-height: 1.2rem;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+#ai-settings .label,
+#ai-settings label.inline {
+  align-items: center;
+}
+
+#ai-config-state {
+  margin: 0;
+}
+
 .job {
   padding: 0.9rem 0;
   border-top: 1px solid var(--line);
@@ -305,6 +335,7 @@ select:focus-visible {
 }
 
 .badge.done { color: var(--ok); border-color: rgba(124, 184, 138, 0.45); }
+.badge.partial { color: var(--warn); border-color: rgba(212, 161, 92, 0.45); }
 .badge.running, .badge.queued { color: var(--warn); border-color: rgba(212, 161, 92, 0.45); }
 .badge.failed { color: var(--bad); border-color: rgba(210, 122, 106, 0.45); }
 

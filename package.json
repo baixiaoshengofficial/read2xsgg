@@ -22,6 +22,7 @@
     "rebase:library": "node ./bin/rebase-library.js",
     "deploy:local": "./scripts/deploy-local.sh",
     "start": "node ./bin/server.js",
+    "agent:bridge": "node ./bin/agent-bridge.js",
     "docker:push": "./scripts/docker-push.sh"
   },
   "keywords": [
