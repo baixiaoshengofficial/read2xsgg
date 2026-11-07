@@ -501,4 +501,4 @@ const xbs = encodeXbs(sources);
 
 ## Sponsors
 
-Sponsored by [ForZTN](https://sponsorship.forztn.com/github.com/read2xsgg).
+Sponsored by [ForZTN](https://sponsorship.forztn.com/github.com/baixiaoshengofficial/read2xsgg).
